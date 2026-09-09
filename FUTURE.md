@@ -87,9 +87,13 @@ API differences are in `docs/operations.md` "Mantic" and the plans in
 `scratch_docs_and_planning/mantic_integration_plan_2026-09-08.md` (Phase 1, the platform seam)
 and `mantic_phase2_plan_2026-09-08.md` (Phase 2: first-class date questions, the
 Mantic-optimized prompt and numeric fixes, and the robustness rules from the readiness review
-in `mantic_research_2026-09-08/`). Operator step remaining:
-`gh secret set MANTIC_TOKEN --repo No-Stream/metaculus-bot < ~/.keys/MANTIC_TOKEN`, then merge;
-the schedule is live once the file is on `main`.
+in `mantic_research_2026-09-08/`). Three later documents from the same day carry the next round:
+`mantic_adversarial_candidates_2026-09-08.md` (written; the corpus read behind the corrected
+out-of-range base rates, the tail-floor decision and the day-bin evidence below),
+`units_investigation_2026-09-08.md` and `mantic_wave_c_plan_2026-09-08.md` (both being written on
+the night of 2026-09-08). The `MANTIC_TOKEN` repository secret was set by the operator on
+2026-09-08 (`gh secret list --repo No-Stream/metaculus-bot` shows it), so the one operator step
+left is the merge; the schedule is live once the file is on `main`.
 
 **Wave C, before Series 2, with live data** (from the Phase 2 plan; each item's receipt is in
 the research dossier):
@@ -112,12 +116,29 @@ the research dossier):
   API at :01 (dispatch events are not subject to schedule dropping); a self-hosted runner does
   not help because the drops are scheduler-side, and running the bot on a box directly loses
   the artifact pipeline. Detail: `docs/operations.md` "Scheduling reliability".
-- **Mechanical 5% out-of-range tail floor: HELD** pending the new `oor_low` / `oor_high`
-  telemetry on the per-member and aggregate numeric markers. Moving each open side from 1% to
-  5% breaks even at a 5% escape rate; Mantic measured 15% on discrete and 51% on date questions,
-  so the floor is probably right, but it would override an honest forecaster and would be inert
-  if the models already place percentiles beyond the bound. Decide on the first live runs' oor
-  fields.
+- **Mantic-only 5% out-of-range tail floor: APPROVED and BUILT 2026-09-08.** The Phase 2
+  plan HELD it pending live `oor_low` / `oor_high` telemetry; the corpus read in
+  `mantic_adversarial_candidates_2026-09-08.md` (candidate 1) flipped the decision. Corrected
+  Series 1 escape rates, annulled questions excluded: numeric 16 of 133 (12.0%; Mantic stored
+  seven numeric escapes as raw values outside the range, which a filter on the
+  `above_upper_bound` / `below_lower_bound` strings misses, so the edge review's 6.6% was an
+  undercount), discrete 35 of 141 (24.8%), quantitative combined 51 of 274 (18.6%), date with
+  an open upper bound 101 of 188 (53.7%). Applying a 5% per-open-side floor to the eleven
+  Series 1 competitors' own published distributions (4,082 forecasts) cost at most 1.9 points
+  per question for any type and gained up to 9.1 for the thin-tailed bots that resemble ours;
+  for a bot at our structural 1% the expected gain is about +11 per quantitative and +42 per
+  date question, and the floor is inert when the models already place 5% beyond. Mechanism
+  (`docs/numeric_pipeline.md` "Step 11: the Mantic out-of-range tail floor"):
+  `MANTIC_OUT_OF_RANGE_TAIL_FLOOR` (0.05) in `constants.py`, applied by
+  `numeric/out_of_range_floor.py` from `TemplateForecaster._aggregate_predictions` to the Mantic
+  aggregate CDF on open sides only; never on Metaculus, never on a closed bound, never reducing
+  a tail already at or above the floor. The `NUMERIC_AGGREGATE` marker carries additive
+  `oor_low_raw` / `oor_high_raw` / `tail_floor` fields, so the unfloored aggregate stays
+  measurable beside the per-member `oor_low` / `oor_high`. **Operator ask, open:** once live oor
+  telemetry has accumulated, benchmark the floor on this bot's OWN forecasts rather than the
+  field's: replay the archived Mantic aggregate and per-member CDFs with and without the floor
+  under Mantic's baseline formula, 50 ln(mass / 0.05) for the out-of-range bucket, and read the
+  delta by question type.
 - **Fast-path alertability in mantic mode** (item 13). The `time_budget_fast_path` counter is
   alertable and would fire routinely under 60-minute windows; decide once the Series 2 window
   length is known.
@@ -129,8 +150,17 @@ the research dossier):
 - **Log-scaled discrete grids are untested.** No `zero_point` (log-scaled) discrete question
   exists in the Mantic corpus, so the plateau cap's use of the linear mean bin width on such a
   grid has no live or recorded case behind it; check the first one that appears.
-- **After 2026-09-20 12:00 UTC:** read question 651's resolution string and reported baseline
-  score to close the on-edge bin-mapping question, and read one resolved Series 2 question's
+- **Day-bin edge convention: decision 2026-09-08, keep the noon mapping (Wave C item C5).** A
+  date-only answer maps to 12:00 UTC of that day (`numeric/date_axis.py`), inside the
+  platform's right-closed day bin. The evidence, from
+  `mantic_adversarial_candidates_2026-09-08.md` section 5: Mantic's resolver stamped 24 of 90
+  in-range Series 1 date resolutions at 00:00 UTC, which the platform's bucket formula would
+  score in the previous day's bin, while the corpus argues Mantic intends inside-day stamps
+  (under the midnight convention post 651's own bin labels break: two answer dates share a bin
+  and the twelfth bin is unreachable). No email to Mantic; confirm from post 651's resolution
+  string and reported baseline score after 2026-09-20 12:00 UTC. If the resolver turns out to
+  stamp midnight, the flip is one constant plus its two pins and the scoring-grid sentence.
+- **After 2026-09-20 12:00 UTC:** the C5 read above, and one resolved Series 2 question's
   score to learn the continuous coefficient Mantic actually uses.
 
 **Accepted with no change (do not re-raise):** loosening the binary 0.98 clamp (at most +2.7
@@ -146,11 +176,13 @@ multiple-choice ceiling; Mantic comment backfill.
   `multi_resolution: true` flag and type-aware (mixture percentiles for continuous and date
   questions, expected share per option for multiple choice, expected fraction of Yes for
   binary); priced at 38.7 points on the live post 650. It lives in the base prompts only. The
-  three stacking prompts do not carry it, or any other base-prompt rule, by the standing rule
-  in `docs/prompts.md`; stacking is off in production and the stacker rewrites the forecasts it
-  is given rather than reasoning about the platform. The consequence is deliberate but worth
-  naming: a stacker on a multi-resolution question never learns it, so revisit before
-  re-enabling numeric stacking.
+  three stacking prompts do not carry it, nor the out-of-range base rate or the scoring-grid
+  clause, by the standing rule in `docs/prompts.md`; the two platform-aware scoring texts
+  (`_scoring_sentence`, in all three, and `_CONTINUOUS_SCORING_RULE`, in the numeric one) are
+  the exception, because the stacking prompts already carried the same sentences. Stacking is
+  off in production and the stacker rewrites the forecasts it is given rather than reasoning
+  about the platform. The consequence is deliberate but worth naming: a stacker on a
+  multi-resolution question never learns it, so revisit before re-enabling numeric stacking.
 - **Prompt notes recorded by the Phase 2 build, not changed.** `_HISTORY_DISCHARGED_RULE` was
   NOT added to the date prompt, pending the operator's say (the date prompt does carry
   `_SOFT_CLOCK_RULE`, since announced target dates in "when will X" questions are the
@@ -186,8 +218,15 @@ multiple-choice ceiling; Mantic comment backfill.
 - **Date questions: SHIPPED in Phase 2.** The question stays a `DateQuestion` end to end and
   the numeric math runs on its epoch-seconds view (`numeric/date_axis.py`); the date runner,
   prompt, structured schema and extraction are in `docs/architecture.md` "The date path". Out of
-  scope and asserted at the code's own seams: backtest, ablation and performance_analysis for
-  date questions, and Mantic residual analysis.
+  scope, each at an explicit seam in the code: the backtest (`backtest/question_prep.py`, the
+  unsupported-type warning and the datetime assert), the ablation harness
+  (`ablation/run_pdf.py`, a raise), the residual dataset (`performance_analysis/collector.py`
+  skips each resolved date question with a WARNING naming it, needed because Metaculus run modes
+  now forecast dates too) and the ghost scorer (`scripts/score_ghosts.py` counts date ghosts by
+  type and reports that none can be scored). Mantic residual analysis is out of scope entirely.
+  A date question's `scaling` bounds arrive as epoch seconds, the axis the ghost's percentiles
+  and the published CDF already use, so date scoring, when wanted, is the numeric path plus a
+  date-resolution parser.
 - **Series 2 cadence: three early crons, dispatcher decision open (Wave C above).** Series 1
   windows were exactly one hour, opened on the hour, up to three questions an hour; two crons at
   :17/:47 under a 22% delivery rate would have forfeited roughly half of them, and the :47 pickup
@@ -208,6 +247,17 @@ multiple-choice ceiling; Mantic comment backfill.
   grids tested. The only production caller is the dormant ablation harness replaying archived
   201-point Metaculus records, where the two are byte-identical, so no pin was added; recorded so
   the finding is not re-raised.
+- **Retrying the pre-spend tournament GET: reviewed 2026-09-08, declined on the merits (review
+  finding F6).** `mantic.preflight_mantic_tournaments` is unretried like the identity preflight
+  moments before it, which is deliberately one-shot; the three crons an hour are the retry, and
+  exporting `fetch_hardening`'s retry internals into the second of two pre-spend gates adds
+  mechanism and makes the startup path incoherent.
+- **A MEMBER_FORECAST line for a member whose CDF build raises: reviewed 2026-09-08, declined on
+  the merits (review finding F17).** The record is not lost: the 201-point path soft-fails to
+  the framework fallback, the declared percentiles are in the run log verbatim through the
+  rationale dump, and the drop is attributed in `FORECASTER_DROPS`; the remedy is a broad except
+  with a harness-scan exemption plus a second marker call site in two functions, worse than the
+  trade `member_forecast.py`'s docstring already documents.
 
 ### Triple-era September re-read (numeric watch + the era's whole scoreboard) (added 2026-07-20, **HIGH — operator-confirmed 2026-08-25**)
 

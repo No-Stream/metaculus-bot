@@ -45,6 +45,9 @@ MIN_PERCENTILES_REQUIRED: int = 3
 
 # --- PCHIP CDF Configuration ---
 
+# The standard grid. ``NumericQuestion.cdf_size`` (and ``DateQuestion.cdf_size``) is a
+# non-optional int on the forecasting-tools model, defaulting to this, so no reader in the
+# pipeline normalises an absent value: a test double that wants the standard grid passes it.
 PCHIP_CDF_POINTS: int = 201
 
 # The 201-grid max step by name: the reference the open-bound piling threshold is calibrated
@@ -152,6 +155,19 @@ JITTER_CONVERGENCE_TOL: float = 1e-10
 BOUNDARY_SAFETY_MARGIN: float = 0.01
 
 MIN_BOUNDARY_DISTANCE: float = 1e-9
+
+
+def minimum_separation(range_size: float) -> float:
+    """The smallest gap the sanitizer opens on a ``range_size``-wide axis.
+
+    ``max(MIN_BOUNDARY_DISTANCE * range_size, STRICT_ORDERING_EPSILON)``: the standoff a clamped
+    or spread value keeps inside a closed bound (``bounds_clamping``, ``cluster_processing``) and
+    the gap the jitter and strict-ordering passes open between equal neighbours. One formula so
+    those passes agree on what "just inside" and "just above" mean and never fight over a value
+    one of them placed.
+    """
+    return max(MIN_BOUNDARY_DISTANCE * range_size, STRICT_ORDERING_EPSILON)
+
 
 # --- Diagnostic and Logging Thresholds ---
 

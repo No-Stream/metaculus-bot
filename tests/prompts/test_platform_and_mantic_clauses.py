@@ -40,11 +40,22 @@ from tests.prompt_builders import (
 )
 
 
-def _mantic_numeric_q(*, open_upper: bool = True, open_lower: bool = False, **question_json):
+def _mantic_numeric_q(
+    *,
+    open_upper: bool = True,
+    open_lower: bool = False,
+    cdf_size: int = 201,
+    zero_point: float | None = None,
+    **question_json,
+):
+    """A Mantic numeric stub: the grid comes off the typed model (``cdf_size``, ``zero_point``), the
+    per-question flags (``precision``, ``multi_resolution``) off ``api_json["question"]``."""
     q = _numeric_q()
     q.page_url = MANTIC_PAGE_URL
     q.open_upper_bound = open_upper
     q.open_lower_bound = open_lower
+    q.cdf_size = cdf_size
+    q.zero_point = zero_point
     q.api_json = {"question": question_json}
     return q
 
@@ -101,7 +112,14 @@ class TestPlatformScoringSentence:
             assert "metaculus" not in flat, "a Mantic prompt must not attribute its scoring to Metaculus"
 
     def test_the_old_platform_attributions_are_gone(self) -> None:
-        for prompt in (binary_prompt(_binary_q(), research="r"), _numeric_prompt_text(), *_stacked_prompt_texts()):
+        """All six prompts: the MC base prompt is where "Metaculus' log-score" lived."""
+        for prompt in (
+            binary_prompt(_binary_q(), research="r"),
+            multiple_choice_prompt(_mc_q(), research="r"),
+            _numeric_prompt_text(),
+            _date_prompt_text(),
+            *_stacked_prompt_texts(),
+        ):
             assert "the Metaculus peer score" not in prompt
             assert "Metaculus' log-score" not in prompt
             assert "Your Metaculus question is" not in prompt
@@ -185,14 +203,20 @@ class TestManticOutOfRangeBaseRate:
     """
 
     def test_mantic_numeric_with_an_open_bound_carries_the_quantity_rate(self) -> None:
+        """Series 1 corpus, annulled excluded, re-verified 2026-09-08: 51 of 274 quantitative questions
+        resolved outside the range (35 of 141 discrete, 16 of 133 numeric, the numeric count including
+        the seven escapes the platform stored as raw values rather than as a bound token)."""
         for kwargs in ({"open_upper": True, "open_lower": False}, {"open_upper": False, "open_lower": True}):
             prompt = _numeric_text(_mantic_numeric_q(**kwargs))
             flat = _flat(prompt)
             assert _flat(_MANTIC_OUT_OF_RANGE_RATE_QUANTITY) in flat
-            assert "one in seven past quantitative questions resolved outside the displayed range" in flat
+            assert "one in five past quantitative questions resolved outside the displayed range" in flat
+            assert "one in four of the discrete ones, one in eight of the continuous ones" in flat
+            assert "one in seven" not in flat
+            assert "one in fifteen" not in flat
             assert "asserts a 1% chance of an out-of-range outcome" in flat
             # It follows the bound messages, which is where the model reads about open bounds.
-            assert prompt.index("ubm") < prompt.index("one in seven past quantitative questions")
+            assert prompt.index("ubm") < prompt.index("one in five past quantitative questions")
 
     def test_mantic_numeric_with_both_bounds_closed_carries_nothing(self) -> None:
         flat = _flat(_numeric_text(_mantic_numeric_q(open_upper=False, open_lower=False)))
@@ -289,17 +313,30 @@ class TestMultiResolutionClause:
 
 class TestScoringGridClause:
     """B6. The bin count and width, templated on Mantic's ``precision`` (quantitative) or
-    ``date_granularity`` (date); absent on Metaculus questions, whose payloads carry neither."""
+    ``date_granularity`` (date); absent on Metaculus questions, whose payloads carry neither.
+
+    The bin count is the typed model's ``cdf_size - 1``, the same number the CDF builder keys off,
+    so the prompt can never describe a grid other than the one the pipeline submits."""
 
     def test_numeric_with_precision_names_the_grid(self) -> None:
-        q = _mantic_numeric_q(precision=100.0, inbound_outcome_count=450)
+        q = _mantic_numeric_q(precision=100.0, cdf_size=451)
         q.unit_of_measure = "$"
         flat = _flat(_numeric_text(q))
         assert "scoring grid: 450 bins of width 100 $" in flat
         assert "a percentile's value selects the bin it falls in, so detail finer than one bin is wasted" in flat
 
+    def test_numeric_with_precision_on_a_log_grid_names_no_width(self) -> None:
+        """Mantic's OpenAPI defines ``precision`` on a logarithmic grid as the RATIO between adjacent
+        boundaries, so the additive width phrase would be false across the whole axis; the clause
+        names the geometry instead and renders no number it cannot stand behind."""
+        q = _mantic_numeric_q(precision=1.1, cdf_size=201, zero_point=0.0)
+        flat = _flat(_numeric_text(q))
+        assert "scoring grid: 200 bins, log-spaced" in flat
+        assert "a percentile's value selects the bin it falls in, so detail finer than one bin is wasted" in flat
+        assert "bins of width" not in flat
+
     def test_numeric_without_precision_names_no_grid(self) -> None:
-        q = _mantic_numeric_q(inbound_outcome_count=450)
+        q = _mantic_numeric_q(cdf_size=451)
         assert "scoring grid" not in _flat(_numeric_text(q))
         assert "scoring grid" not in _flat(_numeric_prompt_text())
 

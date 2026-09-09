@@ -2055,6 +2055,52 @@ class TestReadDocumentRefusesQuestionPlatformPages:
 
         assert await agentic_tools.read_document(url, "anything") == await agentic_tools.fetch(url)
 
+    @staticmethod
+    def _redirecting_onto_the_platform(monkeypatch: pytest.MonkeyPatch) -> _FakeSession:
+        """A public URL whose host 3xxes onto the competition site, served through the real plain rung."""
+        session = _FakeSession(
+            _FakeResponse(status=302, headers={"Location": "https://competitions.mantic.com/questions/650/"}),
+        )
+        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+        return session
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("_robots_allowed")
+    async def test_a_redirect_onto_a_platform_page_is_refused_before_the_paid_read(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The supplied URL clears the guard; where it LEADS does not. The free ladder refuses the hop,
+        and that refusal has to reach the paid rung too: Gemini dials from Google's address and would
+        follow the same redirect onto the page the guard exists to refuse, billing a read for it. The
+        sibling ladder closes the same hop (``resolution_source._url_context_rung_applies``)."""
+        session = self._redirecting_onto_the_platform(monkeypatch)
+        monkeypatch.setenv("GOOGLE_API_KEY", "key")
+        reader = _no_paid_reader(monkeypatch)
+        rendered = AsyncMock(return_value=None)
+        monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", rendered)
+
+        outcome = await agentic_tools.read_document("https://t.co/crucible650", "what do the other forecasters say?")
+
+        assert outcome.status == "blocked"
+        assert outcome.content_markdown == fetch_outcomes._PLATFORM_FETCH_BLOCK_MSG
+        assert outcome.method == "plain"
+        assert session.calls == [("https://t.co/crucible650", False)], "the platform hop itself is never dialed"
+        reader.assert_not_called()
+        rendered.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_redirect_refusal_is_the_one_fetch_gives(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        url = "https://t.co/crucible650"
+        self._redirecting_onto_the_platform(monkeypatch)
+        _no_paid_reader(monkeypatch)
+        monkeypatch.setenv("GOOGLE_API_KEY", "key")
+
+        read = await agentic_tools.read_document(url, "anything")
+        self._redirecting_onto_the_platform(monkeypatch)
+
+        assert read == await agentic_tools.fetch(url)
+
     @pytest.mark.asyncio
     @pytest.mark.usefixtures("_no_local_document")
     async def test_the_rest_of_the_platforms_domain_still_reaches_the_reader(

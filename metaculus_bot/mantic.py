@@ -28,12 +28,16 @@ Three robustness rules from the 2026-09-08 readiness review sit beside them:
   is gone. The parse override now counts the drop (``get_post_drop_count``, read into cli's
   alertable arithmetic so the run reddens) and emits one ``MANTIC_POST_DROPPED`` line before
   re-raising. Fail-fast is kept: nothing here swallows the error.
-- :func:`preflight_mantic_tournaments` makes ONE authenticated GET of the tournament list before
-  any spend and does two things with it: refuses to run unless the token's ``user_permission`` on
-  the configured tournament allows forecasting (a view-only token reads fine and would fail only at
-  the publish POST, after the ensemble had been paid for, every hour), and logs
-  ``MANTIC_TOURNAMENTS`` naming every ongoing bots-only tournament, at WARNING when one is not the
-  configured slug, so a Series 2 slug is named in the log the run it appears.
+- :func:`preflight_mantic_tournaments` makes two authenticated GETs before any spend, neither
+  retried. The tournament list logs ``MANTIC_TOURNAMENTS`` naming every ongoing bots-only tournament,
+  at WARNING when one is not the configured slug, so a Series 2 slug is named in the log the run it
+  appears. The configured tournament's own route (``/projects/tournaments/<slug>/``) is then read
+  and the run refuses to proceed unless the token's ``user_permission`` there allows forecasting (a
+  view-only token reads fine and would fail only at the publish POST, after the ensemble had been
+  paid for, every hour). The detail route rather than the list row because the list omits an
+  ``unlisted`` project, the state a new season sits in before its first question opens, so absence
+  from the list proves nothing, while a slug no tournament has 404s there. Every failure shape of
+  either GET is one ``ApiIdentityError`` for the operator to grep.
 
 Every parsed question emits one ``MANTIC_QUESTION`` line so the fields Mantic added and the framework
 does not model (``multi_resolution``, ``date_granularity``, ``precision``), plus the type as it
@@ -51,12 +55,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from typing import Any
 
 import requests
 from forecasting_tools.data_models.questions import DateQuestion, MetaculusQuestion, NumericQuestion
 from forecasting_tools.helpers.metaculus_client import ApiFilter, GroupQuestionMode, MetaculusClient
 
-from metaculus_bot.api_preflight import ApiIdentityError
+from metaculus_bot.api_preflight import BODY_PREVIEW_CHARS, ApiIdentityError
 from metaculus_bot.constants import (
     MANTIC_API_BASE_URL,
     MANTIC_FETCH_QUESTION_CEILING,
@@ -73,7 +78,8 @@ _ABSENT = "n/a"
 # The Metaculus backend's ObjectPermission roles that may forecast (projects/permissions.py); viewer and null only read.
 _FORECASTING_PERMISSIONS: frozenset[str] = frozenset({"forecaster", "curator", "admin", "creator"})
 _BOTS_ONLY_LEADERBOARD = "bots_only"
-_BODY_PREVIEW_CHARS = 200
+# Live, both tournament routes answer a mistyped or revoked token with a 403, not the 401 one expects.
+_AUTH_REJECTED_HINT = "A 401 or 403 ('Invalid token.') means MANTIC_TOKEN is not accepted."
 
 _post_drop_count = 0
 
@@ -135,27 +141,72 @@ class ManticClient(MetaculusClient):
     def list_tournaments(self) -> list[dict]:
         """One authenticated GET of ``/projects/tournaments/``; ``ApiIdentityError`` on anything but a 200 list.
 
-        Authenticated on purpose: the platform's token authentication answers 401 to a revoked or
-        mistyped token here, which the unauthenticated identity preflight cannot see, and
-        ``user_permission`` in the payload is the caller's own. Not retried, like the identity
-        preflight: a transient failure stops the run before any spend and the next cron retries.
+        Authenticated on purpose: the platform's token authentication rejects a revoked or mistyped
+        token here, which the unauthenticated identity preflight cannot see, and ``user_permission``
+        in the payload is the caller's own. Not retried, like the identity preflight: a transient
+        failure stops the run before any spend and the next cron retries.
         """
         url = f"{self.base_url}/projects/tournaments/"
-        response = requests.get(url, headers=self._get_auth_headers()["headers"], timeout=self.timeout)
-        body_preview = response.text[:_BODY_PREVIEW_CHARS]
-        if response.status_code != 200:
-            raise ApiIdentityError(
-                f"Mantic tournament list GET {url!r} answered status={response.status_code} "
-                f"(first {_BODY_PREVIEW_CHARS} chars: {body_preview!r}); the token's forecast permission cannot "
-                "be confirmed, so the run stops before any spend. A 401 means MANTIC_TOKEN is not accepted."
-            )
-        tournaments = response.json()
+        tournaments, body_preview = self._get_json(url, what="tournament list", status_hint=_AUTH_REJECTED_HINT)
         if not isinstance(tournaments, list):
             raise ApiIdentityError(
                 f"Mantic tournament list GET {url!r} answered 200 but not with a JSON list "
-                f"(first {_BODY_PREVIEW_CHARS} chars: {body_preview!r}); stopping before any spend."
+                f"(first {BODY_PREVIEW_CHARS} chars: {body_preview!r}); stopping before any spend."
             )
         return tournaments
+
+    def get_tournament(self, tournament_id: str) -> dict:
+        """One authenticated GET of ``/projects/tournaments/<slug>/``; ``ApiIdentityError`` unless a 200 object.
+
+        The route that is authoritative for one project: slug and numeric id both resolve, a slug no
+        tournament has 404s, and the payload carries the caller's own ``user_permission``. Unretried,
+        like :meth:`list_tournaments`.
+        """
+        url = f"{self.base_url}/projects/tournaments/{tournament_id}/"
+        tournament, body_preview = self._get_json(
+            url,
+            what=f"tournament {tournament_id!r}",
+            status_hint=(
+                f"A 404 means no tournament has the slug {tournament_id!r}: re-point MANTIC_TOURNAMENT_ID in "
+                f"constants.py. {_AUTH_REJECTED_HINT}"
+            ),
+        )
+        if not isinstance(tournament, dict):
+            raise ApiIdentityError(
+                f"Mantic tournament {tournament_id!r} GET {url!r} answered 200 but not with a JSON object "
+                f"(first {BODY_PREVIEW_CHARS} chars: {body_preview!r}); stopping before any spend."
+            )
+        return tournament
+
+    def _get_json(self, url: str, *, what: str, status_hint: str) -> tuple[Any, str]:
+        """One authenticated, unretried GET decoded as JSON, plus the body preview for diagnostics.
+
+        Every failure shape is ``ApiIdentityError``: a transport failure (DNS, TLS, connect,
+        timeout), a non-200 status, and a 200 whose body is not JSON (the captive-portal shape).
+        The run stops before any spend either way; wrapping makes the stop one greppable exception
+        carrying the URL, status and body preview instead of a requests traceback.
+        """
+        try:
+            response = requests.get(url, headers=self._get_auth_headers()["headers"], timeout=self.timeout)
+        except requests.RequestException as exc:
+            raise ApiIdentityError(
+                f"Mantic {what} GET {url!r} failed before any response ({type(exc).__name__}: {exc}); the token's "
+                "forecast permission cannot be confirmed, so the run stops before any spend."
+            ) from exc
+        body_preview = response.text[:BODY_PREVIEW_CHARS]
+        if response.status_code != 200:
+            raise ApiIdentityError(
+                f"Mantic {what} GET {url!r} answered status={response.status_code} "
+                f"(first {BODY_PREVIEW_CHARS} chars: {body_preview!r}); the token's forecast permission cannot "
+                f"be confirmed, so the run stops before any spend. {status_hint}"
+            )
+        try:
+            return response.json(), body_preview
+        except requests.exceptions.JSONDecodeError as exc:
+            raise ApiIdentityError(
+                f"Mantic {what} GET {url!r} answered 200 but not with JSON "
+                f"(first {BODY_PREVIEW_CHARS} chars: {body_preview!r}); stopping before any spend."
+            ) from exc
 
 
 def build_mantic_client() -> ManticClient:
@@ -218,17 +269,22 @@ def _count_dropped_post(post_json: dict, exc: BaseException) -> None:
 
 
 def preflight_mantic_tournaments(client: ManticClient, tournament_id: str) -> None:
-    """One authenticated GET of the tournament list, two checks, before any spend.
+    """Two authenticated GETs, two checks, before any spend.
 
-    Series 2 discovery first: ``MANTIC_TOURNAMENTS`` names every ongoing tournament, the configured
-    slug, and the ongoing bots-only tournaments that are NOT the configured one, at WARNING when
-    that last set is non-empty. A zero-question run is green, so without this line a Series 2 slug
-    could open and every hourly run would keep fetching the ended preseason silently.
+    Series 2 discovery first, off the tournament LIST: ``MANTIC_TOURNAMENTS`` names every ongoing
+    tournament, the configured slug, and the ongoing bots-only tournaments that are NOT the
+    configured one, at WARNING when that last set is non-empty. A zero-question run is green, so
+    without this line a Series 2 slug could open and every hourly run would keep fetching the ended
+    preseason silently.
 
-    Then the permission check, which fails shut: ``ApiIdentityError`` unless ``tournament_id`` is
-    on the list with a ``user_permission`` that allows forecasting. A token that authenticates but
-    may only view reads the tournament fine and fails only at the publish POST, after the whole
-    ensemble has been paid for, on every cron until somebody reads the red runs.
+    Then the permission check, off the configured tournament's own route, which fails shut:
+    ``ApiIdentityError`` unless ``/projects/tournaments/<slug>/`` answers 200 with a
+    ``user_permission`` that allows forecasting. The detail route rather than the list row because
+    the list omits an ``unlisted`` project, the state a new season sits in before its first question
+    opens, so absence from the list is not evidence the slug is wrong, while a slug no tournament
+    has 404s there. A token that authenticates but may only view reads the tournament fine and
+    fails only at the publish POST, after the whole ensemble has been paid for, on every cron until
+    somebody reads the red runs.
     """
     tournaments = client.list_tournaments()
     by_slug = {tournament.get("slug"): tournament for tournament in tournaments}
@@ -246,14 +302,7 @@ def preflight_mantic_tournaments(client: ManticClient, tournament_id: str) -> No
         _slugs_csv(new),
     )
 
-    configured = by_slug.get(tournament_id)
-    if configured is None:
-        raise ApiIdentityError(
-            f"Mantic tournament {tournament_id!r} is not on {client.base_url}/projects/tournaments/ "
-            f"(slugs there: {_slugs_csv(sorted(slug for slug in by_slug if slug))}); re-point MANTIC_TOURNAMENT_ID "
-            "in constants.py. Stopping before any spend."
-        )
-    permission = configured.get("user_permission")
+    permission = client.get_tournament(tournament_id).get("user_permission")
     if permission not in _FORECASTING_PERMISSIONS:
         raise ApiIdentityError(
             f"MANTIC_TOKEN holds user_permission={permission!r} on tournament {tournament_id!r}, which does not "

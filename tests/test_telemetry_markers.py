@@ -31,6 +31,8 @@ tests loudly instead of silently dropping records from the archive:
 * LITELLM_CALLBACK_DRAIN_TIMEOUT -> metaculus_bot/credit_telemetry.py:drain_litellm_callbacks
   (the completeness flag on that run's CREDIT_ROLE_SPEND rows)
 * ONLY_POSTS         -> metaculus_bot/cli.py:_tournament_source (the --only-posts smoke filter)
+* QUESTION_CAP_FORFEIT -> metaculus_bot/forecaster.py:forecast_questions (the max-questions cap
+  naming the posts it left behind)
 * STACKER_OUTCOME/TOOLS_USED -> metaculus_bot/comment/markers.py (HTML-comment
   markers; see module docstring in markers.py for why they rarely appear in run logs).
 """
@@ -859,10 +861,14 @@ NUMERIC_PCHIP_FALLBACK_NO_ID_LINE = (
 
 
 class TestNumericDegenerateDeclaration:
-    """A per-forecaster fabrication-ATTEMPT rate, which is why it needs a spec.
+    """A per-forecaster point-mass declaration, and what the grid made of it.
 
-    A point-mass declaration is no longer cluster-spread, so the unit-mismatch guard sees the
-    model's own zero span and withholds the forecaster. The drop itself lands in
+    On the 201-point continuous grid a point-mass declaration is not cluster-spread
+    (``spread_applied=false``), so the unit-mismatch guard sees the model's own zero span and
+    withholds the forecaster: there the count is a fabrication-ATTEMPT rate, which is why it
+    needs a spec. Where the published bins are the outcome space (a discrete question or any
+    non-201 grid) the collapse is spread under the one-bin cap (``spread_applied=true``) and the
+    member publishes with its mass inside the bin it named. The 201-grid drop itself lands in
     FORECASTER_DROPS as an UnitMismatchError; only this line names the cause, and its
     predecessor (`Cluster spread applied`) was never harvested — which is exactly why the
     finding's prod incidence was unanswerable from the archive.
@@ -881,6 +887,12 @@ class TestNumericDegenerateDeclaration:
         rec = _parse_one(NUMERIC_DEGENERATE_DECLARATION_LINE)
         assert rec["qid"] == 77
         assert rec["qid_kind"] == "question_id"
+
+    def test_spread_applied_true_harvests_as_a_bool(self):
+        """On a grid whose bins are the outcome space the collapse IS spread and published, and the
+        emitter renders the real value; the ``\\S+`` capture takes it and coercion makes it a bool."""
+        rec = _parse_one(NUMERIC_DEGENERATE_DECLARATION_LINE.replace("spread_applied=false", "spread_applied=true"))
+        assert rec["spread_applied"] is True
 
     def test_unlabelled_model_stays_a_readable_string(self):
         # "unknown" is what the line carries when a caller doesn't pass model_name. All
@@ -2134,6 +2146,17 @@ NUMERIC_AGGREGATE_DATE_LINE = (
 NUMERIC_AGGREGATE_NUMERIC_LINE = (
     PFX + "NUMERIC_AGGREGATE: question=45065 qtype=numeric cdf_size=201 oor_low=0.001000 oor_high=0.037500"
 )
+# The current shape, with the three trailing tail-floor fields: a Mantic discrete question (post
+# 650, both bounds open, 450 bins) whose aggregate carried the structural 1% beyond each bound and
+# was published at the 5% floor; a Metaculus question whose tails were left as built.
+NUMERIC_AGGREGATE_FLOORED_LINE = PFX + (
+    "NUMERIC_AGGREGATE: question=650 qtype=numeric cdf_size=451 oor_low=0.050000 oor_high=0.050000 "
+    "oor_low_raw=0.010000 oor_high_raw=0.010000 tail_floor=0.050000"
+)
+NUMERIC_AGGREGATE_UNFLOORED_LINE = PFX + (
+    "NUMERIC_AGGREGATE: question=45065 qtype=numeric cdf_size=201 oor_low=0.010000 oor_high=0.037500 "
+    "oor_low_raw=0.010000 oor_high_raw=0.037500 tail_floor=0.000000"
+)
 
 
 class TestOutOfRangeMassFields:
@@ -2184,6 +2207,34 @@ class TestOutOfRangeMassFields:
         assert rec["cdf_size"] == 201
         assert rec["oor_low"] == 0.001
         assert rec["oor_high"] == 0.0375
+
+    def test_a_floored_mantic_aggregate_line_carries_raw_and_published_tails(self):
+        rec = _parse_one(NUMERIC_AGGREGATE_FLOORED_LINE)
+        assert rec["marker"] == "numeric_aggregate"
+        assert rec["qid"] == 650
+        assert rec["cdf_size"] == 451
+        # oor_low / oor_high keep their meaning: what was PUBLISHED, here the floor itself.
+        assert rec["oor_low"] == 0.05
+        assert rec["oor_high"] == 0.05
+        assert rec["oor_low_raw"] == 0.01
+        assert rec["oor_high_raw"] == 0.01
+        assert rec["tail_floor"] == 0.05
+
+    def test_an_unfloored_aggregate_line_reads_a_zero_floor_and_equal_tails(self):
+        rec = _parse_one(NUMERIC_AGGREGATE_UNFLOORED_LINE)
+        assert rec["oor_low"] == rec["oor_low_raw"] == 0.01
+        assert rec["oor_high"] == rec["oor_high_raw"] == 0.0375
+        assert rec["tail_floor"] == 0.0
+
+    def test_aggregate_lines_that_predate_the_floor_fields_read_none_for_them(self):
+        # The three fields are one optional trailing group, so every earlier archived line still
+        # harvests, and a None there says "not recorded", never a measured zero floor.
+        for line in (NUMERIC_AGGREGATE_DATE_LINE, NUMERIC_AGGREGATE_NUMERIC_LINE):
+            rec = _parse_one(line)
+            assert rec["marker"] == "numeric_aggregate"
+            assert rec["oor_low_raw"] is None
+            assert rec["oor_high_raw"] is None
+            assert rec["tail_floor"] is None
 
     def test_the_grid_mismatch_marker_is_not_claimed_by_the_aggregate_spec(self):
         # NUMERIC_AGGREGATE_GRID_MISMATCH shares the prefix; each line must land in its own spec.
@@ -3038,6 +3089,35 @@ class TestOnlyPosts:
         assert rec["requested"] == "650,999"
         assert rec["matched"] is None
         assert rec["dropped"] == 4
+
+
+# The max-questions cap (metaculus_bot/forecaster.py:forecast_questions): one WARNING per run
+# that cut the tightest-close-first list, naming the platform and the posts it left behind.
+# Run-level, so no question ref; ``posts`` is comma-separated post ids in drop order.
+QUESTION_CAP_FORFEIT_LINE = PFX_WARN + "QUESTION_CAP_FORFEIT: platform=mantic cap=10 total=12 dropped=2 posts=7011,7012"
+QUESTION_CAP_FORFEIT_ONE_POST_LINE = (
+    PFX_WARN + "QUESTION_CAP_FORFEIT: platform=metaculus cap=10 total=11 dropped=1 posts=38880"
+)
+
+
+class TestQuestionCapForfeit:
+    def test_two_forfeits(self):
+        rec = _parse_one(QUESTION_CAP_FORFEIT_LINE)
+        assert rec["marker"] == "question_cap_forfeit"
+        assert rec["platform"] == "mantic"
+        assert rec["cap"] == 10
+        assert rec["total"] == 12
+        assert rec["dropped"] == 2
+        assert rec["posts"] == "7011,7012"
+        assert "qid" not in rec
+        assert "qid_kind" not in rec
+
+    def test_one_forfeit(self):
+        """A lone post id coerces to int, as on ONLY_POSTS."""
+        rec = _parse_one(QUESTION_CAP_FORFEIT_ONE_POST_LINE)
+        assert rec["platform"] == "metaculus"
+        assert rec["dropped"] == 1
+        assert rec["posts"] == 38880
 
 
 # Gemini ungrounded-suppression WARN (metaculus_bot/research/gemini_search.py

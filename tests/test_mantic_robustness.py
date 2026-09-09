@@ -10,14 +10,16 @@ Three rules, one class each, all in ``metaculus_bot/mantic.py``:
   as one warning and forfeited silently on every run. The client counts the drop and emits one
   ``MANTIC_POST_DROPPED`` line before re-raising, keeping fail-fast; cli reads the counter into the
   alertable arithmetic (pinned in ``tests/test_cli.py``).
-- **The tournament preflight** (items 5 and 20). One authenticated GET of the tournament list logs
-  ``MANTIC_TOURNAMENTS`` (Series 2 discovery) and refuses to run unless the token's
-  ``user_permission`` on the configured slug allows forecasting, before any spend.
+- **The tournament preflight** (items 5 and 20). Two authenticated GETs before any spend, neither
+  retried: the tournament list logs ``MANTIC_TOURNAMENTS`` (Series 2 discovery), then the configured
+  tournament's own route decides whether the token's ``user_permission`` allows forecasting. The
+  detail route, because the list omits an ``unlisted`` project (a new season before its first
+  question) while a slug no tournament has 404s there.
 
 ``tests/test_mantic_client.py`` owns the recorded preseason fixture and the parsing seams; this module
 reuses its fixture loader and never opens a socket (the autouse egress guard in conftest would refuse).
-The live tournament list below is the unauthenticated ``GET /api/projects/tournaments/`` of 2026-09-08,
-reduced to the fields the preflight reads.
+The live tournament list below is the ``GET /api/projects/tournaments/`` of 2026-09-08, reduced to the
+fields the preflight reads; the detail payload carries the same fields and more.
 """
 
 from __future__ import annotations
@@ -48,6 +50,11 @@ _FAKE_TOKEN = "f" * 40
 _UNPACK = "unpack_subquestions"
 _MANTIC_LOGGER = "metaculus_bot.mantic"
 _TOURNAMENTS_URL = f"{MANTIC_API_BASE_URL}/projects/tournaments/"
+_CONFIGURED_TOURNAMENT_URL = f"{_TOURNAMENTS_URL}{MANTIC_TOURNAMENT_ID}/"
+# What both routes answer to a mistyped or revoked token, live: a 403, not a 401.
+_INVALID_TOKEN_STATUS = 403
+_INVALID_TOKEN_BODY = {"detail": "Invalid token."}
+_NOT_FOUND_BODY = {"detail": "Not found."}
 # Prod cli.py log format, as in tests/test_telemetry_markers.py; the level is irrelevant to the harvest.
 _LOG_PREFIX = "2026-09-08 14:23:01,123 - metaculus_bot.mantic - ERROR - "
 _HARVEST_META = {
@@ -78,19 +85,37 @@ LIVE_TOURNAMENTS = [
 ]
 
 
-def _json_response(status: int, payload: object) -> requests.Response:
+def _text_response(status: int, text: str) -> requests.Response:
     response = requests.Response()
     response.status_code = status
-    response._content = json.dumps(payload).encode()
+    response._content = text.encode()
     response.encoding = "utf-8"
     return response
 
 
-def _serve(monkeypatch: pytest.MonkeyPatch, payload: object, status: int = 200) -> MagicMock:
-    """Answer the next ``requests.get`` with ``payload``; returns the spy so a test can read the request."""
-    fake_get = MagicMock(return_value=_json_response(status, payload))
+def _json_response(status: int, payload: object) -> requests.Response:
+    return _text_response(status, json.dumps(payload))
+
+
+def _serve(monkeypatch: pytest.MonkeyPatch, *answers: requests.Response | Exception) -> MagicMock:
+    """Answer successive ``requests.get`` calls with ``answers`` in order (an exception is raised);
+    returns the spy so a test can read the requests."""
+    fake_get = MagicMock(side_effect=list(answers))
     monkeypatch.setattr(mantic.requests, "get", fake_get)
     return fake_get
+
+
+def _serve_preflight(
+    monkeypatch: pytest.MonkeyPatch, tournaments: list[dict[str, Any]], configured: dict[str, Any] | None = None
+) -> MagicMock:
+    """The preflight's two GETs in order: the tournament list, then the configured tournament's detail
+    (``configured`` defaults to the live preseason project)."""
+    detail = _tournament(MANTIC_TOURNAMENT_ID, is_ongoing=True) if configured is None else configured
+    return _serve(monkeypatch, _json_response(200, tournaments), _json_response(200, detail))
+
+
+def _requested_urls(fake_get: MagicMock) -> list[str]:
+    return [call.args[0] for call in fake_get.call_args_list]
 
 
 def _question_stub(question_id: int) -> MagicMock:
@@ -303,7 +328,7 @@ class TestListTournaments:
     def test_the_get_is_authenticated_bounded_and_aimed_at_the_tournament_list(
         self, client: ManticClient, monkeypatch: pytest.MonkeyPatch
     ):
-        fake_get = _serve(monkeypatch, LIVE_TOURNAMENTS)
+        fake_get = _serve(monkeypatch, _json_response(200, LIVE_TOURNAMENTS))
 
         assert client.list_tournaments() == LIVE_TOURNAMENTS
 
@@ -316,25 +341,116 @@ class TestListTournaments:
     def test_a_non_200_fails_shut_naming_the_status(
         self, client: ManticClient, monkeypatch: pytest.MonkeyPatch, status: int
     ):
-        _serve(monkeypatch, {"detail": "no"}, status=status)
+        _serve(monkeypatch, _json_response(status, {"detail": "no"}))
 
         with pytest.raises(ApiIdentityError, match=f"status={status}"):
             client.list_tournaments()
 
     def test_a_200_that_is_not_a_list_fails_shut(self, client: ManticClient, monkeypatch: pytest.MonkeyPatch):
-        _serve(monkeypatch, {"detail": "a lander, not the API"})
+        _serve(monkeypatch, _json_response(200, {"detail": "a lander, not the API"}))
 
         with pytest.raises(ApiIdentityError, match="not with a JSON list"):
             client.list_tournaments()
 
+    def test_a_200_that_is_not_json_fails_shut_with_the_body_preview(
+        self, client: ManticClient, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The captive-portal shape: a 200 HTML lander. The decode failure is folded into the one
+        exception the docstring promises rather than escaping as a bare ``JSONDecodeError``."""
+        _serve(monkeypatch, _text_response(200, "<html><body>Sign in to the network</body></html>"))
+
+        with pytest.raises(ApiIdentityError, match="not with JSON") as excinfo:
+            client.list_tournaments()
+
+        assert "Sign in to the network" in str(excinfo.value)
+        assert isinstance(excinfo.value.__cause__, requests.exceptions.JSONDecodeError)
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            requests.ConnectionError("Name or service not known"),
+            requests.Timeout("30s"),
+            requests.exceptions.SSLError(),
+        ],
+        ids=lambda failure: type(failure).__name__,
+    )
+    def test_a_transport_failure_is_the_same_greppable_exception(
+        self, client: ManticClient, monkeypatch: pytest.MonkeyPatch, failure: Exception
+    ):
+        _serve(monkeypatch, failure)
+
+        with pytest.raises(ApiIdentityError, match=type(failure).__name__) as excinfo:
+            client.list_tournaments()
+
+        assert excinfo.value.__cause__ is failure
+        assert _TOURNAMENTS_URL in str(excinfo.value)
+
+
+class TestGetTournament:
+    """The detail route is authoritative for one project where the list is not: the list omits an
+    ``unlisted`` project (the state a new season sits in before its first question), so only this
+    route can say whether the configured slug exists and what the token may do on it."""
+
+    def test_the_get_is_authenticated_bounded_and_aimed_at_the_detail_route(
+        self, client: ManticClient, monkeypatch: pytest.MonkeyPatch
+    ):
+        detail = _tournament(MANTIC_TOURNAMENT_ID, is_ongoing=True)
+        fake_get = _serve(monkeypatch, _json_response(200, detail))
+
+        assert client.get_tournament(MANTIC_TOURNAMENT_ID) == detail
+
+        fake_get.assert_called_once()
+        assert fake_get.call_args.args[0] == _CONFIGURED_TOURNAMENT_URL
+        assert fake_get.call_args.kwargs["headers"]["Authorization"] == f"Token {_FAKE_TOKEN}"
+        assert fake_get.call_args.kwargs["timeout"] == client.timeout
+
+    def test_a_404_fails_shut_naming_the_slug_and_the_constant_to_re_point(
+        self, client: ManticClient, monkeypatch: pytest.MonkeyPatch
+    ):
+        _serve(monkeypatch, _json_response(404, _NOT_FOUND_BODY))
+
+        with pytest.raises(ApiIdentityError, match="status=404") as excinfo:
+            client.get_tournament("series-2")
+
+        message = str(excinfo.value)
+        assert "'series-2'" in message
+        assert "MANTIC_TOURNAMENT_ID" in message
+
+    def test_a_rejected_token_fails_shut_naming_the_token_variable(
+        self, client: ManticClient, monkeypatch: pytest.MonkeyPatch
+    ):
+        _serve(monkeypatch, _json_response(_INVALID_TOKEN_STATUS, _INVALID_TOKEN_BODY))
+
+        with pytest.raises(ApiIdentityError, match=f"status={_INVALID_TOKEN_STATUS}") as excinfo:
+            client.get_tournament(MANTIC_TOURNAMENT_ID)
+
+        assert "MANTIC_TOKEN" in str(excinfo.value)
+
+    def test_a_200_that_is_not_an_object_fails_shut(self, client: ManticClient, monkeypatch: pytest.MonkeyPatch):
+        _serve(monkeypatch, _json_response(200, LIVE_TOURNAMENTS))
+
+        with pytest.raises(ApiIdentityError, match="not with a JSON object"):
+            client.get_tournament(MANTIC_TOURNAMENT_ID)
+
+    def test_a_transport_failure_is_the_same_greppable_exception(
+        self, client: ManticClient, monkeypatch: pytest.MonkeyPatch
+    ):
+        failure = requests.ConnectionError("connection refused")
+        _serve(monkeypatch, failure)
+
+        with pytest.raises(ApiIdentityError, match="ConnectionError") as excinfo:
+            client.get_tournament(MANTIC_TOURNAMENT_ID)
+
+        assert excinfo.value.__cause__ is failure
+
 
 class TestPreflightManticTournaments:
-    """One GET, two checks: the discovery line first, then the permission gate."""
+    """Two GETs, two checks: the discovery line off the list, then the permission gate off the detail."""
 
-    def test_the_live_list_passes_and_logs_the_marker_at_info(
+    def test_the_live_tournaments_pass_and_log_the_marker_at_info(
         self, client: ManticClient, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ):
-        fake_get = _serve(monkeypatch, LIVE_TOURNAMENTS)
+        fake_get = _serve_preflight(monkeypatch, LIVE_TOURNAMENTS)
 
         with caplog.at_level(logging.INFO, logger=_MANTIC_LOGGER):
             preflight_mantic_tournaments(client, MANTIC_TOURNAMENT_ID)
@@ -342,12 +458,12 @@ class TestPreflightManticTournaments:
         [record] = _marker_lines(caplog, "MANTIC_TOURNAMENTS")
         assert record.getMessage() == "MANTIC_TOURNAMENTS: ongoing=preseason-2 configured=preseason-2 new=none"
         assert record.levelno == logging.INFO
-        fake_get.assert_called_once()
+        assert _requested_urls(fake_get) == [_TOURNAMENTS_URL, _CONFIGURED_TOURNAMENT_URL]
 
     def test_the_registered_spec_harvests_the_emitted_line(
         self, client: ManticClient, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ):
-        _serve(monkeypatch, [*LIVE_TOURNAMENTS, _tournament("series-2", is_ongoing=True)])
+        _serve_preflight(monkeypatch, [*LIVE_TOURNAMENTS, _tournament("series-2", is_ongoing=True)])
         with caplog.at_level(logging.INFO, logger=_MANTIC_LOGGER):
             preflight_mantic_tournaments(client, MANTIC_TOURNAMENT_ID)
         [record] = _marker_lines(caplog, "MANTIC_TOURNAMENTS")
@@ -363,7 +479,7 @@ class TestPreflightManticTournaments:
         self, client: ManticClient, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ):
         """The Series 2 shape: a second ongoing bots-only slug the constants have not been re-pointed at."""
-        _serve(monkeypatch, [*LIVE_TOURNAMENTS, _tournament("series-2", is_ongoing=True)])
+        _serve_preflight(monkeypatch, [*LIVE_TOURNAMENTS, _tournament("series-2", is_ongoing=True)])
 
         with caplog.at_level(logging.INFO, logger=_MANTIC_LOGGER):
             preflight_mantic_tournaments(client, MANTIC_TOURNAMENT_ID)
@@ -378,7 +494,9 @@ class TestPreflightManticTournaments:
     def test_an_ongoing_human_tournament_is_not_new(
         self, client: ManticClient, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ):
-        _serve(monkeypatch, [*LIVE_TOURNAMENTS, _tournament("humans-welcome", is_ongoing=True, bots_only=False)])
+        _serve_preflight(
+            monkeypatch, [*LIVE_TOURNAMENTS, _tournament("humans-welcome", is_ongoing=True, bots_only=False)]
+        )
 
         with caplog.at_level(logging.INFO, logger=_MANTIC_LOGGER):
             preflight_mantic_tournaments(client, MANTIC_TOURNAMENT_ID)
@@ -395,7 +513,8 @@ class TestPreflightManticTournaments:
     ):
         """After 2026-09-20 the preseason stops being ongoing; the stale-slug red exit is cli's job
         (``_check_tournament_dates``), not this gate's, which only asks about permission."""
-        _serve(monkeypatch, [_tournament(MANTIC_TOURNAMENT_ID, is_ongoing=False)])
+        ended = _tournament(MANTIC_TOURNAMENT_ID, is_ongoing=False)
+        _serve_preflight(monkeypatch, [ended], configured=ended)
 
         with caplog.at_level(logging.INFO, logger=_MANTIC_LOGGER):
             preflight_mantic_tournaments(client, MANTIC_TOURNAMENT_ID)
@@ -411,7 +530,12 @@ class TestPreflightManticTournaments:
         caplog: pytest.LogCaptureFixture,
         permission: str | None,
     ):
-        _serve(monkeypatch, [_tournament(MANTIC_TOURNAMENT_ID, is_ongoing=True, user_permission=permission)])
+        """The permission is read off the DETAIL route: the list row still says ``forecaster`` here."""
+        _serve_preflight(
+            monkeypatch,
+            LIVE_TOURNAMENTS,
+            configured=_tournament(MANTIC_TOURNAMENT_ID, is_ongoing=True, user_permission=permission),
+        )
 
         with (
             caplog.at_level(logging.INFO, logger=_MANTIC_LOGGER),
@@ -425,27 +549,74 @@ class TestPreflightManticTournaments:
     def test_every_forecasting_role_passes(
         self, client: ManticClient, monkeypatch: pytest.MonkeyPatch, permission: str
     ):
-        _serve(monkeypatch, [_tournament(MANTIC_TOURNAMENT_ID, is_ongoing=True, user_permission=permission)])
+        _serve_preflight(
+            monkeypatch,
+            LIVE_TOURNAMENTS,
+            configured=_tournament(MANTIC_TOURNAMENT_ID, is_ongoing=True, user_permission=permission),
+        )
 
         preflight_mantic_tournaments(client, MANTIC_TOURNAMENT_ID)
 
-    def test_a_configured_slug_missing_from_the_list_fails_shut_naming_what_is_there(
-        self, client: ManticClient, monkeypatch: pytest.MonkeyPatch
-    ):
-        _serve(monkeypatch, LIVE_TOURNAMENTS)
-
-        with pytest.raises(ApiIdentityError, match="'series-2' is not on") as excinfo:
-            preflight_mantic_tournaments(client, "series-2")
-
-        assert "practice-series-1,preseason-2,series-1" in str(excinfo.value)
-        assert "MANTIC_TOURNAMENT_ID" in str(excinfo.value)
-
-    def test_a_failed_list_get_propagates_before_any_discovery_line(
+    def test_an_unlisted_configured_tournament_passes_off_the_detail_route(
         self, client: ManticClient, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ):
-        _serve(monkeypatch, {"detail": "Invalid token."}, status=401)
+        """The Series 2 hand-over: the operator re-points the slug while Mantic still has the project
+        ``unlisted``, so it is absent from the list. Absence there is not evidence the project does
+        not exist; the detail route answers for it and the run proceeds."""
+        fake_get = _serve_preflight(monkeypatch, LIVE_TOURNAMENTS, configured=_tournament("series-2", is_ongoing=True))
 
-        with caplog.at_level(logging.INFO, logger=_MANTIC_LOGGER), pytest.raises(ApiIdentityError, match="status=401"):
+        with caplog.at_level(logging.INFO, logger=_MANTIC_LOGGER):
+            preflight_mantic_tournaments(client, "series-2")
+
+        [record] = _marker_lines(caplog, "MANTIC_TOURNAMENTS")
+        assert record.getMessage() == "MANTIC_TOURNAMENTS: ongoing=preseason-2 configured=series-2 new=preseason-2"
+        assert _requested_urls(fake_get) == [_TOURNAMENTS_URL, f"{_TOURNAMENTS_URL}series-2/"]
+
+    def test_a_slug_no_tournament_has_fails_shut_after_the_discovery_line(
+        self, client: ManticClient, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ):
+        """The detail route 404s for a slug that does not exist; that, not absence from the list, is
+        the bad-slug catch."""
+        _serve(monkeypatch, _json_response(200, LIVE_TOURNAMENTS), _json_response(404, _NOT_FOUND_BODY))
+
+        with (
+            caplog.at_level(logging.INFO, logger=_MANTIC_LOGGER),
+            pytest.raises(ApiIdentityError, match="status=404") as excinfo,
+        ):
+            preflight_mantic_tournaments(client, "series-2")
+
+        assert "'series-2'" in str(excinfo.value)
+        assert "MANTIC_TOURNAMENT_ID" in str(excinfo.value)
+        assert len(_marker_lines(caplog, "MANTIC_TOURNAMENTS")) == 1
+
+    def test_a_rejected_token_fails_shut_before_any_discovery_line(
+        self, client: ManticClient, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ):
+        fake_get = _serve(monkeypatch, _json_response(_INVALID_TOKEN_STATUS, _INVALID_TOKEN_BODY))
+
+        with (
+            caplog.at_level(logging.INFO, logger=_MANTIC_LOGGER),
+            pytest.raises(ApiIdentityError, match=f"status={_INVALID_TOKEN_STATUS}") as excinfo,
+        ):
             preflight_mantic_tournaments(client, MANTIC_TOURNAMENT_ID)
 
+        assert "MANTIC_TOKEN" in str(excinfo.value)
+        assert _marker_lines(caplog, "MANTIC_TOURNAMENTS") == []
+        fake_get.assert_called_once()
+
+    def test_a_connect_failure_stops_the_run_with_the_same_exception(
+        self, client: ManticClient, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ):
+        """DNS, TLS and connect failures stop the run before any spend either way; wrapping them
+        makes the stop one greppable ``ApiIdentityError`` instead of a requests traceback."""
+        failure = requests.ConnectionError("Name or service not known")
+        _serve(monkeypatch, failure)
+
+        with (
+            caplog.at_level(logging.INFO, logger=_MANTIC_LOGGER),
+            pytest.raises(ApiIdentityError, match="ConnectionError") as excinfo,
+        ):
+            preflight_mantic_tournaments(client, MANTIC_TOURNAMENT_ID)
+
+        assert excinfo.value.__cause__ is failure
         assert _marker_lines(caplog, "MANTIC_TOURNAMENTS") == []

@@ -13,6 +13,7 @@ from forecasting_tools.data_models.numeric_report import Percentile
 
 from metaculus_bot.constants import NUM_MAX_STEP, NUM_MIN_PROB_STEP
 from metaculus_bot.numeric.pchip_cdf import (
+    _rebuild_with_min_steps,
     enforce_min_steps,
     enforce_strict_increasing,
     generate_pchip_cdf,
@@ -589,7 +590,10 @@ class TestAggressiveMinStepEnforcement:
     check then refused a range 1e-16 short and dropped the member (Mantic edge-case
     review, 2026-09, rank 3). The trigger and the range check now share the
     ``_MIN_STEP_TOLERANCE`` the post-check and final assertion always had, so the
-    saturated grid builds as-is and only a genuine shortfall reaches the raise.
+    saturated grid builds as-is and only a genuine shortfall reaches the raise. After
+    that change the tier is reachable through ``generate_pchip_cdf`` only as that
+    ValueError, so its success branch is pinned by direct call below; FUTURE.md holds
+    it as a dead-code cleanup candidate.
     """
 
     SIMPLE_PERCENTILES: ClassVar[dict[int | float, float]] = {10.0: 1.0, 50.0: 5.0, 90.0: 9.0}
@@ -661,6 +665,26 @@ class TestAggressiveMinStepEnforcement:
         messages = [record.getMessage() for record in caplog.records]
         assert not any("PCHIP minimum step enforcement required" in m for m in messages)
         assert not any("PCHIP aggressive enforcement completed" in m for m in messages)
+
+    def test_the_rebuild_success_path_is_pinned_by_direct_call(self, caplog):
+        """Exact values, so the tier can be restructured without silently changing what it
+        emits: the shape-preserving allocation, the post-check and the completion line."""
+        with caplog.at_level("INFO", logger="metaculus_bot.numeric.pchip_cdf"):
+            out = _rebuild_with_min_steps(
+                np.array([0.0, 0.05, 0.5, 1.0]),
+                0.1,
+                open_lower_bound=False,
+                open_upper_bound=False,
+                question_id=4242,
+                question_url="https://ex/q/4242",
+            )
+
+        np.testing.assert_allclose(out, [0.0, 1 / 6, 0.5666666666666667, 1.0], rtol=0, atol=1e-15)
+        assert float(np.diff(out).min()) == pytest.approx(1 / 6)
+        assert out[0] == 0.0
+        assert out[-1] == 1.0
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("PCHIP aggressive enforcement completed for Q 4242" in m for m in messages)
 
     def test_range_too_small_for_min_steps_raises(self):
         with pytest.raises(ValueError, match="Cannot satisfy minimum step requirement"):

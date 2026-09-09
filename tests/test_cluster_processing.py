@@ -380,3 +380,29 @@ class TestDiscreteGridPlateauCap:
             [10.0, 20.0, 20.0, 20.0, 30.0], question, value_eps=1e-6, spread_delta=1.0, range_size=100.0
         )
         assert result == pytest.approx([10.0, 19.5, 20.0, 20.5, 30.0])
+
+    def test_a_whole_set_collapse_is_spread_inside_its_bin_where_the_bins_are_the_outcome_space(self):
+        """Thirteen identical values on twelve one-day bins: "100% on this day" is fully
+        expressible there, so the set is spread like any other plateau, under the one-bin cap,
+        and reaches the unit-mismatch guard with a real span instead of being withheld. The
+        201-grid contrast is ``test_whole_set_collapse_is_not_spread``: there the collapse is
+        left alone and the guard withholds it."""
+        day = 86_400.0
+        noon_of_day_8 = 8 * day + day / 2
+        values = [noon_of_day_8] * 13
+        range_size = 12 * day
+        value_eps, _base_delta, spread_delta = compute_cluster_parameters(
+            range_size, detect_count_like_pattern(values), span=0.0
+        )
+        question = self._discrete_question(13, 0.0, range_size)
+
+        result, clusters_applied = apply_cluster_spreading(
+            values, question, value_eps=value_eps, spread_delta=spread_delta, range_size=range_size
+        )
+
+        assert clusters_applied == 1
+        assert all(a < b for a, b in pairwise(result))
+        assert 8 * day < result[0]
+        assert result[-1] < 9 * day
+        assert result[-1] - result[0] == pytest.approx(12 * spread_delta)
+        assert result[-1] - result[0] <= day

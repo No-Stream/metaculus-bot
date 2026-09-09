@@ -711,10 +711,11 @@ opens, re-point `MANTIC_TOURNAMENT_ID` and `MANTIC_TOURNAMENT_END_DATE` in
 tournament route. Two things make that hand-over hard to miss (both from the 2026-09-08
 readiness review, item 5): every Mantic run logs a `MANTIC_TOURNAMENTS` line naming the
 ongoing bots-only tournaments on the API, at WARNING when one is not the configured slug,
-and from the day after `MANTIC_TOURNAMENT_END_DATE` every Mantic run exits non-zero after
-publishing, because a zero-question run is otherwise green and the shared two-week hard
-stop would have kept the preseason's dead slug green and silent while Series 2 questions
-opened and closed unforecast.
+and from the UTC day after `MANTIC_TOURNAMENT_END_DATE` every Mantic run exits non-zero after
+publishing (the constant names the last open day, and Preseason 2 forecasts until 12:00 UTC on
+it), because a zero-question run is otherwise green and the shared two-week hard stop would
+have kept the preseason's dead slug green and silent while Series 2 questions opened and
+closed unforecast.
 
 ### How the mode works
 
@@ -799,16 +800,24 @@ Five rules from the 2026-09-08 readiness review
 identity preflight and the first paid call. Every one is free.
 
 - **Forecast-permission preflight** (review item 20). After `build_mantic_client()` and before
-  the forecaster is built, `mantic.preflight_mantic_tournaments` makes ONE authenticated GET of
-  `/api/projects/tournaments/` and raises `ApiIdentityError` unless the configured slug is on
-  the list with a `user_permission` that allows forecasting: `forecaster`, `curator`, `admin`
-  or `creator`, the Metaculus backend's `ObjectPermission` vocabulary (the live token reads
-  `forecaster`). A token that may only view reads the tournament fine and would otherwise
-  research and forecast every question and fail at the publish POST, hourly, at about $2.60 a
-  question. Because the GET is authenticated, a revoked or mistyped token fails here with a
-  401 too, which the unauthenticated identity preflight cannot see. Not retried, like the
-  identity preflight: the next cron is the retry.
-- **Series 2 discovery** (item 5). The same response logs
+  the forecaster is built, `mantic.preflight_mantic_tournaments` makes two authenticated GETs,
+  neither retried (the next cron is the retry, as for the identity preflight): the tournament
+  list `/api/projects/tournaments/` for the discovery line below, then the configured
+  tournament's own route `/api/projects/tournaments/<slug>/`, and raises `ApiIdentityError`
+  unless that route answers 200 with a `user_permission` that allows forecasting: `forecaster`,
+  `curator`, `admin` or `creator`, the Metaculus backend's `ObjectPermission` vocabulary (the
+  live token reads `forecaster`). The detail route rather than the list row because the list
+  omits an `unlisted` project, the state a new season sits in before its first question opens
+  (see "Read the project object before editing a slug" above), so the Series 2 hand-over cannot
+  abort on a slug that exists but is not yet listed, while a slug no tournament has 404s there
+  and stops the run naming `MANTIC_TOURNAMENT_ID`. A token that may only view reads the
+  tournament fine and would otherwise research and forecast every question and fail at the
+  publish POST, hourly, at about $2.60 a question. Because the GETs are authenticated, a revoked
+  or mistyped token fails here too, as a 403 `Invalid token.` on either route (verified live),
+  which the unauthenticated identity preflight cannot see. A DNS, TLS or connect failure and a
+  200 that is not JSON (a captive portal) are the same `ApiIdentityError`, so every stop is one
+  greppable exception.
+- **Series 2 discovery** (item 5). The list GET logs
   `MANTIC_TOURNAMENTS: ongoing=<slugs> configured=<slug> new=<slugs>`, where `new` is the
   ongoing bots-only tournaments that are not the configured one, at WARNING when that set is
   non-empty and INFO otherwise (`none` for an empty list). A registered marker, so the first
@@ -818,8 +827,11 @@ identity preflight and the first paid call. Every one is free.
   Preseason 2 closes on 2026-09-20 every scheduled run would have stayed green and silent for
   a fortnight while a Series 2 slug went unforecast, about seventy questions at Series 1's
   rate. In mantic mode the check's verdict (`cli._check_tournament_dates`) is held and turned
-  into a non-zero exit AFTER publishing, the fall-cup reminder's shape. The Metaculus tournament
-  keeps the warning advisory and `TOURNAMENT_HARD_STOP_WEEKS` is untouched.
+  into a non-zero exit AFTER publishing, the fall-cup reminder's shape. The end date is the last
+  OPEN day: Preseason 2 forecasts until 12:00 UTC on `MANTIC_TOURNAMENT_END_DATE`, so the red
+  exits start on the UTC day after it, and a run in the final open hours publishes and exits 0.
+  The Metaculus tournament keeps the warning advisory and `TOURNAMENT_HARD_STOP_WEEKS` is
+  untouched.
 - **Parse drops are counted** (item 12). A post the framework cannot parse (a new Mantic type
   string, a missing field) is caught by the framework's per-post loop, logged as one warning
   and otherwise forfeited silently on every run. `ManticClient` now counts the drop and logs
@@ -854,32 +866,52 @@ derived (Mantic sets `nominal_max` to the last bin's left edge), and a date-only
 noon UTC of that day, so its mass lands inside that day's bin under the platform's
 right-closed bucketing. The design and its receipts are in
 `scratch_docs_and_planning/mantic_phase2_plan_2026-09-08.md`; the pipeline map is in
-`docs/architecture.md`.
+`docs/architecture.md`. The analysis side stays date-free by decision until a date question
+has resolved under this code: the backtest, the ablation harness and the residual dataset each
+skip date questions at an explicit seam, and the ghost scorer counts them as unscoreable
+(`docs/performance_analysis.md` "Date questions are excluded from the dataset").
 
 ### Mantic-optimized forecasting
 
 The scoring reader and the edge-case review in
 `scratch_docs_and_planning/mantic_research_2026-09-08/` priced what the Metaculus-shaped prompts
 and numeric repairs cost under Mantic's baseline scoring, and the Phase 2 merge ships the fixes.
-Every prompt clause is a named constant in `prompts.py` with its reason, has presence and absence
-pins under `tests/prompts/`, and none of them appears in the three stacking prompts.
+Every prompt clause is a named constant in `prompts.py` with its reason and has presence and
+absence pins under `tests/prompts/`. The Mantic-gated clauses (the out-of-range base rate, the
+multi-resolution rule, the scoring grid and the series-variant reading) appear in no stacking
+prompt; the two platform-aware scoring texts are the exception, because the three stacking
+prompts already carried the same wording: `_scoring_sentence` renders in all three and
+`_CONTINUOUS_SCORING_RULE` in `stacking_numeric_prompt`.
 
 - **Out-of-range base rate** (review item 1, the largest lever). Mantic scores a resolution
   outside the displayed range as its own outcome against a fixed 5% reference: a 1% tail scores
   -80.5, 5% scores 0, 50% scores +115, verified to zero error against the platform's own scores
   on 146 of 146 resolved out-of-range questions. The pipeline publishes exactly 1% beyond an open
   bound whenever every percentile sits inside the range, and Mantic escapes its ranges far more
-  often than Metaculus: 22% of resolved discrete questions, 7% of numeric and 51% of date
-  questions, against 2 to 3% in the Metaculus archive. `_MANTIC_OUT_OF_RANGE_RATE_QUANTITY` and
-  `_MANTIC_OUT_OF_RANGE_RATE_DATE` state that base rate in the bound messages on Mantic only
-  (`question_platform.question_platform` reads the platform off `page_url`, so the Metaculus
-  prompts are unchanged). **The mechanical 5% tail floor is HELD.** Moving each open side from
-  1% to 5% gains 80.5 points when the outcome escapes and costs 4.26 when it does not, break-even
-  at a 5% escape rate against the measured 15% and 51%, so it is probably right, but it would
-  override an honest forecaster and would be inert if the models already place percentiles
-  beyond the bound. The additive `oor_low=` / `oor_high=` fields on the per-member
-  `MEMBER_FORECAST` line and the new per-question `NUMERIC_AGGREGATE` marker record the
-  published out-of-range mass, which is what decides the floor after the first live runs.
+  often than Metaculus. Series 1, annulled questions excluded: 24.8% of resolved discrete
+  questions (35 of 141), 12.0% of numeric (16 of 133), 18.6% of quantitative questions combined
+  (51 of 274) and 53.7% of date questions with an open upper bound (101 of 188), against 2 to 3%
+  in the Metaculus archive. The numeric figure used to read 7%: Mantic stored seven numeric
+  escapes as raw values outside the range rather than as `above_upper_bound` /
+  `below_lower_bound`, which a filter on those strings misses (receipt:
+  `scratch_docs_and_planning/mantic_adversarial_candidates_2026-09-08.md`, candidate 2).
+  `_MANTIC_OUT_OF_RANGE_RATE_QUANTITY` and `_MANTIC_OUT_OF_RANGE_RATE_DATE` state that base rate
+  in the bound messages on Mantic only (`question_platform.question_platform` reads the platform
+  off `page_url`, so the Metaculus prompts are unchanged). **The mechanical 5% tail floor was
+  approved and built on 2026-09-08** after being held through Phase 2
+  (`docs/numeric_pipeline.md` "Step 11: the Mantic out-of-range tail floor"):
+  `MANTIC_OUT_OF_RANGE_TAIL_FLOOR` (0.05, `constants.py`) is applied by
+  `numeric/out_of_range_floor.py` from `TemplateForecaster._aggregate_predictions` to the Mantic
+  aggregate CDF on open sides only, never on Metaculus, never on a closed bound, and never
+  reducing a tail already at or above the floor. Moving each
+  open side from 1% to 5% gains 80.5 points when the outcome escapes and costs 4.26 when it does
+  not, and the same floor applied to the eleven Series 1 competitors' own published
+  distributions cost at most 1.9 points per question for any type. The additive `oor_low=` /
+  `oor_high=` fields on the per-member `MEMBER_FORECAST` line keep measuring the models'
+  unfloored behaviour, and the per-question `NUMERIC_AGGREGATE` marker carries the published
+  tails beside additive `oor_low_raw=` / `oor_high_raw=` / `tail_floor=` fields, so the floor
+  can be benchmarked on this bot's own forecasts once live telemetry accumulates (the ask is
+  recorded in `FUTURE.md` "Mantic Crucible").
 - **Platform-aware scoring text** (item 6). The numeric prompt no longer claims a uniform 0.01
   PDF floor or that sharpness above 35 stops paying, two Metaculus facts that told the model the
   out-of-range cliff was an order of magnitude shallower than it is; `_CONTINUOUS_SCORING_RULE`
@@ -891,8 +923,8 @@ pins under `tests/prompts/`, and none of them appears in the three stacking prom
 - **Series-variant clause** (item 9). The displayed range is stated as weak evidence about which
   series variant resolves and as no evidence about the magnitude of the outcome. The old premise,
   that the bounds were set by someone who could see the real series, is false on Mantic, where
-  question writers are paid for bot disagreement and 51% of date questions resolved above the
-  ceiling.
+  question writers are paid for bot disagreement and 54% of date questions with an open upper
+  bound (101 of 188) resolved above the ceiling.
 - **Multi-resolution questions** (post 650's shape, `multi_resolution: true`). Gated on the
   question's own API flag (`_multi_resolution_clause`, an identity test on `is True`) and
   type-aware: continuous and date questions forecast each resolution instance and report the
@@ -1007,15 +1039,17 @@ DONATED_OPENROUTER_KEY_ENABLED=false uv run python main.py --mode mantic
 
 The smoke run is the same command narrowed to one chosen question. `--only-posts`
 takes comma-separated post ids (the number in the question URL) and forecasts only
-those of the tournament's open questions:
+those of the tournament's open questions. The Phase 1 smoke was this command on post 650
+(the multi-resolution discrete question); it ran and passed on 2026-09-08 at 18:00 PT:
 
 ```bash
 DONATED_OPENROUTER_KEY_ENABLED=false uv run python main.py --mode mantic --only-posts 650
 # or: make run_mantic_one POST=650
 ```
 
-The approved date smoke is the same command on the preseason's date question, post 651
-(twelve daily bins, both bounds closed), once per approval:
+The date smoke is the same command on the preseason's date question, post 651 (twelve
+daily bins, both bounds closed). It is approved but has not run yet, and like every paid
+run it fires once per approval:
 
 ```bash
 DONATED_OPENROUTER_KEY_ENABLED=false uv run python main.py --mode mantic --only-posts 651
@@ -1041,12 +1075,8 @@ Both commands need `MANTIC_TOKEN` in `.env` (the operator also keeps it at
 
 Operator steps, in order:
 
-1. Store the token as a repository secret (credential handling, so ask first):
-
-   ```bash
-   gh secret set MANTIC_TOKEN --repo No-Stream/metaculus-bot < ~/.keys/MANTIC_TOKEN
-   ```
-
+1. Done 2026-09-08: the token is stored as the `MANTIC_TOKEN` repository secret
+   (`gh secret list --repo No-Stream/metaculus-bot` shows it, set 2026-09-08 20:32 UTC).
 2. Merge to `main`. The schedule is live from that moment; there is nothing to
    enable in the Actions UI.
 3. When Series 2 opens, update `MANTIC_TOURNAMENT_ID` and
@@ -1931,6 +1961,12 @@ the telemetry markers:
   A question with no publishable budget at all (close already passed, or so near
   that the prediction POST cannot fit) is skipped before any spend and bumps
   `questions_failed_to_publish`.
+- `QUESTION_CAP_FORFEIT: platform=<metaculus|mantic> cap=<n> total=<n> dropped=<n>
+  posts=<ids>` — one WARNING per run, from `forecast_questions` (`forecaster.py`), when
+  more questions are open than `max_questions_per_run` allows. Questions are sorted
+  tightest close first before the cap, so the posts named are the latest-closing ones
+  left behind; on Mantic, which opens an hour's batch at once, each is a real forfeit,
+  and the marker is registered so the loss outlives the 90-day log expiry.
 - `Degradation counters: forecasters_dropped=..., questions_failed_to_publish=...,
   stacker_primary_failed=..., stacker_fallback_used=...,
   stacker_fallback_failed=..., research_provider_failures=...,

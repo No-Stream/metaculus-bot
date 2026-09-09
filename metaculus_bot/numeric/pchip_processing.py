@@ -102,8 +102,8 @@ def generate_pchip_cdf_with_smoothing(
             zero_point=zero_point,
             min_step=NUM_MIN_PROB_STEP,
             num_points=PCHIP_CDF_POINTS,
-            question_id=getattr(question, "id_of_question", None),
-            question_url=getattr(question, "page_url", None),
+            question_id=question.id_of_question,
+            question_url=question.page_url,
             model_name=model_name,
         )
 
@@ -157,8 +157,8 @@ def _apply_ramp_smoothing(pchip_cdf: list[float], question: NumericQuestion, *, 
         min_delta_after = float(np.min(diffs_after)) if len(diffs_after) else 1.0
         logger.warning(
             "CDF ramp smoothing for Q %s | URL %s | min_prob_delta_before=%.8f | min_prob_delta_after=%.8f | k_factor=%.1f",
-            getattr(question, "id_of_question", None),
-            getattr(question, "page_url", None),
+            question.id_of_question,
+            question.page_url,
             min_delta_before,
             min_delta_after,
             NUM_RAMP_K_FACTOR,
@@ -208,7 +208,7 @@ def _log_pchip_success(pchip_cdf: list[float], question: NumericQuestion, smooth
 
     logger.info(
         "PCHIP OK for Q %s | points=%d | min_step=%.8f | max_step=%.8f | smoothing=%s | open_bounds=(%s,%s)",
-        getattr(question, "id_of_question", "N/A"),
+        question.id_of_question,
         len(pchip_cdf),
         min_step,
         max_step,
@@ -269,7 +269,7 @@ def create_pchip_numeric_distribution(
         upper_bound=question.upper_bound,
         lower_bound=question.lower_bound,
         zero_point=zero_point,
-        cdf_size=getattr(question, "cdf_size", None),
+        cdf_size=question.cdf_size,
         is_date=isinstance(question, EpochDateQuestion),
         # Our CDF is already the final, min/max-step- and bound-enforced submission,
         # exposed via the get_cdf() override above. strict_validation=False stops the
@@ -292,11 +292,16 @@ def create_fallback_numeric_distribution(
 ) -> NumericDistribution:
     """Create fallback NumericDistribution when PCHIP fails.
 
-    Wraps forecasting-tools' native CDF builder (``get_cdf()``) but re-pins
-    open-bound endpoints through ``safe_cdf_bounds``. Metaculus rejects open-bound
-    CDFs with ``cdf[0] < 0.001`` / ``cdf[-1] > 0.999`` and caps the per-bin step,
-    so we enforce the legal range and max-step here rather than trust the raw
-    builder output.
+    Wraps forecasting-tools' native CDF builder (``get_cdf()``) but runs its output
+    through ``safe_cdf_bounds`` whatever the bound shape. Metaculus rejects open-bound
+    CDFs with ``cdf[0] < 0.001`` / ``cdf[-1] > 0.999`` and caps the per-bin step on
+    every question, so the legal range and the grid's step limits are enforced here
+    rather than trusting the raw builder output. The closed/closed case used to be
+    handed back raw: a tight declaration (normal, sd 0.6 on a [0, 100] grid) produced
+    a 0.297 bin against the server's 0.2 cap and an HTTP 400 on the lone-survivor
+    path, on the modal Mantic date shape. ``safe_cdf_bounds`` pins nothing on a
+    closed bound and ``enforce_min_steps`` caps at [0.0, 1.0], so the closed
+    endpoints survive it exactly.
 
     ``standardize_cdf=False`` keeps ``get_cdf()`` on the non-standardizing raw
     linear-interpolation path (the 0.2.54 behavior this fallback was written
@@ -324,9 +329,6 @@ def create_fallback_numeric_distribution(
             if cached_cdf is not None:
                 return cached_cdf
             base = super().get_cdf()
-            if not (self.open_lower_bound or self.open_upper_bound):
-                cached_cdf = base
-                return cached_cdf
             probs = np.array([p.percentile for p in base], dtype=float)
             # Scale the min/max-step constraints to the actual grid length. On a coarse
             # discrete grid (cdf_size < 201) the 201-grid defaults (max_step=0.2) would
@@ -359,7 +361,7 @@ def create_fallback_numeric_distribution(
         upper_bound=question.upper_bound,
         lower_bound=question.lower_bound,
         zero_point=zero_point,
-        cdf_size=getattr(question, "cdf_size", None),
+        cdf_size=question.cdf_size,
         is_date=isinstance(question, EpochDateQuestion),
         # strict_validation=False: preserve the beyond-range declared percentiles
         # verbatim (no _check_too_far_from_bounds rejection, no

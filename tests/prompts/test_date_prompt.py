@@ -10,12 +10,13 @@ STRUCTURED FORECAST example teaches ISO-8601 strings the extraction ladder actua
 from __future__ import annotations
 
 import json
+import time
 from datetime import UTC, datetime
 
 import pytest
 
 from metaculus_bot.numeric.config import STANDARD_PERCENTILES
-from metaculus_bot.numeric.date_axis import as_epoch_question, parse_iso_utc
+from metaculus_bot.numeric.date_axis import as_epoch_question, parse_forecast_date
 from metaculus_bot.prompts import _SOFT_CLOCK_RULE, date_prompt
 from metaculus_bot.structured_output_schema import parse_structured_payload
 from tests.prompt_builders import (
@@ -151,7 +152,7 @@ class TestDateSchemaBlock:
         assert values[0] == "2026-09-08"
         assert values[-1] == "2026-09-19"
         assert all(len(v) == len("YYYY-MM-DD") for v in values)
-        parsed_dates = [parse_iso_utc(v) for v in values]
+        parsed_dates = [parse_forecast_date(v) for v in values]
         assert parsed_dates == sorted(parsed_dates)
 
     def test_legacy_fine_grid_example_shows_utc_timestamps(self) -> None:
@@ -161,17 +162,42 @@ class TestDateSchemaBlock:
         assert values[-1] == "2027-03-01T00:00:00Z"
         assert all(v.endswith("Z") for v in values)
 
-    def test_schema_notes_allow_ties_and_forbid_bare_years(self) -> None:
+    def test_schema_notes_allow_ties_but_not_a_total_collapse(self) -> None:
+        """Repeated dates are fine (the rendered example itself repeats a calendar date on a coarse
+        grid), but thirteen identical values are withheld downstream: the spreader leaves a fully
+        collapsed set alone, so only the jitter epsilon separates the values and the unit-mismatch
+        guard fires on the span ratio. The note forbids exactly that one shape and nothing more."""
         flat = _flat(_date_prompt_text())
         schema = flat[flat.rfind("structured forecast") :]
         assert "must contain all 13 standard" in schema
         assert schema.count("must contain all") == 1
         assert "non-decreasing across percentiles" in schema
-        assert "a repeated date is allowed where your mass concentrates on one day, a decrease is not" in schema
-        assert "a bare year, a month, or a number is rejected" in schema
+        assert (
+            "repeated dates are allowed, but not for every percentile, so the 0.01 and 0.99 values must differ"
+            in schema
+        )
+        assert "a decrease is rejected, as are a bare year, a month, or a number" in schema
         assert "strictly increasing" not in schema, "13 strictly increasing dates cannot fit a 12-bin grid"
+        assert "a repeated date is allowed where your mass concentrates on one day" not in schema
         assert "outcome_type" not in schema
         assert "no scientific notation" not in schema
+
+    def test_schema_notes_teach_the_sub_day_timestamp_form_in_the_questions_own_calendar(self) -> None:
+        """The way to concentrate on one day is increasing UTC timestamps inside it, which is the shape
+        the pipeline's own ``september_16_members`` fixture publishes cleanly. The example day is the
+        midpoint of the displayed range, so the model sees its own calendar rather than another's."""
+        flat = _flat(_date_prompt_text())
+        schema = flat[flat.rfind("structured forecast") :]
+        assert "to put all of your mass on one day, give increasing utc timestamps inside that day" in schema
+        assert "(e.g. 2026-09-13t02:00:00z through 2026-09-13t22:00:00z)" in schema
+        first, last = parse_forecast_date("2026-09-13T02:00:00Z"), parse_forecast_date("2026-09-13T22:00:00Z")
+        assert first < last
+        assert first.date() == last.date()
+        # The legacy fine-grid question renders its own midpoint day, not post 651's.
+        legacy = _flat(_date_prompt_text(_open_upper_date_q()))
+        assert (
+            "(e.g. 2026-11-30t02:00:00z through 2026-11-30t22:00:00z)" in legacy[legacy.rfind("structured forecast") :]
+        )
 
 
 class TestDatePromptAcceptsEitherView:
@@ -180,10 +206,27 @@ class TestDatePromptAcceptsEitherView:
         view = as_epoch_question(q)
         assert date_prompt(q, "r", "l", "u") == date_prompt(view, "r", "l", "u")
 
+    def test_the_epoch_view_carries_every_field_the_prompt_reads(self) -> None:
+        """The continuous template reads the platform (``page_url``), the Mantic flags (``api_json``),
+        the prose and the window off ONE handle, the numeric view, so the adapter must carry each of
+        them verbatim from the ``DateQuestion``; ``as_epoch_question`` excludes only the bound fields."""
+        q = _date_q()
+        view = as_epoch_question(q)
+        for field in (
+            "page_url",
+            "api_json",
+            "question_text",
+            "background_info",
+            "resolution_criteria",
+            "fine_print",
+            "open_time",
+            "scheduled_resolution_time",
+            "unit_of_measure",
+        ):
+            assert getattr(view, field) == getattr(q, field), field
+
     def test_bound_and_window_dates_do_not_depend_on_the_host_timezone(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Every rendered date comes from a tz-aware UTC value; the host clock never enters."""
-        import time
-
         monkeypatch.setenv("TZ", "America/Los_Angeles")
         time.tzset()
         try:

@@ -349,7 +349,7 @@ def make_mock_numeric_question(
     open_lower_bound: bool = False,
     open_upper_bound: bool = False,
     zero_point: float | None = None,
-    cdf_size: int | None = None,
+    cdf_size: int = 201,
     id_of_question: int = 42,
     page_url: str | None = None,
     question_text: str = "What will X be?",

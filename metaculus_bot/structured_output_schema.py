@@ -39,14 +39,10 @@ from pydantic import (
     model_validator,
 )
 
-from metaculus_bot.numeric.date_axis import parse_iso_utc
+from metaculus_bot.numeric.date_axis import parse_forecast_date
+from metaculus_bot.question_types import QuestionType
 
 logger = logging.getLogger(__name__)
-
-# The question types a structured block may declare. ``question_types.QuestionType`` is the
-# same set; it is restated here as the schema's own vocabulary because that leaf is typed on
-# question CLASSES while this module is typed on the block's ``question_type`` string.
-StructuredQuestionType = Literal["binary", "numeric", "multiple_choice", "date"]
 
 
 # ---------------------------------------------------------------------------
@@ -400,7 +396,7 @@ class NumericStructured(BaseModel):
 class DateStructured(BaseModel):
     """Structured declaration for a date question: the 13 percentiles as ISO-8601 dates.
 
-    The values are parsed by ``numeric.date_axis.parse_iso_utc`` and nothing else: a calendar
+    The values are parsed by ``numeric.date_axis.parse_forecast_date`` and nothing else: a calendar
     date ``YYYY-MM-DD`` means noon UTC of that day (so it lands inside the platform's right-closed
     day bin), a timestamp is taken as written with a naive time read as UTC, and every other
     spelling fails. That single parser is what makes this block the TRUNCATION GUARD for dates.
@@ -432,7 +428,7 @@ class DateStructured(BaseModel):
                 raise ValueError(
                     f"declared_percentiles[{percentile_level!r}] must be an ISO-8601 date string, got {value!r}"
                 )
-            parsed[percentile_level] = parse_iso_utc(value)
+            parsed[percentile_level] = parse_forecast_date(value)
         return parsed
 
     @field_validator("declared_percentiles")
@@ -682,7 +678,7 @@ def extract_first_balanced_braces(s: str) -> str | None:
 
 def parse_structured_payload(
     raw_json: str,
-    question_type: StructuredQuestionType,
+    question_type: QuestionType,
     *,
     log_failures: bool = True,
 ) -> StructuredBlock | None:
@@ -734,7 +730,7 @@ def parse_structured_payload(
 
 def _decode_structured_payload(
     raw_json: str,
-    question_type: StructuredQuestionType,
+    question_type: QuestionType,
     *,
     log_failures: bool,
 ) -> dict | None:
@@ -835,7 +831,7 @@ def _retry_without_binary_telemetry(
 
 def parse_structured_block(
     rationale_text: str,
-    question_type: StructuredQuestionType,
+    question_type: QuestionType,
 ) -> StructuredBlock | None:
     """
     Extract and validate a structured JSON block from a rationale.

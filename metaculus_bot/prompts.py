@@ -3,7 +3,7 @@ import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Literal
 
 import numpy as np
 from forecasting_tools import (
@@ -17,7 +17,7 @@ from forecasting_tools.data_models.questions import DateQuestion
 
 from metaculus_bot.constants import MC_PROB_MIN, PLATFORM_MANTIC
 from metaculus_bot.numeric.config import EXPECTED_PERCENTILE_COUNT, STANDARD_PERCENTILES
-from metaculus_bot.numeric.date_axis import EpochDateQuestion, as_epoch_question, format_epoch
+from metaculus_bot.numeric.date_axis import EpochDateQuestion, as_epoch_question, format_epoch, question_json
 from metaculus_bot.numeric.utils import nominal_bounds
 from metaculus_bot.question_platform import question_platform
 from metaculus_bot.time_utils import _as_utc
@@ -1169,17 +1169,6 @@ class _ContinuousAxis:
     schema_block: str
 
 
-def _question_json(question: MetaculusQuestion) -> dict[str, Any]:
-    """The API's ``question`` object, or ``{}`` for a question not built from API JSON.
-
-    Mantic's per-question flags (``multi_resolution``, ``precision``, ``date_granularity``) live
-    here and nowhere on the ``forecasting_tools`` model; Metaculus payloads never carry them,
-    which is what lets the clauses below self-disable there without a run-mode flag.
-    """
-    question_json = question.api_json.get("question")
-    return question_json if isinstance(question_json, dict) else {}
-
-
 # The continuous scoring paragraph, shared by the numeric, date and stacking-numeric prompts.
 # Until 2026-09-08 it described Metaculus' implementation (a uniform 0.01 PDF floor, so
 # excluding the truth costs ln(0.01) = -4.6; a sharpness cap near 35), which told the model
@@ -1198,14 +1187,18 @@ _CONTINUOUS_SCORING_RULE = (
 
 
 # Mantic's measured out-of-range base rates, rendered only on a Mantic question with the relevant
-# open bound (``question_platform`` reads the platform off ``page_url``). Receipt, Series 1 (520
-# resolved questions, 2026-09-08 corpus read): 101 of 188 date questions with an open upper
-# bound resolved ABOVE it (53.7%); 35 of 141 discrete (24.8%) and 9 of 133 numeric (6.8%)
-# resolved outside their range, 15% of quantitative questions combined, against 2.2 to 2.6% in
-# this bot's Metaculus archives. The pipeline fact both sentences end on is structural: when all
-# 13 percentiles sit inside the range, the published CDF puts exactly 1% beyond each open
-# bound, which Mantic scores at -80.5 points when the outcome lands there. Metaculus questions
-# never render either sentence, so Metaculus behaviour cannot move.
+# open bound (``question_platform`` reads the platform off ``page_url``). Receipt, the Series 1
+# corpus under scratch_docs_and_planning/mantic_research_2026-09-08/ (520 questions, annulled
+# excluded): 101 of 188 date questions with an open upper bound resolved ABOVE it (53.7%); 35
+# of 141 discrete (24.8%) and 16 of 133 numeric (12.0%)
+# resolved outside their range, 51 of 274 quantitative questions combined (18.6%), against 2.2 to
+# 2.6% in this bot's Metaculus archives. Seven of the numeric escapes (posts 512, 460, 426, 396
+# and 305 on linear grids, 387 and 200 on log grids) are stored as raw values outside the range
+# rather than as a bound token, which is how a filter on the tokens alone undercounts them at 9.
+# The pipeline fact both sentences end on is structural: when all 13 percentiles sit inside the
+# range, the published CDF puts exactly 1% beyond each open bound, which Mantic scores at -80.5
+# points when the outcome lands there. Metaculus questions never render either sentence, so
+# Metaculus behaviour cannot move.
 _MANTIC_OUT_OF_RANGE_RATE_DATE = (
     "On this platform about half of past date questions with an open upper bound resolved AFTER it (101 of 188 "
     'in Series 1), so treat "the event has not happened by the upper bound" as a live central case and not a '
@@ -1213,15 +1206,15 @@ _MANTIC_OUT_OF_RANGE_RATE_DATE = (
     "displayed range asserts a 1% chance of an out-of-range outcome."
 )
 _MANTIC_OUT_OF_RANGE_RATE_QUANTITY = (
-    "On this platform about one in seven past quantitative questions resolved outside the displayed range (one "
-    "in five of the discrete ones, one in fifteen of the continuous ones), so keeping every percentile inside the "
+    "On this platform about one in five past quantitative questions resolved outside the displayed range (one "
+    "in four of the discrete ones, one in eight of the continuous ones), so keeping every percentile inside the "
     "range asserts a 1% chance of an out-of-range outcome; if your view puts more than that beyond an open bound, "
     "place percentiles beyond it."
 )
 
 
-def _mantic_out_of_range_clause(question: MetaculusQuestion, view: NumericQuestion) -> str:
-    """The Mantic base-rate sentence for ``view``'s open bound, or ``""``.
+def _mantic_out_of_range_clause(question: NumericQuestion) -> str:
+    """The Mantic base-rate sentence for ``question``'s open bound, or ``""``.
 
     Appended after the bound messages so ``numeric.utils.bound_messages`` stays platform-agnostic.
     The date sentence is about the open UPPER bound specifically (that is where the measured half
@@ -1230,9 +1223,9 @@ def _mantic_out_of_range_clause(question: MetaculusQuestion, view: NumericQuesti
     """
     if question_platform(question) != PLATFORM_MANTIC:
         return ""
-    if isinstance(view, EpochDateQuestion):
-        return _MANTIC_OUT_OF_RANGE_RATE_DATE if view.open_upper_bound else ""
-    return _MANTIC_OUT_OF_RANGE_RATE_QUANTITY if (view.open_lower_bound or view.open_upper_bound) else ""
+    if isinstance(question, EpochDateQuestion):
+        return _MANTIC_OUT_OF_RANGE_RATE_DATE if question.open_upper_bound else ""
+    return _MANTIC_OUT_OF_RANGE_RATE_QUANTITY if (question.open_lower_bound or question.open_upper_bound) else ""
 
 
 # Mantic Series 2 "one forecast, many resolutions" (rules doc section 7; live on Preseason 2 post
@@ -1269,7 +1262,7 @@ _MULTI_RESOLUTION_BINARY_RULE = (
 
 def _multi_resolution_clause(question: MetaculusQuestion, rule: str) -> str:
     """``rule`` when the question's own API JSON declares ``multi_resolution: true``, else ``""``."""
-    return rule if _question_json(question).get("multi_resolution") is True else ""
+    return rule if question_json(question).get("multi_resolution") is True else ""
 
 
 # The scoring grid, named when the platform declares it. Mantic buckets a continuous CDF into
@@ -1278,28 +1271,29 @@ def _multi_resolution_clause(question: MetaculusQuestion, rule: str) -> str:
 # day/week granularity and power-of-ten step sizes the default) a model that does not know the
 # grid smears a confident view across neighbouring bins. ``precision`` (quantitative) and
 # ``date_granularity`` (date) exist only on Mantic payloads, so a Metaculus question renders
-# nothing here. The bin count is read from the same ``question`` object rather than re-derived.
-def _scoring_grid_clause(question: MetaculusQuestion, view: NumericQuestion) -> str:
-    question_json = _question_json(question)
-    if isinstance(view, EpochDateQuestion):
-        granularity = view.date_granularity
+# nothing here. The bin count is the typed ``cdf_size - 1``, the number the CDF builder keys off,
+# so the prompt can only ever describe the grid the pipeline submits. Mantic's OpenAPI defines
+# ``precision`` as the additive bin width on a linear scale but the RATIO between adjacent
+# boundaries on a logarithmic one, so a ``zero_point`` grid names its geometry and no width.
+def _scoring_grid_clause(question: NumericQuestion) -> str:
+    bins = question.cdf_size - 1
+    if isinstance(question, EpochDateQuestion):
+        granularity = question.date_granularity
         if not granularity:
             return ""
-        bins = int(question_json["inbound_outcome_count"])
         return (
             f"Scoring grid: {bins} bins of one calendar {granularity} each, in UTC. A date selects the bin that "
             f"contains it (a date with no time of day means that whole day), so detail finer than one "
             f"{granularity} is wasted."
         )
-    precision = question_json.get("precision")
+    precision = question_json(question).get("precision")
     if precision is None:
         return ""
-    bins = int(question_json["inbound_outcome_count"])
-    unit = view.unit_of_measure or "base units"
-    return (
-        f"Scoring grid: {bins} bins of width {float(precision):g} {unit}. A percentile's value selects the bin it "
-        "falls in, so detail finer than one bin is wasted."
-    )
+    if question.zero_point is not None:
+        grid = f"{bins} bins, log-spaced"
+    else:
+        grid = f"{bins} bins of width {float(precision):g} {question.unit_of_measure or 'base units'}"
+    return f"Scoring grid: {grid}. A percentile's value selects the bin it falls in, so detail finer than one bin is wasted."
 
 
 def _bullet_lines(*sentences: str, indent: int = 8) -> str:
@@ -1322,7 +1316,7 @@ def _numeric_axis(question: NumericQuestion) -> _ContinuousAxis:
                 "range, so a percentile may sit at or beyond it when warranted (see the bound notes below).",
                 "If your reasoning uses billions/millions/thousands, convert to base unit numerically (e.g., 350B → "
                 "350000000000). No suffixes or scientific notation, just numbers.",
-                _scoring_grid_clause(question, question),
+                _scoring_grid_clause(question),
             ),
         ]
     )
@@ -1381,9 +1375,9 @@ def _numeric_axis(question: NumericQuestion) -> _ContinuousAxis:
     )
 
 
-def _date_axis(question: MetaculusQuestion, view: EpochDateQuestion) -> _ContinuousAxis:
-    nom_upper, nom_lower = nominal_bounds(view)
-    granularity = view.date_granularity
+def _date_axis(question: EpochDateQuestion) -> _ContinuousAxis:
+    nom_upper, nom_lower = nominal_bounds(question)
+    granularity = question.date_granularity
     lower_date = format_epoch(nom_lower, granularity)
     upper_date = format_epoch(nom_upper, granularity)
     axis_block = "\n".join(
@@ -1397,19 +1391,21 @@ def _date_axis(question: MetaculusQuestion, view: EpochDateQuestion) -> _Continu
                 "bound (the outcome cannot fall outside it); an open bound is only the displayed range, so a "
                 "percentile may sit at or beyond it when warranted (see the bound notes below). Dates after an open "
                 'upper bound are how you say "this does not happen within the displayed window".',
-                _scoring_grid_clause(question, view),
+                _scoring_grid_clause(question),
             ),
         ]
     )
     # The example spans the displayed range in the question's own rendering, so the model sees
     # the exact string form its grid expects (a calendar date on a day/week grid, a timestamp on
-    # a legacy fine grid) rather than an illustrative value from another calendar.
+    # a legacy fine grid) rather than an illustrative value from another calendar; the one-day
+    # timestamp example in the notes is the range's midpoint day for the same reason.
     example_epochs = np.linspace(nom_lower, nom_upper, EXPECTED_PERCENTILE_COUNT)
     example_pairs = [
         f'"{p:g}": "{format_epoch(float(x), granularity)}"'
         for p, x in zip(STANDARD_PERCENTILES, example_epochs, strict=True)
     ]
     example_rows = ",\n            ".join(", ".join(example_pairs[i : i + 5]) for i in range(0, len(example_pairs), 5))
+    one_day = format_epoch(float(example_epochs[len(example_epochs) // 2]), "day")
     schema_block = f"""\
         Schema (`declared_percentiles` is REQUIRED and MUST contain all {EXPECTED_PERCENTILE_COUNT} standard
         percentiles — {_STANDARD_PERCENTILES_DECIMAL_CSV}):
@@ -1424,9 +1420,11 @@ def _date_axis(question: MetaculusQuestion, view: EpochDateQuestion) -> _Continu
         ```
 
         Notes:
-        - Values are ISO-8601 strings, non-decreasing across percentiles: a repeated date is
-          allowed where your mass concentrates on one day, a decrease is not. A bare year, a
-          month, or a number is rejected; write the full calendar date (or UTC timestamp)."""
+        - Values are ISO-8601 strings, non-decreasing across percentiles: repeated dates are
+          allowed, but not for every percentile, so the 0.01 and 0.99 values must differ. To put
+          all of your mass on one day, give increasing UTC timestamps inside that day (e.g.
+          {one_day}T02:00:00Z through {one_day}T22:00:00Z). A decrease is rejected, as are a bare
+          year, a month, or a number; write the full calendar date (or UTC timestamp)."""
     return _ContinuousAxis(
         axis_block=axis_block,
         status_quo_question=(
@@ -1466,15 +1464,19 @@ def _date_axis(question: MetaculusQuestion, view: EpochDateQuestion) -> _Continu
 
 
 def _continuous_prompt(
-    question: MetaculusQuestion,
+    question: NumericQuestion,
     *,
-    view: NumericQuestion,
     research: str,
     lower_bound_message: str,
     upper_bound_message: str,
     axis: _ContinuousAxis,
 ) -> str:
-    """The one continuous template; ``numeric_prompt`` and ``date_prompt`` fill its axis slots."""
+    """The one continuous template; ``numeric_prompt`` and ``date_prompt`` fill its axis slots.
+
+    ``question`` is the question the numeric math runs on: the ``NumericQuestion`` itself, or a
+    ``DateQuestion``'s ``numeric.date_axis`` view, which carries every field read here (the platform
+    off ``page_url``, the Mantic flags off ``api_json``, the prose and the window) verbatim.
+    """
     # Only surface the anchor guidance when an anchor section is actually in the research:
     # the same cheap substring gate ``_strong_evidence_market_clause`` applies to the market
     # clause, so neither clause spends prompt on a table the forecaster does not have.
@@ -1527,7 +1529,7 @@ def _continuous_prompt(
 
         {lower_bound_message}
         {upper_bound_message}
-        {_mantic_out_of_range_clause(question, view)}
+        {_mantic_out_of_range_clause(question)}
 
         Reproduce the following analysis template in your answer:
 
@@ -1601,7 +1603,7 @@ def _continuous_prompt(
 {axis.schema_block}
 
         The LAST thing you write MUST be this fenced ```json block. Write nothing after it.
-        """  # not SQL: the prompt prose "INSIDE VIEW UPDATE (update from your base rate)" trips the heuristic
+        """
     )
 
 
@@ -1614,7 +1616,6 @@ def numeric_prompt(
     """The forecaster prompt for a numeric (or discrete) question; ``bound_messages`` supplies the two notes."""
     return _continuous_prompt(
         question,
-        view=question,
         research=research,
         lower_bound_message=lower_bound_message,
         upper_bound_message=upper_bound_message,
@@ -1636,12 +1637,11 @@ def date_prompt(
     """
     view = question if isinstance(question, EpochDateQuestion) else as_epoch_question(question)
     return _continuous_prompt(
-        question,
-        view=view,
+        view,
         research=research,
         lower_bound_message=lower_bound_message,
         upper_bound_message=upper_bound_message,
-        axis=_date_axis(question, view),
+        axis=_date_axis(view),
     )
 
 

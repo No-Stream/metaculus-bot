@@ -7,14 +7,17 @@ from __future__ import annotations
 import json
 import logging
 from datetime import UTC, datetime
-from typing import get_args
+from typing import get_args, get_type_hints
 
 import pytest
 from pydantic import ValidationError
 
+from metaculus_bot import structured_output_schema
+from metaculus_bot.question_types import QuestionType
 from metaculus_bot.structured_output_schema import (
     _MAX_STRUCTURED_BLOCK_BYTES,
     _NUMERIC_OUTCOME_TYPES,
+    _QUESTION_TYPE_TO_MODEL,
     BaseRateAnchor,
     BinaryStructured,
     CriteriaClause,
@@ -849,7 +852,7 @@ class TestNumericDeclaredPercentiles:
 
 
 class TestDateStructured:
-    """The date block: ISO-8601 strings parsed by ``numeric.date_axis.parse_iso_utc`` and nothing else."""
+    """The date block: ISO-8601 strings parsed by ``numeric.date_axis.parse_forecast_date`` and nothing else."""
 
     @staticmethod
     def _block(declared: dict[str, object], **extra: object) -> DateStructured:
@@ -1285,6 +1288,17 @@ class TestIterBalancedBraces:
 # ===========================================================================
 # parse_structured_block
 # ===========================================================================
+
+
+class TestQuestionTypeVocabulary:
+    def test_the_parsers_accept_exactly_the_shared_question_types(self) -> None:
+        """One vocabulary, one definition: the ``question_type`` a block may declare is
+        ``question_types.QuestionType``, not a restated copy, and every token in it has a model.
+        A restated copy fails asymmetrically (adding ``date`` cost four synchronized edits)."""
+        assert set(_QUESTION_TYPE_TO_MODEL) == set(get_args(QuestionType))
+        for parser in (parse_structured_block, parse_structured_payload):
+            assert get_type_hints(parser)["question_type"] is QuestionType
+        assert not hasattr(structured_output_schema, "StructuredQuestionType"), "the restated copy is back"
 
 
 class TestParseStructuredBlock:

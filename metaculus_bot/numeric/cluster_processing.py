@@ -15,10 +15,10 @@ from metaculus_bot.numeric.config import (
     CLUSTER_SPREAD_BASE_DELTA,
     COUNT_LIKE_DELTA_MULTIPLIER,
     COUNT_LIKE_THRESHOLD,
-    MIN_BOUNDARY_DISTANCE,
     STRICT_ORDERING_EPSILON,
     grid_bin_width,
     grid_is_outcome_space,
+    minimum_separation,
 )
 
 logger = logging.getLogger(__name__)
@@ -50,7 +50,10 @@ def is_degenerate_cluster(values: list[float], value_eps: float) -> bool:
     count-like question is a full unit per position (a 13-percentile point mass
     on [0, 100] came out 12 units wide). That fabricated span is also exactly
     what let the point mass PASS ``detect_unit_mismatch``'s span-ratio test,
-    which would otherwise have withheld the degenerate declaration.
+    which would otherwise have withheld the degenerate declaration. Where the
+    grid's bins are the outcome space the spreader does spread it, under its
+    one-bin cap, so the width it adds stays inside the bin the forecaster named
+    (``apply_cluster_spreading``).
     """
     if len(values) < 2:
         return False
@@ -114,7 +117,7 @@ def _spread_cluster_values(
     new_vals = [center + off for off in offsets]
 
     # Enforce bounds softly during spread to avoid later large clamps
-    tiny = max(MIN_BOUNDARY_DISTANCE * range_size, CLUSTER_DETECTION_ATOL)
+    tiny = minimum_separation(range_size)
     if not question.open_lower_bound:
         new_vals = [max(v, question.lower_bound + tiny) for v in new_vals]
     if not question.open_upper_bound:
@@ -147,16 +150,25 @@ def apply_cluster_spreading(
 
     Separates genuinely-plateaued neighbours (a count-like question where a model
     declares P20 = P40 = P50 = 1) from each other; it does NOT invent a
-    distribution where the model declared none. A whole-set collapse — every
-    value inside one epsilon cluster — is left ALONE and reported as 0 clusters
-    applied: downstream jitter / strict-ordering give it the minimum separation
-    the CDF format needs, and ``detect_unit_mismatch`` then sees the honest
-    (essentially zero) span and withholds the forecaster. See
-    ``is_degenerate_cluster``.
+    distribution where the model declared none. On the 201-point continuous grid
+    a whole-set collapse — every value inside one epsilon cluster — is left ALONE
+    and reported as 0 clusters applied: downstream jitter / strict-ordering give
+    it the minimum separation the CDF format needs, and ``detect_unit_mismatch``
+    then sees the honest (essentially zero) span and withholds the forecaster.
+    See ``is_degenerate_cluster``.
+
+    Where the published bins are the outcome space (``grid_is_outcome_space``)
+    the whole-set case is spread like any other plateau, under the one-bin cap
+    ``_spread_cluster_values`` applies. "100% on 2026-09-16" is fully expressible
+    on post 651's twelve one-day bins, and the date prompt invites that shape, so
+    the member publishes with its mass in that day instead of being withheld as a
+    unit mismatch; the width the spread adds stays inside the bin the forecaster
+    named. A genuine scale error on such a grid sits several bins outside the
+    bounds and still raises in ``clamp_values_to_bounds``.
 
     Mutates and returns ``modified_values``.
     """
-    if is_degenerate_cluster(modified_values, value_eps):
+    if is_degenerate_cluster(modified_values, value_eps) and not grid_is_outcome_space(question):
         return modified_values, 0
 
     clusters_applied = 0
@@ -191,9 +203,9 @@ def apply_jitter_for_duplicates(
     percentile_list: list[Percentile],
 ) -> list[float]:
     """Apply jitter to eliminate any remaining duplicate values."""
+    epsilon = minimum_separation(range_size)
     for i in range(1, len(modified_values)):
         if modified_values[i] <= modified_values[i - 1]:
-            epsilon = max(MIN_BOUNDARY_DISTANCE * range_size, STRICT_ORDERING_EPSILON)
             target = modified_values[i - 1] + epsilon
 
             if not question.open_upper_bound:
@@ -218,7 +230,7 @@ def ensure_strictly_increasing_bounded(
     modified_values: list[float], question: NumericQuestion, range_size: float
 ) -> list[float]:
     """Final pass to ensure all values are strictly increasing within bounds."""
-    epsilon = max(MIN_BOUNDARY_DISTANCE * range_size, STRICT_ORDERING_EPSILON)
+    epsilon = minimum_separation(range_size)
 
     # Re-ensure increasing after clamping, bounded (left-to-right)
     for i in range(1, len(modified_values)):

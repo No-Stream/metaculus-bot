@@ -539,7 +539,7 @@ async def extract_date(
 
     Mirrors ``extract_numeric``: the caller hands ``outcome.value`` to the same guarded numeric
     distribution build, on the question's ``numeric.date_axis.as_epoch_question`` view. Every
-    rung converts through one parser (``numeric.date_axis.parse_iso_utc``): the block rung via
+    rung converts through one parser (``numeric.date_axis.parse_forecast_date``): the block rung via
     ``DateStructured``, the LLM salvage rung via ``IsoDatePercentile``, so a date-only value lands
     at noon UTC inside its day bin on both paths and a naive timestamp is never read as host
     time. ``prompt_notes`` should be the date sibling of ``build_parse_notes`` so the rung-3

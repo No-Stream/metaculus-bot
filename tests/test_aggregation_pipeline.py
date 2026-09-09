@@ -9,7 +9,9 @@ Exercises AggregationPipeline's three main paths:
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections import defaultdict
+from datetime import UTC, datetime
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -25,13 +27,16 @@ from forecasting_tools import (
 from forecasting_tools.data_models.data_organizer import PredictionTypes
 from forecasting_tools.data_models.multiple_choice_report import PredictedOption
 from forecasting_tools.data_models.numeric_report import Percentile
+from forecasting_tools.data_models.questions import DateQuestion
 
 from metaculus_bot.aggregation_pipeline import AggregationCounters, AggregationPipeline
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.constants import THIN_PUBLISH_BINARY_CEIL, THIN_PUBLISH_BINARY_FLOOR
 from metaculus_bot.numeric.config import STANDARD_PERCENTILES
+from metaculus_bot.numeric.date_axis import EpochDateQuestion
 from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
 from tests.conftest import make_mock_numeric_question
+from tests.mantic_fakes import DATE_POST_ID, load_preseason_post
 
 
 def _make_binary_question(qid: int = 100) -> BinaryQuestion:
@@ -533,6 +538,45 @@ class TestRunStacking:
 
         assert result == expected_pol
         assert pipeline.meta_reasoning[402] == "MC meta text"
+
+    @pytest.mark.asyncio
+    async def test_a_date_question_stacks_on_its_epoch_view(self, caplog):
+        """The date branch is reachable only with NUMERIC_STACKING_ENABLED on (off in prod), so no
+        live run exercises the ``numeric_view`` hand-off: the stacker must be handed the epoch
+        adapter, the built distribution must keep the date axis, and the stacker's MEMBER_FORECAST
+        line must say ``qtype=date``."""
+        caplog.set_level(logging.INFO, logger="metaculus_bot")
+        pipeline = _make_pipeline()
+        question = DateQuestion.from_metaculus_api_json(load_preseason_post(DATE_POST_ID))
+        qid = question.id_of_question
+        assert qid is not None
+        window_start = datetime(2026, 9, 16, 2, tzinfo=UTC).timestamp()
+        window_seconds = 20 * 3600
+        epoch_percentiles = [
+            Percentile(percentile=p, value=window_start + window_seconds * i / (len(STANDARD_PERCENTILES) - 1))
+            for i, p in enumerate(STANDARD_PERCENTILES)
+        ]
+        reasoned: list[ReasonedPrediction[PredictionTypes]] = [
+            ReasonedPrediction(prediction_value=0.5, reasoning="Model: m1\n\nEarly."),
+            ReasonedPrediction(prediction_value=0.5, reasoning="Model: m2\n\nLate."),
+        ]
+
+        with patch(
+            "metaculus_bot.aggregation_pipeline.stacking.run_stacking_numeric",
+            new=AsyncMock(return_value=(epoch_percentiles, "date meta")),
+        ) as stacker:
+            result = await pipeline.run_stacking(question, "research", reasoned)
+
+        handed = stacker.call_args.args[2]
+        assert isinstance(handed, EpochDateQuestion)
+        assert handed.id_of_question == qid
+        assert isinstance(result, NumericDistribution)
+        assert result.is_date is True
+        assert pipeline.meta_reasoning[qid] == "date meta"
+        (line,) = [r.getMessage() for r in caplog.records if r.getMessage().startswith("MEMBER_FORECAST:")]
+        assert f"question={qid} " in line
+        assert " role=stacker " in line
+        assert " qtype=date " in line
 
 
 class TestThresholdLookup:

@@ -23,6 +23,7 @@ from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import DateQuestion, DiscreteQuestion, MultipleChoiceQuestion
 
 from metaculus_bot.numeric.bounds_clamping import calculate_bounds_buffer, clamp_values_to_bounds
+from metaculus_bot.numeric.config import minimum_separation
 from metaculus_bot.numeric.date_axis import (
     DATE_GRANULARITIES,
     EpochDateQuestion,
@@ -30,7 +31,7 @@ from metaculus_bot.numeric.date_axis import (
     format_epoch,
     numeric_qtype,
     numeric_view,
-    parse_iso_utc,
+    parse_forecast_date,
     to_epoch,
 )
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
@@ -177,7 +178,7 @@ class TestTheGridMatchesThePlatform:
 
 class TestParsingIsStrictUtcAndLandsInsideTheDay:
     def test_a_date_only_value_is_noon_utc(self) -> None:
-        moment = parse_iso_utc("2026-09-16")
+        moment = parse_forecast_date("2026-09-16")
         assert moment == datetime(2026, 9, 16, 12, tzinfo=UTC)
         assert moment.tzinfo is UTC
 
@@ -186,7 +187,7 @@ class TestParsingIsStrictUtcAndLandsInsideTheDay:
         would sit ON edge 8, where the platform's 1e-10 bucket fudge decides the bin."""
         epoch = as_epoch_question(q651)
         grid = build_cdf_value_grid(epoch.lower_bound, epoch.upper_bound, None, epoch.cdf_size)
-        value = to_epoch(parse_iso_utc("2026-09-16"))
+        value = to_epoch(parse_forecast_date("2026-09-16"))
         assert grid[8] < value < grid[9]
         assert value - grid[8] == pytest.approx(_DAY / 2)
 
@@ -201,7 +202,7 @@ class TestParsingIsStrictUtcAndLandsInsideTheDay:
         ],
     )
     def test_timestamps_are_honoured_and_a_naive_one_is_utc(self, text: str, expected: datetime) -> None:
-        assert parse_iso_utc(text) == expected
+        assert parse_forecast_date(text) == expected
 
     @pytest.mark.parametrize(
         "text",
@@ -209,7 +210,7 @@ class TestParsingIsStrictUtcAndLandsInsideTheDay:
     )
     def test_anything_looser_than_iso_is_rejected(self, text: str) -> None:
         with pytest.raises(ValueError, match="not a strict ISO-8601"):
-            parse_iso_utc(text)
+            parse_forecast_date(text)
 
     def test_the_epoch_does_not_depend_on_the_host_timezone(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """forecasting-tools' own date template calls ``.timestamp()`` on a naive datetime, an
@@ -220,7 +221,7 @@ class TestParsingIsStrictUtcAndLandsInsideTheDay:
             for zone in ("America/Los_Angeles", "Asia/Tokyo", "UTC"):
                 monkeypatch.setenv("TZ", zone)
                 time.tzset()
-                assert to_epoch(parse_iso_utc("2026-09-16")) == expected
+                assert to_epoch(parse_forecast_date("2026-09-16")) == expected
                 assert to_epoch(datetime(2026, 9, 16, 12)) == expected
                 # The framework's naive call is the trap this guards against.
                 naive_local = datetime(2026, 9, 16, 12).timestamp()
@@ -259,6 +260,15 @@ class TestRenderingForHumans:
         assert "2026-06-17T15:00:00Z" in lower_msg
         assert "closed" in lower_msg
 
+        # Neither recorded payload has an open lower bound, so that rendering is pinned on a built question.
+        open_lower = make_real_date_question(open_lower_bound=True, date_granularity="")
+        upper_msg, lower_msg = bound_messages(as_epoch_question(open_lower))
+        assert "The lower bound is open: 2026-09-08T00:00:00Z is the bottom of the displayed range" in lower_msg
+        assert "resolve below 2026-09-08T00:00:00Z" in lower_msg
+        assert "closed" not in lower_msg
+        assert str(int(to_epoch(open_lower.lower_bound))) not in lower_msg
+        assert upper_msg == "The upper bound is closed: the outcome can not be higher than 2026-09-20T00:00:00Z."
+
     def test_bound_messages_on_a_plain_numeric_question_are_unchanged(self) -> None:
         upper_msg, lower_msg = bound_messages(make_real_numeric_question(lower_bound=0.0, upper_bound=20.0))
         assert "20.0" in upper_msg
@@ -295,7 +305,8 @@ class TestNumericViewAndTypeDispatch:
 
 
 class TestTheClosedBoundClampOnADateAxis:
-    """One day outside a closed bound of a 12-day question clamps; ten days outside still raises."""
+    """One day outside a closed bound of a 12-day question clamps to just inside the bound, in the
+    first day's bin rather than a whole day in; ten days outside still raises."""
 
     def test_one_day_before_a_closed_lower_bound_clamps(self, q651: DateQuestion) -> None:
         epoch = as_epoch_question(q651)
@@ -305,7 +316,8 @@ class TestTheClosedBoundClampOnADateAxis:
         percentiles = _percentiles([day_before, epoch.lower_bound + 2 * _DAY, epoch.lower_bound + 5 * _DAY])
         values, corrected = clamp_values_to_bounds([p.value for p in percentiles], percentiles, epoch, buffer)
         assert corrected
-        assert values[0] == epoch.lower_bound + buffer
+        assert values[0] == epoch.lower_bound + minimum_separation(epoch.upper_bound - epoch.lower_bound)
+        assert epoch.lower_bound < values[0] < epoch.lower_bound + _DAY
         assert values[1:] == [epoch.lower_bound + 2 * _DAY, epoch.lower_bound + 5 * _DAY]
 
     def test_ten_bins_outside_still_raises(self, q651: DateQuestion) -> None:

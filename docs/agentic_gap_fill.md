@@ -357,7 +357,11 @@ concluded explicitly (not when the deadline cut it off) and is bounded by its ow
 `GHOST_FORECAST` line kept byte-identical for the already-harvested archive, and
 an additive `GHOST_FORECAST_JSON` line carrying the complete forecast (every
 percentile, not just the median) so `scripts/score_ghosts.py` can score numeric
-ghosts. The JSON line is suppressed when no structured block parsed. The turn-one
+ghosts. A date ghost's percentiles are written in epoch seconds, the axis the date
+pipeline forecasts on; the scorer counts date ghosts by type and reports that none
+can be scored while the residual dataset excludes date questions
+(`docs/performance_analysis.md`). The JSON line is suppressed when no structured
+block parsed. The turn-one
 plan emits the same pair as `GHOST_PRE` / `GHOST_PRE_JSON`
 (`_set_research_plan_tool`) from the driver's pre-research dry run, so the
 pre-versus-post delta measures whether v2's own research moved its own view.

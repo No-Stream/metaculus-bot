@@ -241,7 +241,7 @@ class TestDatePercentileWrapper:
     forecasting-tools' own date template lets pydantic coerce the value (a date-only string lands
     at midnight naive, a bare integer becomes a 1970 unix timestamp) and then calls ``.timestamp()``
     on the naive result, which is host-local time. ``IsoDatePercentile`` routes the raw string
-    through ``numeric.date_axis.parse_iso_utc`` instead.
+    through ``numeric.date_axis.parse_forecast_date`` instead.
     """
 
     @pytest.mark.asyncio

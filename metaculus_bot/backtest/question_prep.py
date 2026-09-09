@@ -535,9 +535,9 @@ def _extract_ground_truth(question: MetaculusQuestion) -> GroundTruth | None:
 
     # Date questions resolve to a datetime, but they hit the unsupported-type branch above
     # and return None; binary/numeric/MC resolutions never carry a datetime here. That
-    # exclusion is a decision, not an oversight: the live bot forecasts date questions
-    # (2026-09-08, on an epoch-seconds axis), but the backtest, ablation and residual
-    # analysis stay date-free until a Mantic date question has resolved under this code.
+    # exclusion is a decision, not an oversight: the live bot forecasts date questions on an
+    # epoch-seconds axis, but the backtest, ablation and residual analysis stay date-free
+    # until a Mantic date question has resolved under this code.
     assert not isinstance(typed_res, datetime)
 
     return GroundTruth(

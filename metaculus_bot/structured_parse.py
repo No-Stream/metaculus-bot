@@ -18,7 +18,7 @@ from forecasting_tools.data_models.numeric_report import DatePercentile, Percent
 from pydantic import BaseModel, field_validator
 
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
-from metaculus_bot.numeric.date_axis import parse_iso_utc
+from metaculus_bot.numeric.date_axis import parse_forecast_date
 from metaculus_bot.simple_types import OptionProbability
 
 logger = logging.getLogger(__name__)
@@ -35,7 +35,7 @@ class IsoDatePercentile(DatePercentile):
     leaves a date-only string at midnight naive and a bare integer as a unix timestamp, and then
     calls ``.timestamp()`` on the naive result, which is host-local time (an 8-hour error on a
     Pacific laptop; correct on a UTC runner by accident). Routing the raw string through
-    ``numeric.date_axis.parse_iso_utc`` instead gives the LLM salvage rung the same semantics as
+    ``numeric.date_axis.parse_forecast_date`` instead gives the LLM salvage rung the same semantics as
     the block rung: strict ISO-8601, a naive time read as UTC, a date-only value at noon UTC so it
     lands inside its day bin, and a loud failure on anything else. The parser LLM's constrained
     schema still asks for a date-time string, since that is what ``DatePercentile`` declares.
@@ -43,9 +43,9 @@ class IsoDatePercentile(DatePercentile):
 
     @field_validator("value", mode="before")
     @classmethod
-    def _parse_iso_utc(cls, value: object) -> object:
+    def _parse_forecast_date(cls, value: object) -> object:
         if isinstance(value, str):
-            return parse_iso_utc(value)
+            return parse_forecast_date(value)
         raise ValueError(f"DatePercentile.value must be an ISO-8601 date string, got {value!r}")
 
 

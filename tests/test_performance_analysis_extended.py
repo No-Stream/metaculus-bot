@@ -557,6 +557,35 @@ class TestCollectorCommentCreatedAt:
         assert _process_post(post, {6: comment}) == []
 
 
+class TestCollectorExcludesDateQuestions:
+    """The live bot forecasts date questions (since 2026-09-08, on the epoch-seconds axis), so a
+    resolved one reaches the collector; the residual dataset stays date-free by decision, the
+    same exclusion ``backtest/question_prep.py`` and ``ablation/run_pdf.py`` carry at their
+    seams. The skip has to be explicit and named in the log: ``parse_resolution``'s unknown-type
+    fallthrough would file the same question as a parser bug."""
+
+    @pytest.mark.parametrize("resolution", ["above_upper_bound", "2026-07-20T12:00:00Z"])
+    def test_a_resolved_date_question_is_skipped_by_type_with_one_named_warning(self, resolution, caplog):
+        # Wire shape of a resolved date question (tests/data/mantic_series1_date_post_500_2026_09_08.json):
+        # ``type`` is ``date``, ``scaling`` bounds are epoch seconds, and the resolution is either an
+        # out-of-range token or an ISO timestamp.
+        post = _binary_post(500, 5000, resolution=resolution)
+        post["question"]["type"] = "date"
+        post["question"]["open_upper_bound"] = True
+        post["question"]["scaling"] = {"range_min": 1781708400.0, "range_max": 1786536000.0, "zero_point": None}
+        post["question"]["my_forecasts"]["latest"]["forecast_values"] = [0.0, 0.4, 0.9]
+        comment = {"id": 1004, "text": "*Forecaster 1*: 2026-07-20\n", "on_post": 500}
+
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.performance_analysis"):
+            assert _process_post(post, {500: comment}) == []
+
+        warnings = [(r.name, r.getMessage()) for r in caplog.records if r.levelno == logging.WARNING]
+        (message,) = [text for name, text in warnings if name.endswith(".collector")]
+        assert "Q5000" in message
+        assert "date question" in message
+        assert not any("Unknown question type" in text for _, text in warnings)
+
+
 # ---------------------------------------------------------------------------
 # collector — stacker_outcome / stacker_outcome_source fields
 # ---------------------------------------------------------------------------

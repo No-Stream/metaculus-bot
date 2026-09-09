@@ -12,6 +12,7 @@ import json
 import math
 import sys
 from pathlib import Path
+from typing import ClassVar
 
 import numpy as np
 import pytest
@@ -663,3 +664,46 @@ class TestGhostGridScaledMaxStep:
         assert summary["numeric"]["n_unscoreable"] == 0
         row = summary["numeric"]["rows"][0]
         assert row["delta"] == pytest.approx(0.0, abs=1e-9)
+
+
+class TestGhostsWithoutAScorer:
+    """Gap-fill v2 emits date ghosts (since 2026-09-08) and nothing here can score one: the
+    residual dataset excludes date questions by decision, so no date record exists to join, and
+    the tally has no date arm should one ever appear. Both facts are counted and named in the
+    report; before this a date ghost fell off the end of the type dispatch with no trace, so the
+    operator read the missing pairs as questions still waiting on resolutions."""
+
+    _DATE_PAYLOAD: ClassVar[dict] = {
+        "qtype": "date",
+        "declared_percentiles": {"0.1": 1_789_000_000.0, "0.5": 1_789_040_000.0, "0.9": 1_789_080_000.0},
+        "median": 1_789_040_000.0,
+    }
+
+    def test_date_ghosts_are_counted_in_the_inventory_and_named_in_the_report(self):
+        json_ghosts = [_json_ghost(1, self._DATE_PAYLOAD), _json_ghost(2, {"qtype": "binary", "prob": 0.9})]
+        summary = join_and_score(json_ghosts, [], [_binary_record(2, True, 0.5)])
+
+        assert summary["qtype_counts"] == {"binary": 1, "date": 1}
+        assert summary["n_joined"] == 1  # the date ghost had no record to join
+        assert summary["joined_without_scorer"] == {}
+        report = render_report(summary)
+        assert "by type: binary=1 date=1" in report
+        assert "date ghosts cannot be scored" in report
+
+    def test_a_joined_ghost_of_a_type_without_a_scorer_is_counted_not_dropped(self):
+        date_record = {**_numeric_record(1, 1_789_040_000.0, [0.0, 0.5, 1.0]), "type": "date"}
+        unparsed_legacy = [_legacy_ghost(3, "unknown", "")]
+        records = [date_record, _binary_record(3, True, 0.5)]
+        summary = join_and_score([_json_ghost(1, self._DATE_PAYLOAD)], unparsed_legacy, records)
+
+        assert summary["n_joined"] == 2
+        assert summary["n_scored"] == 0
+        assert summary["joined_without_scorer"] == {"date": 1, "unknown": 1}
+        assert "joined but no scorer for the type: date=1 unknown=1" in render_report(summary)
+
+    def test_a_report_without_date_ghosts_says_nothing_about_them(self):
+        summary = join_and_score([_json_ghost(1, {"qtype": "binary", "prob": 0.9})], [], [_binary_record(1, True, 0.5)])
+        report = render_report(summary)
+        assert "by type: binary=1" in report
+        assert "date ghosts" not in report
+        assert "no scorer" not in report

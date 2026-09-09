@@ -29,11 +29,12 @@ import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 from pydantic import ValidationError
 
 from metaculus_bot.numeric.date_axis import format_epoch, to_epoch
+from metaculus_bot.question_types import QuestionType
 from metaculus_bot.research.agentic.artifact import detachment_lint, render_findings
 from metaculus_bot.research.agentic.dispatch import (
     _absorb_tool_results,
@@ -434,15 +435,11 @@ def _log_completion(state: _LoopState, log_prefix: str) -> None:
     )
 
 
-_GHOST_QTYPES: tuple[Literal["binary", "multiple_choice", "numeric", "date"], ...] = (
-    "binary",
-    "multiple_choice",
-    "numeric",
-    "date",
-)
+# Derived, not restated: a question type added to the shared Literal reaches the ghost parser too.
+_GHOST_QTYPES: tuple[QuestionType, ...] = get_args(QuestionType)
 
 
-def _declared_qtype(raw_text: str) -> Literal["binary", "multiple_choice", "numeric", "date"] | None:
+def _declared_qtype(raw_text: str) -> QuestionType | None:
     """Peek the ghost block's self-declared ``question_type`` without parsing it.
 
     The ghost emits exactly one structured block that names its own

@@ -40,18 +40,24 @@ against the ACTUAL emitted format strings (the source of truth):
   ``_research_and_make_predictions`` (per-QUESTION positive survivor count; the
   drop marker above is silent on a healthy question, and its comment-side twin
   ``FORECASTERS_USED`` never reaches stdout)
+* ``QUESTION_CAP_FORFEIT`` — ``metaculus_bot/forecaster.py`` ``forecast_questions`` (per-RUN,
+  only when ``max_questions_per_run`` cut the sorted question list: the platform, the cap,
+  how many questions were open, how many were forfeited and their post ids. On a tournament
+  that opens a whole batch at once every forfeited question is a paid forecast never made)
 * ``MEMBER_FORECAST``   — ``metaculus_bot/member_forecast.py`` ``format_member_forecast_marker``,
   emitted from ``forecaster_runners.py`` (each member, all four types), ``stacking.py``
   (stacker binary / MC) and ``aggregation_pipeline.py`` (stacker numeric and date): per-VALUE
   record of what the ladder extracted and what the runner handed on, both as compact
   JSON. The one marker that carries a member's forecast value on every question; before
-  it the raw value lived only in the trim-lossy published comment. Since 2026-09-08 a
-  numeric or date line ends with the built CDF's out-of-range mass, ``oor_low`` /
-  ``oor_high`` (optional in the regex, so older lines still parse)
+  it the raw value lived only in the trim-lossy published comment. A numeric or date line
+  ends with the built CDF's out-of-range mass, ``oor_low`` / ``oor_high`` (optional in the
+  regex, so lines that predate the fields still parse)
 * ``NUMERIC_AGGREGATE``  — ``metaculus_bot/member_forecast.py`` ``format_numeric_aggregate_marker``,
   emitted from ``forecaster.py`` ``_aggregate_predictions`` (per-QUESTION, numeric and date:
   the PUBLISHED distribution's grid size and out-of-range mass, the aggregate twin of the
-  member fields above; what decides whether a mechanical tail floor is ever warranted)
+  member fields above, then the same mass before the platform tail floor and the floor that
+  moved it, ``oor_low_raw`` / ``oor_high_raw`` / ``tail_floor``; how the Mantic floor gets
+  benchmarked on this bot's own forecasts)
 * ``CLOSE_MARGIN``      — ``metaculus_bot/close_margin.py`` (emitted at submit time in ``forecaster.py``)
 * ``MARKET_RANKING``    — ``metaculus_bot/research/prediction_market.py``
   ``_log_ranking_telemetry`` (per-QUESTION ranked-retrieval outcome: pool size,
@@ -71,9 +77,12 @@ against the ACTUAL emitted format strings (the source of truth):
   and the deterministic pass refused it that top tier; silent otherwise, and it
   fires on nothing in the archive, so a first record is itself the finding)
 * ``NUMERIC_DEGENERATE_DECLARATION`` — ``metaculus_bot/numeric/pipeline.py``
-  ``_apply_jitter_and_clamp`` (per-FORECASTER point-mass numeric declaration that
-  is no longer cluster-spread into a width nobody stated — a fabrication-attempt
-  rate, since the unit-mismatch guard then withholds that forecaster)
+  ``_apply_jitter_and_clamp`` (per-FORECASTER point-mass numeric declaration, with
+  ``spread_applied`` saying what the grid made of it: on the 201-point continuous grid
+  it is not cluster-spread into a width nobody stated, so the unit-mismatch guard
+  withholds that forecaster and the count is a fabrication-attempt rate; where the
+  published bins are the outcome space it is spread under the one-bin cap and the
+  member publishes with its mass inside the bin it named)
 * ``NUMERIC_AGGREGATE_GRID_MISMATCH`` — ``metaculus_bot/numeric/utils.py``
   ``aggregate_numeric`` (per-MODEL CDF whose grid length disagreed with the
   question's; expect zero in prod, so any record means a length drifted)
@@ -573,13 +582,20 @@ MARKER_SPECS: list[MarkerSpec] = [
         "numeric_degenerate_declaration",
         # Per-FORECASTER point-mass numeric declaration (numeric/pipeline.py
         # _apply_jitter_and_clamp): the model put (near-)identical values at every
-        # percentile, so the cluster spreader is deliberately NOT applied and the honest
-        # zero span reaches the unit-mismatch guard, which withholds that forecaster. The
-        # count is therefore a per-model fabrication-ATTEMPT rate: before 2026-08-25 the
-        # spreader manufactured a ±6-unit distribution from it and that width was exactly
-        # what let it pass the guard, so the published forecast stated a width nobody
-        # declared. The resulting drop shows up as UnitMismatchError in FORECASTER_DROPS;
-        # this line is the only place the CAUSE is named.
+        # percentile. What happens next depends on the grid, and ``spread_applied`` says
+        # which. On the 201-point continuous grid the cluster spreader is deliberately NOT
+        # applied (``spread_applied=false``) and the honest zero span reaches the
+        # unit-mismatch guard, which withholds that forecaster, so there the count is a
+        # per-model fabrication-ATTEMPT rate: before 2026-08-25 the spreader manufactured a
+        # ±6-unit distribution from it and that width was exactly what let it pass the
+        # guard, so the published forecast stated a width nobody declared. Where the
+        # published bins are the outcome space (a discrete question, or any non-201 grid such
+        # as a day-granularity date question; numeric/config.py grid_is_outcome_space) the
+        # collapse IS spread like any other plateau, under the one-bin cap
+        # (``spread_applied=true``): "100% on 2026-09-16" is fully expressible on twelve
+        # one-day bins, so the member publishes with its mass inside the bin it named. The
+        # 201-grid drop shows up as UnitMismatchError in FORECASTER_DROPS; this line is the
+        # only place the CAUSE is named.
         #
         # ``model`` names the forecaster (or the stacker, on the aggregation path). All three
         # sanitize_percentiles callers pass it, so "unknown" now means a NEW caller forgot to
@@ -826,9 +842,9 @@ MARKER_SPECS: list[MarkerSpec] = [
         # rather than a page. ``unreadable_document`` splits into ``no_text_layer`` /
         # ``encrypted`` / ``malformed``, and ``unsupported_type`` carries
         # ``budget_skipped`` / ``parse_contention`` when it was a document we were holding
-        # and declined to parse. ``blocked`` carries ``metaculus_self_ref`` (2026-09-08) when
-        # the refusal was ours — a redirect onto the question platform's own site — rather
-        # than the host's. The provider appends it only where it applies, so the group
+        # and declined to parse. ``blocked`` carries ``metaculus_self_ref`` when the refusal
+        # was ours — a redirect onto the question platform's own site — rather than the
+        # host's. The provider appends it only where it applies, so the group
         # is optional in BOTH directions — absent on every line the archive already holds,
         # and absent on a fresh line whose status carries no reason.
         #
@@ -1128,10 +1144,10 @@ MARKER_SPECS: list[MarkerSpec] = [
         # and numeric vectors stayed strings. ``model`` is ``.+?`` like extraction_rung's,
         # since the same ``forecaster_llm.model`` feeds both.
         #
-        # ``oor_low`` / ``oor_high`` (2026-09-08, additive): the out-of-range mass of the CDF the
-        # runner built from ``published``, ``cdf[0]`` and ``1 - cdf[-1]``, on numeric and date
-        # lines only. Optional in the regex so every earlier line and every binary / MC line
-        # (no CDF, no fields) still harvests, with both fields None on those records.
+        # ``oor_low`` / ``oor_high``: the out-of-range mass of the CDF the runner built from
+        # ``published``, ``cdf[0]`` and ``1 - cdf[-1]``, on numeric and date lines only. Optional
+        # in the regex so every line that predates the fields and every binary / MC line (no
+        # CDF, no fields) still harvests, with both fields None on those records.
         re.compile(
             r"MEMBER_FORECAST:\s*question=(?P<question>\S+)\s+model=(?P<model>.+?)\s+role=(?P<role>\S+)"
             r"\s+qtype=(?P<qtype>\S+)\s+raw=(?P<raw>\S+)\s+published=(?P<published>\S+)"
@@ -1148,14 +1164,25 @@ MARKER_SPECS: list[MarkerSpec] = [
         # through): the grid it was submitted on and its out-of-range mass, ``cdf[0]`` below
         # the lower bound and ``1 - cdf[-1]`` above the upper. The platform scores an
         # out-of-range resolution against a fixed 0.05 reference (a 1% tail scores -80.5, 5%
-        # scores 0), Mantic's Series 1 resolved half its date questions and a fifth of its
-        # discrete ones outside the displayed range, and this pipeline publishes exactly 1%
-        # there whenever every percentile sits inside; these two fields, joined with the
-        # per-member ``oor_*`` fields on MEMBER_FORECAST, are how "do the models already place
-        # mass beyond the bounds?" gets answered before any mechanical tail floor is built.
+        # scores 0), Mantic's Series 1 resolved half its date questions and a quarter of its
+        # discrete ones outside the displayed range, and this pipeline builds exactly 1% there
+        # whenever every percentile sits inside; so on a Mantic question the published
+        # aggregate's open tails are raised to MANTIC_OUT_OF_RANGE_TAIL_FLOOR
+        # (numeric/out_of_range_floor.py).
+        #
+        # ``oor_low`` / ``oor_high`` are the PUBLISHED tails, after that floor. The trailing
+        # ``oor_low_raw`` / ``oor_high_raw`` are the aggregate's own tails before it and
+        # ``tail_floor`` the floor that moved an endpoint (0 on Metaculus, on a closed-bound
+        # question, or when the tails already met it), so the floor's cost and gain can be
+        # replayed on this bot's own forecasts; joined with the per-member ``oor_*`` fields on
+        # MEMBER_FORECAST they also say whether the models place mass beyond the bounds on their
+        # own. The three are one optional group at the tail, so lines that predate them harvest
+        # with all three None.
         re.compile(
             r"NUMERIC_AGGREGATE:\s*question=(?P<question>\S+)\s+qtype=(?P<qtype>\S+)"
             r"\s+cdf_size=(?P<cdf_size>\d+)\s+oor_low=(?P<oor_low>\S+)\s+oor_high=(?P<oor_high>\S+)"
+            r"(?:\s+oor_low_raw=(?P<oor_low_raw>\S+)\s+oor_high_raw=(?P<oor_high_raw>\S+)"
+            r"\s+tail_floor=(?P<tail_floor>\S+))?"
         ),
         qid_kind=QID_KIND_QUESTION_ID,  # forecaster.py passes question.id_of_question
     ),
@@ -1395,8 +1422,8 @@ MARKER_SPECS: list[MarkerSpec] = [
             r"donated_404=(?P<donated_404>\S+?), credit=(?P<credit>\S+?)"
             r"(?: with (?P<suppressed_credit>\S+?) credit event\(s\) suppressed until (?P<resume_date>\S+?))?"
             r"(?:, donated_key=(?P<donated_key>\S+?))?"
-            # ``mantic_post_drops`` (2026-09-08, additive): posts the Mantic client could not parse,
-            # folded into ``alertable`` and rendered ONLY when non-zero, so absent harvests as None.
+            # ``mantic_post_drops``: posts the Mantic client could not parse, folded into
+            # ``alertable`` and rendered ONLY when non-zero, so absent harvests as None.
             r"(?:, mantic_post_drops=(?P<mantic_post_drops>\S+?))?\);"
         ),
     ),
@@ -1408,6 +1435,21 @@ MARKER_SPECS: list[MarkerSpec] = [
         # a one-question paid run spent on. ``requested`` / ``matched`` are comma-separated post
         # ids (a lone id coerces to int, several stay one string) and an empty match is ``none``.
         re.compile(r"ONLY_POSTS:\s*requested=(?P<requested>\S+)\s+matched=(?P<matched>\S+)\s+dropped=(?P<dropped>\d+)"),
+    ),
+    MarkerSpec(
+        "question_cap_forfeit",
+        # The ``max_questions_per_run`` cap (forecaster.py ``forecast_questions``), one WARNING per
+        # run that cut the tightest-close-first list: which platform's questions, the cap, how
+        # many were open after the skip filter, how many were left behind and their post ids.
+        # Run-level, so no question ref. ``posts`` is comma-separated post ids in the order the
+        # cap dropped them (a lone id coerces to int, several stay one string). On Mantic the
+        # fetch ceiling is 500 against a default cap of 10 and a whole hour's batch opens at
+        # once, so each row is a paid forecast the run never made; the only trace before this
+        # spec was a free-text WARNING gone with the 90-day GitHub Actions log expiry.
+        re.compile(
+            r"QUESTION_CAP_FORFEIT:\s*platform=(?P<platform>\S+)\s+cap=(?P<cap>\d+)\s+total=(?P<total>\d+)"
+            r"\s+dropped=(?P<dropped>\d+)\s+posts=(?P<posts>\S+)"
+        ),
     ),
     MarkerSpec(
         "gemini_ungrounded_suppressed",

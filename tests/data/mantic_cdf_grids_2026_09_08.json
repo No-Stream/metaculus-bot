@@ -1,0 +1,533 @@
+{
+ "source": "Every distinct (inbound_outcome_count, open_lower_bound, open_upper_bound) triple among the numeric, discrete and date questions in the recorded corpus of all public Mantic posts, GET /api/posts/ on competitions.mantic.com, 2026-09-08 (556 posts, 524 continuous questions). The out-of-range tail floor acts on CDF heights only, so the value axis (range_min, range_max, zero_point) is not part of a grid's identity here.",
+ "grids": [
+  {
+   "inbound_outcome_count": 3,
+   "open_lower_bound": false,
+   "open_upper_bound": false,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 4,
+   "open_lower_bound": false,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 4,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 5,
+   "open_lower_bound": false,
+   "open_upper_bound": false,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 6,
+   "open_lower_bound": false,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 7,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 8,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 9,
+   "open_lower_bound": false,
+   "open_upper_bound": false,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 9,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 10,
+   "open_lower_bound": false,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 11,
+   "open_lower_bound": false,
+   "open_upper_bound": true,
+   "questions": 5
+  },
+  {
+   "inbound_outcome_count": 12,
+   "open_lower_bound": false,
+   "open_upper_bound": false,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 13,
+   "open_lower_bound": false,
+   "open_upper_bound": false,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 13,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 2
+  },
+  {
+   "inbound_outcome_count": 15,
+   "open_lower_bound": false,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 16,
+   "open_lower_bound": false,
+   "open_upper_bound": false,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 16,
+   "open_lower_bound": false,
+   "open_upper_bound": true,
+   "questions": 2
+  },
+  {
+   "inbound_outcome_count": 16,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 2
+  },
+  {
+   "inbound_outcome_count": 18,
+   "open_lower_bound": false,
+   "open_upper_bound": false,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 19,
+   "open_lower_bound": false,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 21,
+   "open_lower_bound": false,
+   "open_upper_bound": false,
+   "questions": 3
+  },
+  {
+   "inbound_outcome_count": 21,
+   "open_lower_bound": false,
+   "open_upper_bound": true,
+   "questions": 5
+  },
+  {
+   "inbound_outcome_count": 23,
+   "open_lower_bound": false,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 25,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 26,
+   "open_lower_bound": false,
+   "open_upper_bound": false,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 26,
+   "open_lower_bound": false,
+   "open_upper_bound": true,
+   "questions": 2
+  },
+  {
+   "inbound_outcome_count": 26,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 28,
+   "open_lower_bound": false,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 29,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 30,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 31,
+   "open_lower_bound": false,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 31,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 4
+  },
+  {
+   "inbound_outcome_count": 36,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 37,
+   "open_lower_bound": false,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 39,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 40,
+   "open_lower_bound": false,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 41,
+   "open_lower_bound": false,
+   "open_upper_bound": true,
+   "questions": 5
+  },
+  {
+   "inbound_outcome_count": 41,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 4
+  },
+  {
+   "inbound_outcome_count": 42,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 46,
+   "open_lower_bound": false,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 46,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 48,
+   "open_lower_bound": false,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 50,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 51,
+   "open_lower_bound": false,
+   "open_upper_bound": false,
+   "questions": 3
+  },
+  {
+   "inbound_outcome_count": 51,
+   "open_lower_bound": false,
+   "open_upper_bound": true,
+   "questions": 5
+  },
+  {
+   "inbound_outcome_count": 51,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 58,
+   "open_lower_bound": false,
+   "open_upper_bound": false,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 61,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 2
+  },
+  {
+   "inbound_outcome_count": 62,
+   "open_lower_bound": false,
+   "open_upper_bound": false,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 66,
+   "open_lower_bound": false,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 66,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 71,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 4
+  },
+  {
+   "inbound_outcome_count": 73,
+   "open_lower_bound": false,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 76,
+   "open_lower_bound": false,
+   "open_upper_bound": true,
+   "questions": 2
+  },
+  {
+   "inbound_outcome_count": 80,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 81,
+   "open_lower_bound": false,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 81,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 4
+  },
+  {
+   "inbound_outcome_count": 84,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 86,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 2
+  },
+  {
+   "inbound_outcome_count": 96,
+   "open_lower_bound": false,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 99,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 100,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 101,
+   "open_lower_bound": false,
+   "open_upper_bound": false,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 101,
+   "open_lower_bound": false,
+   "open_upper_bound": true,
+   "questions": 8
+  },
+  {
+   "inbound_outcome_count": 101,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 4
+  },
+  {
+   "inbound_outcome_count": 116,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 3
+  },
+  {
+   "inbound_outcome_count": 121,
+   "open_lower_bound": false,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 126,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 131,
+   "open_lower_bound": false,
+   "open_upper_bound": true,
+   "questions": 2
+  },
+  {
+   "inbound_outcome_count": 131,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 2
+  },
+  {
+   "inbound_outcome_count": 141,
+   "open_lower_bound": false,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 149,
+   "open_lower_bound": false,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 151,
+   "open_lower_bound": false,
+   "open_upper_bound": true,
+   "questions": 6
+  },
+  {
+   "inbound_outcome_count": 151,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 10
+  },
+  {
+   "inbound_outcome_count": 161,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 3
+  },
+  {
+   "inbound_outcome_count": 170,
+   "open_lower_bound": false,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 171,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 177,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 181,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 3
+  },
+  {
+   "inbound_outcome_count": 191,
+   "open_lower_bound": false,
+   "open_upper_bound": false,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 191,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 196,
+   "open_lower_bound": false,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 200,
+   "open_lower_bound": false,
+   "open_upper_bound": false,
+   "questions": 21
+  },
+  {
+   "inbound_outcome_count": 200,
+   "open_lower_bound": false,
+   "open_upper_bound": true,
+   "questions": 231
+  },
+  {
+   "inbound_outcome_count": 200,
+   "open_lower_bound": true,
+   "open_upper_bound": false,
+   "questions": 3
+  },
+  {
+   "inbound_outcome_count": 200,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 114
+  },
+  {
+   "inbound_outcome_count": 201,
+   "open_lower_bound": false,
+   "open_upper_bound": true,
+   "questions": 1
+  },
+  {
+   "inbound_outcome_count": 450,
+   "open_lower_bound": true,
+   "open_upper_bound": true,
+   "questions": 1
+  }
+ ]
+}

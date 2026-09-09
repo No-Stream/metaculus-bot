@@ -9,8 +9,10 @@ Two marker sources, in preference order:
 
 * ``GHOST_FORECAST_JSON`` — the full-fidelity companion marker (a compact JSON blob:
   binary posterior, complete MC option probs, or the complete percentile set + median
-  for numeric). Preferred when present — it makes numeric ghosts scoreable, not just
-  countable.
+  for numeric, in epoch seconds for a date ghost). Preferred when present — it makes
+  numeric ghosts scoreable, not just countable. A date ghost is counted by type and
+  reported as unscoreable: the residual dataset excludes date questions by decision
+  (FUTURE.md, Mantic section), so no date record exists to pair it with.
 * ``GHOST_FORECAST``      — the legacy lossy summary line. Falls back to this for the
   pre-upgrade era (binary/MC scoreable from the summary; numeric exposes a median only,
   so it stays unscoreable there).
@@ -430,6 +432,26 @@ def _count_sources(selected: dict[int, dict]) -> dict[str, int]:
     return source_counts
 
 
+def _qtype_label(ghost: dict) -> str:
+    """The ghost's question type as a report key; a block that never parsed reads ``unknown``."""
+    return str(ghost.get("qtype") or "unknown")
+
+
+def _count_qtypes(selected: dict[int, dict]) -> dict[str, int]:
+    """How many of the ghosts to score carry each question type, before the join.
+
+    The inventory is what makes a date ghost visible at all: the residual dataset excludes
+    date questions by decision (FUTURE.md, Mantic section), so a date ghost never finds a
+    record to join and would otherwise be indistinguishable from a question still waiting
+    on its resolution.
+    """
+    counts: dict[str, int] = {}
+    for ghost in selected.values():
+        label = _qtype_label(ghost)
+        counts[label] = counts.get(label, 0) + 1
+    return counts
+
+
 @dataclass
 class _GhostScoreTally:
     """Per-type row buckets plus the pre-identity split, filled one ghost/record pair at a time.
@@ -445,6 +467,7 @@ class _GhostScoreTally:
     numeric_rows: list[dict] = field(default_factory=list)
     numeric_joined: int = 0
     numeric_unscoreable: dict[str, int] = field(default_factory=dict)
+    joined_without_scorer: dict[str, int] = field(default_factory=dict)
     split_rows: dict[str, list[dict]] = field(
         default_factory=lambda: {"pre_identical": [], "loop_moved": [], "no_pre_marker": []}
     )
@@ -458,6 +481,14 @@ class _GhostScoreTally:
             self._add_row(self.mc_rows, ghost, _score_mc(ghost, record))
         elif qtype == "numeric":
             self._add_numeric(ghost, record)
+        else:
+            # No scorer for this type: a date ghost (scoring it is the numeric path on the
+            # epoch-seconds axis, but the record side needs the date parsing the residual
+            # dataset does not build yet) or a ghost whose block never parsed. Counted so a
+            # joined pair the report cannot score never reads as one still waiting on a
+            # resolution.
+            label = _qtype_label(ghost)
+            self.joined_without_scorer[label] = self.joined_without_scorer.get(label, 0) + 1
 
     def _add_row(self, bucket: list[dict], ghost: dict, row: dict | None) -> None:
         if row is None:
@@ -490,8 +521,9 @@ def join_and_score(
 
     JSON-source ghosts (full forecast) are preferred over legacy summary-only ghosts
     for the same qid. Binary, MC, and — new with the JSON marker — numeric ghosts are
-    all scoreable. Everything is pure/in-memory so the n=0 path (no resolved v2-era
-    questions yet) is exercised in tests.
+    all scoreable; a ghost of any other type that joins a record is counted under
+    ``joined_without_scorer`` (see ``_GhostScoreTally.add``). Everything is pure/in-memory
+    so the n=0 path (no resolved v2-era questions yet) is exercised in tests.
 
     Join key is ``post_id``, NOT ``question_id``. A ghost's qid is parsed by
     ``qid_from_ref`` from the marker's ``question=`` field, which the gap-fill v2 seam
@@ -520,6 +552,8 @@ def join_and_score(
         "n_joined": n_joined,
         "n_scored": tally.n_scored,
         "source_counts": _count_sources(selected),
+        "qtype_counts": _count_qtypes(selected),
+        "joined_without_scorer": tally.joined_without_scorer,
         "binary": _summarize_rows(tally.binary_rows),
         "multiple_choice": _summarize_rows(tally.mc_rows),
         "numeric": {
@@ -539,15 +573,52 @@ def join_and_score(
     }
 
 
-def render_report(summary: dict) -> str:
-    """Human-readable summary. A positive mean delta = ghost out-scores published."""
+def _counts_inline(counts: dict[str, int]) -> str:
+    return " ".join(f"{key}={count}" for key, count in sorted(counts.items()))
+
+
+def _inventory_lines(summary: dict) -> list[str]:
+    """The ghost inventory and the join, before any scoring: counts by source and by type."""
     source_counts = summary["source_counts"]
+    qtype_counts = summary["qtype_counts"]
     lines = [
-        "=== Ghost-forecast scoring (gap-fill v2 ghost vs published) ===",
         f"Ghosts (latest per qid): {summary['n_ghosts']}",
         f"  by source: json={source_counts.get('json', 0)} legacy={source_counts.get('legacy', 0)}",
-        f"Joined to resolved-question dataset: {summary['n_joined']}",
     ]
+    if qtype_counts:
+        lines.append("  by type: " + _counts_inline(qtype_counts))
+    lines.append(f"Joined to resolved-question dataset: {summary['n_joined']}")
+    if summary["joined_without_scorer"]:
+        lines.append("  joined but no scorer for the type: " + _counts_inline(summary["joined_without_scorer"]))
+    if qtype_counts.get("date"):
+        lines.append(
+            "  date ghosts cannot be scored yet: the residual dataset excludes date questions by decision "
+            "(FUTURE.md, Mantic section)"
+        )
+    return lines
+
+
+def _pre_identity_lines(summary: dict) -> list[str]:
+    """The pooled ghost-versus-dry-run split; empty until something has been scored."""
+    split = summary.get("split_by_pre_identity")
+    if not split or not summary["n_scored"]:
+        return []
+    bucket_labels = {
+        "pre_identical": "byte-identical to the pre-research dry run (measures the driver's prior)",
+        "loop_moved": "loop moved the driver's forecast (the only bucket that measures v2's research)",
+        "no_pre_marker": "no GHOST_PRE_JSON to compare (predates the marker, or legacy ghost)",
+    }
+    lines = ["Ghost vs pre-research dry run (pooled across types — do not quote the pooled delta):"]
+    for bucket, label in bucket_labels.items():
+        block = split[bucket]
+        if block["n"]:
+            lines.append(f"  {label}: n={block['n']} mean_delta={block['mean_delta']:+.4f}")
+    return lines
+
+
+def render_report(summary: dict) -> str:
+    """Human-readable summary. A positive mean delta = ghost out-scores published."""
+    lines = ["=== Ghost-forecast scoring (gap-fill v2 ghost vs published) ===", *_inventory_lines(summary)]
     if summary["n_scored"] == 0:
         lines.append("Scored ghosts: n=0 — waiting on resolutions (v2 live in prod 2026-07-21; expected today).")
     else:
@@ -566,19 +637,7 @@ def render_report(summary: dict) -> str:
         )
         for reason, count in sorted(numeric["unscoreable_reasons"].items()):
             lines.append(f"    - {reason}: {count}")
-    split = summary.get("split_by_pre_identity")
-    if split and summary["n_scored"]:
-        bucket_labels = {
-            "pre_identical": "byte-identical to the pre-research dry run (measures the driver's prior)",
-            "loop_moved": "loop moved the driver's forecast (the only bucket that measures v2's research)",
-            "no_pre_marker": "no GHOST_PRE_JSON to compare (predates the marker, or legacy ghost)",
-        }
-        lines.append("Ghost vs pre-research dry run (pooled across types — do not quote the pooled delta):")
-        for bucket, label in bucket_labels.items():
-            block = split[bucket]
-            if not block["n"]:
-                continue
-            lines.append(f"  {label}: n={block['n']} mean_delta={block['mean_delta']:+.4f}")
+    lines.extend(_pre_identity_lines(summary))
     return "\n".join(lines)
 
 

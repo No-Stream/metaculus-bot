@@ -29,6 +29,7 @@ from forecasting_tools import (
     BinaryQuestion,
     GeneralLlm,
     MultipleChoiceQuestion,
+    NumericDistribution,
     NumericQuestion,
     Percentile,
     PredictedOption,
@@ -224,8 +225,18 @@ class TestFormatter:
         assert "oor_" not in without
 
     def test_numeric_aggregate_marker_names_grid_and_tails(self):
-        line = format_numeric_aggregate_marker(question_id=651, qtype="date", cdf_size=13, out_of_range=(0.0, 0.0))
-        assert line == "NUMERIC_AGGREGATE: question=651 qtype=date cdf_size=13 oor_low=0.000000 oor_high=0.000000"
+        line = format_numeric_aggregate_marker(
+            question_id=651,
+            qtype="date",
+            cdf_size=13,
+            out_of_range=(0.0, 0.0),
+            out_of_range_raw=(0.0, 0.0),
+            tail_floor=0.0,
+        )
+        assert line == (
+            "NUMERIC_AGGREGATE: question=651 qtype=date cdf_size=13 oor_low=0.000000 oor_high=0.000000"
+            " oor_low_raw=0.000000 oor_high_raw=0.000000 tail_floor=0.000000"
+        )
         rec = _harvest_any(line)
         assert rec["marker"] == "numeric_aggregate"
         assert rec["qid"] == 651
@@ -651,7 +662,7 @@ class TestStackerEmission:
             ),
             patch("metaculus_bot.aggregation_pipeline.sanitize_percentiles", return_value=(sanitized, None)),
         ):
-            await pipeline.run_stacking(question, "research", reasoned)
+            stacked = await pipeline.run_stacking(question, "research", reasoned)
 
         (line,) = _member_lines(caplog)
         rec = _harvest(line)
@@ -662,3 +673,10 @@ class TestStackerEmission:
         assert json.loads(rec["raw"]) == percentile_pairs(percentiles)
         assert json.loads(rec["published"]) == percentile_pairs(sanitized)
         assert percentile_pairs(sanitized) != percentile_pairs(percentiles)
+        # The stacker is the one emitter the member-side twin does not cover: the CDF is built
+        # before the guard precisely so this line can carry the built tails, and the formatter
+        # and the registry regex both make the fields optional, so only the call site pins them.
+        assert isinstance(stacked, NumericDistribution)
+        assert rec["oor_low"] is not None
+        assert rec["oor_high"] is not None
+        assert (rec["oor_low"], rec["oor_high"]) == pytest.approx(out_of_range_mass(stacked))

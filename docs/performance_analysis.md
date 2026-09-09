@@ -625,6 +625,22 @@ did not already carry `my_forecasts` (`--no-forfeits` opts out), and a question 
 state stays unreadable is reported as `unknown` rather than filed as a forfeit. Default
 slugs come from the repo's constants; see `docs/operations.md` "Season-start checklist".
 
+## Date questions are excluded from the dataset, by decision
+
+The live bot forecasts date questions since 2026-09-08 (Mantic's Crucible made them first
+class, and the Metaculus run modes forecast them too where they used to be skipped), so a
+resolved date question now reaches the collector. It does not enter the dataset:
+`collector.py` `_process_single_question` skips it with a WARNING naming the question and
+the post (`Skipping Q<id> (post <id>): date question, excluded from residual analysis by
+decision`), ahead of `parse_resolution`, which would otherwise have filed it under "Unknown
+question type" and made the exclusion look like a parser bug. The backtest
+(`backtest/question_prep.py`) and the ablation harness (`ablation/run_pdf.py`) carry the same
+exclusion at their own seams, and `scripts/score_ghosts.py` counts date ghosts by type and says
+in its report that none can be scored. The decision is recorded in `FUTURE.md` "Mantic
+Crucible" and holds until a date question has resolved under the live date path. A round pull
+over a tournament with date questions logs one such WARNING per resolved date question; their
+count is the number of resolved questions the round is not reading.
+
 ## Vocabulary that collides
 
 Four pairs of names describe one thing, or two different things under similar names.

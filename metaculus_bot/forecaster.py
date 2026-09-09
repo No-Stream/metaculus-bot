@@ -66,7 +66,9 @@ from metaculus_bot.forecaster_runners import (
     run_numeric_forecast,
 )
 from metaculus_bot.llm_setup import prepare_llm_config
-from metaculus_bot.member_forecast import format_numeric_aggregate_marker, out_of_range_mass
+from metaculus_bot.member_forecast import format_numeric_aggregate_marker
+from metaculus_bot.numeric.date_axis import numeric_qtype, numeric_view
+from metaculus_bot.numeric.out_of_range_floor import floor_published_tails
 from metaculus_bot.numeric.pchip_processing import log_pchip_summary, reset_pchip_stats
 from metaculus_bot.performance_analysis.parsing import extract_model_display_name_from_reasoning
 from metaculus_bot.publish_gate import (
@@ -75,7 +77,7 @@ from metaculus_bot.publish_gate import (
     reset_publish_skipped_closed,
 )
 from metaculus_bot.publish_hardening import publish_attempt_failures, reset_publish_attempt_failures
-from metaculus_bot.question_types import question_type_of
+from metaculus_bot.question_platform import question_platform
 from metaculus_bot.research.orchestrator import ResearchOrchestrator
 from metaculus_bot.research.providers import (
     ResearchCallable,
@@ -374,15 +376,18 @@ class TemplateForecaster(CompactLoggingForecastBot):
             ),
         )
 
-        # Enforce max questions per run safety cap. WARNING, naming the posts left behind:
-        # on a tournament whose questions all open together (Mantic releases a whole hour's
-        # batch at once) the cap forfeits real questions, and a forfeit at INFO is invisible.
+        # Enforce max questions per run safety cap. A registered WARNING marker naming the posts
+        # left behind: on a tournament whose questions all open together (Mantic releases a whole
+        # hour's batch at once) the cap forfeits real questions, and a forfeit that is not
+        # harvestable is gone with the 90-day GitHub Actions log expiry.
         if self.max_questions_per_run is not None and len(questions) > self.max_questions_per_run:
             dropped = list(questions)[self.max_questions_per_run :]
             logger.warning(
-                "Limiting to the %d soonest-closing questions out of %d; dropped posts: %s",
+                "QUESTION_CAP_FORFEIT: platform=%s cap=%d total=%d dropped=%d posts=%s",
+                question_platform(dropped[0]),
                 self.max_questions_per_run,
                 len(questions),
+                len(dropped),
                 ",".join(str(q.id_of_post) for q in dropped),
             )
             questions = list(questions)[: self.max_questions_per_run]
@@ -1035,17 +1040,21 @@ class TemplateForecaster(CompactLoggingForecastBot):
         else:
             aggregated = self._pipeline.simple_combine(predictions, question)
         # The one seam every aggregation path (stacked, base-combine, median fallback, single
-        # survivor, simple) returns through, so the PUBLISHED distribution's tails are logged once.
+        # survivor, simple) returns through: the platform tail floor is applied to the PUBLISHED
+        # distribution here, and its tails are logged once, raw and as published.
         if isinstance(aggregated, NumericDistribution):
-            cdf = aggregated.get_cdf()
+            floored = floor_published_tails(aggregated, question)
             logger.info(
                 format_numeric_aggregate_marker(
                     question_id=question.id_of_question,
-                    qtype=question_type_of(question) or "numeric",
-                    cdf_size=len(cdf),
-                    out_of_range=out_of_range_mass(aggregated),
+                    qtype=numeric_qtype(numeric_view(question)),
+                    cdf_size=floored.cdf_size,
+                    out_of_range=floored.published,
+                    out_of_range_raw=floored.raw,
+                    tail_floor=floored.floor,
                 )
             )
+            return floored.distribution
         return aggregated
 
     def _pull_research_chart(self, qid: int | None) -> str | None:

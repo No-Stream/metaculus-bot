@@ -100,32 +100,60 @@ a clean, strictly-increasing, in-bounds set. In order:
    (`numeric/validation.py`).
 3. `sort_by_percentile_level` — order by percentile level.
 4. `_apply_jitter_and_clamp` (`numeric/pipeline.py`) — detect count-like (integer-
-   adjacent) clusters and spread them, jitter exact duplicates, clamp values into the
-   question bounds with a safety buffer, then enforce strictly increasing values.
-   **Exception: a WHOLE-SET epsilon collapse is not spread.** A model declaring
-   (near-)the same value at all 13 percentiles has declared no width, and spreading it
-   manufactured a ±6-unit distribution — which was precisely what let it pass Step 8's
+   adjacent) clusters and spread them, jitter exact duplicates, clamp values just outside a
+   closed bound back inside it (the tolerance and landing rules are below), then enforce
+   strictly increasing values.
+   **On the 201-point continuous grid a WHOLE-SET epsilon collapse is not spread.** A model
+   declaring (near-)the same value at all 13 percentiles has declared no width, and spreading
+   it manufactured a ±6-unit distribution — which was precisely what let it pass Step 8's
    span-ratio test, so the invented width was load-bearing for publishing a forecast the
-   model never stated. A point mass now gets only the format minimum (the jitter /
+   model never stated. There a point mass gets only the format minimum (the jitter /
    strict-ordering epsilon) and reaches the guard with its own honest span, which
-   withholds the forecaster. Only PARTIAL clusters are spread. Each collapse logs
-   `NUMERIC_DEGENERATE_DECLARATION: question=... model=... n_unique=... span=...
-   value_eps=... spread_applied=false` (harvested as `numeric_degenerate_declaration`), so
-   the per-model incidence is a query rather than a guess. Open item: a *confident*
-   DISCRETE point mass ("the count will be exactly 3") is now withheld rather than
-   published as a hedge. Building the spike CDF is expressible on a coarse discrete grid
-   (`grid_step_constraints` relaxes the max step there) and is the faithful third option
-   if the marker starts firing on real forecasts.
+   withholds the forecaster; only PARTIAL clusters are spread. **Where the published bins
+   are the outcome space** (`grid_is_outcome_space`, below) the collapse IS spread, like any
+   other plateau and under the same one-bin cap: "100% on 2026-09-16" is fully expressible
+   on twelve one-day bins and the date prompt invites that shape, so the member publishes
+   with its mass in that day (0.97 of it on post 651) instead of being dropped as a unit
+   mismatch. The width the spread adds stays inside the bin the forecaster named, and a
+   genuine scale error on such a grid sits several bins outside the bounds and still raises
+   in the clamp. Each collapse logs `NUMERIC_DEGENERATE_DECLARATION: question=... model=...
+   n_unique=... span=... value_eps=... spread_applied=true|false` (harvested as
+   `numeric_degenerate_declaration`; `spread_applied` reports which branch it took), so the
+   per-model incidence is a query rather than a guess.
 5. `_maybe_widen_tails` — optional tail widening (Step 4).
 
 The schema deliberately accepts non-decreasing values: tied values are valid concentrated
 declarations and the sanitizer can separate partial clusters. The prompt still asks for
 strictly increasing values, while the schema rejects decreases before
 `sort_by_percentile_level` can order the declarations. A whole-set collapse remains valid
-schema input, but sanitization does not invent width for it; the unit-mismatch guard then
-withholds the member. The archive audit found exact ties in 2 of 346 declarations and no
-whole-set collapses, supporting this distinction without adding a separate distinct-value
-requirement.
+schema input; on the continuous grid sanitization does not invent width for it and the
+unit-mismatch guard withholds the member. The archive audit found exact ties in 2 of 346
+declarations and no whole-set collapses, supporting this distinction without adding a
+separate distinct-value requirement.
+
+The closed-bound clamp (`numeric/bounds_clamping.py`) is governed by two different numbers.
+`calculate_bounds_buffer` is the accept-or-raise TOLERANCE: a declared value may sit outside
+a closed bound by at most the larger of the range-based tolerance (1% of the range, a flat
+1.0 once the range exceeds 100) and one grid bin (`grid_bin_width`), and is clamped in;
+anything further out raises and the member is dropped as a scale error. The bin floor holds
+on EVERY grid, the 201-point continuous one included, because a value within one bin of the
+edge is indistinguishable from the edge once bucketed: on a Metaculus question with range
+> 200 the drop-versus-clamp threshold is therefore `range / 200` rather than the old flat
+1.0, which removes the discontinuity where 1.0 was 1% of a 100-wide range and 0.005% of a
+20,000-wide one. In plain words: on a 201-point question whose range exceeds 200, a
+percentile that sits between 1.0 and `range / 200` outside a closed bound is now clamped to
+the bound instead of the member being dropped (an intentional, documented change of
+2026-09; inside 1.0 it always clamped, beyond `range / 200` it still drops). On a date question the axis is epoch seconds, so the flat 1.0 was a
+one-second tolerance and a date named one day outside a closed bound used to drop the
+member. The tolerance changes only drop-versus-clamp, never where a clamped value lands:
+that is `minimum_separation` (`numeric/config.py`), the same standoff the spreader and the
+strict-ordering passes keep just inside a closed bound. Landing the value one tolerance
+inside instead moved it a whole bin on a coarse grid, and the left-to-right strict-ordering
+pass then dragged every percentile declared inside that first bin up behind it (post 651:
+6.3 points of mass left the day the member declared; a [0, 20000] Metaculus question
+published four percentiles at 100.0 when three were in range). The heavy-clamping WARNING
+counts values at that same standoff, so an in-range forecast concentrated near a bound no
+longer reads as clamped.
 
 Wherever the published bins are the outcome space, the spreader keeps a plateau inside the
 bin it names: the plateau's TOTAL spread is capped at one bin width, `grid_bin_width`
@@ -399,9 +427,10 @@ sanity check on the numbers.
 The guard **fails SHUT**: it used to wrap its arithmetic in a try/except that returned
 "no mismatch" on any internal error, which is byte-identical to a passing check — so a
 crash inside the guard silently published the order-of-magnitude error it exists to
-block. Errors now propagate. Related: a point-mass declaration reaches this guard with
-its real (zero) span rather than the cluster spreader's invented one, which is why
-Step 3 no longer spreads whole-set collapses.
+block. Errors now propagate. Related: on the 201-point continuous grid a point-mass
+declaration reaches this guard with its real (zero) span rather than the cluster spreader's
+invented one, which is why Step 3 does not spread whole-set collapses there; where the bins
+are the outcome space Step 3 spreads the collapse inside its bin and the guard passes it.
 
 ## Step 9: ensemble aggregation in CDF space
 
@@ -464,6 +493,53 @@ For discrete questions, the per-model `declared_percentiles` have already been
 overwritten with a resampled CDF grid whose labels are cumulative probabilities, so
 `_key_percentile_values` (`spread_metrics.py`) reads P10/P50/P90 by interpolating the
 empirical CDF instead of looking up label nodes.
+
+## Step 11: the Mantic out-of-range tail floor
+
+`floor_published_tails` (`numeric/out_of_range_floor.py`) is the last touch on a numeric,
+discrete or date aggregate before it is published, applied in
+`TemplateForecaster._aggregate_predictions` (`forecaster.py`), the one seam every aggregation
+path (median, mean, base-combine, stacker, single survivor) returns through, so the publish
+gate, the comment and the `NUMERIC_AGGREGATE` marker all read the floored distribution.
+
+**The rule.** On a question whose platform is Mantic (`question_platform` reads it off
+`page_url`; `PLATFORM_MANTIC` in `constants.py`), the published CDF carries at least
+`MANTIC_OUT_OF_RANGE_TAIL_FLOOR` (`constants.py`, 0.05) beyond each OPEN bound: an open tail
+under the floor is raised to exactly the floor (`cdf[0] = 0.05`, or `cdf[-1] = 0.95`), an open
+tail already at or above it is left alone, and a closed bound stays at its exact `0.0` / `1.0`.
+Both sides may move at once. The interior is rescaled affinely between the new endpoints, which
+keeps it monotone and can only shrink steps, so the platform's max step cannot be newly
+violated; the bins that sat exactly on the min step (the uniform-mixture tails of a
+concentrated PCHIP build) do land below it, so `enforce_min_steps` (`numeric/pchip_cdf.py`)
+runs again with the new endpoints as its caps. When an endpoint moves, the distribution is
+rebuilt through `create_pchip_numeric_distribution` on the question's numeric view (the epoch
+adapter for a date question, so `is_date` and the date rendering survive) with the floored
+heights as both its CDF and its `declared_percentiles`, on the value axis the aggregate already
+carried. `tests/test_out_of_range_floor.py` checks the server's `continuous_cdf` rules on the
+result for every distinct grid in the recorded 2026-09-08 Mantic corpus
+(`tests/data/mantic_cdf_grids_2026_09_08.json`: 88 grids, 3 to 450 bins, every bound
+combination), on six aggregate shapes each.
+
+**Why.** Mantic scores an out-of-range resolution against a fixed 0.05 reference,
+`50 * ln(mass / 0.05)`: 5% there scores 0 and the structural 1% the pipeline builds whenever every
+declared percentile sits inside the range scores -80.5. Mantic's writers set the ranges and are
+paid for bot disagreement; in Series 1 half the date questions, a quarter of the discrete and an
+eighth of the numeric ones resolved outside the displayed range. Applying the same floor to every
+Series 1 competitor's own 4,082 published distributions cost at most 1.9 points per question on
+average for any type and gained up to 9.1 for thin-tailed bots
+(`scratch_docs_and_planning/mantic_adversarial_candidates_2026-09-08.md`, section 1).
+Operator-approved 2026-09-08.
+
+**The platform gate.** A Metaculus aggregate comes back as the very same object, byte-identical;
+per-member forecasts are never touched (their `MEMBER_FORECAST` tails keep measuring what the
+models declared); the backtest, ablation and benchmark harnesses replay Metaculus questions, so
+the gate covers them without a flag.
+
+**Telemetry.** `NUMERIC_AGGREGATE` keeps `oor_low` / `oor_high` as the PUBLISHED tails and adds
+three trailing fields: `oor_low_raw` / `oor_high_raw`, the aggregate's own tails before the
+floor, and `tail_floor`, the floor that moved an endpoint (`0.000000` on Metaculus, on a
+closed-bound question, or when the tails already met it). Raw against published is how the floor
+gets benchmarked on this bot's own forecasts once live Mantic telemetry accumulates.
 
 ## The time-series anchor provider
 

@@ -70,6 +70,7 @@ from metaculus_bot.constants import (
     BINARY_PROB_MIN,
     DONATED_OPENROUTER_KEY_ENABLED_ENV,
     MANTIC_API_BASE_URL,
+    MANTIC_OUT_OF_RANGE_TAIL_FLOOR,
     MANTIC_SITE_URL,
     MANTIC_TOKEN_ENV,
     MANTIC_TOURNAMENT_ID,
@@ -797,9 +798,12 @@ class TestDateTelemetry:
             assert all(day_start < value < day_start + 86_400 for _, value in published)
 
     def test_the_aggregate_marker_names_the_date_grid(self, mantic_run: _ManticRun) -> None:
+        # Both of post 651's bounds are closed, so the tail floor has nothing to move: raw and
+        # published tails are zero and the floor reads zero.
         lines = [line for line in mantic_run.marker_lines("NUMERIC_AGGREGATE:") if f"question={DATE_POST_ID} " in line]
         assert lines == [
-            f"NUMERIC_AGGREGATE: question={DATE_POST_ID} qtype=date cdf_size=13 oor_low=0.000000 oor_high=0.000000"
+            f"NUMERIC_AGGREGATE: question={DATE_POST_ID} qtype=date cdf_size=13 oor_low=0.000000 oor_high=0.000000 "
+            "oor_low_raw=0.000000 oor_high_raw=0.000000 tail_floor=0.000000"
         ]
 
     def test_the_discrete_question_has_its_aggregate_marker_too(self, mantic_run: _ManticRun) -> None:
@@ -814,6 +818,42 @@ class TestDateTelemetry:
         assert "type=date" in line
         assert "cdf_size=13" in line
         assert "date_granularity=day" in line
+
+
+class TestTheOutOfRangeTailFloor:
+    """The published discrete aggregate carries the Mantic tail floor beyond each open bound.
+
+    Post 650 has both bounds open and every member's thirteen percentiles inside the range, so
+    the aggregate's own tails are the structural 1% and the floor raises each to
+    ``MANTIC_OUT_OF_RANGE_TAIL_FLOOR``. The payload the server receives is what is checked, so
+    the floor is proven on the wire and not only at the seam.
+    """
+
+    def test_the_published_discrete_cdf_carries_the_floor_beyond_each_open_bound(self, mantic_run: _ManticRun) -> None:
+        question_json = next(post["question"] for post in mantic_run.posts if post["id"] == DISCRETE_POST_ID)
+        scaling = question_json["scaling"]
+        assert scaling["open_lower_bound"] is True
+        assert scaling["open_upper_bound"] is True
+        probs = np.asarray(mantic_run.forecast_payload(DISCRETE_POST_ID)["continuous_cdf"], dtype=float)
+        assert probs[0] == MANTIC_OUT_OF_RANGE_TAIL_FLOOR
+        assert 1.0 - probs[-1] == pytest.approx(MANTIC_OUT_OF_RANGE_TAIL_FLOOR)
+
+    def test_the_discrete_aggregate_marker_records_raw_and_published_tails(self, mantic_run: _ManticRun) -> None:
+        lines = [
+            line for line in mantic_run.marker_lines("NUMERIC_AGGREGATE:") if f"question={DISCRETE_POST_ID} " in line
+        ]
+        assert lines == [
+            f"NUMERIC_AGGREGATE: question={DISCRETE_POST_ID} qtype=numeric cdf_size=451 oor_low=0.050000 "
+            "oor_high=0.050000 oor_low_raw=0.010000 oor_high_raw=0.010000 tail_floor=0.050000"
+        ]
+
+    def test_the_members_keep_their_own_tails(self, mantic_run: _ManticRun) -> None:
+        lines = [
+            line for line in mantic_run.marker_lines("MEMBER_FORECAST:") if f"question={DISCRETE_POST_ID} " in line
+        ]
+        assert len(lines) == _FORECASTS_PER_QUESTION
+        for line in lines:
+            assert line.endswith(" oor_low=0.010000 oor_high=0.010000")
 
 
 class TestNothingReachesMetaculus:

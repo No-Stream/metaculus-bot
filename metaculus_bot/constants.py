@@ -72,6 +72,16 @@ MANTIC_TOURNAMENT_END_DATE: str = "2026-09-20"  # forecasting_end_date on projec
 # the fetch passes error_if_question_target_missed=False. Five pages; the most Mantic has ever held
 # open at once is three questions, and the Series 2 rules allow batch releases.
 MANTIC_FETCH_QUESTION_CEILING: int = 500
+# The least mass a PUBLISHED Mantic numeric, discrete or date aggregate carries beyond each OPEN bound
+# (``numeric/out_of_range_floor.py``; Metaculus aggregates are untouched). Mantic scores an
+# out-of-range resolution against a fixed 0.05 reference, ``50 * ln(mass / 0.05)``: 5% there scores
+# 0, the structural 1% the pipeline publishes when every percentile sits inside scores -80.5, and
+# in Series 1 half the date questions, a quarter of the discrete and an eighth of the numeric ones
+# resolved outside the displayed range. Applying this floor to every Series 1 competitor's own
+# 4,082 published distributions cost at most 1.9 points per question on average for any type and
+# gained up to 9.1 for thin-tailed bots (receipts: scratch_docs_and_planning/
+# mantic_adversarial_candidates_2026-09-08.md, section 1). Operator-approved 2026-09-08.
+MANTIC_OUT_OF_RANGE_TAIL_FLOOR: float = 0.05
 
 # The question platforms the bot publishes to, whose own pages are self-references for research.
 # One tuple because the two sets are the same two hosts today; if they ever diverge, split the
@@ -154,7 +164,9 @@ def check_tournament_dates(
 ) -> bool:
     """Check if tournament dates are stale and warn/error accordingly; True when past the end date.
 
-    - Warns, and returns True, if the current date is past the tournament's end date
+    - Warns, and returns True, once the current UTC date is past the tournament's end date. The
+      end date is the LAST open day, not the first dead one: Preseason 2 forecasts until 12:00 UTC
+      on ``MANTIC_TOURNAMENT_END_DATE``, and a run in those hours publishes normally.
     - Raises TournamentExpiredError if past end date + TOURNAMENT_HARD_STOP_WEEKS
 
     Defaults to the Metaculus bot tournament (``TOURNAMENT_ID`` / ``TOURNAMENT_END_DATE``);
@@ -180,6 +192,7 @@ def check_tournament_dates(
         return False
 
     today = _as_utc(datetime.now(UTC))
+    stale_from = end_date + timedelta(days=1)
     hard_stop_date = end_date + timedelta(weeks=TOURNAMENT_HARD_STOP_WEEKS)
 
     if today > hard_stop_date:
@@ -188,7 +201,7 @@ def check_tournament_dates(
             f"date ({hard_stop_date.date()}) has passed. Please update its tournament id and "
             f"end date (and TOURNAMENT_HARD_STOP_WEEKS if needed) in constants.py for the new season."
         )
-    if today > end_date:
+    if today >= stale_from:
         days_past = (today - end_date).days
         days_until_error = (hard_stop_date - today).days
         log.warning(

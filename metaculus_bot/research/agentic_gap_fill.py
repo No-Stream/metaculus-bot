@@ -90,8 +90,8 @@ async def run_gap_fill_v2(
         # questions, so v2 is hard-off in benchmarking runs.
         return ""
     if not isinstance(question, _SupportedQuestion):
-        # The dry-run scaffold embeds the panel's per-qtype template; question
-        # types without one (e.g. date questions) skip v2 entirely.
+        # The dry-run scaffold embeds the panel's per-qtype template. Every type the bot
+        # forecasts has one, so only a conditional question reaches this branch.
         logger.info(
             "Gap-fill v2 skipped: unsupported question type %s",
             type(question).__name__,

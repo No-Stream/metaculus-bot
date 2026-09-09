@@ -85,10 +85,9 @@ def build_numeric_distribution(
     ``NUMERIC_DEGENERATE_DECLARATION``.
     """
 
-    target_cdf_size = getattr(question, "cdf_size", None)
-    if target_cdf_size is not None and target_cdf_size != PCHIP_CDF_POINTS:
+    if question.cdf_size != PCHIP_CDF_POINTS:
         prediction = _build_discrete_distribution(
-            percentile_list, question, zero_point, target_cdf_size, model_name=model_name
+            percentile_list, question, zero_point, question.cdf_size, model_name=model_name
         )
         validate_cdf_construction(prediction, question)
         return prediction
@@ -142,8 +141,8 @@ def _build_discrete_distribution(
         min_step=min_step,
         max_step=max_step,
         num_points=target_cdf_size,
-        question_id=getattr(question, "id_of_question", None),
-        question_url=getattr(question, "page_url", None),
+        question_id=question.id_of_question,
+        question_url=question.page_url,
         model_name=model_name,
     )
     value_grid = build_cdf_value_grid(question.lower_bound, question.upper_bound, zero_point, target_cdf_size)
@@ -158,7 +157,7 @@ def _build_discrete_distribution(
     )
     logger.info(
         "Discrete build in build_numeric_distribution | Q %s | built directly on the %d-point grid",
-        getattr(question, "id_of_question", None),
+        question.id_of_question,
         target_cdf_size,
     )
     return prediction
@@ -180,23 +179,6 @@ def _apply_jitter_and_clamp(
     span = (max(values) - min(values)) if values else 0.0
     value_eps, _base_delta, spread_delta = compute_cluster_parameters(range_size, count_like, span)
 
-    if is_degenerate_cluster(values, value_eps):
-        # A point mass: the model put (near-)identical values at every percentile,
-        # declaring no width at all. We add only the minimum separation the CDF
-        # format needs (the jitter / strict-ordering epsilon below), never the
-        # cluster spread — so the span the unit-mismatch guard judges is the
-        # model's own, and the degenerate declaration is withheld instead of
-        # publishing as a distribution the forecaster never stated.
-        logger.warning(
-            "NUMERIC_DEGENERATE_DECLARATION: question=%s model=%s n_unique=%d span=%.6g value_eps=%.6g "
-            "spread_applied=false",
-            getattr(question, "id_of_question", None),
-            model_name or "unknown",
-            len({float(v) for v in values}),
-            span,
-            value_eps,
-        )
-
     modified_values, clusters_applied = apply_cluster_spreading(
         modified_values,
         question,
@@ -204,6 +186,20 @@ def _apply_jitter_and_clamp(
         spread_delta=spread_delta,
         range_size=range_size,
     )
+
+    if is_degenerate_cluster(values, value_eps):
+        # A point mass. Withheld on the continuous grid, spread inside its bin and published
+        # where the bins are the outcome space: ``apply_cluster_spreading`` has the why.
+        logger.warning(
+            "NUMERIC_DEGENERATE_DECLARATION: question=%s model=%s n_unique=%d span=%.6g value_eps=%.6g "
+            "spread_applied=%s",
+            question.id_of_question,
+            model_name or "unknown",
+            len({float(v) for v in values}),
+            span,
+            value_eps,
+            "true" if clusters_applied > 0 else "false",
+        )
 
     modified_values = apply_jitter_for_duplicates(modified_values, question, range_size, percentile_list)
     modified_values, corrections_made = clamp_values_to_bounds(modified_values, percentile_list, question, buffer)
@@ -217,7 +213,7 @@ def _apply_jitter_and_clamp(
         count_like=count_like,
     )
     log_corrections_summary(modified_values, values, question, corrections_made)
-    log_heavy_clamping_diagnostics(modified_values, values, question, buffer)
+    log_heavy_clamping_diagnostics(modified_values, values, question)
 
     modified_values = ensure_strictly_increasing_bounded(modified_values, question, range_size)
 

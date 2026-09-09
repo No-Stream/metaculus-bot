@@ -85,11 +85,15 @@ class HeldDocument:
     even for a scan, where ``text`` is empty, because "we looked locally and there is no text
     layer" is exactly what tells a later call to stop trying for free. ``oversize`` means the
     body was refused before parsing, which is a reason NOT to escalate rather than a reason to.
+    ``refused_landing`` is the ladder's own ``blocked`` result for a URL that LED somewhere it
+    must not dial (a 3xx onto a question-platform host): the paid reader dials from Google's
+    address and would follow the same hop, so the refusal is held for it to honour too.
     """
 
     text: str = ""
     pdf: PdfText | None = None
     oversize: bool = False
+    refused_landing: PlainFetchResult | None = None
 
     @property
     def has_text(self) -> bool:

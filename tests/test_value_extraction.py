@@ -672,7 +672,7 @@ class TestDateExtraction:
     """``extract_date``: the numeric ladder on the calendar axis, returning epoch seconds.
 
     Both readers (the block rung's ``DateStructured`` and the salvage rung's ``IsoDatePercentile``)
-    go through ``numeric.date_axis.parse_iso_utc``, so a date-only value lands at noon UTC inside
+    go through ``numeric.date_axis.parse_forecast_date``, so a date-only value lands at noon UTC inside
     its day bin on every path and a naive timestamp is never read as host time.
     """
 

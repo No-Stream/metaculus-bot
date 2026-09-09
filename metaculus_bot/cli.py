@@ -18,6 +18,8 @@ from metaculus_bot.constants import (
     MANTIC_TOURNAMENT_ID,
     METACULUS_CUP_ID,
     PERSIST_RESEARCH_ENABLED_ENV,
+    PLATFORM_MANTIC,
+    PLATFORM_METACULUS,
     TEST_QUESTIONS_OVERRIDE_ENV,
     TOURNAMENT_ID,
     check_fall_cup_reminder,
@@ -57,7 +59,7 @@ from metaculus_bot.mantic import (
     reset_post_drop_count,
 )
 from metaculus_bot.publish_hardening import apply_publish_hardening
-from metaculus_bot.research.persistence import PLATFORM_MANTIC, PLATFORM_METACULUS, ResearchPersistenceWriter
+from metaculus_bot.research.persistence import ResearchPersistenceWriter
 
 logger = logging.getLogger(__name__)
 

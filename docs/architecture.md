@@ -169,11 +169,15 @@ bounds, the same CDF validation rules). `_run_forecast_on_date` (`forecaster.py`
 `run_date_forecast` (`forecaster_runners.py`), a thin wrapper of the numeric runner: the
 `date_prompt` (`prompts.py`) asks for ISO dates and names the bin granularity, `DateStructured`
 (`structured_output_schema.py`) carries the declared percentiles as datetimes, the extraction
-ladder converts them to epoch seconds (`parse_iso_utc`: UTC always, a date-only value is noon
+ladder converts them to epoch seconds (`parse_forecast_date`: UTC always, a date-only value is noon
 UTC of that day so it lands inside that day's right-closed bin), and the same guarded PCHIP
 build, CDF-space aggregation (`numeric_view` at every routing site) and publish path follow
 with `is_date` set so the comment renders dates through the framework formatter. Nominal bounds
-are read from the API's `scaling` block and never derived for a date question. Detail:
+are read from the API's `scaling` block and never derived for a date question. The analysis
+side stays date-free by decision, each at an explicit seam: the backtest
+(`backtest/question_prep.py`), the ablation harness (`ablation/run_pdf.py`), the residual
+dataset (`performance_analysis/collector.py`) and the ghost scorer (`scripts/score_ghosts.py`);
+see `docs/performance_analysis.md` "Date questions are excluded from the dataset". Detail:
 [numeric_pipeline.md](numeric_pipeline.md) and `docs/operations.md` "Date questions".
 
 The ensemble is a handful of forecaster LLMs, one per vendor. The exact roster
@@ -370,7 +374,7 @@ Whichever applies, keep the `# noqa: PLC0415`, state the reason inline, and neve
 | Forecaster runners | `metaculus_bot/forecaster_runners.py` |
 | Value extraction | `metaculus_bot/value_extraction.py` |
 | Numeric CDF | `metaculus_bot/numeric/` |
-| Date question as a numeric question on the epoch-seconds axis | `metaculus_bot/numeric/date_axis.py` (`EpochDateQuestion`, `as_epoch_question`, `numeric_view`, `parse_iso_utc`, `format_epoch`) |
+| Date question as a numeric question on the epoch-seconds axis | `metaculus_bot/numeric/date_axis.py` (`EpochDateQuestion`, `as_epoch_question`, `numeric_view`, `parse_forecast_date`, `format_epoch`, `question_json`) |
 | Aggregation + stacking | `metaculus_bot/aggregation_pipeline.py`, `stacking.py` |
 | Model roster (source of truth) | `metaculus_bot/llm_configs.py` |
 | Prompts | `metaculus_bot/prompts.py` |

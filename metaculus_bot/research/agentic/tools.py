@@ -603,6 +603,11 @@ def _pdf_local_outcome(url: str, plain: PlainFetchResult, *, start_char: int) ->
     return _read_content_outcome(url, plain.text, plain.links, method=plain.method, start_char=start_char)
 
 
+def _blocked_outcome(blocked: PlainFetchResult) -> ToolOutcome:
+    """The one ``blocked`` contract the driver reads, whichever tool or rung refused the URL."""
+    return ToolOutcome(content_markdown=blocked.text, method=blocked.method, status="blocked")
+
+
 def _held_from_result(url: str, result: PlainFetchResult) -> local_document.HeldDocument:
     """What one ladder rung's result leaves us holding for ``url``.
 
@@ -613,6 +618,9 @@ def _held_from_result(url: str, result: PlainFetchResult) -> local_document.Held
     """
     if result.method == local_document.OVERSIZE_DOCUMENT_METHOD:
         return local_document.HeldDocument(oversize=True)
+    if result.status == "blocked" and _fetch_plain_url_block(result.url) is not None:
+        # A 3xx onto a question platform, held so the paid reader (Google's address) declines the same hop.
+        return local_document.HeldDocument(refused_landing=result)
     pdf = local_document.cached_document(result.url)
     if pdf is not None:
         held = local_document.held_pdf(pdf)
@@ -749,7 +757,7 @@ async def fetch(url: str, start_char: int = 0, *, question_topic: str = "") -> T
 
     plain = await _fetch_plain_with_impersonated_retry(url)
     if plain.status == "blocked":
-        return ToolOutcome(content_markdown=plain.text, method=plain.method, status="blocked")
+        return _blocked_outcome(plain)
     if plain.method == local_document.PDF_LOCAL_METHOD:
         return _pdf_local_outcome(url, plain, start_char=start_char)
     if plain.method == DOCUMENT_NEEDED_METHOD:
@@ -830,6 +838,27 @@ async def _url_context_robots_skip(url: str) -> bool:
     return await google_extended_blocks_url(url, fetch_text=_fetch_robots_txt)
 
 
+async def _free_route_outcome(url: str, ask: str, held: local_document.HeldDocument) -> ToolOutcome | None:
+    """What the free ladder settles for ``read_document`` without a paid read; None gives the reader its turn.
+
+    Three settled shapes. A URL that led onto a question platform is refused, because the paid
+    reader would follow the same hop. An oversize body is an error rather than a reason to
+    escalate. Text we hold is digested, and the size gate rides the same branch as the text it
+    guards so the two can never disagree: a document we hold is served from the digest whatever
+    its size, and the biggest are the clearest case (the nine archived documents past the gate
+    carried 67% of the season's reader tokens and the largest of them returned nothing for the
+    money). A None digest is the one shape that must not be served: sub-floor chrome that no
+    passage matched, which the paid reader is the right rung for (see ``_local_digest_outcome``).
+    """
+    if held.refused_landing is not None:
+        return _blocked_outcome(held.refused_landing)
+    if held.oversize:
+        return _format_fetch_error(local_document.oversize_message(url), method=local_document.OVERSIZE_DOCUMENT_METHOD)
+    if held.has_text or local_document.exceeds_url_context_size_gate(held.text):
+        return await _local_digest_outcome(url, ask, held)
+    return None
+
+
 async def read_document(url: str, ask: str, *, ladder_exhausted: bool = False) -> ToolOutcome:
     """Answer ``ask`` about ``url``: from the page's own text where we can get it, else Gemini.
 
@@ -843,7 +872,9 @@ async def read_document(url: str, ask: str, *, ladder_exhausted: bool = False) -
     A question-platform URL (metaculus.com, competitions.mantic.com) is refused before any rung
     runs, with the same ``blocked`` outcome ``fetch`` gives it (``_fetch_plain_url_block``). The
     paid reader dials from Google's address, so it is the one rung that our-IP refusal could not
-    otherwise reach, and on Mantic the page it would read carries the other bots' forecasts.
+    otherwise reach, and on Mantic the page it would read carries the other bots' forecasts. A URL
+    that 3xxes onto a platform host is refused the same way: the free ladder's refusal of that hop
+    comes back as ``HeldDocument.refused_landing`` and the paid rung declines on it.
 
     The retrieval-count guard on the paid rung stays exactly as it was, because it is what
     keeps that rung honest: ``method="document"`` maps to the ``fetched`` tier
@@ -863,21 +894,12 @@ async def read_document(url: str, ask: str, *, ladder_exhausted: bool = False) -
     """
     blocked = _fetch_plain_url_block(url)
     if blocked is not None:
-        return ToolOutcome(content_markdown=blocked.text, method=blocked.method, status="blocked")
+        return _blocked_outcome(blocked)
     started = monotonic()
     held = local_document.HeldDocument() if ladder_exhausted else await _acquire_local_document(url)
-    if held.oversize:
-        return _format_fetch_error(local_document.oversize_message(url), method=local_document.OVERSIZE_DOCUMENT_METHOD)
-    if held.has_text or local_document.exceeds_url_context_size_gate(held.text):
-        # The size gate rides the same branch as the text it guards, so the two can never
-        # disagree: a document we hold is served from the digest whatever its size, and the
-        # biggest are the clearest case — the nine archived documents past the gate carried 67%
-        # of the season's reader tokens and the largest of them returned nothing for the money.
-        # A None here is the one shape that must not be served: sub-floor chrome that no passage
-        # matched, which the paid reader below is the right rung for (see _local_digest_outcome).
-        served = await _local_digest_outcome(url, ask, held)
-        if served is not None:
-            return served
+    settled = await _free_route_outcome(url, ask, held)
+    if settled is not None:
+        return settled
     if not os.getenv(GOOGLE_API_KEY_ENV):
         return _format_fetch_error(f"Google API key is not configured; set {GOOGLE_API_KEY_ENV}.", method="document")
     if await _url_context_robots_skip(url):

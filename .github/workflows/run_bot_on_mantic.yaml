@@ -15,8 +15,9 @@
 #
 # Merging this file to main auto-enables the schedule: GitHub runs a new scheduled workflow
 # as soon as its file is on the default branch, unless someone disables it in the Actions
-# UI. The operator's remaining step is `gh secret set MANTIC_TOKEN`. Every run spends the
-# personal OpenRouter and research keys (~$2.60 per question) and publishes to Mantic.
+# UI. The MANTIC_TOKEN repository secret is set, so the merge is the only step left. Every
+# run spends the personal OpenRouter and research keys (~$2.60 per question) and publishes to
+# Mantic.
 name: Forecast on Mantic tournament
 
 on:

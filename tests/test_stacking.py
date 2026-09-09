@@ -736,6 +736,10 @@ class TestStackingMethods:
             numeric_question.unit_of_measure = "units"
             numeric_question.zero_point = None
             numeric_question.cdf_size = 201
+            # spec=NumericQuestion does not expose Pydantic field names, and nominal_bounds
+            # reads these two directly (None means "fall back to the hard bounds").
+            numeric_question.nominal_upper_bound = None
+            numeric_question.nominal_lower_bound = None
             result = await bot._pipeline.run_stacking(numeric_question, "research", reasoned_preds)
             mock_binary.assert_not_called()
             mock_mc.assert_not_called()
@@ -1074,6 +1078,9 @@ class TestStackingGuardsAndReasoning:
         # Build a minimal numeric question and two distributions on same bounds
         num_q = Mock(spec=NumericQuestion)
         num_q.id_of_question = 999
+        # A Metaculus page_url, set explicitly because spec=NumericQuestion does not expose Pydantic
+        # field names: the publish path reads the platform off it for the Mantic-only tail floor.
+        num_q.page_url = "https://www.metaculus.com/questions/999/"
         num_q.open_upper_bound = False
         num_q.open_lower_bound = False
         num_q.upper_bound = 100.0
@@ -1285,6 +1292,9 @@ class TestStackingNumericParseNotes:
         q.open_lower_bound = open_lower_bound
         q.open_upper_bound = open_upper_bound
         q.zero_point = None
+        q.cdf_size = 201
+        q.nominal_upper_bound = None
+        q.nominal_lower_bound = None
         q.open_time = _stub_open_time()
         q.scheduled_resolution_time = _stub_resolve_time()
         return cast(NumericQuestion, q)

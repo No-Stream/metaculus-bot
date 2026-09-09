@@ -73,7 +73,7 @@ def clamp_and_renormalize_probs(
     n=200 ft accepts a top option up to ~0.06 and no floor choice lifts that). Metaculus MC
     ballots are far below this cardinality in practice, but Mantic (Crucible) runs ballots of
     up to 50 options, where the floor binds on about 41% of real option probabilities. Loosening
-    it for Mantic was priced and REFUSED (2026-09-08): the floor is forecasting-tools' own, so a
+    it for Mantic was priced and REFUSED: the floor is forecasting-tools' own, so a
     lower value here changes nothing, and routing around its validator would be a parallel
     publish path for a measured cost of 0.70 baseline points per ballot (6.64 at worst, on a
     50-option question) on the 5% of the pool that is MC. Do not re-derive this; see

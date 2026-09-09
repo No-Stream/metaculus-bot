@@ -21,15 +21,17 @@ def _supported_question(done: bool = False, closes_in: timedelta | None = None) 
     ``isinstance(q, BinaryQuestion)`` while letting us set ``already_forecasted``
     for the skip filter.
 
-    ``close_time`` and ``id_of_post`` have to be set explicitly because ``spec=BinaryQuestion``
-    does not expose Pydantic field names as class attributes: forecast_questions sorts on the
-    former (tightest close first, so the cap keeps the most urgent questions) and names the
-    latter for every question the cap drops.
+    ``close_time``, ``id_of_post`` and ``page_url`` have to be set explicitly because
+    ``spec=BinaryQuestion`` does not expose Pydantic field names as class attributes:
+    forecast_questions sorts on the first (tightest close first, so the cap keeps the most urgent
+    questions) and names the other two, as the post id and the platform, for every question the
+    cap drops.
     """
     q = MagicMock(spec=BinaryQuestion)
     q.already_forecasted = done
     q.close_time = datetime.now(UTC) + (closes_in if closes_in is not None else timedelta(days=1))
     q.id_of_post = next(_POST_IDS)
+    q.page_url = f"https://www.metaculus.com/questions/{q.id_of_post}/"
     return cast(MetaculusQuestion, q)
 
 
@@ -93,16 +95,18 @@ async def test_cap_limits_to_10(monkeypatch, caplog):
 
     assert captured == [10]
     assert len(results) == 10
-    # The cap forfeits real questions, so it is a WARNING that names the posts left behind
-    # (the two latest-closing ones: the stubs close in creation order and the sort keeps the
-    # soonest-closing ten).
+    # The cap forfeits real questions, so it is a registered WARNING marker that names the posts
+    # left behind (the two latest-closing ones: the stubs close in creation order and the sort
+    # keeps the soonest-closing ten). Verbatim, since the archive keys off this spelling.
     dropped_ids = [q.id_of_post for q in questions[-2:]]
-    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-    assert any(
-        "Limiting to the 10 soonest-closing questions out of 12" in message
-        and f"dropped posts: {dropped_ids[0]},{dropped_ids[1]}" in message
-        for message in warnings
-    ), warnings
+    forfeit_lines = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING and r.getMessage().startswith("QUESTION_CAP_FORFEIT:")
+    ]
+    assert forfeit_lines == [
+        f"QUESTION_CAP_FORFEIT: platform=metaculus cap=10 total=12 dropped=2 posts={dropped_ids[0]},{dropped_ids[1]}"
+    ]
 
 
 @pytest.mark.asyncio

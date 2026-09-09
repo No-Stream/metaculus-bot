@@ -5,13 +5,11 @@ import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
-from metaculus_bot.constants import PLATFORM_MANTIC, PLATFORM_METACULUS
-
 logger = logging.getLogger(__name__)
 
 RESEARCH_SCHEMA_VERSION = 2
 
-__all__ = ["PLATFORM_MANTIC", "PLATFORM_METACULUS", "RESEARCH_SCHEMA_VERSION", "ResearchPersistenceWriter"]
+__all__ = ["RESEARCH_SCHEMA_VERSION", "ResearchPersistenceWriter"]
 
 
 class ResearchPersistenceWriter:

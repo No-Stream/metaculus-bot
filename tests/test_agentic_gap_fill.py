@@ -30,6 +30,7 @@ from tests.agentic_fakes import response as _response
 from tests.agentic_fakes import tool_call as _tool_call
 from tests.pipeline_test_helpers import (
     make_real_binary_question,
+    make_real_date_question,
     make_real_mc_question,
     make_real_numeric_question,
 )
@@ -155,8 +156,8 @@ class TestRunGapFillV2Seam:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "question_factory",
-        [make_real_binary_question, make_real_mc_question, make_real_numeric_question],
-        ids=["binary", "mc", "numeric"],
+        [make_real_binary_question, make_real_mc_question, make_real_numeric_question, make_real_date_question],
+        ids=["binary", "mc", "numeric", "date"],
     )
     async def test_happy_path_returns_findings_and_emits_markers(
         self,
@@ -164,12 +165,16 @@ class TestRunGapFillV2Seam:
         caplog: pytest.LogCaptureFixture,
         question_factory,
     ) -> None:
+        """Every type the bot forecasts passes the ``_SupportedQuestion`` gate: with the Mantic workflow
+        running v2 and date questions about 40% of that pool, a date type dropped from the union would
+        forecast them with no agentic pass and no test would notice."""
         monkeypatch.setenv("GAP_FILL_V2_ENABLED", "true")
         caplog.set_level(logging.INFO, logger="metaculus_bot.research.agentic.loop")
+        question = question_factory()
         fake_llm = _happy_path_llm()
         llm_patch, tools_patch = _patch_loop_internals(fake_llm)
         with llm_patch, tools_patch:
-            result = await run_gap_fill_v2(question_factory(), BUNDLE, is_benchmarking=False)
+            result = await run_gap_fill_v2(question, BUNDLE, is_benchmarking=False)
 
         assert "## Agentic Research Findings" in result
         assert _FINDING["claim"] in result
@@ -181,7 +186,7 @@ class TestRunGapFillV2Seam:
         ghost_lines = [m for m in messages if "GHOST_FORECAST:" in m]
         assert any("qtype=binary" in m and "summary=posterior_prob=0.1200" in m for m in ghost_lines)
         # log_prefix carries the question reference on the marker lines.
-        assert any("question=https://www.metaculus.com/questions/" in m for m in messages if "GAP_FILL_V2:" in m)
+        assert any(f"question={question.page_url}" in m for m in messages if "GAP_FILL_V2:" in m)
 
     @pytest.mark.asyncio
     async def test_user_brief_embeds_question_and_bundle(self, monkeypatch: pytest.MonkeyPatch) -> None:

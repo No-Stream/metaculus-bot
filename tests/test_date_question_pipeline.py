@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -22,7 +23,7 @@ import numpy as np
 import pytest
 from forecasting_tools import GeneralLlm, NumericDistribution, ReasonedPrediction
 from forecasting_tools.data_models.data_organizer import PredictionTypes
-from forecasting_tools.data_models.numeric_report import Percentile
+from forecasting_tools.data_models.numeric_report import NumericReport, Percentile
 from forecasting_tools.data_models.questions import DateQuestion
 
 from metaculus_bot.aggregation_pipeline import AggregationPipeline
@@ -37,7 +38,7 @@ from metaculus_bot.forecaster_runners import (
     run_date_forecast,
 )
 from metaculus_bot.numeric.config import STANDARD_PERCENTILES
-from metaculus_bot.numeric.date_axis import as_epoch_question, parse_iso_utc, to_epoch
+from metaculus_bot.numeric.date_axis import as_epoch_question, parse_forecast_date, to_epoch
 from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
 from metaculus_bot.prompts import MARKET_SNAPSHOT_SECTION_HEADER
 from metaculus_bot.research.agentic.driver_prompt import _question_header, _template_skeleton
@@ -45,10 +46,11 @@ from metaculus_bot.research.agentic.loop import _summarize_ghost
 from metaculus_bot.spread_metrics import compute_spread
 from metaculus_bot.stacking_route import _conditional_stacking_verdict, _type_gate_enabled
 from tests.mantic_fakes import DATE_POST_ID, load_legacy_date_post, load_preseason_post
-from tests.pipeline_test_helpers import assert_server_accepts_cdf, make_e2e_bot
+from tests.pipeline_test_helpers import assert_server_accepts_cdf, make_e2e_bot, make_real_date_question
 
 _DAY = timedelta(days=1)
 _EPOCH_FLOAT_PATTERN = "17"  # every epoch second in 2026 starts with these digits
+_TEN_DIGIT_EPOCH = re.compile(r"\b1\d{9}\b")
 
 
 def _iso_z(moment: datetime) -> str:
@@ -81,7 +83,7 @@ def _member(question: DateQuestion, declared: dict[str, str]) -> NumericDistribu
     """One forecaster's built distribution, through the real sanitize and build on the epoch view."""
     epoch = as_epoch_question(question)
     percentiles = [
-        Percentile(percentile=float(key), value=to_epoch(parse_iso_utc(value))) for key, value in declared.items()
+        Percentile(percentile=float(key), value=to_epoch(parse_forecast_date(value))) for key, value in declared.items()
     ]
     sanitized, zero_point = sanitize_percentiles(percentiles, epoch, model_name="test-model")
     return build_numeric_distribution(sanitized, epoch, zero_point, model_name="test-model")
@@ -167,6 +169,16 @@ class TestTheRunner:
         assert "extract that date verbatim" in open_upper
         assert "at or after the lower bound 2026-06-17T15:00:00Z" in open_upper
 
+        # Neither recorded payload has an open lower bound, so that branch is pinned on a built question.
+        open_lower = build_date_parse_notes(
+            as_epoch_question(make_real_date_question(open_lower_bound=True, date_granularity=""))
+        )
+        assert "The lower bound 2026-09-08T00:00:00Z is only the start of the displayed range" in open_lower
+        assert "states a date before 2026-09-08T00:00:00Z, extract that date verbatim" in open_lower
+        assert "never move it later into range" in open_lower
+        assert "at or before the upper bound 2026-09-20T00:00:00Z" in open_lower
+        assert _TEN_DIGIT_EPOCH.search(open_lower) is None
+
     def test_mass_after_an_open_upper_bound_means_not_by_then(
         self, q500: DateQuestion, test_llm: GeneralLlm, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -179,7 +191,8 @@ class TestTheRunner:
         after_window = q500.upper_bound + timedelta(days=60)
         declared = _spread_over(start, after_window)
         percentiles = [
-            Percentile(percentile=float(key), value=to_epoch(parse_iso_utc(value))) for key, value in declared.items()
+            Percentile(percentile=float(key), value=to_epoch(parse_forecast_date(value)))
+            for key, value in declared.items()
         ]
 
         prediction = _build_guarded_numeric_distribution(percentiles, epoch, test_llm)
@@ -193,6 +206,64 @@ class TestTheRunner:
         assert " qtype=date " in line
         oor_high = float(line.rsplit("oor_high=", 1)[1])
         assert oor_high == pytest.approx(1.0 - heights[-1], abs=1e-6)
+
+    def test_every_percentile_on_one_day_publishes_with_the_mass_in_that_day(
+        self, q651: DateQuestion, test_llm: GeneralLlm, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The date prompt invites this shape and twelve one-day bins can express it. Before the
+        outcome-space carve-out in ``apply_cluster_spreading`` the thirteen identical values
+        reached the unit-mismatch guard with only the jitter epsilon between them and the member
+        was dropped; the gap between "dropped" and "96% on the right day" was one differing
+        percentile."""
+        caplog.set_level(logging.WARNING, logger="metaculus_bot.numeric.pipeline")
+        epoch = as_epoch_question(q651)
+        september_16 = to_epoch(parse_forecast_date("2026-09-16"))
+        percentiles = [Percentile(percentile=p, value=september_16) for p in STANDARD_PERCENTILES]
+
+        prediction = _build_guarded_numeric_distribution(percentiles, epoch, test_llm)
+
+        heights = _cdf_heights(prediction)
+        mass = np.diff(heights)
+        assert len(heights) == 13
+        assert int(np.argmax(mass)) == 8
+        assert mass[8] > 0.95
+        assert_server_accepts_cdf(heights, cdf_size=13, open_lower=False, open_upper=False)
+        (line,) = [
+            r.getMessage() for r in caplog.records if r.getMessage().startswith("NUMERIC_DEGENERATE_DECLARATION:")
+        ]
+        assert " n_unique=1 " in line
+        assert line.endswith(" spread_applied=true")
+
+    def test_the_fallback_distribution_of_a_201_grid_date_question_still_renders_dates(
+        self, q500: DateQuestion, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A 201-grid date question (post 500's shape) takes the PCHIP path and lands in
+        ``create_fallback_numeric_distribution`` on any build failure. ``is_date`` has to ride
+        that path too, or the published comment renders ten-digit epoch floats on exactly the
+        questions whose PCHIP build already failed."""
+        epoch = as_epoch_question(q500)
+        declared = _spread_over(datetime(2026, 7, 1, tzinfo=UTC), q500.upper_bound - timedelta(days=5))
+        percentiles = [
+            Percentile(percentile=float(key), value=to_epoch(parse_forecast_date(value)))
+            for key, value in declared.items()
+        ]
+        sanitized, zero_point = sanitize_percentiles(percentiles, epoch)
+
+        def _pchip_fails(*_args, **_kwargs):
+            raise ValueError("forced PCHIP failure")
+
+        monkeypatch.setattr("metaculus_bot.numeric.pipeline.generate_pchip_cdf_with_smoothing", _pchip_fails)
+
+        prediction = build_numeric_distribution(sanitized, epoch, zero_point)
+
+        assert type(prediction).__name__ == "BoundSafeNumericDistribution"
+        assert prediction.is_date is True
+        readable = NumericReport.make_readable_prediction(prediction)
+        assert "2026-07-" in readable
+        assert " UTC" in readable
+        assert _TEN_DIGIT_EPOCH.search(readable) is None
+        heights = _cdf_heights(prediction)
+        assert_server_accepts_cdf(heights, cdf_size=201, open_lower=False, open_upper=True)
 
 
 class TestRoutingSites:
@@ -285,7 +356,9 @@ class TestTheForecaster:
         assert isinstance(aggregated, NumericDistribution)
         assert aggregated.is_date is True
         (line,) = [r.getMessage() for r in caplog.records if r.getMessage().startswith("NUMERIC_AGGREGATE:")]
-        assert line == "NUMERIC_AGGREGATE: question=651 qtype=date cdf_size=13 oor_low=0.000000 oor_high=0.000000"
+        assert line.startswith(
+            "NUMERIC_AGGREGATE: question=651 qtype=date cdf_size=13 oor_low=0.000000 oor_high=0.000000"
+        )
 
 
 class TestGapFillV2:
@@ -312,6 +385,6 @@ class TestGapFillV2:
         assert qtype == "date"
         assert forecast is not None
         assert forecast["qtype"] == "date"
-        assert forecast["median"] == to_epoch(parse_iso_utc(declared["0.5"]))
+        assert forecast["median"] == to_epoch(parse_forecast_date(declared["0.5"]))
         assert summary == f"median={declared['0.5']}"
         assert set(forecast["declared_percentiles"]) == set(STANDARD_PERCENTILES)

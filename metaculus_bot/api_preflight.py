@@ -113,8 +113,8 @@ _AUTH_GATED_STATUSES = frozenset({401, 403})
 # message so the operator doesn't chase a phantom hijack.
 _TRANSIENT_STATUSES = frozenset({408, 429, 502, 503, 504})
 
-# Cap on the response body echoed into the diagnostic (keeps the log line bounded).
-_BODY_PREVIEW_CHARS = 200
+# Cap on the body echoed into an ApiIdentityError, shared with the Mantic preflight so both gates document one cap.
+BODY_PREVIEW_CHARS = 200
 
 
 def _hijack_hint(host: str) -> str:
@@ -169,7 +169,7 @@ def verify_api_identity(base_url: str, *, timeout: float = 20.0) -> None:
         ) from e
 
     status = response.status_code
-    body_preview = response.text[:_BODY_PREVIEW_CHARS]
+    body_preview = response.text[:BODY_PREVIEW_CHARS]
 
     if status in _AUTH_GATED_STATUSES:
         logger.info(f"API identity preflight passed for {host} ({status=} auth-gated)")
@@ -182,13 +182,13 @@ def verify_api_identity(base_url: str, *, timeout: float = 20.0) -> None:
             return
         raise ApiIdentityError(
             f"{preflight} got {status=} from {url!r} but the body is not the expected JSON results "
-            f"payload (first {_BODY_PREVIEW_CHARS} chars: {body_preview!r}); {_hijack_hint(host)}."
+            f"payload (first {BODY_PREVIEW_CHARS} chars: {body_preview!r}); {_hijack_hint(host)}."
         )
 
     if status in _TRANSIENT_STATUSES:
         raise ApiIdentityError(
             f"{preflight} got {status=} from {url!r} "
-            f"(first {_BODY_PREVIEW_CHARS} chars: {body_preview!r}); transient edge throttle/server condition — "
+            f"(first {BODY_PREVIEW_CHARS} chars: {body_preview!r}); transient edge throttle/server condition — "
             "not necessarily a hijack; a later retry of the whole run is appropriate; "
             "do NOT retry with credentials now."
         )
@@ -196,7 +196,7 @@ def verify_api_identity(base_url: str, *, timeout: float = 20.0) -> None:
     if 500 <= status < 600:
         raise ApiIdentityError(
             f"{preflight} got {status=} from {url!r} "
-            f"(first {_BODY_PREVIEW_CHARS} chars: {body_preview!r}); cannot verify API identity. "
+            f"(first {BODY_PREVIEW_CHARS} chars: {body_preview!r}); cannot verify API identity. "
             f"This may be a genuine {host} server error rather than a hijack, but the run is useless either way. "
             "Do NOT retry with credentials; check the platform's status channels."
         )
@@ -205,7 +205,7 @@ def verify_api_identity(base_url: str, *, timeout: float = 20.0) -> None:
     # status, not a followed hop), an unexpected 2xx, or a stray 4xx.
     raise ApiIdentityError(
         f"{preflight} got unexpected {status=} from {url!r} "
-        f"(first {_BODY_PREVIEW_CHARS} chars: {body_preview!r}); {_hijack_hint(host)}."
+        f"(first {BODY_PREVIEW_CHARS} chars: {body_preview!r}); {_hijack_hint(host)}."
     )
 
 

@@ -8,7 +8,6 @@ import pytest
 
 from metaculus_bot.constants import MANTIC_HOST, PLATFORM_MANTIC, PLATFORM_METACULUS
 from metaculus_bot.question_platform import question_platform
-from metaculus_bot.research import persistence
 
 
 def _question_with_url(page_url: str | None) -> MagicMock:
@@ -45,7 +44,6 @@ class TestQuestionPlatform:
         assert question_platform(_question_with_url(page_url)) == PLATFORM_METACULUS
 
     def test_the_vocabulary_is_the_research_archives(self) -> None:
-        """The two tokens are the archive's ``platform`` field: one spelling, defined in constants and
-        still importable from the persistence writer that stamps records with it."""
-        assert persistence.PLATFORM_MANTIC == PLATFORM_MANTIC == "mantic"
-        assert persistence.PLATFORM_METACULUS == PLATFORM_METACULUS == "metaculus"
+        """The two tokens are the archive's ``platform`` field, so their spelling is a data contract."""
+        assert PLATFORM_MANTIC == "mantic"
+        assert PLATFORM_METACULUS == "metaculus"

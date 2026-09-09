@@ -44,7 +44,8 @@ __all__ = [
     "format_epoch",
     "numeric_qtype",
     "numeric_view",
-    "parse_iso_utc",
+    "parse_forecast_date",
+    "question_json",
     "to_epoch",
 ]
 
@@ -75,7 +76,7 @@ def to_epoch(moment: datetime) -> float:
     return _as_utc(moment).timestamp()
 
 
-def parse_iso_utc(text: str) -> datetime:
+def parse_forecast_date(text: str) -> datetime:
     """Parse a forecaster's strict ISO-8601 date or timestamp to tz-aware UTC.
 
     ``YYYY-MM-DD`` maps to 12:00:00 UTC of that day (module docstring: noon sits inside the
@@ -84,9 +85,11 @@ def parse_iso_utc(text: str) -> datetime:
     including a bare year, a year-month, and every non-ISO spelling.
 
     The two regexes are deliberately narrower than ``datetime.fromisoformat``, which also admits
-    the basic ``YYYYMMDD`` and ISO-week forms nobody asked a forecaster for. Distinct from
-    ``time_utils.parse_iso_utc``, the lenient archive reader that answers None on a bad value and
-    keeps a date-only value at midnight: a forecast value must fail loudly and land inside its day.
+    the basic ``YYYYMMDD`` and ISO-week forms nobody asked a forecaster for. This is the reader
+    for a FORECAST VALUE and nothing else; the archive reader is ``time_utils.parse_iso_utc``,
+    which is lenient, answers None on a bad value and keeps a date-only value at midnight. The
+    two are named apart because a date read through the archive reader lands on a bin edge,
+    where the platform's 1e-10 bucket fudge decides the day, with no error anywhere.
     """
     candidate = text.strip()
     if _DATE_ONLY_RE.fullmatch(candidate):
@@ -110,19 +113,27 @@ def format_epoch(value: float, granularity: str) -> str:
     return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _scaling_block(question: DateQuestion) -> dict[str, Any]:
-    """The API's ``question.scaling`` dict, empty when the question was not built from API JSON."""
-    question_json = question.api_json.get("question")
-    if not isinstance(question_json, dict):
-        return {}
-    scaling = question_json.get("scaling")
+def question_json(question: MetaculusQuestion) -> dict[str, Any]:
+    """The API's ``question`` object off ``api_json``, or ``{}`` for a question not built from API JSON.
+
+    Mantic's per-question fields (``scaling``, ``date_granularity``, ``multi_resolution``,
+    ``precision``) live under that key and nowhere on the ``forecasting_tools`` model. Metaculus
+    payloads never carry the Mantic flags, so a prompt clause keyed on one disables itself there
+    without a run-mode flag. The one accessor for that read, so every consumer tolerates a
+    test-built question the same way.
+    """
+    payload = question.api_json.get("question")
+    return payload if isinstance(payload, dict) else {}
+
+
+def _scaling_block(payload: dict[str, Any]) -> dict[str, Any]:
+    """The ``scaling`` dict of a ``question_json`` payload, empty when absent."""
+    scaling = payload.get("scaling")
     return scaling if isinstance(scaling, dict) else {}
 
 
-def _read_granularity(question: DateQuestion) -> str:
-    question_json = question.api_json.get("question")
-    raw = question_json.get("date_granularity") if isinstance(question_json, dict) else None
-    granularity = raw or ""
+def _read_granularity(question: DateQuestion, payload: dict[str, Any]) -> str:
+    granularity = payload.get("date_granularity") or ""
     if granularity not in DATE_GRANULARITIES:
         raise ValueError(
             f"Question {question.id_of_question}: unknown date_granularity {granularity!r}; "
@@ -142,7 +153,8 @@ def as_epoch_question(question: DateQuestion) -> EpochDateQuestion:
     """
     lower_bound = to_epoch(question.lower_bound)
     upper_bound = to_epoch(question.upper_bound)
-    scaling = _scaling_block(question)
+    payload = question_json(question)
+    scaling = _scaling_block(payload)
     nominal_min = scaling.get("nominal_min")
     nominal_max = scaling.get("nominal_max")
     base_fields = question.model_dump(
@@ -167,7 +179,7 @@ def as_epoch_question(question: DateQuestion) -> EpochDateQuestion:
         cdf_size=question.cdf_size,
         nominal_lower_bound=float(nominal_min) if nominal_min is not None else lower_bound,
         nominal_upper_bound=float(nominal_max) if nominal_max is not None else upper_bound,
-        date_granularity=_read_granularity(question),
+        date_granularity=_read_granularity(question, payload),
     )
 
 

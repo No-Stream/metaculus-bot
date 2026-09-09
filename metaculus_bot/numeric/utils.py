@@ -130,17 +130,14 @@ def _postprocess_ensemble_cdf(
 
 
 def _canonical_cdf_length(question: NumericQuestion) -> int:
-    """Points the question's submitted CDF has: ``cdf_size``, else the 201-point default.
+    """Points the question's submitted CDF has: its ``cdf_size``.
 
-    Mirrors ``build_numeric_distribution``'s target (pipeline.py reads a None
-    ``cdf_size`` as the standard grid the same way), so per-model CDFs and the
+    Mirrors ``build_numeric_distribution``'s target, so per-model CDFs and the
     ensemble CDF live on the same grid by construction. An out-of-range value
     raises LOUDLY rather than silently substituting 201: a ``cdf_size`` below 2 is
     a malformed question, and the substitution would publish a 201-point CDF
     against a grid the platform never declared.
     """
-    if question.cdf_size is None:
-        return PCHIP_CDF_POINTS
     target = int(question.cdf_size)
     if target < 2:
         raise ValueError(f"NumericQuestion.cdf_size must be >= 2 to define a CDF grid, got {target}")
@@ -243,14 +240,8 @@ def nominal_bounds(question: NumericQuestion) -> tuple[float, float]:
     """
     nominal_upper = getattr(question, "nominal_upper_bound", None)
     nominal_lower = getattr(question, "nominal_lower_bound", None)
-    cdf_size = getattr(question, "cdf_size", None)
-    if (
-        nominal_upper is None
-        and nominal_lower is None
-        and cdf_size is not None
-        and cdf_size > 1
-        and cdf_size != PCHIP_CDF_POINTS
-    ):
+    cdf_size = question.cdf_size
+    if nominal_upper is None and nominal_lower is None and cdf_size > 1 and cdf_size != PCHIP_CDF_POINTS:
         step = (question.upper_bound - question.lower_bound) / (cdf_size - 1)
         nominal_upper = question.upper_bound - step / 2
         nominal_lower = question.lower_bound + step / 2

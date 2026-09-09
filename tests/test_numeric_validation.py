@@ -27,7 +27,7 @@ def _make_question(
     lower=0.0,
     upper=100.0,
     zero_point=None,
-    cdf_size=None,
+    cdf_size=201,
 ):
     return cast(
         NumericQuestion,

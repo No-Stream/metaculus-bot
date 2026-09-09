@@ -31,7 +31,7 @@ from metaculus_bot.prompts import (
     stacking_multiple_choice_prompt,
     stacking_numeric_prompt,
 )
-from tests.mantic_fakes import DATE_POST_ID, load_preseason_posts
+from tests.mantic_fakes import DATE_POST_ID, load_preseason_post
 
 # One page URL per platform, so a test can build the same stub as a Metaculus or a Mantic question.
 METACULUS_PAGE_URL = f"https://www.{METACULUS_HOST}/questions/1/"
@@ -76,6 +76,11 @@ def _numeric_q(**kwargs) -> MagicMock:
     q.unit_of_measure = "widgets"
     q.lower_bound = 0
     q.upper_bound = 1000
+    # The Metaculus default grid, typed as the model carries it: the scoring-grid clause reads
+    # the bin count off ``cdf_size`` and the geometry off ``zero_point``, and a MagicMock attribute
+    # is neither an int nor None.
+    q.cdf_size = 201
+    q.zero_point = None
     return q
 
 
@@ -85,8 +90,7 @@ def _date_q() -> DateQuestion:
     A real ``DateQuestion`` rather than a MagicMock because ``date_prompt`` builds the epoch view
     through ``numeric.date_axis.as_epoch_question``, which reads the API's ``scaling`` block.
     """
-    post = next(post for post in load_preseason_posts() if post["id"] == DATE_POST_ID)
-    return DateQuestion.from_metaculus_api_json(post)
+    return DateQuestion.from_metaculus_api_json(load_preseason_post(DATE_POST_ID))
 
 
 def _open_upper_date_q() -> DateQuestion:

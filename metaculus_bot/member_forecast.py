@@ -5,19 +5,24 @@ for every ensemble member and for the stacker::
 
     MEMBER_FORECAST: question=<id> model=<name> role=member|stacker qtype=<type> raw=<json> published=<json>
 
-A numeric or date line carries two additive trailing fields, ``oor_low=<f> oor_high=<f>``
-(2026-09-08): the OUT-OF-RANGE mass of the CDF the runner built from ``published``, i.e.
-``cdf[0]`` (below the lower bound) and ``1 - cdf[-1]`` (above the upper). The same pair ends
-the per-question aggregate marker::
+A numeric or date line carries two additive trailing fields, ``oor_low=<f> oor_high=<f>``:
+the OUT-OF-RANGE mass of the CDF the runner built from ``published``, i.e. ``cdf[0]`` (below
+the lower bound) and ``1 - cdf[-1]`` (above the upper). The per-question aggregate marker
+carries the same pair for the PUBLISHED distribution, then the pair as it stood before the
+platform tail floor and the floor that moved it::
 
     NUMERIC_AGGREGATE: question=<id> qtype=numeric|date cdf_size=<n> oor_low=<f> oor_high=<f>
+        oor_low_raw=<f> oor_high_raw=<f> tail_floor=<f>
 
 Why the tails: the platform scores an out-of-range resolution against a fixed 0.05
-reference, and on Mantic half of all resolved date questions and a fifth of discrete ones
+reference, and on Mantic half of all resolved date questions and a quarter of discrete ones
 resolved outside the displayed range, while this pipeline publishes exactly 1% there
-whenever every percentile sits inside. These fields are how the "do models already place
-mass beyond the bounds?" question gets answered from the archive before any mechanical
-tail floor is considered (plan B10).
+whenever every percentile sits inside. On a Mantic question the published aggregate's open
+tails are raised to ``MANTIC_OUT_OF_RANGE_TAIL_FLOOR`` (``numeric/out_of_range_floor.py``);
+``oor_low_raw`` / ``oor_high_raw`` keep the aggregate's own tails and ``tail_floor`` is the
+floor that moved an endpoint (``0`` on Metaculus, on a closed-bound question, or when the
+tails were already at or above it), so the floor can be benchmarked on this bot's own
+forecasts from the archive, and the member lines keep measuring what the models declared.
 
 ``raw`` is the value the extraction ladder read off the model's rationale, before any
 clamp, renormalise or sanitise touched it. ``published`` is what the runner returns.
@@ -143,9 +148,17 @@ def format_numeric_aggregate_marker(
     qtype: QuestionType,
     cdf_size: int,
     out_of_range: OutOfRangeMass,
+    out_of_range_raw: OutOfRangeMass,
+    tail_floor: float,
 ) -> str:
-    """Build the per-question NUMERIC_AGGREGATE line for the published distribution."""
+    """Build the per-question NUMERIC_AGGREGATE line for the published distribution.
+
+    ``out_of_range`` is the PUBLISHED distribution's tail mass, ``out_of_range_raw`` the same pair
+    before the platform tail floor, ``tail_floor`` the floor that moved an endpoint (module docstring).
+    """
+    raw_low, raw_high = out_of_range_raw
     return (
         f"NUMERIC_AGGREGATE: question={question_id} qtype={qtype} cdf_size={cdf_size}"
         f"{_out_of_range_suffix(out_of_range)}"
+        f" oor_low_raw={raw_low:.6f} oor_high_raw={raw_high:.6f} tail_floor={tail_floor:.6f}"
     )
