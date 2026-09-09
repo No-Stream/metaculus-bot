@@ -175,9 +175,12 @@ Metaculus, pinned in `tests/test_cluster_processing.py`.
 
 The WHOLE-SET collapse on an outcome-space grid, all 13 declared values equal, is the one
 shape placed differently (`_spread_whole_set_collapse`, `numeric/cluster_processing.py`),
-decided on the declared value `v = values[0]` with exact comparisons rather than on
-`np.mean`, whose rounding read a collapse exactly on an open bound of 1.3 as beyond it and
-published 7 of 13 values past the bound (codex re-check, 2026-09). With `lower <= v <=
+decided on the declared value `v`, the median element of the sorted set, with exact
+comparisons: an exactly-equal collapse compares exactly against the bounds, an epsilon-chain
+of near-equal values (which `is_degenerate_cluster` also admits) is centred rather than placed
+off its first value, and `np.mean` is never used, because its rounding read a collapse exactly
+on an open bound of 1.3 as beyond it and published 7 of 13 values past the bound (codex
+re-checks, 2026-09). With `lower <= v <=
 upper`, equality included, the full 12-step span goes inside the range, translated as needed
 with its spacing intact: the bound value buckets into the terminal bin, so a plateau ON the
 bound (a forecaster writing the bound's own timestamp at every percentile, which the date

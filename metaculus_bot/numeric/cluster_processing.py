@@ -95,10 +95,12 @@ def _declared_beyond_an_open_bound(declared: float, question: NumericQuestion) -
 
 
 def _spread_whole_set_collapse(values: list[float], question: NumericQuestion, *, spread_delta: float) -> list[float]:
-    """The whole-set collapse (every declared value equal) placed by its declared value on an outcome-space grid.
+    """The whole-set collapse (``is_degenerate_cluster``) placed by its declared value on an outcome-space grid.
 
-    Decided on ``values[0]`` with exact comparisons, never a mean: ``np.mean([1.3] * 13)`` is
-    ``1.3000000000000003``, which read a collapse ON an open bound of 1.3 as beyond it. Inside
+    The declared value is the median ELEMENT of the sorted set, compared exactly against the
+    bounds: an exactly-equal collapse compares exactly, an epsilon-chain of near-equal values is
+    centred rather than placed off its first value, and no mean is taken (``np.mean([1.3] * 13)``
+    is ``1.3000000000000003``, which read a collapse ON an open bound of 1.3 as beyond it). Inside
     the range or exactly on a bound the full span goes inside, under the one-bin cap and
     translated as needed, because the bound value buckets into the terminal bin. Strictly
     beyond an OPEN bound the spread stays symmetric about the value, a real out-of-range
@@ -106,8 +108,8 @@ def _spread_whole_set_collapse(values: list[float], question: NumericQuestion, *
     ``clamp_values_to_bounds``, which runs after this, judges the declared distance. A collapse
     has no neighbours, so no repair re-spaces it. Receipts: ``docs/numeric_pipeline.md`` Step 3.
     """
-    declared = values[0]
     size = len(values)
+    declared = sorted(values)[size // 2]
     bin_width = grid_bin_width(question.lower_bound, question.upper_bound, question.cdf_size)
     plateau = _symmetric_plateau(declared, size, min(spread_delta, bin_width / (size - 1)))
     if _declared_beyond_an_open_bound(declared, question):

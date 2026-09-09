@@ -266,7 +266,7 @@ class TestApplyClusterSpreadingGoldenOutputs:
     property tests above cover the individual rules; these goldens pin the composition
     (multiple clusters in one pass, a cluster at each bound, a chained near-equal run)
     so the walk can be restructured without moving a published value. Captured from the
-    implementation as of 2026-08-26.
+    implementation as of 2026-08-26 as exact reprs, and compared bit for bit.
     """
 
     SHAPES: ClassVar[dict[str, list[float]]] = {
@@ -316,8 +316,7 @@ class TestApplyClusterSpreadingGoldenOutputs:
 
         expected_values, expected_clusters = self.GOLDEN[shape_name, open_lower, open_upper]
         assert clusters_applied == expected_clusters
-        for got, want in zip(result, expected_values, strict=True):
-            assert got == pytest.approx(want, rel=1e-12, abs=1e-15)
+        assert result == expected_values
 
     def test_spreading_mutates_the_caller_list_in_place(self):
         """The spreader returns the SAME list object it was handed; the pipeline relies
@@ -508,18 +507,39 @@ class TestCollapseOnABoundOfAnOutcomeSpaceGrid:
 
 
 class TestWholeSetCollapseDecidesOnTheDeclaredValue:
-    """The whole-set collapse is placed by its DECLARED value, ``values[0]``, with exact comparisons.
+    """The whole-set collapse is placed by its DECLARED value, the median element of the sorted
+    set, compared exactly against the bounds.
 
     ``np.mean([1.3] * 13)`` is ``1.3000000000000003``, which read a collapse exactly ON an open
     upper bound of 1.3 as beyond it, skipped the translation and published 7 of 13 values past
-    the bound (codex re-check 3, 2026-09, on grids 3 to 2001). On the bound or inside, the full
-    span goes inside the range; strictly beyond an OPEN bound the spread stays symmetric about
-    the declared value; strictly beyond a CLOSED bound the plateau starts at it, so the clamp
-    that runs after the spreader judges the declared distance. A whole-set collapse has no
-    neighbours, so the shift-up / compress repairs never re-space it.
+    the bound (codex re-check 3, 2026-09, on grids 3 to 2001); ``values[0]`` placed an
+    epsilon-CHAIN of near-equal values off its centre by the chain's width (re-check 4). On the
+    bound or inside, the full span goes inside the range; strictly beyond an OPEN bound the
+    spread stays symmetric about the declared value; strictly beyond a CLOSED bound the plateau
+    starts at it, so the clamp that runs after the spreader judges the declared distance. A
+    whole-set collapse has no neighbours, so the shift-up / compress repairs never re-space it.
     """
 
     GRID_SIZES: ClassVar[tuple[int, ...]] = (3, 13, 22, 451, 2001)
+    RANGE: ClassVar[tuple[float, float]] = (0.0, 12.0)
+
+    def _full_span(self, cdf_size: int, spread_delta: float = 1.0) -> float:
+        """The whole-set collapse's span on ``RANGE``: 12 steps of the capped per-position spread."""
+        lower, upper = self.RANGE
+        return (EXPECTED_PERCENTILE_COUNT - 1) * min(
+            spread_delta, grid_bin_width(lower, upper, cdf_size) / (EXPECTED_PERCENTILE_COUNT - 1)
+        )
+
+    def _spread(self, values: list[float], question: NumericQuestion, *, spread_delta: float = 1.0) -> list[float]:
+        result, clusters_applied = apply_cluster_spreading(
+            values,
+            question,
+            value_eps=1e-6,
+            spread_delta=spread_delta,
+            range_size=question.upper_bound - question.lower_bound,
+        )
+        assert clusters_applied == 1
+        return result
 
     def _question(
         self, lower: float, upper: float, cdf_size: int, *, open_lower: bool, open_upper: bool
@@ -571,35 +591,90 @@ class TestWholeSetCollapseDecidesOnTheDeclaredValue:
         assert (result[0] if edge == "lower" else result[-1]) == declared
         assert result[-1] - result[0] == pytest.approx((EXPECTED_PERCENTILE_COUNT - 1) * per_position)
 
-    @pytest.mark.parametrize(
-        ("declared", "expected_edges"),
-        [(-0.25, (-0.75, 0.25)), (12.25, (11.75, 12.75))],
-        ids=["below_open_lower", "above_open_upper"],
-    )
+    @pytest.mark.parametrize("cdf_size", GRID_SIZES)
+    @pytest.mark.parametrize("declared", [-0.25, 12.25], ids=["below_open_lower", "above_open_upper"])
     def test_strictly_beyond_an_open_bound_spreads_symmetrically_about_the_declared_value(
-        self, declared: float, expected_edges: tuple[float, float]
+        self, declared: float, cdf_size: int
     ) -> None:
-        question = self._question(0.0, 12.0, 13, open_lower=True, open_upper=True)
+        question = self._question(*self.RANGE, cdf_size, open_lower=True, open_upper=True)
+        half_span = self._full_span(cdf_size) / 2
 
         result = self._collapse(declared, question, value_eps=1e-6, spread_delta=1.0)
 
         assert sum(result) / len(result) == pytest.approx(declared)
-        assert (result[0], result[-1]) == pytest.approx(expected_edges)
+        assert (result[0], result[-1]) == pytest.approx((declared - half_span, declared + half_span))
 
-    @pytest.mark.parametrize(
-        ("declared", "expected_edges"),
-        [(-0.25, (-0.25, 0.75)), (12.25, (11.25, 12.25))],
-        ids=["below_closed_lower", "above_closed_upper"],
-    )
-    def test_strictly_beyond_a_closed_bound_starts_at_the_declared_value(
-        self, declared: float, expected_edges: tuple[float, float]
-    ) -> None:
-        question = self._question(0.0, 12.0, 13, open_lower=False, open_upper=False)
+    @pytest.mark.parametrize("cdf_size", GRID_SIZES)
+    @pytest.mark.parametrize("declared", [-0.25, 12.25], ids=["below_closed_lower", "above_closed_upper"])
+    def test_strictly_beyond_a_closed_bound_starts_at_the_declared_value(self, declared: float, cdf_size: int) -> None:
+        question = self._question(*self.RANGE, cdf_size, open_lower=False, open_upper=False)
+        span = self._full_span(cdf_size)
+        below = declared < question.lower_bound
 
         result = self._collapse(declared, question, value_eps=1e-6, spread_delta=1.0)
 
+        expected_edges = (declared, declared + span) if below else (declared - span, declared)
         assert (result[0], result[-1]) == pytest.approx(expected_edges)
-        assert (result[0] if declared < question.lower_bound else result[-1]) == declared
+        assert (result[0] if below else result[-1]) == declared
+
+    @pytest.mark.parametrize("cdf_size", GRID_SIZES)
+    @pytest.mark.parametrize("bound_kind", ["closed", "open"])
+    @pytest.mark.parametrize("bins_inside", [0.5, 1.0], ids=["half_a_bin_inside", "one_bin_inside"])
+    @pytest.mark.parametrize("edge", ["lower", "upper"])
+    def test_inside_the_range_near_a_bound_is_centred_on_the_declared_value(
+        self, edge: str, bins_inside: float, bound_kind: str, cdf_size: int
+    ) -> None:
+        """Half a bin inside (the terminal bin's centre) is where the capped span first fits without
+        a translation; from there inward the collapse is symmetric about its declared value."""
+        lower, upper = self.RANGE
+        is_open = bound_kind == "open"
+        question = self._question(
+            lower, upper, cdf_size, open_lower=is_open and edge == "lower", open_upper=is_open and edge == "upper"
+        )
+        offset = bins_inside * grid_bin_width(lower, upper, cdf_size)
+        declared = lower + offset if edge == "lower" else upper - offset
+        half_span = self._full_span(cdf_size) / 2
+
+        result = self._collapse(declared, question, value_eps=1e-6, spread_delta=1.0)
+
+        assert all(lower <= v <= upper for v in result)
+        assert all(a < b for a, b in pairwise(result))
+        assert (result[0], result[-1]) == pytest.approx((declared - half_span, declared + half_span))
+
+    def test_an_epsilon_chain_dipping_below_an_open_bound_is_placed_by_its_median(self) -> None:
+        """Thirteen near-equal values chained within ``value_eps`` are one collapse
+        (``is_degenerate_cluster``). Placed by ``values[0]`` this chain was read as beyond the open
+        bound and left straddling it; its median sits exactly on the bound, so it goes inside."""
+        question = self._question(*self.RANGE, 13, open_lower=True, open_upper=False)
+        chain = [-3e-7 + i * 5e-8 for i in range(EXPECTED_PERCENTILE_COUNT)]
+        assert sorted(chain)[EXPECTED_PERCENTILE_COUNT // 2] == question.lower_bound
+
+        result = self._spread(chain, question)
+
+        assert (result[0], result[-1]) == (question.lower_bound, question.lower_bound + self._full_span(13))
+        assert all(a < b for a, b in pairwise(result))
+
+    def test_an_epsilon_chain_inside_the_range_is_centred_on_its_median(self) -> None:
+        question = self._question(*self.RANGE, 13, open_lower=True, open_upper=True)
+        chain = [6.0 + i * 5e-8 for i in range(EXPECTED_PERCENTILE_COUNT)]
+        median = sorted(chain)[EXPECTED_PERCENTILE_COUNT // 2]
+
+        result = self._spread(chain, question)
+
+        assert sum(result) / len(result) == pytest.approx(median, abs=1e-9)
+        assert result[-1] - result[0] == pytest.approx(self._full_span(13))
+        assert all(a < b for a, b in pairwise(result))
+
+    def test_the_codex_epsilon_chain_repro_lands_inside_with_its_full_span(self) -> None:
+        """``[i * 5e-8 for i in range(13)]`` on an open-lower [0, 12] grid (codex re-check 4): the
+        median 3e-7 is inside, the symmetric span crosses the bound, so the translated plateau is
+        ``[0.0, 1.0]`` under the narrowed rule; the pre-branch straddle was never the intent."""
+        question = self._question(*self.RANGE, 13, open_lower=True, open_upper=False)
+
+        result = self._spread([i * 5e-8 for i in range(EXPECTED_PERCENTILE_COUNT)], question)
+
+        assert (result[0], result[-1]) == (0.0, 1.0)
+        assert all(a < b for a, b in pairwise(result))
 
     def test_no_neighbour_repair_re_spaces_the_collapse(self) -> None:
         """No preceding or following value exists, so every gap is exactly the capped per-position
