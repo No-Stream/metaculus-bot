@@ -1335,8 +1335,9 @@ stderr), so per-run spend is durably grep-able:
   no-spend. `scripts/reconcile_credit_spend.py` recovers the settled number.
 - `CREDIT_ROLE_SPEND: role=... key=... usd=... calls=... costed_calls=...
   byok_usd=... prompt_tokens=... completion_tokens=... cached_tokens=...
-  reasoning_tokens=...`: one line per (role, key) at end of run, saying WHERE the
-  OpenRouter dollars and tokens went. See "Per-role spend" below.
+  reasoning_tokens=... charged_usd=... byok_calls=...`: one line per (role, key)
+  at end of run, saying WHERE the OpenRouter dollars and tokens went. See
+  "Per-role spend" below.
 - `CREDIT_FLOOR_BREACH: key=donated remaining=... floor=...` when the donated
   key's remaining balance drops below `OPENROUTER_CREDIT_FLOOR_USD`
   (`constants.py`, $100). That level is an early warning, not an empty tank. Read
@@ -1359,15 +1360,59 @@ How the number is produced, because it decides how to read it:
   (and the raw-`acompletion` gap-fill v2 driver) stamps a litellm `metadata=`
   tag with its role and the key it bills (`donated` for the wrapper's primary,
   `personal` for its fallback or a personal-key-pinned model, `direct` for a
-  non-OpenRouter slug). A litellm success callback (`RoleSpendTracker`) reads
-  the tag back together with **OpenRouter's own per-call usage accounting** off
-  the response: `usage.cost` (credits drawn from the key) plus
-  `usage.cost_details.upstream_inference_cost` (the provider's charge on a BYOK
-  route). `usd` is their sum; `byok_usd` is the upstream part on its own. The
-  donated key routes through Metaculus's BYOK integrations, so on that key nearly
-  everything is `byok_usd`, the same money `/auth/key` books as `byok_usage` and
-  subtracts from `limit_remaining`; the personal key is not BYOK, so its rows read
-  `byok_usd=0.0000`. This is the provider's figure, not litellm's price table.
+  non-OpenRouter slug). `metadata` is a litellm-only kwarg: it lands in
+  `litellm_params["metadata"]` for callbacks and is never forwarded to
+  OpenRouter, and `GeneralLlm` passes unknown kwargs through to `acompletion`
+  unchanged, so a tag stamped at construction reaches every completion that LLM
+  makes. A litellm success callback (`RoleSpendTracker`) reads the tag back
+  together with **OpenRouter's own per-call usage accounting** off the
+  response, which is the provider's figure, not litellm's price table. The
+  callback is the one seam that still sees the raw `ModelResponse`:
+  forecasting-tools' `GeneralLlm.invoke` returns only the text, and the
+  `TextTokenCostResponse` it builds keeps litellm's `response_cost` hidden param
+  (about $0 for every BYOK call) and drops the usage object. Only
+  `async_log_success_event` is implemented, because litellm skips the sync hook
+  for `acompletion` unless a sync-only callback is registered, and implementing
+  both would double count. The callback runs on the event loop inside litellm's
+  logging worker and the accumulation has no `await`, so the ledger needs no
+  lock (the same bytecode-atomic argument
+  `fallback_openrouter.record_donated_key_fallback` makes for its counters).
+- The usage fields, and what each one means for the money:
+  `usage.cost` is what OpenRouter charged the key's credits; on a BYOK route that
+  is only OpenRouter's fee (5% of list price, waived under the plan's monthly
+  allowance, so 0 in practice), off BYOK it is the whole charge.
+  `usage.cost_details.upstream_inference_cost` is the provider's own charge on a
+  BYOK route, billed to the BYOK account's owner (Metaculus for the donated key;
+  the operator's own provider account for a personal-key BYOK route), and it is
+  what `/auth/key` books as `byok_usage` and subtracts from `limit_remaining`.
+  OpenRouter's docs say it is 0 or null off BYOK, but since at least 2026-09-03
+  it is reported on non-BYOK calls too, equal to `cost`. `usage.is_byok` says
+  which route the call took. `byok_usd` is the upstream sum on its own.
+- **`usd` double counts non-BYOK rows and is kept as it was.** `usd` is
+  `cost + upstream_inference_cost` summed over the row, the definition it shipped
+  with, and a marker field's meaning never changes in place. Off BYOK that adds
+  the echoed upstream figure to the real charge. The 2026-09-09 cost pass proved
+  it on the three production runs whose only personal-key row was the Google
+  forecaster slot: the key's settled usage moved by that row's `byok_usd` to the
+  cent (0.57 against `usd=1.1433`, 0.14 against 0.2787, 0.67 against 1.3268), so
+  the Google slot costs $0.13 a question, the cheapest of the three, not the
+  $0.27 the raw ledger showed. Since 2026-09-09 every row also carries
+  `charged_usd` (`cost`, plus the upstream cost only on calls with `is_byok`
+  true: the money actually charged across both payers) and `byok_calls` (how
+  many of `calls` routed BYOK). Sum `charged_usd`; `usd` on a pre-2026-09-09
+  personal-key row that reads twice its `byok_usd` is the double count.
+- **Which balance sees which part.** The donated key's `limit_remaining` drop
+  covers `byok_usage`, so it matches `charged_usd`. The personal key's `usage`
+  moves by the `cost` part only (`usd - byok_usd`), so a personal-key BYOK route
+  never appears in any OpenRouter balance and is visible only on this ledger.
+  The 2026-09-03 dry-donated-key run (33775800806) is the worked example: the
+  personal key's usage grew by exactly the Anthropic and Google slots' `cost`
+  ($1.18 + $0.65 = $1.83, settled and unchanged the next day), while the
+  OpenAI-model rows (the resolver, the OpenAI slot, the v2 driver, native
+  search, the summarizer: $8.53 of `byok_usd` with `cost` 0) never touched the
+  credits. The ledger therefore implies the personal OpenRouter account has a
+  BYOK key configured for OpenAI, billed to the operator's own OpenAI account;
+  `byok_calls` on the next personal-key fallback run confirms it directly.
 - `usd=n/a` means none of that row's calls carried cost data. It is never a
   fabricated zero; `costed_calls` says how many of `calls` the sum covers.
 - The four token fields (since 2026-09-09) sum over every call of the row:
@@ -1400,9 +1445,13 @@ How the number is produced, because it decides how to read it:
 
 Harvested as `credit_role_spend.jsonl` in the telemetry archive.
 `uv run python scripts/reconcile_credit_spend.py --roles` (free, offline) prints
-each run's role-ledger total beside its settled per-key spend (the two measure
+each run's role-ledger total (`charged_usd`, falling back to `usd` on the rows
+archived before 2026-09-09) beside its settled per-key spend (the two measure
 the same money from opposite ends, so their ratio is the ledger's own coverage
-check), plus a per-role table over the selected runs.
+check), plus a per-role table over the selected runs. On the personal key the
+ratio compares all charged money against a credits-only balance, so a run that
+fell back to the personal key for OpenAI models reads above 100% by exactly the
+BYOK part.
 
 **The per-question spend figure to quote is `$0.38–0.41`**, measured over 29
 triple-era runs across 33 questions, and it is an OpenRouter-only LOWER bound: it

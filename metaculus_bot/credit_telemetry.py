@@ -472,52 +472,7 @@ def classify_donated_key_state() -> DonatedKeyState:
         return state
 
 
-# --- Per-role dollar attribution ---------------------------------------------
-#
-# WHY. The per-key deltas above cannot say which ROLE spent the money, and every cost
-# argument in the 2026-08-31 gemini-slot review was blocked on exactly that: the measured
-# $0.38-0.41/question could not be split into forecaster vs research vs ranker, so "a 4th
-# member costs +33%" stayed an assertion (scratch/residual_2026-08-31/gemini_review/
-# RECOMMENDATION.md §3, §4 item 4).
-#
-# SOURCE OF TRUTH: OpenRouter's own per-call usage accounting, not litellm's price table.
-# OpenRouter returns a ``usage`` object on every completion (usage accounting is on by
-# default per openrouter.ai/docs/use-cases/usage-accounting; litellm 1.92's OpenRouter
-# transformation also sends ``usage: {include: true}`` explicitly) carrying
-#   * ``cost``: "The total amount charged to your account" — the credits drawn from the
-#     key. Off BYOK routing this is the whole charge; on BYOK routing it is only
-#     OpenRouter's platform fee (5% of list price, waived under a monthly allowance).
-#   * ``cost_details.upstream_inference_cost``: "The actual cost charged by the upstream
-#     AI provider", BYOK requests only, ``0``/``null`` otherwise.
-# The donated Metaculus key routes OpenAI/Anthropic/Google through Metaculus's BYOK
-# integrations, so on that key nearly everything lands in ``upstream_inference_cost`` —
-# which is also what ``/auth/key`` books as ``byok_usage`` and subtracts from
-# ``limit_remaining`` (module docstring: a $3.34 run left ``usage`` frozen). The personal
-# key is not BYOK, so its whole bill is ``cost``. Summing the two therefore gives one
-# number, on either key, that maps onto what ``CREDIT_SPEND`` measures.
-#
-# WHY A litellm CALLBACK. forecasting-tools' ``GeneralLlm.invoke`` returns only the text;
-# the ``TextTokenCostResponse`` it builds keeps litellm's ``response_cost`` hidden param
-# (= ``usage.cost`` via litellm's header lift, i.e. ~$0 for every BYOK call) and drops the
-# usage object itself. The one seam that still sees the raw ``ModelResponse`` — and so
-# ``cost_details`` — is litellm's success callback, which is also how forecasting-tools'
-# own ``LitellmCostTracker`` works. ``litellm.Usage`` keeps every extra field the body
-# carried as an attribute, so ``response.usage.get("cost_details")`` reads straight off it.
-#
-# WHY ``metadata=``. ``metadata`` is a litellm-only kwarg: it lands in
-# ``litellm_params["metadata"]`` for callbacks and is never forwarded to OpenRouter
-# (litellm forwards it to a provider only for OpenAI under ``enable_preview_features``).
-# ``GeneralLlm`` passes unknown kwargs through to ``acompletion`` unchanged, so a
-# ``metadata=llm_call_metadata(role, key_alias)`` stamped at construction reaches every
-# completion that LLM makes. The raw ``acompletion`` path in ``research/agentic/llm.py``
-# stamps the same dict per call.
-#
-# THREADING. The callback runs on the event loop inside litellm's logging worker, and the
-# accumulation below has no ``await``, so the ledger needs no lock — the same
-# bytecode-atomic argument ``fallback_openrouter.record_donated_key_fallback`` makes for
-# the fallback counters. Only ``async_log_success_event`` is implemented: litellm skips
-# the sync ``log_success_event`` for ``acompletion`` unless a sync-only callback is
-# registered, and implementing both would double-count.
+# --- Per-role dollar attribution. Semantics, the callback seam and threading: docs/operations.md "Per-role spend".
 
 # litellm ``metadata=`` keys the ledger reads back. Distinct from the ``KEY_SPECS``
 # aliases below on purpose: these name FIELDS, those name KEYS.
@@ -611,15 +566,24 @@ NO_TOKENS: TokenCounts = TokenCounts()
 class _RoleSpendAccumulator:
     calls: int = 0
     costed_calls: int = 0
+    byok_calls: int = 0
     usd: float = 0.0
     byok_usd: float = 0.0
+    charged_usd: float = 0.0
     tokens: TokenCounts = field(default_factory=TokenCounts)
 
 
 @dataclass(frozen=True)
 class RoleSpendRow:
-    """One ``CREDIT_ROLE_SPEND`` line. ``usd`` / ``byok_usd`` are ``None`` when no call
-    carried cost data (rendered ``n/a``), never a fabricated zero."""
+    """One ``CREDIT_ROLE_SPEND`` line.
+
+    ``usd`` is the original ``cost + upstream_inference_cost`` sum, kept as emitted since
+    2026-09-03; it double counts a non-BYOK call whose upstream cost OpenRouter echoes. Since
+    2026-09-09 ``charged_usd`` is the money actually charged (``cost`` plus, on a BYOK call only,
+    the upstream cost) and ``byok_calls`` says how many of ``calls`` routed BYOK. The three
+    dollar fields are ``None`` when no call carried cost data (rendered ``n/a``), never a
+    fabricated zero.
+    """
 
     role: str
     key_alias: str
@@ -628,6 +592,8 @@ class RoleSpendRow:
     usd: float | None
     byok_usd: float | None
     tokens: TokenCounts
+    charged_usd: float | None
+    byok_calls: int
 
 
 _role_spend: dict[tuple[str, str], _RoleSpendAccumulator] = {}
@@ -639,23 +605,28 @@ def record_llm_call_spend(
     *,
     cost_usd: float | None,
     byok_upstream_usd: float | None,
+    is_byok: bool = False,
     tokens: TokenCounts = NO_TOKENS,
 ) -> None:
     """Add one successful completion to the ledger.
 
-    ``cost_usd`` is OpenRouter's ``usage.cost`` (credits drawn from the key) and
-    ``byok_upstream_usd`` its ``cost_details.upstream_inference_cost`` (the provider's
-    charge on a BYOK route). A call with neither is counted but not costed; its tokens are
-    summed either way. Synchronous and await-free by design — see the THREADING note above.
+    ``cost_usd`` is OpenRouter's ``usage.cost`` (what it charged the key's credits) and
+    ``byok_upstream_usd`` its ``cost_details.upstream_inference_cost`` (the provider's charge,
+    billed to the BYOK account's owner when ``is_byok``). A call with neither is counted but
+    not costed; its tokens are summed either way. Synchronous and await-free by design (the
+    callback runs on the event loop; docs/operations.md "Per-role spend").
     """
     accumulator = _role_spend.setdefault((role, key_alias), _RoleSpendAccumulator())
     accumulator.calls += 1
+    accumulator.byok_calls += is_byok
     accumulator.tokens = accumulator.tokens + tokens
     if cost_usd is None and byok_upstream_usd is None:
         return
     accumulator.costed_calls += 1
     accumulator.usd += (cost_usd or 0.0) + (byok_upstream_usd or 0.0)
     accumulator.byok_usd += byok_upstream_usd or 0.0
+    # Off BYOK, OpenRouter echoes the upstream cost beside cost; only the BYOK route charges both payers.
+    accumulator.charged_usd += (cost_usd or 0.0) + ((byok_upstream_usd or 0.0) if is_byok else 0.0)
 
 
 def role_spend_rows() -> list[RoleSpendRow]:
@@ -669,6 +640,8 @@ def role_spend_rows() -> list[RoleSpendRow]:
             usd=acc.usd if acc.costed_calls else None,
             byok_usd=acc.byok_usd if acc.costed_calls else None,
             tokens=acc.tokens,
+            charged_usd=acc.charged_usd if acc.costed_calls else None,
+            byok_calls=acc.byok_calls,
         )
         for (role, key_alias), acc in _role_spend.items()
     ]
@@ -700,7 +673,8 @@ def log_role_spend() -> None:
     for row in rows:
         logger.info(
             "CREDIT_ROLE_SPEND: role=%s key=%s usd=%s calls=%d costed_calls=%d byok_usd=%s"
-            " prompt_tokens=%d completion_tokens=%d cached_tokens=%d reasoning_tokens=%d",
+            " prompt_tokens=%d completion_tokens=%d cached_tokens=%d reasoning_tokens=%d"
+            " charged_usd=%s byok_calls=%d",
             row.role,
             row.key_alias,
             _fmt_usd(row.usd),
@@ -711,15 +685,18 @@ def log_role_spend() -> None:
             row.tokens.completion,
             row.tokens.cached,
             row.tokens.reasoning,
+            _fmt_usd(row.charged_usd),
+            row.byok_calls,
         )
 
 
 @dataclass(frozen=True)
 class _CallUsage:
-    """What one completion's ``usage`` object says about money and tokens."""
+    """What one completion's ``usage`` object says about money, routing and tokens."""
 
     cost_usd: float | None
     byok_upstream_usd: float | None
+    is_byok: bool
     tokens: TokenCounts
 
 
@@ -735,16 +712,17 @@ def _usage_token_counts(usage: Any) -> TokenCounts:
 
 
 def _openrouter_call_usage(response_obj: Any) -> _CallUsage:
-    """Read ``usage.cost``, ``usage.cost_details.upstream_inference_cost`` and the token counts
-    off a litellm response; each dollar figure is ``None`` when unreported (or non-finite, same
-    rule as ``_as_float``), and a response without ``usage`` reads as uncosted with zero tokens."""
+    """Read ``usage.cost``, ``usage.cost_details.upstream_inference_cost``, ``usage.is_byok`` and the
+    token counts off a litellm response; each dollar figure is ``None`` when unreported (or
+    non-finite, same rule as ``_as_float``), and a response without ``usage`` reads as uncosted."""
     usage = getattr(response_obj, "usage", None)
     if usage is None:
-        return _CallUsage(cost_usd=None, byok_upstream_usd=None, tokens=NO_TOKENS)
+        return _CallUsage(cost_usd=None, byok_upstream_usd=None, is_byok=False, tokens=NO_TOKENS)
     cost_details = usage.get("cost_details") or {}
     return _CallUsage(
         cost_usd=_as_float(usage.get("cost")),
         byok_upstream_usd=_as_float(cost_details.get("upstream_inference_cost")),
+        is_byok=usage.get("is_byok") is True,
         tokens=_usage_token_counts(usage),
     )
 
@@ -764,6 +742,7 @@ class RoleSpendTracker(CustomLogger):
             metadata.get(KEY_ALIAS_METADATA_KEY, UNKNOWN_KEY_ALIAS),
             cost_usd=usage.cost_usd,
             byok_upstream_usd=usage.byok_upstream_usd,
+            is_byok=usage.is_byok,
             tokens=usage.tokens,
         )
 

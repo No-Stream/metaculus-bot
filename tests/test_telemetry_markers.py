@@ -1702,12 +1702,13 @@ class TestCredit:
 CREDIT_ROLE_SPEND_LINE = (
     PFX + "CREDIT_ROLE_SPEND: role=forecaster:openai key=donated usd=0.2030 calls=2 costed_calls=2 byok_usd=0.2000"
     " prompt_tokens=104000 completion_tokens=12500 cached_tokens=0 reasoning_tokens=11000"
+    " charged_usd=0.2030 byok_calls=2"
 )
 CREDIT_ROLE_SPEND_NA_LINE = (
     PFX + "CREDIT_ROLE_SPEND: role=perplexity_research key=direct usd=n/a calls=2 costed_calls=0 byok_usd=n/a"
-    " prompt_tokens=0 completion_tokens=0 cached_tokens=0 reasoning_tokens=0"
+    " prompt_tokens=0 completion_tokens=0 cached_tokens=0 reasoning_tokens=0 charged_usd=n/a byok_calls=0"
 )
-# The pre-2026-09-09 shape, still in the archive: no token tail.
+# The pre-2026-09-09 shape, still in the archive: neither the token tail nor the charged tail.
 CREDIT_ROLE_SPEND_PRE_TOKENS_LINE = (
     PFX + "CREDIT_ROLE_SPEND: role=forecaster:google key=personal usd=1.1433 calls=4 costed_calls=4 byok_usd=0.5716"
 )
@@ -1729,10 +1730,12 @@ class TestCreditRoleSpend:
         assert rec["byok_usd"] == 0.2000
         assert (rec["prompt_tokens"], rec["completion_tokens"]) == (104000, 12500)
         assert (rec["cached_tokens"], rec["reasoning_tokens"]) == (0, 11000)
+        assert (rec["charged_usd"], rec["byok_calls"]) == (0.2030, 2)
 
-    def test_pre_token_rows_still_parse_with_the_token_fields_absent(self):
-        """The token tail was added 2026-09-09; the 44 archived rows before it must keep harvesting,
-        and their token fields read None ("this run predates the field"), never a fake zero."""
+    def test_pre_token_rows_still_parse_with_the_new_fields_absent(self):
+        """Both 2026-09-09 tails are optional; the 44 archived rows before them must keep harvesting,
+        with the new fields read as None ("this run predates the field"), never a fake zero. This
+        row is the double-counted personal-key Google slot: usd is twice byok_usd."""
         rec = _parse_one(CREDIT_ROLE_SPEND_PRE_TOKENS_LINE)
         assert (rec["role"], rec["key"], rec["usd"], rec["byok_usd"]) == (
             "forecaster:google",
@@ -1741,10 +1744,10 @@ class TestCreditRoleSpend:
             0.5716,
         )
         assert (rec["calls"], rec["costed_calls"]) == (4, 4)
-        assert rec["prompt_tokens"] is None
-        assert rec["completion_tokens"] is None
-        assert rec["cached_tokens"] is None
-        assert rec["reasoning_tokens"] is None
+        for field in ("prompt_tokens", "completion_tokens", "cached_tokens", "reasoning_tokens"):
+            assert rec[field] is None, field
+        assert rec["charged_usd"] is None
+        assert rec["byok_calls"] is None
 
     def test_uncosted_row_reads_none_not_zero(self):
         """``n/a`` is the whole point of ``costed_calls``: the calls happened, the dollars are unknown, and a
@@ -1754,7 +1757,8 @@ class TestCreditRoleSpend:
         assert rec["key"] == "direct"
         assert rec["usd"] is None
         assert rec["byok_usd"] is None
-        assert (rec["calls"], rec["costed_calls"]) == (2, 0)
+        assert rec["charged_usd"] is None
+        assert (rec["calls"], rec["costed_calls"], rec["byok_calls"]) == (2, 0, 0)
 
     def test_empty_ledger_line_is_not_a_row(self):
         """The no-completions line shares the token so it is greppable, but it must not harvest as a

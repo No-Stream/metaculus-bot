@@ -1201,6 +1201,27 @@ upstream-provider charge OpenRouter reports beside its own `usage.cost`. Roles a
 `credit_telemetry.llm_call_metadata` (`forecaster:<vendor>`, `parser`, `native_search`, ...);
 `untagged` means a completion nobody stamped.
 
+`usd` is `usage.cost + upstream_inference_cost` summed over the row, the definition it has had
+since the marker shipped on 2026-09-03, and it is kept in place because the field's meaning may
+not change. It DOUBLE COUNTS a non-BYOK call: OpenRouter's docs say `upstream_inference_cost` is
+0 or null off BYOK, but since at least 2026-09-03 it is reported on non-BYOK calls too, equal to
+`cost`, while only `cost` is drawn from the key. The 2026-09-09 cost pass proved it on the three
+production runs whose only personal-key row was the Google forecaster slot: the key's settled
+usage moved by that row's `byok_usd` to the cent (0.57 against `usd=1.1433`, 0.14 against
+0.2787, 0.67 against 1.3268), so the slot costs $0.13 a question, not $0.27
+(`scratch/cost_pass_2026-09-09/cost_anatomy.md` section 2). A pre-2026-09-09 personal-key row
+whose `usd` is twice its `byok_usd` is that double count.
+
+`charged_usd` and `byok_calls`, added 2026-09-09, are the correction: `charged_usd` sums `cost`
+plus, on calls whose `usage.is_byok` is true, `upstream_inference_cost`, so it is the money
+actually charged across both payers (OpenRouter credits, and the BYOK account's owner for the
+upstream part); `byok_calls` is how many of `calls` routed BYOK. On a BYOK row `charged_usd ==
+usd`; on a non-BYOK row `charged_usd == usd - byok_usd`. A row with `byok_calls=0` but
+`byok_usd > charged_usd` on the donated key would mean OpenRouter stopped sending `is_byok`,
+which is then visible rather than silently zeroed. Consumers sum `charged_usd`
+(`scripts/reconcile_credit_spend.py` falls back to `usd` on the 44 older rows). Both 2026-09-09
+tails are optional regex groups, so those older rows still harvest with the new fields as None.
+
 Token fields, added 2026-09-09 and summed over every call of the row (costed or not):
 `prompt_tokens` and `completion_tokens` are the base counts; `cached_tokens` is
 `usage.prompt_tokens_details.cached_tokens`, the prompt tokens the provider served from its prompt

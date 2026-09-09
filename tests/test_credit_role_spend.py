@@ -57,6 +57,7 @@ from metaculus_bot.llm_configs import (
 from scripts.telemetry.markers import MARKER_SPECS
 
 NO_TOKENS_TAIL = " prompt_tokens=0 completion_tokens=0 cached_tokens=0 reasoning_tokens=0"
+UNCOSTED_TAIL = NO_TOKENS_TAIL + " charged_usd=n/a byok_calls=0"
 
 
 @pytest.fixture
@@ -106,8 +107,12 @@ class TestRoleSpendLedger:
         """Two donated-key forecaster calls (BYOK: a small OpenRouter fee in ``cost`` plus the
         provider charge in ``upstream_inference_cost``) and one personal-key call whose whole
         charge is ``cost``. Same role, different keys, so two rows."""
-        record_llm_call_spend("forecaster:openai", DONATED_KEY_ALIAS, cost_usd=0.001, byok_upstream_usd=0.12)
-        record_llm_call_spend("forecaster:openai", DONATED_KEY_ALIAS, cost_usd=0.002, byok_upstream_usd=0.08)
+        record_llm_call_spend(
+            "forecaster:openai", DONATED_KEY_ALIAS, cost_usd=0.001, byok_upstream_usd=0.12, is_byok=True
+        )
+        record_llm_call_spend(
+            "forecaster:openai", DONATED_KEY_ALIAS, cost_usd=0.002, byok_upstream_usd=0.08, is_byok=True
+        )
         record_llm_call_spend("forecaster:openai", PERSONAL_KEY_ALIAS, cost_usd=0.25, byok_upstream_usd=None)
 
         with caplog.at_level(logging.INFO, logger="metaculus_bot.credit_telemetry"):
@@ -115,9 +120,37 @@ class TestRoleSpendLedger:
 
         assert _role_lines(caplog) == [
             "CREDIT_ROLE_SPEND: role=forecaster:openai key=personal usd=0.2500 calls=1 costed_calls=1 byok_usd=0.0000"
-            + NO_TOKENS_TAIL,
+            + NO_TOKENS_TAIL
+            + " charged_usd=0.2500 byok_calls=0",
             "CREDIT_ROLE_SPEND: role=forecaster:openai key=donated usd=0.2030 calls=2 costed_calls=2 byok_usd=0.2000"
-            + NO_TOKENS_TAIL,
+            + NO_TOKENS_TAIL
+            + " charged_usd=0.2030 byok_calls=2",
+        ]
+
+    def test_charged_usd_counts_the_upstream_cost_only_on_byok_calls(self, caplog) -> None:
+        """The double count the 2026-09-09 cost pass found: off BYOK, OpenRouter echoes the upstream
+        cost beside ``cost`` (the personal-key Google slot: 0.57 charged, 1.14 in ``usd``), and only
+        ``cost`` hits the key. ``usd`` keeps its old meaning; ``charged_usd`` is the money."""
+        record_llm_call_spend(
+            "forecaster:google", PERSONAL_KEY_ALIAS, cost_usd=0.5716, byok_upstream_usd=0.5716, is_byok=False
+        )
+        record_llm_call_spend(
+            "forecaster:openai", DONATED_KEY_ALIAS, cost_usd=0.0, byok_upstream_usd=1.1409, is_byok=True
+        )
+        record_llm_call_spend(
+            "forecaster:openai", DONATED_KEY_ALIAS, cost_usd=None, byok_upstream_usd=None, is_byok=True
+        )
+
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.credit_telemetry"):
+            log_role_spend()
+
+        assert _role_lines(caplog) == [
+            "CREDIT_ROLE_SPEND: role=forecaster:google key=personal usd=1.1432 calls=1 costed_calls=1 byok_usd=0.5716"
+            + NO_TOKENS_TAIL
+            + " charged_usd=0.5716 byok_calls=0",
+            "CREDIT_ROLE_SPEND: role=forecaster:openai key=donated usd=1.1409 calls=2 costed_calls=1 byok_usd=1.1409"
+            + NO_TOKENS_TAIL
+            + " charged_usd=1.1409 byok_calls=2",
         ]
 
     def test_token_counts_sum_per_row_including_uncosted_calls(self, caplog) -> None:
@@ -128,6 +161,7 @@ class TestRoleSpendLedger:
             DONATED_KEY_ALIAS,
             cost_usd=0.0,
             byok_upstream_usd=0.03,
+            is_byok=True,
             tokens=TokenCounts(prompt=40_000, completion=900, cached=38_000, reasoning=700),
         )
         record_llm_call_spend(
@@ -135,6 +169,7 @@ class TestRoleSpendLedger:
             DONATED_KEY_ALIAS,
             cost_usd=None,
             byok_upstream_usd=None,
+            is_byok=True,
             tokens=TokenCounts(prompt=1_000, completion=100, cached=0, reasoning=50),
         )
 
@@ -143,7 +178,8 @@ class TestRoleSpendLedger:
 
         assert _role_lines(caplog) == [
             "CREDIT_ROLE_SPEND: role=gap_fill_v2_driver key=donated usd=0.0300 calls=2 costed_calls=1 byok_usd=0.0300"
-            " prompt_tokens=41000 completion_tokens=1000 cached_tokens=38000 reasoning_tokens=750",
+            " prompt_tokens=41000 completion_tokens=1000 cached_tokens=38000 reasoning_tokens=750"
+            " charged_usd=0.0300 byok_calls=2",
         ]
 
     def test_uncosted_calls_render_na_not_zero(self, caplog) -> None:
@@ -157,7 +193,7 @@ class TestRoleSpendLedger:
 
         assert _role_lines(caplog) == [
             "CREDIT_ROLE_SPEND: role=perplexity_research key=direct usd=n/a calls=2 costed_calls=0 byok_usd=n/a"
-            + NO_TOKENS_TAIL,
+            + UNCOSTED_TAIL,
         ]
 
     def test_mixed_costed_and_uncosted_reports_both_counts(self, caplog) -> None:
@@ -170,7 +206,8 @@ class TestRoleSpendLedger:
 
         assert _role_lines(caplog) == [
             "CREDIT_ROLE_SPEND: role=parser key=donated usd=0.0100 calls=2 costed_calls=1 byok_usd=0.0000"
-            + NO_TOKENS_TAIL,
+            + NO_TOKENS_TAIL
+            + " charged_usd=0.0100 byok_calls=0",
         ]
 
     def test_rows_sort_by_usd_descending_with_uncosted_last(self) -> None:
@@ -218,8 +255,14 @@ class TestRoleSpendLedger:
         assert uncosted is not None
         assert costed.group("cached_tokens") == "0"
         assert costed.group("reasoning_tokens") == "5200"
+        assert (costed.group("usd"), costed.group("charged_usd"), costed.group("byok_calls")) == (
+            "1.1400",
+            "0.5700",
+            "0",
+        )
         assert uncosted.group("usd") == "n/a"
         assert uncosted.group("prompt_tokens") == "0"
+        assert (uncosted.group("charged_usd"), uncosted.group("byok_calls")) == ("n/a", "0")
 
     def test_key_aliases_are_the_credit_spend_key_names(self) -> None:
         """``CREDIT_ROLE_SPEND key=`` must join onto ``CREDIT_SPEND key=`` / ``CREDIT_BALANCE key=``,
@@ -268,17 +311,62 @@ class TestLlmCallMetadata:
 @pytest.mark.usefixtures("clean_role_ledger")
 class TestRoleSpendTracker:
     async def test_callback_reads_role_key_and_openrouter_usage_fields(self) -> None:
+        """A BYOK call: OpenRouter's fee in ``cost``, the provider's charge in ``upstream_inference_cost``,
+        ``is_byok`` true. Both payers were charged, so ``charged_usd`` is their sum."""
         tracker = RoleSpendTracker()
-        response = _response_with_usage(cost=0.0015, cost_details={"upstream_inference_cost": 0.31})
+        response = _response_with_usage(cost=0.0015, is_byok=True, cost_details={"upstream_inference_cost": 0.31})
 
         await tracker.async_log_success_event(
             _success_kwargs(llm_call_metadata("stacker", DONATED_KEY_ALIAS)), response, None, None
         )
 
         (row,) = role_spend_rows()
-        assert (row.role, row.key_alias, row.calls, row.costed_calls) == ("stacker", DONATED_KEY_ALIAS, 1, 1)
+        assert (row.role, row.key_alias, row.calls, row.costed_calls, row.byok_calls) == (
+            "stacker",
+            DONATED_KEY_ALIAS,
+            1,
+            1,
+            1,
+        )
         assert row.usd == pytest.approx(0.3115)
         assert row.byok_usd == pytest.approx(0.31)
+        assert row.charged_usd == pytest.approx(0.3115)
+
+    async def test_non_byok_call_that_echoes_upstream_cost_is_charged_once(self) -> None:
+        """The production shape behind the double count (run 34091717001, the personal-key Google
+        slot): ``cost`` and ``upstream_inference_cost`` both 0.1394, ``is_byok`` false, and the key's
+        settled usage moved by 0.14. ``usd`` still shows the legacy sum so old rows stay comparable."""
+        tracker = RoleSpendTracker()
+        response = _response_with_usage(cost=0.1394, is_byok=False, cost_details={"upstream_inference_cost": 0.1394})
+
+        await tracker.async_log_success_event(
+            _success_kwargs(llm_call_metadata("forecaster:google", PERSONAL_KEY_ALIAS)), response, None, None
+        )
+
+        (row,) = role_spend_rows()
+        assert row.usd == pytest.approx(0.2788)
+        assert row.byok_usd == pytest.approx(0.1394)
+        assert row.charged_usd == pytest.approx(0.1394)
+        assert row.byok_calls == 0
+
+    async def test_usage_without_is_byok_reads_as_not_byok(self) -> None:
+        """A body that omits ``is_byok`` charges ``cost`` only; on a BYOK key that shows as
+        ``charged_usd`` below ``byok_usd`` with ``byok_calls=0``, the visible signature of
+        OpenRouter dropping the field, not a silent zero."""
+        tracker = RoleSpendTracker()
+        response = _response_with_usage(cost=0.0, cost_details={"upstream_inference_cost": 0.31})
+
+        await tracker.async_log_success_event(
+            _success_kwargs(llm_call_metadata("summarizer", DONATED_KEY_ALIAS)), response, None, None
+        )
+
+        (row,) = role_spend_rows()
+        assert (row.usd, row.byok_usd, row.charged_usd, row.byok_calls) == (
+            pytest.approx(0.31),
+            pytest.approx(0.31),
+            0.0,
+            0,
+        )
 
     async def test_callback_reads_cached_and_reasoning_tokens_off_the_usage_details(self) -> None:
         """The two OpenRouter detail objects, ``prompt_tokens_details.cached_tokens`` and
@@ -331,7 +419,12 @@ class TestRoleSpendTracker:
         )
 
         (row,) = role_spend_rows()
-        assert (row.usd, row.byok_usd, row.costed_calls) == (pytest.approx(0.02), 0.0, 1)
+        assert (row.usd, row.byok_usd, row.charged_usd, row.costed_calls) == (
+            pytest.approx(0.02),
+            0.0,
+            pytest.approx(0.02),
+            1,
+        )
 
     async def test_missing_metadata_files_under_untagged_and_unknown_key(self) -> None:
         """Any litellm completion the bot did not build (forecasting-tools' own helpers, an
@@ -362,7 +455,7 @@ class TestRoleSpendTracker:
         )
 
         (row,) = role_spend_rows()
-        assert (row.calls, row.costed_calls, row.usd, row.tokens) == (1, 0, None, TokenCounts())
+        assert (row.calls, row.costed_calls, row.usd, row.charged_usd, row.tokens) == (1, 0, None, None, TokenCounts())
 
     async def test_non_finite_cost_is_treated_as_unreported(self) -> None:
         """Same rule as the balance parser: NaN would poison every sum it touched."""

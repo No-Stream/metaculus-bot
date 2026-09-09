@@ -1,37 +1,22 @@
 """Reconcile per-run OpenRouter spend against the telemetry archive.
 
-Why this exists
----------------
-``CREDIT_SPEND: key=personal`` is a LOWER BOUND, and often reads ``0.00`` on a run
-that spent real money. The personal key reports no ``limit_remaining``, so the
-per-run delta falls back to the lifetime ``usage`` field — and OpenRouter has
-typically not settled a run's spend by the time the end snapshot fires, seconds
-after the last call.
+``CREDIT_SPEND: key=personal`` is a LOWER BOUND that often reads ``0.00`` on a run that spent
+real money: the personal key reports no ``limit_remaining``, so its per-run delta falls back to
+the lifetime ``usage`` field, which OpenRouter has typically not settled by the time the end
+snapshot fires. The settled figure IS recoverable afterwards, and that is what this script
+computes: for each run, the next observation's usage minus this run's start usage. The final
+run in the archive has no successor, so its spend is reported as still-unsettled rather than
+guessed at. The measurements behind the diagnosis (settlement lag, not BYOK) are in
+docs/operations.md "Credit telemetry and the refill floor".
 
-Measured over ``backtests/telemetry_archive/credit_balance.jsonl`` (178 paired
-personal-key runs, 2026-07-20 to 2026-07-27): within-run deltas summed to $3.31
-against $5.66 of true lifetime-usage growth, so the marker captured 58%. The
-missing $2.35 is fully recovered by the gap between each run's ``phase=end`` usage
-and the NEXT run's ``phase=start`` usage — $3.31 + $2.35 = $5.66 exactly. The money
-is not lost, just late.
-
-So the honest per-run figure is not obtainable at end-of-run. It IS obtainable
-afterwards, which is what this script computes: for each run, the settled spend is
-the next observation's usage minus this run's start usage. The final run in the
-archive has no successor, so its spend is reported as still-unsettled rather than
-guessed at.
-
-Free and offline: reads only the local archive. Run ``make sync_all`` first if you
-want the archive current (that pull is also free).
-
-``--roles`` adds the per-role ledger (``credit_role_spend.jsonl``, the
-``CREDIT_ROLE_SPEND`` marker, since the 2026-09 bundle): each run's role-ledger
-total for the same key beside its settled spend — the two measure the same money
-from opposite ends (OpenRouter's per-call usage accounting vs. the key's booked
-balance), so their ratio is the ledger's own coverage check — plus a per-(role, key)
-table over the selected runs, which is the decomposition every cost argument used
-to lack. Both printed coverage ratios cover the SETTLED runs only, since the trailing
-run's settled spend is unknown and every figure states the run set it sums.
+``--roles`` adds the per-role ledger (``credit_role_spend.jsonl``, the ``CREDIT_ROLE_SPEND``
+marker): each run's role-ledger total for the same key beside its settled spend, since the two
+measure the same money from opposite ends, plus a per-(role, key) table over the selected runs.
+The ledger figure is each row's ``charged_usd`` (the money actually charged, since 2026-09-09),
+falling back to the older ``usd`` on rows archived before that field existed; ``usd`` double
+counts non-BYOK rows that echoed the upstream cost (docs/operations.md "Per-role spend").
+Both printed coverage ratios cover the SETTLED runs only, and every figure states the run set
+it sums. Free and offline: reads only the local archive (``make sync_all`` refreshes it).
 
 Usage
 -----
@@ -100,8 +85,7 @@ def _paired_snapshots(records: list[dict], key: str) -> list[tuple[str, dict, di
         for run_id, phases in by_run.items()
         if "start" in phases and "end" in phases
     ]
-    # Order by the START snapshot's own timestamp: run_date is the workflow's
-    # dispatch time, which can tie across concurrently-dispatched runs.
+    # Order by the START snapshot's own timestamp: run_date is the dispatch time and ties across concurrent runs.
     return sorted(paired, key=lambda triple: (triple[1].get("line_ts") or "", triple[0]))
 
 
@@ -159,12 +143,12 @@ class SettledCohort:
 
 @dataclass(frozen=True)
 class RunRoleSpend:
-    """One run's role-ledger total on one key. ``usd`` is None when no row carried cost."""
+    """One run's role-ledger total on one key. ``charged_usd`` is None when no row carried cost."""
 
     run_id: str
     rows: int
     costed_rows: int
-    usd: float | None
+    charged_usd: float | None
 
 
 @dataclass(frozen=True)
@@ -175,7 +159,14 @@ class RoleTotal:
     key: str
     calls: int
     costed_calls: int
-    usd: float | None
+    charged_usd: float | None
+
+
+def row_charged_usd(record: dict) -> float | None:
+    """The money a ``credit_role_spend`` row actually charged: ``charged_usd`` since 2026-09-09,
+    else the older ``usd`` (which double counts non-BYOK rows that echoed the upstream cost)."""
+    charged = record.get("charged_usd")
+    return charged if charged is not None else record.get("usd")
 
 
 def role_spend_by_run(role_records: list[dict], key: str) -> dict[str, RunRoleSpend]:
@@ -183,8 +174,8 @@ def role_spend_by_run(role_records: list[dict], key: str) -> dict[str, RunRoleSp
 
     Comparable with :func:`reconcile`'s ``settled_usd`` for the same key: both are that key's
     spend on that run, one read per call from OpenRouter's usage accounting, the other from
-    the key's booked balance. A row whose ``usd`` is None (no cost data) is counted but not
-    summed, and a run with only such rows reports ``usd=None`` rather than a false zero.
+    the key's booked balance. A row with no cost data is counted but not summed, and a run
+    with only such rows reports ``charged_usd=None`` rather than a false zero.
     """
     by_run: dict[str, list[dict]] = defaultdict(list)
     for record in role_records:
@@ -192,9 +183,9 @@ def role_spend_by_run(role_records: list[dict], key: str) -> dict[str, RunRoleSp
             by_run[record["run_id"]].append(record)
     out: dict[str, RunRoleSpend] = {}
     for run_id, rows in by_run.items():
-        costed = [row["usd"] for row in rows if row.get("usd") is not None]
+        costed = [charged for charged in map(row_charged_usd, rows) if charged is not None]
         out[run_id] = RunRoleSpend(
-            run_id=run_id, rows=len(rows), costed_rows=len(costed), usd=sum(costed) if costed else None
+            run_id=run_id, rows=len(rows), costed_rows=len(costed), charged_usd=sum(costed) if costed else None
         )
     return out
 
@@ -204,25 +195,31 @@ def aggregate_roles(role_records: list[dict], run_ids: set[str] | None = None) -
     rows with no cost data last."""
     calls: dict[tuple[str, str], int] = defaultdict(int)
     costed_calls: dict[tuple[str, str], int] = defaultdict(int)
-    usd: dict[tuple[str, str], float | None] = {}
+    charged: dict[tuple[str, str], float | None] = {}
     for record in role_records:
         if run_ids is not None and record["run_id"] not in run_ids:
             continue
         line = (record["role"], record["key"])
         calls[line] += record["calls"]
         costed_calls[line] += record["costed_calls"]
-        row_usd = record.get("usd")
-        if row_usd is not None:
-            usd[line] = (usd.get(line) or 0.0) + row_usd
+        row_charged = row_charged_usd(record)
+        if row_charged is not None:
+            charged[line] = (charged.get(line) or 0.0) + row_charged
         else:
-            usd.setdefault(line, None)
+            charged.setdefault(line, None)
     totals = [
         RoleTotal(
-            role=role, key=key, calls=calls[(role, key)], costed_calls=costed_calls[(role, key)], usd=usd[(role, key)]
+            role=role,
+            key=key,
+            calls=calls[(role, key)],
+            costed_calls=costed_calls[(role, key)],
+            charged_usd=charged[(role, key)],
         )
         for role, key in calls
     ]
-    return sorted(totals, key=lambda total: (total.usd is None, -(total.usd or 0.0), total.role, total.key))
+    return sorted(
+        totals, key=lambda total: (total.charged_usd is None, -(total.charged_usd or 0.0), total.role, total.key)
+    )
 
 
 def _fmt(value: float | None) -> str:
@@ -249,11 +246,13 @@ def _print_role_table(role_records: list[dict], run_ids: set[str]) -> None:
     if not totals:
         print("\nno credit_role_spend rows for the selected runs")
         return
-    grand = sum(total.usd or 0.0 for total in totals)
-    print(f"\n{'role':24} {'key':9} {'calls':>6} {'costed':>6} {'usd':>8} {'share':>6}")
+    grand = sum(total.charged_usd or 0.0 for total in totals)
+    print(f"\n{'role':24} {'key':9} {'calls':>6} {'costed':>6} {'charged':>8} {'share':>6}")
     for total in totals:
-        share = "   n/a" if total.usd is None or grand <= 0 else f"{total.usd / grand:6.0%}"
-        print(f"{total.role:24} {total.key:9} {total.calls:6d} {total.costed_calls:6d} {_fmt4(total.usd)} {share}")
+        share = "   n/a" if total.charged_usd is None or grand <= 0 else f"{total.charged_usd / grand:6.0%}"
+        print(
+            f"{total.role:24} {total.key:9} {total.calls:6d} {total.costed_calls:6d} {_fmt4(total.charged_usd)} {share}"
+        )
     print(f"{'total (all keys, costed)':24} {'':9} {'':6} {'':6} {_fmt4(grand)}")
 
 
@@ -281,7 +280,7 @@ def _print_run_table(rows: list[RunSpend], role_totals: dict[str, RunRoleSpend] 
         roles_cell = ""
         if role_totals is not None:
             run_roles = role_totals.get(row.run_id)
-            roles_cell = f" {_fmt4(None if run_roles is None else run_roles.usd)}"
+            roles_cell = f" {_fmt4(None if run_roles is None else run_roles.charged_usd)}"
         print(
             f"{row.run_date[:16]:17} {row.run_id:12} {row.workflow:16} "
             f"{_fmt(row.within_run_usd)} {_fmt(row.settled_usd)} {_fmt(row.lagged_usd)}{roles_cell}{note}"
@@ -299,9 +298,7 @@ def _print_key_totals(rows: list[RunSpend]) -> SettledCohort:
     print(f"\nmarker-reported total: ${marker_total:.2f}  (all {len(rows)} runs)")
     print(f"settled total:         ${cohort.usd:.2f}  ({cohort.label})")
     if cohort.usd > 0:
-        # Numerator restricted to the settled cohort, because the denominator is: summing the
-        # markers of runs whose settled spend is unknown against a total that cannot include
-        # them overstates capture, and reads over 100% whenever the trailing run spent much.
+        # Numerator restricted to the settled cohort because the denominator is; otherwise it reads over 100%.
         marker_on_settled = sum(row.within_run_usd or 0.0 for row in settled_rows)
         print(f"marker captured:       {marker_on_settled / cohort.usd:.0%} of settled spend ({cohort.label})")
     zeros = sum(1 for row in rows if row.within_run_usd == 0.0)
@@ -325,10 +322,12 @@ def _print_role_summary(
     too), and the table's grand total, which spans BOTH keys because its rows do.
     """
     selected_run_ids = {row.run_id for row in rows}
-    roles_total = sum(run.usd or 0.0 for run_id, run in role_totals.items() if run_id in selected_run_ids)
+    roles_total = sum(run.charged_usd or 0.0 for run_id, run in role_totals.items() if run_id in selected_run_ids)
     print(f"role-ledger total ({key}, all {len(rows)} runs): ${roles_total:.4f}")
     if settled.usd > 0:
-        roles_on_settled = sum(run.usd or 0.0 for run_id, run in role_totals.items() if run_id in settled.run_ids)
+        roles_on_settled = sum(
+            run.charged_usd or 0.0 for run_id, run in role_totals.items() if run_id in settled.run_ids
+        )
         print(f"role ledger covers:    {roles_on_settled / settled.usd:.0%} of settled spend ({settled.label})")
     _print_role_table(role_records, selected_run_ids)
 
