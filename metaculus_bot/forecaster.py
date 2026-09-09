@@ -158,9 +158,6 @@ class TemplateForecaster(CompactLoggingForecastBot):
         research_sink: Any | None = None,
         metaculus_client: MetaculusClient | None = None,
     ) -> None:
-        if not isinstance(aggregation_strategy, AggregationStrategy):
-            raise ValueError(f"aggregation_strategy must be an AggregationStrategy enum, got {aggregation_strategy}")
-
         setup = prepare_llm_config(
             llms=llms,
             aggregation_strategy=aggregation_strategy,
