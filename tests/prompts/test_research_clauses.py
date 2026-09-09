@@ -106,7 +106,31 @@ class TestGapFillAnalyzerPrompt:
 
 
 class TestGapFillSearchPrompt:
-    """Covers the benchmarking carve-out in the per-gap search prompt."""
+    """The benchmarking carve-out in the per-gap search prompt, and the criteria slot the resolver reads."""
+
+    # q44267 as the API served it: the title names the zone, the criteria pin the zone-entry SUBSET.
+    _Q44267_TITLE = (
+        "What will be the highest daily number of PLA aircraft tracked by Taiwan's Ministry of National "
+        "Defense in Taiwan's air-defense identification zone (ADIZ) in July-August 2026?"
+    )
+    _Q44267_CRITERIA = (
+        "This question resolves as the highest number of PLA aircraft accused by Taiwan's Ministry of "
+        "National Defense (MND) of having been detected in Taiwan's de facto ADIZ for any date after "
+        "June 30, 2026 and before September 1, 2026, as reported by the MND at its "
+        "[Regional Dynamic List ](https://www.mnd.gov.tw/news/plaactlist)portal.&#x20;"
+    )
+    _Q44267_FINE_PRINT = (
+        "This question's information (resolution criteria, fine print, background info, etc) is synced "
+        "with an [original identical question](https://www.metaculus.com/questions/44245) which opened on "
+        "2026-06-26 20:00:00. This question will resolve based on the resolution criteria and fine print "
+        "of the linked original question. However, if this question would resolve differently than the "
+        "original question, then this question will be annulled. Additionally, if the original question's "
+        "resolution could have been known before this question opened, then this question will be annulled."
+    )
+    _Q44267_GAP = (
+        "Clarify whether the question resolves on total PLA aircraft detected around Taiwan in each MND "
+        "daily report or only the subset that crossed the median line or entered ADIZ sectors"
+    )
 
     def test_benchmarking_true_includes_warning_and_bans_prediction_markets(self) -> None:
         """The per-gap search prompt also needs the benchmarking carve-out."""
@@ -114,6 +138,8 @@ class TestGapFillSearchPrompt:
             gap="What was the 2025 GDP?",
             search_query="US 2025 GDP BEA",
             question_text="Will GDP exceed 30T?",
+            resolution_criteria="rc",
+            fine_print="fp",
             is_benchmarking=True,
         )
 
@@ -130,6 +156,8 @@ class TestGapFillSearchPrompt:
             gap="What was the 2025 GDP?",
             search_query="US 2025 GDP BEA",
             question_text="Will GDP exceed 30T?",
+            resolution_criteria="rc",
+            fine_print="fp",
             is_benchmarking=False,
         )
 
@@ -145,12 +173,77 @@ class TestGapFillSearchPrompt:
             gap="Was the treaty signed?",
             search_query="treaty signing Sept 2026",
             question_text="Will the treaty be in force by 2027?",
+            resolution_criteria="rc",
+            fine_print="fp",
             is_benchmarking=False,
         )
 
         assert "Was the treaty signed?" in result
         assert "treaty signing Sept 2026" in result
         assert "Will the treaty be in force by 2027?" in result
+
+    def test_renders_the_resolution_criteria_and_fine_print_after_the_title(self) -> None:
+        """The resolver reads what the question resolves on, labelled so the criteria outrank the
+        title and any sister question it finds, and placed before the search instruction."""
+        result = gap_fill_search_prompt(
+            gap="Which of the two published figures resolves the question?",
+            search_query="official count definition",
+            question_text="Will the count exceed 40?",
+            resolution_criteria="Resolves YES if the official count exceeds 40.",
+            fine_print="Counts from the June revision are used.",
+        )
+
+        assert (
+            "Resolution criteria (what the question actually resolves on):\n"
+            "Resolves YES if the official count exceeds 40." in result
+        )
+        assert "Fine print:\nCounts from the June revision are used." in result
+        assert (
+            result.index("Will the count exceed 40?")
+            < result.index("Resolution criteria (what the question actually resolves on):")
+            < result.index("Fine print:")
+            < result.index("Search the web for CURRENT, AUTHORITATIVE evidence")
+        )
+
+    @pytest.mark.parametrize("fine_print", ["", "   ", None])
+    def test_omits_the_fine_print_line_when_there_is_none(self, fine_print: str | None) -> None:
+        result = gap_fill_search_prompt(
+            gap="g",
+            search_query="q",
+            question_text="Will X happen?",
+            resolution_criteria="Resolves YES if X.",
+            fine_print=fine_print,
+        )
+
+        assert "Fine print" not in result
+        assert "Resolution criteria (what the question actually resolves on):\nResolves YES if X." in result
+
+    def test_missing_criteria_render_the_analyzer_placeholder(self) -> None:
+        """Same ``(none provided)`` label as ``gap_fill_analyzer_prompt``, so a question with no criteria
+        reads the same in both gap-fill prompts."""
+        result = gap_fill_search_prompt(
+            gap="g", search_query="q", question_text="Will X happen?", resolution_criteria=None, fine_print=None
+        )
+
+        assert "Resolution criteria (what the question actually resolves on):\n(none provided)" in result
+
+    def test_q44267_criteria_put_the_adiz_subset_in_front_of_the_resolver(self) -> None:
+        """Regression pin on the 2026-09-09 round's worst miss (q44267, -95.66 spot peer): the resolver was
+        asked which of two figures in a Ministry of National Defense daily report resolved the question,
+        saw only the title, and ruled for the headline sortie count from a sister question's wording.
+        The criteria name the zone-entry subset; they now sit in the prompt."""
+        result = gap_fill_search_prompt(
+            gap=self._Q44267_GAP,
+            search_query="Taiwan MND PLA aircraft daily report ADIZ median line subset definition",
+            question_text=self._Q44267_TITLE,
+            resolution_criteria=self._Q44267_CRITERIA,
+            fine_print=self._Q44267_FINE_PRINT,
+        )
+
+        assert "detected in Taiwan's de facto ADIZ" in result
+        assert "Regional Dynamic List" in result
+        assert "Fine print:\nThis question's information" in result
+        assert result.index(self._Q44267_GAP) < result.index("detected in Taiwan's de facto ADIZ")
 
 
 class TestTsAnchorClause:

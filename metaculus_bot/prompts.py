@@ -2407,10 +2407,20 @@ def gap_fill_search_prompt(
     search_query: str,
     question_text: str,
     *,
+    resolution_criteria: str | None,
+    fine_print: str | None,
     is_benchmarking: bool = False,
 ) -> str:
-    """Prompt for a grounded search to resolve one specific gap."""
+    """Prompt for a grounded search to resolve one specific gap.
+
+    The resolver reads the question's resolution criteria and fine print, not just its title:
+    a gap is routinely "which of these figures resolves the question", and on q44267 the
+    resolver answered it from a sister question's wording, never having seen this one's
+    criteria (-95.66 spot peer). See ``docs/prompts.md`` "Research-side prompt rules".
+    """
     benchmarking_warning = _benchmarking_warning("search") if is_benchmarking else ""
+    resolution_block = (resolution_criteria or "(none provided)").strip()
+    fine_print_block = f"\n\nFine print:\n{fine_print.strip()}" if fine_print and fine_print.strip() else ""
     return clean_indents(
         f"""
         You are a research assistant resolving ONE specific factual gap for a forecaster.
@@ -2423,6 +2433,9 @@ def gap_fill_search_prompt(
 
         This gap is from forecasting:
         {question_text}
+
+        Resolution criteria (what the question actually resolves on):
+        {resolution_block}{fine_print_block}
 
         Search the web for CURRENT, AUTHORITATIVE evidence addressing the gap. If the gap
         names a specific source or document (e.g., a government report, an SEC filing,

@@ -208,8 +208,8 @@ async def _run_analyzer(
     )
     prompt = gap_fill_analyzer_prompt(
         question_text=question.question_text,
-        resolution_criteria=getattr(question, "resolution_criteria", None),
-        fine_print=getattr(question, "fine_print", None),
+        resolution_criteria=question.resolution_criteria,
+        fine_print=question.fine_print,
         first_pass_research=first_pass_research,
         is_benchmarking=is_benchmarking,
         max_gaps=GAP_FILL_MAX_GAPS,
@@ -234,7 +234,7 @@ async def _run_analyzer(
 
 async def _resolve_single_gap(
     gap: dict[str, str],
-    question_text: str,
+    question: MetaculusQuestion,
     *,
     is_benchmarking: bool,
 ) -> str:
@@ -253,7 +253,9 @@ async def _resolve_single_gap(
     prompt = gap_fill_search_prompt(
         gap=gap["gap"],
         search_query=gap["search_query"],
-        question_text=question_text,
+        question_text=question.question_text,
+        resolution_criteria=question.resolution_criteria,
+        fine_print=question.fine_print,
         is_benchmarking=is_benchmarking,
     )
     llm = build_native_search_llm(
@@ -312,7 +314,7 @@ async def run_gap_fill_pass(
         await asyncio.sleep(0)
         return ""
 
-    search_tasks = [_resolve_single_gap(g, question.question_text, is_benchmarking=is_benchmarking) for g in gaps]
+    search_tasks = [_resolve_single_gap(g, question, is_benchmarking=is_benchmarking) for g in gaps]
     # return_exceptions=True captures per-gap failures so one SDK error
     # doesn't take the whole addendum down.
     results = await asyncio.gather(*search_tasks, return_exceptions=True)

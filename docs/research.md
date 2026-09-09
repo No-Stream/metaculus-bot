@@ -1642,7 +1642,10 @@ budget drops it: the fast path, or a research phase that ran out of budget):
    forecast-moving gap.
 2. Each gap is resolved by a parallel OpenAI native web search
    (`GAP_FILL_RESOLVER_MODEL` at `GAP_FILL_RESOLVER_REASONING_EFFORT`, via
-   OpenRouter on the donated key).
+   OpenRouter on the donated key), briefed with the gap, the suggested query, the
+   question title, and since 2026-09-09 the resolution criteria and fine print, so a
+   "which figure resolves this" gap is answered against the criteria rather than the
+   title (receipt q44267, `docs/prompts.md` "Research-side prompt rules").
    Because the searches run in parallel, latency is the slowest call, not the sum.
 
 The resolver migrated off direct-Google grounding on 2026-06-25, which is why

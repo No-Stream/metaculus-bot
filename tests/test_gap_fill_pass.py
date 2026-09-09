@@ -27,8 +27,8 @@ from metaculus_bot.research.targeted import _parse_gap_list, _run_analyzer, run_
 class MockQuestion:
     """Minimal stand-in for MetaculusQuestion for gap-fill tests.
 
-    Duck-typed to match the attribute access in ``run_gap_fill_pass``: it reads
-    ``question_text``, ``resolution_criteria``, and ``fine_print`` via ``getattr``.
+    Duck-typed to match the attribute access in ``run_gap_fill_pass``: the analyzer and the
+    per-gap resolver both read ``question_text``, ``resolution_criteria`` and ``fine_print``.
     """
 
     question_text: str = "Will X happen by 2026?"
@@ -312,6 +312,33 @@ async def test_analyzer_prompt_carries_the_mc_ballot() -> None:
     assert stub_llm.invoke.await_args is not None
     prompt = stub_llm.invoke.await_args.args[0]
     assert "Options (in resolution order): Mir Kim | Hunter Feuerstein | Other" in prompt
+
+
+@pytest.mark.asyncio
+async def test_resolver_prompt_carries_the_resolution_criteria_and_fine_print() -> None:
+    """The per-gap resolver reads the criteria it is asked about. On q44267 it saw only the title,
+    ruled which of two published figures resolved the question from a sister question's wording,
+    and every forecaster ratified it (-95.66 spot peer); the analyzer had seen both fields all along."""
+    question = MockQuestion(
+        resolution_criteria="Resolves as the count detected in the ADIZ.",
+        fine_print="Synced with the original question.",
+    )
+    gap = {"gap": "Which figure resolves it?", "search_query": "ADIZ count definition", "why_matters": "w"}
+
+    fake_search = AsyncMock(return_value="found it")
+    with (
+        patch("metaculus_bot.research.targeted._run_analyzer", AsyncMock(return_value=[gap])),
+        _patch_resolver(fake_search),
+    ):
+        await run_gap_fill_pass(_q(question), "first-pass research")
+
+    assert fake_search.await_args is not None
+    prompt = fake_search.await_args.args[0]
+    assert (
+        "Resolution criteria (what the question actually resolves on):\nResolves as the count detected in the ADIZ."
+        in prompt
+    )
+    assert "Fine print:\nSynced with the original question." in prompt
 
 
 @pytest.mark.asyncio
