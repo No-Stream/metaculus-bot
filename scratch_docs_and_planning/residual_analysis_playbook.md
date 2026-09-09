@@ -78,8 +78,10 @@ The standing set, each reconciling explicitly with the prior round's same-named 
   era = the live roster, comparison era = the one it replaced): per-arm spot mean / median / frac neg with
   effective n by resolution day, the type-adjusted gap AND its horizon-matched form (comparison arm capped
   at the treated arm's longest submit-to-resolve lag, plus the lag-quintile-adjusted form; the per-arm lag
-  quartile table is the receipt), each with a cluster-bootstrap interval and the by-record bracket. The
-  standing two-sided watch reads the STRICT type-adjusted horizon-matched row: a concern reopens only
+  quartile table is the receipt), each with a cluster-bootstrap interval and the by-record bracket; clusters
+  are event days by default, so pass `--clusters <round>/cluster_structure.json` once the round's curated
+  strong clusters exist and quote that interval as primary (the report says when the brackets disagree on
+  zero). The standing two-sided watch reads the STRICT type-adjusted horizon-matched row: a concern reopens only
   below -5 with the interval excluding zero; a favourable gap is reported, never flagged. Never headline the
   type-adjusted gap without the horizon-matched one beside it (2026-09-09: +10.71 became +8.19), and never
   reopen an underperformance flag on a positive gap. `docs/performance_analysis.md` "The era gap and the

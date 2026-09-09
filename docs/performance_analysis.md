@@ -444,14 +444,27 @@ longer looks worse the longer its questions took to resolve). This is the third 
 this file's era-bucketing section that a control would have changed, and it is why the control
 now runs every round rather than being re-derived by hand in a scratch script.
 
-**Clusters.** One UTC resolution day is one cluster, on both arms, and `eff n` counts them.
-That is coarser than a hand-curated cluster file (20 resolution days against 58 curated clusters
-for the 63-record triple arm on 2026-09-09), so the clustered interval is conservative: same-day
-questions need not share a world state. The by-record interval is printed beside it as the other
-bracket; a curated-cluster interval lies between the two, and when the two brackets disagree on
-whether zero is inside, the verdict depends on the cluster convention and that round should say
-so. The 2026-09-09 round found the convention not load-bearing on its curated file (intervals
-moved by under a point between its cluster variants).
+**Clusters.** By default one UTC day of `actual_resolve_time` is one cluster, on both arms, and
+`eff n` counts them. The key is the event date, never `resolution_set_time`: Metaculus writes
+resolutions in batches, but that is not what makes the day key coarse. On 2026-09-09 the 63-record
+STRICT triple arm had 20 event days against 18 batch days and 58 curated clusters, and the 20
+records resolving on 2026-08-01 were twenty unrelated "before August 1" questions (Putin's
+approval, the hottest US state, a Bitcoin level, a Bank Rate decision), so the coarseness is
+calendar-scheduled deadlines resolving many independent questions together. The clustered
+interval is therefore conservative and the verdict reads it; the by-record interval is printed
+beside it as the other bracket, and the report adds a **Brackets disagree on zero** line whenever
+the two do not agree on whether zero is inside, because on those rows the verdict depends on the
+convention. To let a round's curated clusters drive the interval, pass
+`--clusters <round>/cluster_structure.json`: the file's `strong` clusters (one shared resolution
+driver) collapse to one draw, `weak` members (correlated residuals, still separate draws) and
+unlabelled records stay their own cluster, the report header names the file and how many records
+of each arm it labelled, and `eff n` becomes the round's own effective n (58 and 178 on the
+2026-09-09 file, which labels only the wave and the triple era, so 140 of the 181 comparison
+records are unlabelled there). On that file the STRICT type-adjusted interval is [+0.03, +17.35]
+against [-1.48, +17.13] on the day key, so the day key is what put zero inside on that row (the
+report flags the disagreement), while the horizon-matched watch row reads no measurable difference
+under both: +5.56 with [-5.56, +16.41] curated and [-7.59, +16.07] on the day key. The by-record
+bracket is drawn from its own seeded stream, so it is identical under every cluster convention.
 
 **The two-sided watch** (`era_gap.two_sided_watch`, read on the STRICT type-adjusted
 horizon-matched row): a **concern** reopens only when the point estimate is below -5 spot-peer

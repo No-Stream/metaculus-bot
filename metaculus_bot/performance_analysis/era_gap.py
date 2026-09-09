@@ -8,8 +8,8 @@ residualization as the reweighting counterpart to the cap. Lag is ``actual_resol
 ``bot_comment_created_at`` in days: the forecast horizon, never the batch date Metaculus set the
 resolution on. Type adjustment cannot see the horizon confound, and on 2026-09-09 it moved the
 headline from +10.71 [+1.72, +19.69] to +8.19 [-3.21, +19.90]. Every gap carries a cluster
-bootstrap interval with one UTC resolution day per cluster on both arms. :func:`two_sided_watch`
-is the standing rule. Estimator derivation, the quartile receipt and the cluster convention:
+bootstrap interval, one UTC day of ``actual_resolve_time`` per cluster on both arms by default or a
+round's curated strong clusters via ``--clusters``. :func:`two_sided_watch` is the standing rule. Estimator derivation, the quartile receipt and the cluster convention:
 ``docs/performance_analysis.md`` "The era gap and the horizon confound".
 """
 
@@ -21,7 +21,7 @@ import logging
 import sys
 from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from itertools import pairwise
 
@@ -50,6 +50,10 @@ LAG_QUARTILE_PERCENTILES = (25, 50, 75)
 SECONDS_PER_DAY = 86_400.0
 
 WATCH_LABEL = "type-adjusted, horizon-matched"
+
+RESOLUTION_DAY_CONVENTION = "one UTC day of actual_resolve_time per cluster"
+# The round convention: only a strong cluster (one shared resolution driver) collapses to one draw.
+COLLAPSED_STRENGTH = "strong"
 
 
 class Verdict(StrEnum):
@@ -83,6 +87,7 @@ class ScoredRecord:
     lag_days: float
     cluster: str
     tournament: str | None
+    cluster_labelled: bool = False
 
 
 def _scored(record: dict) -> ScoredRecord | None:
@@ -99,6 +104,42 @@ def _scored(record: dict) -> ScoredRecord | None:
         cluster=resolved.date().isoformat(),
         tournament=record.get("source_tournament"),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class ClusterMap:
+    """A curated question-id to cluster-id map in the round's ``cluster_structure.json`` shape.
+
+    Reads ``qid_to_cluster`` and ``clusters[cid]["strength"]`` (strong, weak or single). Only strong
+    members collapse; weak members (correlated residuals, separate draws) and unlabelled records
+    are each their own cluster.
+    """
+
+    strong: dict[str, str]
+    source: str
+
+    @classmethod
+    def from_cluster_structure(cls, structure: dict, *, source: str) -> ClusterMap:
+        strength = {cid: cluster.get("strength") for cid, cluster in structure["clusters"].items()}
+        strong = {
+            qid: cid for qid, cid in structure["qid_to_cluster"].items() if strength.get(cid) == COLLAPSED_STRENGTH
+        }
+        return cls(strong=strong, source=source)
+
+    @classmethod
+    def load(cls, path: str) -> ClusterMap:
+        with open(path) as f:
+            return cls.from_cluster_structure(json.load(f), source=path)
+
+    @property
+    def convention(self) -> str:
+        return f"curated strong clusters from {self.source}, unlabelled records their own cluster"
+
+    def apply(self, record: ScoredRecord) -> ScoredRecord:
+        cid = self.strong.get(record.question_id)
+        if cid is None:
+            return replace(record, cluster=f"q{record.question_id}", cluster_labelled=False)
+        return replace(record, cluster=cid, cluster_labelled=True)
 
 
 def in_exclusion_cohort(record: dict) -> bool:
@@ -136,9 +177,13 @@ class Arm:
     def max_lag_days(self) -> float:
         return float(self.lags.max())
 
+    @property
+    def n_cluster_labelled(self) -> int:
+        return sum(1 for r in self.records if r.cluster_labelled)
 
-def build_arm(label: str, records: Iterable[dict], *, strict: bool = False) -> Arm:
-    """Score an era's records; ``strict`` drops the exclusion cohorts first and counts them."""
+
+def build_arm(label: str, records: Iterable[dict], *, strict: bool = False, clusters: ClusterMap | None = None) -> Arm:
+    """Score an era's records; ``strict`` drops the exclusion cohorts first, ``clusters`` overrides the day key."""
     kept = list(records)
     n_excluded = 0
     if strict:
@@ -147,6 +192,8 @@ def build_arm(label: str, records: Iterable[dict], *, strict: bool = False) -> A
         n_excluded = n_before - len(kept)
     scored = [_scored(r) for r in kept]
     usable = tuple(s for s in scored if s is not None)
+    if clusters is not None:
+        usable = tuple(clusters.apply(s) for s in usable)
     n_unscoreable = len(scored) - len(usable)
     if n_unscoreable:
         logger.warning(f"era arm {label}: {n_unscoreable} record(s) lack spot peer, submit time or resolve time")
@@ -168,6 +215,7 @@ class ArmSummary:
     label: str
     n: int
     n_clusters: int
+    n_cluster_labelled: int
     n_excluded: int
     n_unscoreable: int
     spot_mean: float
@@ -187,6 +235,7 @@ def summarize_arm(arm: Arm) -> ArmSummary:
         label=arm.label,
         n=arm.n,
         n_clusters=len(set(arm.clusters)),
+        n_cluster_labelled=arm.n_cluster_labelled,
         n_excluded=arm.n_excluded,
         n_unscoreable=arm.n_unscoreable,
         spot_mean=float(spots.mean()),
@@ -278,8 +327,18 @@ class GapEstimate:
     def verdict(self) -> Verdict:
         return two_sided_watch(self.gap, (self.ci_low, self.ci_high))
 
+    @property
+    def brackets_disagree_on_zero(self) -> bool:
+        return _excludes_zero(self.ci_low, self.ci_high) != _excludes_zero(
+            self.ci_low_by_record, self.ci_high_by_record
+        )
+
     def to_dict(self) -> dict:
-        return {**asdict(self), "verdict": self.verdict}
+        return {**asdict(self), "verdict": self.verdict, "brackets_disagree_on_zero": self.brackets_disagree_on_zero}
+
+
+def _excludes_zero(low: float, high: float) -> bool:
+    return low > 0 or high < 0
 
 
 Residualizer = Callable[[ScoredRecord], float]
@@ -299,17 +358,18 @@ def _gap_estimate(
     treated_values = [residual(r) for r in treated.records]
     comparison_values = [residual(r) for r in comparison.records]
     gap = float(np.mean(treated_values) - np.mean(comparison_values))
-    rng = np.random.default_rng(seed)
+    # Separate streams keep the by-record bracket identical under every cluster convention.
+    clustered_seed, record_seed = np.random.SeedSequence(seed).spawn(2)
     clustered = _bootstrap_gaps(
         ClusterSums.from_values(treated_values, treated.clusters),
         ClusterSums.from_values(comparison_values, comparison.clusters),
-        rng,
+        np.random.default_rng(clustered_seed),
         draws,
     )
     by_record = _bootstrap_gaps(
         ClusterSums.from_values(treated_values, _record_ids(treated)),
         ClusterSums.from_values(comparison_values, _record_ids(comparison)),
-        rng,
+        np.random.default_rng(record_seed),
         draws,
     )
     low, high = np.percentile(clustered, CI_PERCENTILES)
@@ -433,6 +493,7 @@ class EraGapReport:
     gaps: list[GapEstimate]
     per_type_horizon_matched: list[PerTypeGap]
     strict: bool
+    cluster_convention: str
     draws: int
     seed: int
 
@@ -450,6 +511,7 @@ class EraGapReport:
             "per_type_horizon_matched": [asdict(row) for row in self.per_type_horizon_matched],
             "watch": self.watch.to_dict(),
             "strict": self.strict,
+            "cluster_convention": self.cluster_convention,
             "draws": self.draws,
             "seed": self.seed,
         }
@@ -460,10 +522,11 @@ def compute_era_gap_report(
     comparison: Arm,
     *,
     strict: bool = False,
+    cluster_convention: str = RESOLUTION_DAY_CONVENTION,
     draws: int = DEFAULT_BOOTSTRAP_DRAWS,
     seed: int = DEFAULT_BOOTSTRAP_SEED,
 ) -> EraGapReport:
-    """Every read of the era gap on two built arms; ``strict`` only labels how the arms were built."""
+    """Every read of the era gap on two built arms; ``strict`` and ``cluster_convention`` label how they were built."""
     _require_records(treated)
     _require_records(comparison)
     matched = horizon_match(comparison, treated.max_lag_days)
@@ -491,6 +554,7 @@ def compute_era_gap_report(
         gaps=gaps,
         per_type_horizon_matched=per_type_gaps(treated, matched),
         strict=strict,
+        cluster_convention=cluster_convention,
         draws=draws,
         seed=seed,
     )
@@ -504,7 +568,7 @@ def _render_arms(report: EraGapReport) -> list[str]:
     header = [
         "arm",
         "n",
-        "eff n (resolve days)",
+        "eff n (clusters)",
         "excl",
         "unscoreable",
         "spot mean",
@@ -594,6 +658,32 @@ def _render_per_type(report: EraGapReport) -> list[str]:
     return markdown_table(header, rows)
 
 
+def _render_cluster_note(report: EraGapReport) -> list[str]:
+    if report.cluster_convention == RESOLUTION_DAY_CONVENTION:
+        return [
+            "Same-day questions need not share a world state (month-end deadlines resolve many unrelated "
+            "questions together), so the clustered interval is conservative; pass `--clusters` with a round's "
+            "`cluster_structure.json` to let curated strong clusters drive it. A curated interval lies between "
+            "the clustered and by-record brackets."
+        ]
+    treated, comparison = report.treated, report.comparison
+    return [
+        f"Curated clusters label {treated.n_cluster_labelled}/{treated.n} treated and "
+        f"{comparison.n_cluster_labelled}/{comparison.n} comparison records; the rest are their own cluster."
+    ]
+
+
+def _render_bracket_note(report: EraGapReport) -> list[str]:
+    disagreeing = [g.label for g in report.gaps if g.brackets_disagree_on_zero]
+    if not disagreeing:
+        return []
+    return [
+        "",
+        f"**Brackets disagree on zero** for: {', '.join(disagreeing)}. The clustered and by-record intervals do "
+        "not agree on whether zero is inside, so the verdict on those rows depends on the cluster convention.",
+    ]
+
+
 def render_report(report: EraGapReport) -> str:
     policy = (
         "STRICT: exclusion cohorts dropped from both arms"
@@ -605,11 +695,12 @@ def render_report(report: EraGapReport) -> str:
         f"# Era gap: {report.treated.label} vs {report.comparison.label} ({policy})",
         "",
         "Spot peer throughout (`platform_scores.spot_peer_score`), treated minus comparison. Lag is "
-        "`actual_resolve_time` minus `bot_comment_created_at` in days, the forecast horizon. A cluster is "
-        f"one UTC resolution day and `eff n` counts them. Bootstrap: {report.draws} draws, seed {report.seed}, "
-        "both arms resampled by cluster for the interval the verdict reads (conservative: same-day questions "
-        "need not share a world state), and by record for the other bracket; a hand-curated cluster interval "
-        "lies between the two. Intervals are the 2.5 and 97.5 percentiles.",
+        "`actual_resolve_time` minus `bot_comment_created_at` in days, the forecast horizon. Clusters: "
+        f"{report.cluster_convention}; `eff n` counts them. Bootstrap: {report.draws} draws, seed {report.seed}, "
+        "both arms resampled by cluster for the interval the verdict reads, and by record for the other bracket. "
+        "Intervals are the 2.5 and 97.5 percentiles.",
+        "",
+        *_render_cluster_note(report),
         "",
         "## Arms",
         "",
@@ -625,6 +716,7 @@ def render_report(report: EraGapReport) -> str:
         "## Gap under each control",
         "",
         *_render_gaps(report),
+        *_render_bracket_note(report),
         "",
         f"**Standing watch** ({WATCH_LABEL}): **{watch.verdict}** at {watch.gap:+.2f} "
         f"[{watch.ci_low:+.2f}, {watch.ci_high:+.2f}]. Rule: a concern reopens only when the point estimate is "
@@ -656,14 +748,29 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Drop the exclusion cohorts (known_bug, degraded_run, partial_degraded) from BOTH arms.",
     )
+    parser.add_argument(
+        "--clusters",
+        default=None,
+        help=(
+            "Optional curated cluster map in the round's cluster_structure.json shape (qid_to_cluster plus "
+            "clusters[cid].strength). Strong clusters collapse to one bootstrap draw; weak and unlabelled "
+            f"records stay their own cluster. Default: {RESOLUTION_DAY_CONVENTION}."
+        ),
+    )
     parser.add_argument("--output-json", default=None, help="Optional path to also write every number as JSON.")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s", stream=sys.stderr)
     data = load_dataset(args.dataset)
-    treated = build_arm(args.treated_era, _era_records(data, args.treated_era), strict=args.strict)
-    comparison = build_arm(args.comparison_era, _era_records(data, args.comparison_era), strict=args.strict)
-    report = compute_era_gap_report(treated, comparison, strict=args.strict)
+    cluster_map = ClusterMap.load(args.clusters) if args.clusters else None
+    convention = cluster_map.convention if cluster_map else RESOLUTION_DAY_CONVENTION
+    treated = build_arm(
+        args.treated_era, _era_records(data, args.treated_era), strict=args.strict, clusters=cluster_map
+    )
+    comparison = build_arm(
+        args.comparison_era, _era_records(data, args.comparison_era), strict=args.strict, clusters=cluster_map
+    )
+    report = compute_era_gap_report(treated, comparison, strict=args.strict, cluster_convention=convention)
 
     # Logging is pinned to stderr above so the rendered report can be piped on its own.
     print(render_report(report))  # noqa: T201

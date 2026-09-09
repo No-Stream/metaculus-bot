@@ -18,7 +18,9 @@ from metaculus_bot.performance_analysis.cohorts import DEGRADED_RUN_QIDS, KNOWN_
 from metaculus_bot.performance_analysis.era_gap import (
     CONCERN_GAP_POINTS,
     ERA_FIELD,
+    RESOLUTION_DAY_CONVENTION,
     Arm,
+    ClusterMap,
     EraGapReport,
     Verdict,
     build_arm,
@@ -49,21 +51,36 @@ def _record(
     q_type: str = "binary",
     submitted: str | None = SUBMITTED,
     tournament: str = "summer-futureeval-2026",
+    resolution_set_time: str | None = None,
 ) -> dict:
     """A collector-shaped record trimmed to the fields the era read touches."""
     resolved = parse_iso_utc(SUBMITTED)
     assert resolved is not None
     resolved += timedelta(days=lag_days)
+    metadata = {"actual_resolve_time": resolved.isoformat().replace("+00:00", "Z")}
+    if resolution_set_time is not None:
+        metadata["resolution_set_time"] = resolution_set_time
     return {
         "question_id": qid,
         "post_id": qid,
         "type": q_type,
         ERA_FIELD: era,
         "bot_comment_created_at": submitted,
-        "metadata": {"actual_resolve_time": resolved.isoformat().replace("+00:00", "Z")},
+        "metadata": metadata,
         "metaculus_scores": {"spot_peer_score": spot},
         "source_tournament": tournament,
     }
+
+
+def _cluster_structure(strong: dict[str, list[int]], weak: dict[str, list[int]]) -> dict:
+    """The round's cluster_structure.json shape: qid_to_cluster plus clusters[cid].strength."""
+    qid_to_cluster: dict[str, str] = {}
+    clusters: dict[str, dict] = {}
+    for strength, groups in (("strong", strong), ("weak", weak)):
+        for cid, qids in groups.items():
+            clusters[cid] = {"cluster_id": cid, "strength": strength}
+            qid_to_cluster.update({str(q): cid for q in qids})
+    return {"qid_to_cluster": qid_to_cluster, "clusters": clusters}
 
 
 def _score_falls_with_lag(lag_days: float) -> float:
@@ -125,6 +142,62 @@ class TestBuildArm:
         del record["type"]
         with pytest.raises(KeyError):
             build_arm("t", [record])
+
+    def test_cluster_key_is_the_event_day_not_the_batch_day(self):
+        """Metaculus writes resolutions in batches; the shared world state is the event, so the key is
+        ``actual_resolve_time`` and ``resolution_set_time`` is ignored entirely."""
+        same_event_day = [
+            _record(1, spot=1.0, lag_days=3, resolution_set_time="2026-07-10T00:00:00Z"),
+            _record(2, spot=1.0, lag_days=3.2, resolution_set_time="2026-07-20T00:00:00Z"),
+        ]
+        same_batch_day = [
+            _record(3, spot=1.0, lag_days=3, resolution_set_time="2026-07-20T00:00:00Z"),
+            _record(4, spot=1.0, lag_days=9, resolution_set_time="2026-07-20T00:00:00Z"),
+        ]
+        assert summarize_arm(build_arm("event", same_event_day)).n_clusters == 1
+        assert summarize_arm(build_arm("batch", same_batch_day)).n_clusters == 2
+
+
+class TestClusterMap:
+    def test_only_strong_clusters_collapse(self):
+        structure = _cluster_structure(strong={"outbreak": [1, 2, 3]}, weak={"regime": [4, 5]})
+        cluster_map = ClusterMap.from_cluster_structure(structure, source="test")
+        # Six records on one event day: the day key would make them ONE cluster.
+        records = [_record(i, spot=float(i), lag_days=5) for i in range(1, 7)]
+        arm = build_arm("t", records, clusters=cluster_map)
+        clusters = {r.question_id: r.cluster for r in arm.records}
+        assert clusters["1"] == clusters["2"] == clusters["3"] == "outbreak"
+        assert clusters["4"] != clusters["5"]  # weak: correlated residuals, still separate draws
+        assert clusters["6"] == "q6"  # unlabelled: its own cluster
+        assert arm.n_cluster_labelled == 3
+        assert summarize_arm(arm).n_clusters == 4
+        assert summarize_arm(build_arm("day", records)).n_clusters == 1
+
+    def test_curated_strong_clusters_drive_the_interval(self):
+        """Every record on its own event day gives a wide day-keyed interval; one strong cluster per arm
+        collapses it onto the point, so the map, not the day key, is what the bootstrap resamples."""
+        treated = [_record(i, spot=float(10 + (i % 2) * 20), lag_days=1 + i) for i in range(8)]
+        comparison = [_record(100 + i, spot=float((i % 2) * 20), lag_days=1 + i) for i in range(8)]
+        structure = _cluster_structure(strong={"t": list(range(8)), "c": list(range(100, 108))}, weak={})
+        cluster_map = ClusterMap.from_cluster_structure(structure, source="test")
+        by_day = unadjusted_gap(build_arm("t", treated), build_arm("c", comparison), draws=FAST_DRAWS, seed=1)
+        curated = unadjusted_gap(
+            build_arm("t", treated, clusters=cluster_map),
+            build_arm("c", comparison, clusters=cluster_map),
+            draws=FAST_DRAWS,
+            seed=1,
+        )
+        assert by_day.ci_low < by_day.gap < by_day.ci_high
+        assert curated.ci_low == pytest.approx(curated.gap)
+        assert curated.ci_high == pytest.approx(curated.gap)
+        assert curated.ci_low_by_record == pytest.approx(by_day.ci_low_by_record)
+
+    def test_load_reads_the_round_file_shape(self, tmp_path):
+        path = tmp_path / "cluster_structure.json"
+        path.write_text(json.dumps(_cluster_structure(strong={"s": [1]}, weak={"w": [2]})))
+        cluster_map = ClusterMap.load(str(path))
+        assert cluster_map.strong == {"1": "s"}
+        assert str(path) in cluster_map.convention
 
 
 class TestArmSummary:
@@ -283,6 +356,22 @@ class TestReport:
         assert "Standing watch" in text
         assert "no measurable difference" in text
         assert f"below {CONCERN_GAP_POINTS:+.0f}" in text
+        assert RESOLUTION_DAY_CONVENTION in text
+        assert "Brackets disagree" not in text
+
+    def test_render_notes_when_the_brackets_disagree_on_zero(self):
+        """One event day per arm collapses the clustered interval onto the point (+1, excluding zero) while
+        the by-record interval on alternating +/-30 scores covers zero: the verdict depends on the convention."""
+        treated = build_arm("t", [_record(i, spot=31.0 if i % 2 else -29.0, lag_days=5) for i in range(8)])
+        comparison = build_arm("c", [_record(100 + i, spot=30.0 if i % 2 else -30.0, lag_days=4) for i in range(8)])
+        report = compute_era_gap_report(treated, comparison, draws=FAST_DRAWS, seed=1)
+        unadjusted = report.gaps[0]
+        assert unadjusted.gap == pytest.approx(1.0)
+        assert unadjusted.brackets_disagree_on_zero
+        assert unadjusted.verdict is Verdict.FAVOURABLE
+        text = render_report(report)
+        assert "**Brackets disagree on zero** for: unadjusted" in text
+        assert report.to_dict()["gaps"][0]["brackets_disagree_on_zero"] is True
 
 
 class TestCli:
@@ -334,3 +423,24 @@ class TestCli:
         path = self._write(tmp_path, self._records())
         with pytest.raises(ValueError, match="no scoreable records"):
             main(["--dataset", path, "--treated-era", "fall_config", "--comparison-era", "post_flip"])
+
+    def test_clusters_argument_names_the_convention_and_the_labelled_counts(self, tmp_path, capsys):
+        path = self._write(tmp_path, self._records())
+        clusters = tmp_path / "cluster_structure.json"
+        clusters.write_text(json.dumps(_cluster_structure(strong={"abc": [0, 1, 2]}, weak={"w": [3, 4]})))
+        main(
+            [
+                "--dataset",
+                path,
+                "--treated-era",
+                "triple_era",
+                "--comparison-era",
+                "post_flip",
+                "--clusters",
+                str(clusters),
+            ]
+        )
+        text = capsys.readouterr().out
+        assert f"curated strong clusters from {clusters}" in text
+        assert "Curated clusters label 3/6 treated and 0/9 comparison records" in text
+        assert RESOLUTION_DAY_CONVENTION not in text
