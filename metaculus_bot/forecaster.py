@@ -95,11 +95,43 @@ from metaculus_bot.utils.logging_utils import CompactLoggingForecastBot
 
 logger = logging.getLogger(__name__)
 
-# Sort sentinel for a question with no close time, so the tightest-close-first
-# ordering in forecast_questions never compares None against a datetime.
+# Sort sentinel for a missing close_time, so the tightest-close-first sort never compares None to a datetime.
 _CLOSE_TIME_MAX = datetime.max.replace(tzinfo=UTC)
 
 load_environment()
+
+
+def _forecast_history_is_readable(question: MetaculusQuestion) -> bool:
+    """True when the payload carries the ``my_forecasts`` field ``already_forecasted`` is derived from."""
+    question_json = question.api_json.get("question") or {}
+    return question_json.get("my_forecasts") is not None
+
+
+def _drop_questions_with_unreadable_forecast_history(questions: Sequence[MetaculusQuestion]) -> list[MetaculusQuestion]:
+    """The skip guard's fail-shut leg: a question whose ``my_forecasts`` field is unreadable is not eligible.
+
+    The framework derives ``already_forecasted`` inside a blanket except that answers False, so a
+    payload without the field (a list GET without ``with_cp=true``, an unauthenticated Mantic read,
+    an API change) would read as never forecast and re-publish every question on every hourly run.
+    One WARNING marker per dropped question keeps the drop visible in the telemetry archive.
+    """
+    readable: list[MetaculusQuestion] = []
+    for question in questions:
+        if _forecast_history_is_readable(question):
+            readable.append(question)
+            continue
+        logger.warning(
+            "SKIP_GUARD_UNREADABLE: question=%s post_id=%s platform=%s reason=my_forecasts_missing",
+            question.id_of_question,
+            question.id_of_post,
+            question_platform(question),
+        )
+    if len(readable) != len(questions):
+        logger.warning(
+            "Dropped %d question(s) with no readable my_forecasts field; the skip guard fails shut",
+            len(questions) - len(readable),
+        )
+    return readable
 
 
 class TemplateForecaster(CompactLoggingForecastBot):
@@ -304,10 +336,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
         stacker_name = self._pipeline.stacker_llm.model if self._pipeline.stacker_llm else "<missing>"
         base_models = [m.model for m in self._forecaster_llms]
-        # Display truncation for one log line, not a computation over a sample.
-        short_list = (
-            base_models if len(base_models) <= 6 else [*base_models[:6], "..."]
-        )  # HARNESS-SCAN-EXEMPT-subsampling
+        shown_models = base_models[:6]  # HARNESS-SCAN-EXEMPT-subsampling: log-line display truncation, no computation
+        short_list = base_models if len(base_models) <= 6 else [*shown_models, "..."]
 
         if self.aggregation_strategy == AggregationStrategy.STACKING:
             logger.info(
@@ -333,16 +363,16 @@ class TemplateForecaster(CompactLoggingForecastBot):
         questions: Sequence[MetaculusQuestion],
         return_exceptions: bool = False,
     ) -> list[ForecastReport] | list[ForecastReport | BaseException]:
-        # Unsupported-type guard. 0.2.92's ApiFilter default and tournament fetch can
-        # return ConditionalQuestion, which this bot does not forecast (_make_prediction
-        # has no runner for it). Drop it up front with a loud WARNING instead of letting
-        # it reach the fan-out and surface as a per-question exception. This is the
-        # single chokepoint every entry path funnels through: both
-        # forecast_on_tournament and forecast_question call forecast_questions, so
-        # filtering here covers the tournament path and the test/URL path without a
-        # separate filter in cli.py. DiscreteQuestion subclasses NumericQuestion and is
-        # intentionally kept; DateQuestion is forecast through the numeric pipeline on
-        # its epoch-seconds view (run_date_forecast).
+        """Filter, sort and cap the fetched questions, then hand the survivors to the framework fan-out.
+
+        The single chokepoint every entry path funnels through (forecast_on_tournament and
+        forecast_question both call it): the unsupported-type guard drops the ConditionalQuestion
+        the 0.2.92 tournament fetch can return, the skip guard fails shut on an unreadable
+        ``my_forecasts``, and the tightest-close-first sort decides who wins the shared research
+        semaphore and the per-run cap. DiscreteQuestion is a NumericQuestion and stays; DateQuestion
+        runs through the numeric pipeline on its epoch-seconds axis.
+        """
+        # A loud WARNING here beats a per-question exception in the fan-out (_make_prediction has no runner).
         supported_types = (BinaryQuestion, MultipleChoiceQuestion, NumericQuestion, DateQuestion)
         supported_questions = [q for q in questions if isinstance(q, supported_types)]
         if len(supported_questions) != len(questions):
@@ -356,18 +386,13 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
         # Apply skip filter first (mirrors base class behavior) so we cap unforecasted items
         if self.skip_previously_forecasted_questions:
+            questions = _drop_questions_with_unreadable_forecast_history(questions)
             unforecasted_questions = [q for q in questions if not q.already_forecasted]
             if len(questions) != len(unforecasted_questions):
                 logger.info(f"Skipping {len(questions) - len(unforecasted_questions)} previously forecasted questions")
             questions = unforecasted_questions
 
-        # Tightest close first. Questions all run under one asyncio.gather, so this
-        # is not a serialization order — it decides who wins the two contended
-        # resources: the shared max_concurrent_research semaphore (6 permits) and,
-        # below, the max_questions_per_run cap, which without this keeps whatever
-        # order the tournament fetch happened to return rather than the N questions
-        # closest to closing. Stable, so questions sharing a close time keep fetch
-        # order, and a missing close_time sorts LAST (no deadline, no urgency).
+        # Stable, so questions sharing a close time keep fetch order; a missing close_time sorts LAST (no urgency).
         questions = sorted(
             questions,
             key=lambda q: (
@@ -376,10 +401,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             ),
         )
 
-        # Enforce max questions per run safety cap. A registered WARNING marker naming the posts
-        # left behind: on a tournament whose questions all open together (Mantic releases a whole
-        # hour's batch at once) the cap forfeits real questions, and a forfeit that is not
-        # harvestable is gone with the 90-day GitHub Actions log expiry.
+        # A registered WARNING marker names the forfeited posts; an unharvestable forfeit is gone at the 90-day log expiry.
         if self.max_questions_per_run is not None and len(questions) > self.max_questions_per_run:
             dropped = list(questions)[self.max_questions_per_run :]
             logger.warning(
@@ -392,7 +414,6 @@ class TemplateForecaster(CompactLoggingForecastBot):
             )
             questions = list(questions)[: self.max_questions_per_run]
 
-        # Log question processing info with progress
         if questions:
             bot_name = getattr(self, "name", "Bot")
             logger.info(f"📊 {bot_name}: Processing {len(questions)} questions...")
@@ -648,7 +669,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         self,
         question: MetaculusQuestion,
     ) -> ResearchWithPredictions[PredictionTypes]:
-        # Call the parent class's method if no specific forecaster LLMs are provided
+        """Research once and fan out over the forecaster roster; the framework's own path when no roster is set."""
         if not self._forecaster_llms:
             return await super()._research_and_make_predictions(question)
 
@@ -861,11 +882,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         text = super()._format_forecaster_rationales(report_number, researched_predictions).lstrip()
         return format_forecaster_rationales_section(text, report_number)
 
-    # The PLR0917 suppression below is PERMANENT, not a TODO: this overrides
-    # ForecastBot._create_unified_explanation, which forecasting-tools calls POSITIONALLY
-    # (forecast_bot.py: "self._create_unified_explanation(question, valid_prediction_set,
-    # aggregated_prediction, final_cost, time_spent_in_minutes)"). Making any of these
-    # keyword-only would break the framework's own call.
+    # The PLR0917 noqa is permanent: forecasting-tools calls this override POSITIONALLY, so nothing can go keyword-only.
     def _create_unified_explanation(  # noqa: PLR0917  # signature is fixed by the ft base class, see comment above
         self,
         question: MetaculusQuestion,
@@ -1014,10 +1031,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # requires ReasonedPrediction[PredictionTypes]; framework has the same pattern
         return prediction  # type: ignore[return-value]
 
-    # The PLR0917 suppression below is PERMANENT, not a TODO: this overrides
-    # ForecastBot._aggregate_predictions, which forecasting-tools calls POSITIONALLY
-    # (forecast_bot.py: "await self._aggregate_predictions(all_predictions, question)"). The params
-    # past ``question`` are ours, but narrowing the first two would break the framework's call.
+    # The PLR0917 noqa is permanent: forecasting-tools calls the first two params POSITIONALLY; the rest are ours.
     async def _aggregate_predictions(  # noqa: PLR0917  # signature is fixed by the ft base class, see comment above
         self,
         predictions: list[PredictionTypes],
@@ -1103,7 +1117,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
     async def _run_forecast_on_date(  # pyright: ignore[reportIncompatibleMethodOverride]  # extra params: ensemble fan-out passes a specific LLM + optional chart per call
         self, question: DateQuestion, research: str, llm_to_use: GeneralLlm, chart_b64: str | None = None
     ) -> ReasonedPrediction[NumericDistribution]:
-        # No discrete-integer vote: integer snapping on an epoch-seconds axis is meaningless.
+        """The date runner on the epoch-seconds axis; no discrete-integer vote, since snapping there is meaningless."""
         return await run_date_forecast(
             question, research, llm_to_use, self.get_llm("parser", "llm"), chart_b64=chart_b64
         )
