@@ -52,11 +52,18 @@ logger = logging.getLogger(__name__)
 _HAZARD_FRACTION_TOLERANCE = 0.01
 _SCENARIO_PROB_SUM_TOLERANCE = 0.02
 _MC_OPTION_PROB_SUM_TOLERANCE = 0.02
+# Why: a forecaster who rounds every probability to two decimals drifts up to 0.005 a key, and a pmf block has up to 33.
+_PMF_PROB_SUM_TOLERANCE_PER_KEY = 0.005
+_PMF_PROB_SUM_TOLERANCE_FLOOR = _MC_OPTION_PROB_SUM_TOLERANCE
 _REQUIRED_NUMERIC_PERCENTILES: frozenset[float] = frozenset({0.1, 0.5, 0.9})
-# Defensive cap on raw structured-block size. Legitimate blocks are <5KB;
-# larger payloads likely indicate a malformed rationale (e.g., an unclosed
-# fence accidentally swallowing half the transcript). We cap rather than
-# parse-on-trust to keep memory / parse time bounded.
+
+
+def pmf_prob_sum_tolerance(key_count: int) -> float:
+    """How far a per-bin block's probabilities may sum from 1.0: the ballot's floor or the per-key drift, whichever is larger."""
+    return max(_PMF_PROB_SUM_TOLERANCE_FLOOR, _PMF_PROB_SUM_TOLERANCE_PER_KEY * key_count)
+
+
+# Why: an unclosed fence can swallow a transcript; see docs/value_extraction.md "Block schemas: design notes".
 _MAX_STRUCTURED_BLOCK_BYTES: int = 200_000
 
 
@@ -225,12 +232,7 @@ def _readable_optional_float(value: object, *, low: float | None, high: float | 
     try:
         number = float(value)
     except OverflowError:
-        # ``json.loads`` decodes an integer literal of any length into an arbitrary-precision
-        # int, and ``float()`` on one past ~308 digits raises. Pydantic converts only
-        # ValueError and AssertionError into a ValidationError, so this would propagate out of
-        # ``model_validate`` and past ``parse_structured_payload``, whose except clause catches
-        # ValidationError only -- strictly worse than the strict code it replaced, which turned
-        # the same input into a clean rejection the ladder could fall through.
+        # Why: pydantic would not convert an OverflowError; see docs/value_extraction.md "Block schemas: design notes".
         return None
     if not math.isfinite(number):
         return None
@@ -241,12 +243,7 @@ def _readable_optional_float(value: object, *, low: float | None, high: float | 
     return number
 
 
-# The DISCRETE-vs-CONTINUOUS vote's vocabulary, declared once. ``_tolerate_unknown_outcome_type``
-# reads its accepted set off this Literal via ``get_args`` rather than restating the two strings:
-# a restated copy fails asymmetrically, since a third outcome type would pass the annotation and
-# then be silently nulled by the validator. A TUPLE, not a set: membership on a tuple compares by
-# equality, so an unhashable declaration (a list, a dict) reads as unrecognised instead of raising
-# TypeError out of the validator.
+# Why: declared once; a restated copy fails asymmetrically; see docs/value_extraction.md "Block schemas: design notes".
 NumericOutcomeType = Literal["discrete_integer", "continuous"]
 _NUMERIC_OUTCOME_TYPES: tuple[str, ...] = get_args(NumericOutcomeType)
 
@@ -279,12 +276,7 @@ class BinaryStructured(BaseModel):
     evidence: list[EvidenceItem] = Field(default_factory=list)
     scenarios: list[ScenarioBranch] = Field(default_factory=list)
     posterior_prob: float = Field(ge=0.0, le=1.0)
-    # ARCHIVED BLOCKS ONLY: the stated outside-view range and priced resolution
-    # clauses (2026-07-08). No longer prompted since 2026-09-02 — the block is written
-    # after the forecast is fixed, so both slots only re-keyed prose we already have, and
-    # their only reader was telemetry behind a flag every prod workflow pins off. The
-    # fields stay optional and tolerant because 49 + 12 published comments carry them and
-    # performance_analysis strict-parses those blocks.
+    # Why: archived blocks only; see docs/value_extraction.md "Block schemas: design notes".
     base_rate_anchor: BaseRateAnchor | None = None
     criteria_clauses: list[CriteriaClause] = Field(default_factory=list)
 
@@ -447,9 +439,7 @@ class MultipleChoiceStructured(BaseModel):
     question_type: Literal["multiple_choice"]
     prior: StatedPrior | None = None
     option_probs: dict[str, float]
-    # ARCHIVED BLOCKS ONLY, and read leniently — see _readable_optional_float. Both were
-    # Dirichlet tool inputs; no longer prompted since 2026-09-02, and an unusable value
-    # now reads as absent rather than costing the ballot that carries the forecast.
+    # Why: archived blocks only, read leniently so a bad value cannot cost the ballot; see _readable_optional_float.
     other_mass: float | None = None
     concentration: float | None = None
 
@@ -461,8 +451,8 @@ class MultipleChoiceStructured(BaseModel):
     @field_validator("concentration", mode="before")
     @classmethod
     def _tolerate_concentration(cls, v: object) -> float | None:
-        # A concentration is a positive Dirichlet hyperparameter, so 0.0 and negatives are
-        # not readings; the widely-copied example value was 20.0, hence no upper bound.
+        """A positive Dirichlet concentration, or None when the declaration is unusable."""
+        # Why: no upper bound, since the widely-copied example value was 20.0.
         read = _readable_optional_float(v, low=None, high=None)
         return read if read is not None and read > 0.0 else None
 
@@ -481,6 +471,42 @@ class MultipleChoiceStructured(BaseModel):
             raise ValueError(
                 f"MultipleChoiceStructured.option_probs must sum to ~1.0 "
                 f"(tol {_MC_OPTION_PROB_SUM_TOLERANCE}), got {total}"
+            )
+        return v
+
+
+class PmfStructured(BaseModel):
+    """Per-bin declaration on an enumerable grid: one probability per bin label, plus the reserved
+    ``below_range`` / ``above_range`` keys where the question's bound is open.
+
+    Not a question type: a coarse-grid numeric or date question (``numeric.config.elicit_per_bin``)
+    is elicited this way instead of as percentiles, so the block declares ``question_type: pmf``
+    while the question keeps its own type everywhere else. The keys are the labels of
+    ``numeric.pmf_grid.PmfGrid.keys``; matching them onto the grid is the extraction ladder's job
+    (``value_extraction.extract_pmf``), so this schema checks only that the object is a probability
+    vector: non-empty, string-keyed, every value in [0, 1], summing to about 1.0.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    question_type: Literal["pmf"]
+    bin_probs: dict[str, float]
+
+    @field_validator("bin_probs")
+    @classmethod
+    def _check_bin_probs(cls, v: dict[str, float]) -> dict[str, float]:
+        if not v:
+            raise ValueError("PmfStructured.bin_probs must be non-empty")
+        for key, prob in v.items():
+            if not key.strip():
+                raise ValueError(f"PmfStructured.bin_probs keys must be non-empty strings, got {key!r}")
+            if not (0.0 <= prob <= 1.0):
+                raise ValueError(f"PmfStructured.bin_probs values must be in [0, 1], got {prob}")
+        total = sum(v.values())
+        tolerance = pmf_prob_sum_tolerance(len(v))
+        if abs(total - 1.0) > tolerance:
+            raise ValueError(
+                f"PmfStructured.bin_probs must sum to ~1.0 (tol {tolerance} for {len(v)} keys), got {total}"
             )
         return v
 
@@ -520,20 +546,21 @@ class DiscreteCountStructured(BaseModel):
 
 
 StructuredBlock = Annotated[
-    BinaryStructured | NumericStructured | MultipleChoiceStructured | DateStructured,
+    BinaryStructured | NumericStructured | MultipleChoiceStructured | DateStructured | PmfStructured,
     Field(discriminator="question_type"),
 ]
 
+# Why: pmf is an elicitation, not a question type; see docs/value_extraction.md "The ladder".
+BlockType = QuestionType | Literal["pmf"]
 
-# NOTE: ``DiscreteCountStructured`` is intentionally NOT mapped here — the
-# runtime tool runner does not dispatch on it yet (phase-3). The class is
-# retained in this module so prompts can declare discrete_count blocks and
-# future activation work can extend the runner without schema changes.
+
+# Why: ``DiscreteCountStructured`` is intentionally unmapped, phase-3 work; see the module docstring.
 _QUESTION_TYPE_TO_MODEL: dict[str, type[BaseModel]] = {
     "binary": BinaryStructured,
     "numeric": NumericStructured,
     "multiple_choice": MultipleChoiceStructured,
     "date": DateStructured,
+    "pmf": PmfStructured,
 }
 
 
@@ -541,9 +568,7 @@ _QUESTION_TYPE_TO_MODEL: dict[str, type[BaseModel]] = {
 # Extraction helpers
 # ---------------------------------------------------------------------------
 
-# Matches fenced blocks of the form ```json ... ```, ```JSON ... ```,
-# ``` json ... ``` (with whitespace), or plain ``` ... ``` where the content
-# itself starts with `{`.
+# Any fence with an optional language tag; the tag and body preferences are ranked in extract_json_block_candidates.
 _FENCE_PATTERN = re.compile(
     r"```[ \t]*(?P<tag>[A-Za-z]*)[ \t]*\r?\n(?P<body>.*?)\r?\n[ \t]*```",
     re.DOTALL,
@@ -584,8 +609,6 @@ def extract_json_block_candidates(rationale_text: str) -> list[str]:
             tagged.append(body)
         elif tag == "" and body.lstrip().startswith("{"):
             untagged.append(body)
-    # Last-by-position first within each tier; the tagged tier ranks ahead of
-    # the untagged one.
     return [*reversed(tagged), *reversed(untagged)]
 
 
@@ -630,8 +653,7 @@ def iter_balanced_braces(s: str) -> Iterator[str]:
             return
         end_idx = _scan_to_matching_brace(s, start_idx)
         if end_idx is None:
-            # Unbalanced from start_idx to end — no further balanced block can
-            # begin inside this run, so stop.
+            # Why: nothing after an unclosed "{" can close, so no later top-level block completes.
             return
         yield s[start_idx : end_idx + 1]
         idx = end_idx + 1
@@ -646,7 +668,7 @@ def _scan_to_matching_brace(s: str, start_idx: int) -> int | None:
     depth = 0
     in_string = False
     escape_next = False
-    for i in range(start_idx, len(s)):
+    for i in range(start_idx, len(s)):  # HARNESS-SCAN-EXEMPT-python-numeric-hotloop: character scan, not numeric data
         c = s[i]
         if escape_next:
             escape_next = False
@@ -678,7 +700,7 @@ def extract_first_balanced_braces(s: str) -> str | None:
 
 def parse_structured_payload(
     raw_json: str,
-    question_type: QuestionType,
+    question_type: BlockType,
     *,
     log_failures: bool = True,
 ) -> StructuredBlock | None:
@@ -730,7 +752,7 @@ def parse_structured_payload(
 
 def _decode_structured_payload(
     raw_json: str,
-    question_type: QuestionType,
+    question_type: BlockType,
     *,
     log_failures: bool,
 ) -> dict | None:
@@ -754,7 +776,7 @@ def _decode_structured_payload(
         payload = json.loads(raw_json)
     except json.JSONDecodeError as exc:
         if log_failures:
-            snippet = raw_json[:200].replace("\n", " ")
+            snippet = raw_json[:200].replace("\n", " ")  # HARNESS-SCAN-EXEMPT-subsampling: a log snippet, not a sample
             logger.warning(
                 "Malformed JSON in structured block (question_type=%s): %s. Snippet: %s", question_type, exc, snippet
             )
@@ -831,7 +853,7 @@ def _retry_without_binary_telemetry(
 
 def parse_structured_block(
     rationale_text: str,
-    question_type: QuestionType,
+    question_type: BlockType,
 ) -> StructuredBlock | None:
     """
     Extract and validate a structured JSON block from a rationale.
@@ -868,10 +890,7 @@ def parse_structured_block(
 
     last_index = len(candidates) - 1
     for index, candidate in enumerate(candidates):
-        # Log a failure only on the LAST candidate we try: earlier failures are
-        # silently skipped (a valid block may still follow), while the final
-        # failure's WARNING preserves the honest end-state signal. A single-block
-        # rationale (the common case) is index==last, so its logging is unchanged.
+        # Why: only the last candidate's failure is the honest end state; a valid block may still follow the others.
         parsed = parse_structured_payload(candidate, question_type, log_failures=index == last_index)
         if parsed is not None:
             if index > 0:

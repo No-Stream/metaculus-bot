@@ -1,9 +1,9 @@
-"""Tests for the tracked question-supply probe (scripts/supply_probe.py).
+"""Tests for the tracked question-supply probe (scripts/supply_probe.py), Metaculus mode.
 
-Fixtures are shaped like the Metaculus posts-list payload the probe pages: a
-single-question post carries ``question``, a group post carries
-``group_of_questions.questions``, a notebook-shaped post carries neither, and every
-question carries ``scheduled_resolve_time`` / ``actual_resolve_time`` / ``resolution``.
+Fixtures are the dict builders in ``tests/supply_probe_fakes.py``, shaped like the Metaculus
+posts-list payload the probe pages. The Mantic mode (``--platform mantic``: public reads, the
+optional token, the spot-time snapshot and the per-release-hour miss table) is covered in
+``tests/test_supply_probe_mantic.py``.
 
 The situation they model is the one this utility exists for. On 2026-08-31 the summer
 tournament held 178 posts at status ``closed`` (closed to forecasting, not yet
@@ -21,7 +21,6 @@ any real connect anyway.
 
 import json
 import logging
-from datetime import UTC, datetime
 
 import pytest
 import requests
@@ -38,50 +37,16 @@ from scripts.supply_probe import (
     render_report,
     summarize_slug_supply,
 )
-
-NOW = datetime(2026, 8, 31, 2, 24, tzinfo=UTC)
-
-
-def _question(
-    qid: int,
-    *,
-    scheduled: str | None = "2026-09-30T00:00:00Z",
-    actual: str | None = None,
-    resolution: object = None,
-    qtype: str = "numeric",
-    forecast: bool | None = None,
-    open_time: str | None = "2026-07-20T03:00:00Z",
-    close_time: str | None = "2026-07-20T06:00:00Z",
-) -> dict:
-    """One question dict.
-
-    ``forecast`` models the three states the forfeit sweep distinguishes: None omits
-    ``my_forecasts`` entirely (a raw posts-LIST page, which is why the sweep needs detail
-    GETs), True carries a forecast, False carries the empty block a never-forecast question
-    shows under the bot's own token.
-    """
-    question = {
-        "id": qid,
-        "type": qtype,
-        "scheduled_resolve_time": scheduled,
-        "actual_resolve_time": actual,
-        "resolution": resolution,
-        "open_time": open_time,
-        "actual_close_time": close_time,
-    }
-    if forecast is True:
-        question["my_forecasts"] = {"latest": {"forecast_values": [0.4, 0.6]}, "history": [{"id": 1}]}
-    elif forecast is False:
-        question["my_forecasts"] = {"latest": None, "history": []}
-    return question
-
-
-def _post(post_id: int, question: dict, *, title: str = "Some question?") -> dict:
-    return {"id": post_id, "title": title, "question": question}
-
-
-def _group_post(post_id: int, questions: list[dict], *, title: str = "A group?") -> dict:
-    return {"id": post_id, "title": title, "group_of_questions": {"questions": questions}}
+from scripts.supply_probe_platforms import (
+    DEFAULT_SLUGS,
+    FORECAST_ABSENT,
+    FORECAST_PRESENT,
+    FORECAST_UNKNOWN,
+    METACULUS_PROBE,
+    POSTS_URL,
+    bot_forecast_state,
+)
+from tests.supply_probe_fakes import NOW, _group_post, _post, _question
 
 
 class TestQuestionsOnPost:
@@ -99,7 +64,7 @@ class TestQuestionsOnPost:
         assert [q["id"] for q in questions_on_post(post)] == [2, 3]
 
     def test_post_with_no_questions_is_empty(self):
-        # Notebook-shaped posts live in tournaments too; they carry no forecastable question.
+        """Notebook-shaped posts live in tournaments too; they carry no forecastable question."""
         assert questions_on_post({"id": 103, "title": "A notebook"}) == []
 
 
@@ -127,8 +92,8 @@ class TestStatusPartition:
         assert [c.status for c in supply.status_counts] == ["open", "closed", "resolved"]
 
     def test_totals_dedup_posts_and_questions_seen_under_two_statuses(self):
-        # A post that resolves mid-probe can be paged under both `closed` and `resolved`;
-        # the per-status rows report what the API said, the totals count each post once.
+        """A post that resolves mid-probe can be paged under both `closed` and `resolved`;
+        the per-status rows report what the API said, the totals count each post once."""
         by_status = self._posts_by_status()
         by_status["resolved"].append(_post(202, _question(12, actual="2026-08-30T00:00:00Z", resolution="9")))
 
@@ -177,8 +142,8 @@ class TestBacklog:
         assert summarize_slug_supply("slug", by_status, now=NOW).backlog == ()
 
     def test_question_resolved_inside_a_closed_group_post_is_not_backlog(self):
-        # A group post's status is the POST's; individual members resolve on their own
-        # schedules, so counting every member of a `closed` post as unresolved over-counts.
+        """A group post's status is the POST's; individual members resolve on their own
+        schedules, so counting every member of a `closed` post as unresolved over-counts."""
         by_status = {
             "closed": [
                 _group_post(
@@ -197,8 +162,8 @@ class TestBacklog:
         assert supply.resolved_within_unresolved_posts == 1
 
     def test_zero_resolution_counts_as_resolved(self):
-        # A numeric/count question can resolve to 0; a truthiness test would read that
-        # as unresolved and file it as backlog.
+        """A numeric/count question can resolve to 0; a truthiness test would read that
+        as unresolved and file it as backlog."""
         by_status = {"closed": [_post(307, _question(28, scheduled="2026-08-14T00:00:00Z", resolution=0))]}
 
         assert summarize_slug_supply("slug", by_status, now=NOW).backlog == ()
@@ -226,8 +191,8 @@ class TestBacklog:
         assert supply.unresolved_without_schedule == 2
 
     def test_naive_now_is_read_as_utc(self):
-        # Analysis scripts hand in bare datetimes; scheduled times parse to tz-aware UTC,
-        # so a naive clock has to be normalized rather than raise on the subtraction.
+        """Analysis scripts hand in bare datetimes; scheduled times parse to tz-aware UTC,
+        so a naive clock has to be normalized rather than raise on the subtraction."""
         by_status = {"closed": [_post(313, _question(34, scheduled="2026-08-14T00:00:00Z"))]}
 
         naive = summarize_slug_supply("slug", by_status, now=NOW.replace(tzinfo=None))
@@ -247,23 +212,23 @@ class TestBotForecastState:
     forfeit, and conflating the two is how a sweep reports a whole season as forfeited."""
 
     def test_a_list_page_question_answers_unknown(self):
-        assert supply_probe.bot_forecast_state(_question(1)) == supply_probe.FORECAST_UNKNOWN
+        assert bot_forecast_state(_question(1)) == FORECAST_UNKNOWN
 
     def test_an_empty_block_is_a_forfeit(self):
-        assert supply_probe.bot_forecast_state(_question(1, forecast=False)) == supply_probe.FORECAST_ABSENT
+        assert bot_forecast_state(_question(1, forecast=False)) == FORECAST_ABSENT
 
     def test_a_populated_block_is_a_forecast(self):
-        assert supply_probe.bot_forecast_state(_question(1, forecast=True)) == supply_probe.FORECAST_PRESENT
+        assert bot_forecast_state(_question(1, forecast=True)) == FORECAST_PRESENT
 
     def test_a_latest_without_a_history_still_counts_as_a_forecast(self):
-        # Never call a real forecast a forfeit: the scoring collector keys on `latest`, so a
-        # payload carrying it has a forecast whatever `history` looks like.
+        """Never call a real forecast a forfeit: the scoring collector keys on `latest`, so a
+        payload carrying it has a forecast whatever `history` looks like."""
         question = _question(1) | {"my_forecasts": {"latest": {"forecast_values": [0.5, 0.5]}, "history": []}}
-        assert supply_probe.bot_forecast_state(question) == supply_probe.FORECAST_PRESENT
+        assert bot_forecast_state(question) == FORECAST_PRESENT
 
     def test_a_null_block_answers_unknown_not_forfeit(self):
         question = _question(1) | {"my_forecasts": None}
-        assert supply_probe.bot_forecast_state(question) == supply_probe.FORECAST_UNKNOWN
+        assert bot_forecast_state(question) == FORECAST_UNKNOWN
 
 
 class TestForfeitSweep:
@@ -366,7 +331,7 @@ class TestResolveBotForecasts:
         seen: list[str] = []
         sleeps: list[float] = []
 
-        def _fake_get(params, token, *, url=supply_probe.POSTS_URL):
+        def _fake_get(params, token, *, url=POSTS_URL):
             seen.append(url)
             post_id = int(url.rstrip("/").rsplit("/", 1)[-1])
             if post_id in failing_ids:
@@ -385,7 +350,7 @@ class TestResolveBotForecasts:
         fetched = supply_probe.resolve_bot_forecasts(by_status, "token")
 
         assert fetched == 1
-        assert seen == [f"{supply_probe.POSTS_URL}920/"]
+        assert seen == [f"{POSTS_URL}920/"]
         supply = summarize_slug_supply("slug", by_status, now=NOW)
         assert [row.question_id for row in supply.forfeits] == [110]
 
@@ -410,10 +375,9 @@ class TestResolveBotForecasts:
         seen, _sleeps = self._install_details(monkeypatch, {923: detail})
 
         assert supply_probe.resolve_bot_forecasts(by_status, "token") == 1
-        assert seen == [f"{supply_probe.POSTS_URL}923/"]
+        assert seen == [f"{POSTS_URL}923/"]
         assert all(
-            supply_probe.bot_forecast_state(questions_on_post(posts[0])[0]) == supply_probe.FORECAST_ABSENT
-            for posts in by_status.values()
+            bot_forecast_state(questions_on_post(posts[0])[0]) == FORECAST_ABSENT for posts in by_status.values()
         )
 
     def test_requests_are_spaced_between_posts_but_not_after_the_last(self, monkeypatch):
@@ -465,7 +429,7 @@ class TestResolveBotForecasts:
         monkeypatch.setattr(
             supply_probe,
             "fetch_posts_by_status",
-            lambda slug, statuses, token: {"closed": [_post(928, _question(118))]},
+            lambda slug, statuses, token, **_: {"closed": [_post(928, _question(118))]},
         )
         monkeypatch.setattr(
             supply_probe,
@@ -604,9 +568,9 @@ class TestRateLimitRetry:
         assert calls[0]["timeout"] == supply_probe.REQUEST_TIMEOUT_SECS
 
     def test_the_backoff_grows_one_multiple_per_attempt_and_none_follows_the_last(self, monkeypatch):
-        # Linear, not exponential, and deliberately so: the endpoint recovers in seconds and
-        # the probe pages several slugs. The absent trailing sleep is the point of the
-        # arithmetic — waiting after the final attempt would delay a failure nobody retries.
+        """Linear, not exponential, and deliberately so: the endpoint recovers in seconds and
+        the probe pages several slugs. The absent trailing sleep is the point of the
+        arithmetic — waiting after the final attempt would delay a failure nobody retries."""
         calls, sleeps = self._install_responses(monkeypatch, [429] * supply_probe.MAX_RETRIES)
 
         with pytest.raises(requests.RequestException):
@@ -618,8 +582,8 @@ class TestRateLimitRetry:
         ]
 
     def test_exhausted_retries_raise_a_requests_exception_naming_the_cause(self, monkeypatch):
-        # requests.RequestException specifically, because that is the only class probe_slugs
-        # catches: anything else aborts the whole survey instead of filing one error row.
+        """requests.RequestException specifically, because that is the only class probe_slugs
+        catches: anything else aborts the whole survey instead of filing one error row."""
         self._install_responses(monkeypatch, [429] * supply_probe.MAX_RETRIES)
 
         with pytest.raises(requests.RequestException) as excinfo:
@@ -635,7 +599,7 @@ class TestRateLimitRetry:
         driven down to ``requests.get``, every detail GET would silently hit the posts LIST
         endpoint, which answers 200 with a page of other posts."""
         calls, _sleeps = self._install_responses(monkeypatch, [200], payload={"id": 920})
-        detail_url = f"{supply_probe.POSTS_URL}920/"
+        detail_url = f"{POSTS_URL}920/"
 
         data = supply_probe._get_json({}, "token", url=detail_url)
 
@@ -643,8 +607,8 @@ class TestRateLimitRetry:
         assert [call["url"] for call in calls] == [detail_url]
 
     def test_a_non_429_error_status_is_not_retried(self, monkeypatch):
-        # A 4xx slug is the expected case here (the bare `metaculus-cup` slug returns 400 today), and
-        # retrying it six times with backoff would stall the survey on every dead slug.
+        """A 4xx slug is the expected case here (the bare `metaculus-cup` slug returns 400 today),
+        and retrying it six times with backoff would stall the survey on every dead slug."""
         calls, sleeps = self._install_responses(monkeypatch, [404])
 
         with pytest.raises(requests.HTTPError):
@@ -676,7 +640,7 @@ class TestFetchPaging:
     def _install_pages(self, monkeypatch, pages_by_status):
         seen: list[dict] = []
 
-        def _fake_get(params, token):
+        def _fake_get(params, token, *, url=POSTS_URL):
             seen.append(dict(params))
             status = params["statuses"]
             index = params["offset"] // supply_probe.PAGE_SIZE
@@ -709,8 +673,9 @@ class TestFetchPaging:
         assert {p["tournaments"] for p in seen} == {"slug"}
 
     def test_paging_is_bounded(self, monkeypatch):
-        # An endpoint that never returns a short page must not page forever.
-        def _always_full(params, token):
+        """An endpoint that never returns a short page must not page forever."""
+
+        def _always_full(params, token, *, url=POSTS_URL):
             offset = params["offset"]
             return {"results": [_post(3000 + offset, _question(3000 + offset))] * supply_probe.PAGE_SIZE}
 
@@ -724,7 +689,7 @@ class TestFetchPaging:
 
 class TestProbeSlugsSoftFailsPerSlug:
     def test_one_dead_slug_does_not_hide_the_live_ones(self, monkeypatch):
-        def _fake_fetch(slug, statuses, token):
+        def _fake_fetch(slug, statuses, token, *, platform=METACULUS_PROBE):
             if slug == "metaculus-cup":
                 raise requests.HTTPError("404 Client Error: Not Found")
             return {"closed": [_post(601, _question(61, scheduled="2026-08-14T00:00:00Z"))]}
@@ -760,7 +725,7 @@ class TestMain:
             ],
             "resolved": [_post(703, _question(73, actual="2026-08-01T00:00:00Z", resolution="7", forecast=True))],
         }
-        monkeypatch.setattr(supply_probe, "fetch_posts_by_status", lambda slug, statuses, token: posts)
+        monkeypatch.setattr(supply_probe, "fetch_posts_by_status", lambda slug, statuses, token, **_: posts)
         monkeypatch.setattr(supply_probe, "verify_metaculus_api_identity", lambda: None)
         monkeypatch.setenv("METACULUS_TOKEN", "token")
         monkeypatch.setattr("sys.argv", ["supply_probe", "--slugs", "summer-futureeval-2026", *extra_argv])
@@ -794,8 +759,7 @@ class TestMain:
         self._run(monkeypatch, extra_argv=["--no-forfeits"])
         out = capsys.readouterr().out
 
-        # The flag only skips the RESOLVER; these fixtures already answer from their list
-        # payload, so the count still lands. On real list pages it would read all-unknown.
+        # The flag skips only the RESOLVER; these fixtures answer from the list payload, so the count lands.
         assert "never forecast by the bot: 1" in out
 
     def test_main_writes_the_json_dump(self, monkeypatch, tmp_path, capsys):
@@ -824,11 +788,10 @@ class TestMain:
 
     def test_identity_preflight_runs_before_the_token_pull(self, monkeypatch, capsys):
         calls: list[str] = []
-        # forecast= is set so the default forfeit sweep answers off this payload and issues no
-        # detail GET; this test is about ordering, not about the sweep.
+        # forecast=True lets the default sweep answer off this payload with no detail GET; this pins ordering.
         posts = {"closed": [_post(801, _question(81, forecast=True))]}
 
-        def _fetch(slug, statuses, token):
+        def _fetch(slug, statuses, token, *, platform=METACULUS_PROBE):
             calls.append("fetch")
             return posts
 
@@ -845,18 +808,18 @@ class TestMain:
 
 class TestDefaults:
     def test_default_slugs_come_from_the_repo_constants(self):
-        assert TOURNAMENT_ID in supply_probe.DEFAULT_SLUGS
-        assert FALL_CUP_SLUG in supply_probe.DEFAULT_SLUGS
-        assert METACULUS_CUP_ID in supply_probe.DEFAULT_SLUGS
-        assert len(set(supply_probe.DEFAULT_SLUGS)) == len(supply_probe.DEFAULT_SLUGS)
+        assert TOURNAMENT_ID in DEFAULT_SLUGS
+        assert FALL_CUP_SLUG in DEFAULT_SLUGS
+        assert METACULUS_CUP_ID in DEFAULT_SLUGS
+        assert len(set(DEFAULT_SLUGS)) == len(DEFAULT_SLUGS)
 
     def test_closed_is_a_default_status(self):
         assert "closed" in supply_probe.DEFAULT_STATUSES
 
     def test_probe_url_shares_the_host_the_preflight_vets(self):
-        # The identity guard's promise is that the vetted host is the host the token goes
-        # to, so a hardcoded probe URL would quietly break it under a base-URL override.
-        assert api_preflight.preflight_url().startswith(supply_probe.POSTS_URL)
+        """The identity guard's promise is that the vetted host is the host the token goes
+        to, so a hardcoded probe URL would quietly break it under a base-URL override."""
+        assert api_preflight.preflight_url().startswith(POSTS_URL)
 
     def test_an_override_loaded_from_a_dotenv_file_moves_both_urls_together(
         self, monkeypatch: pytest.MonkeyPatch

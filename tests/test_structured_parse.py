@@ -24,6 +24,8 @@ from forecasting_tools.data_models.numeric_report import Percentile
 from metaculus_bot import structured_parse as sp
 from metaculus_bot.simple_types import OptionProbability
 from metaculus_bot.structured_parse import (
+    BinProbability,
+    BinProbabilityListWrapper,
     DatePercentileListWrapper,
     IsoDatePercentile,
     OptionProbabilityListWrapper,
@@ -181,8 +183,7 @@ class TestFallbackGuarantee:
     @pytest.mark.asyncio
     async def test_wrapper_json_validation_error_falls_back(self, parser_llm):
         """Constrained returns JSON that parses but fails Percentile validation → fallback."""
-        # `percentile` outside [0,1] fails Percentile's pydantic validators, so
-        # PercentileListWrapper.model_validate_json raises.
+        # A percentile outside [0,1] makes PercentileListWrapper.model_validate_json raise.
         canned = '{"percentiles": [{"percentile": 1.5, "value": 10.0}]}'
         constrained = _patch_build_constrained_llm(canned)
         fallback_result = [Percentile(percentile=0.5, value=99.0)]
@@ -296,3 +297,49 @@ class TestDatePercentileWrapper:
         assert w.percentiles[0].value == datetime(2026, 9, 16, 12, tzinfo=UTC)
         assert sp._get_wrapper_type(list[IsoDatePercentile]) is DatePercentileListWrapper
         assert sp._get_wrapper_type(list[Percentile]) is PercentileListWrapper
+
+
+class TestBinProbabilityWrapper:
+    """The per-bin salvage rung: ``list[BinProbability]`` needs its own wrapper, or the constrained
+    schema falls back to a bare list and the parser LLM's output is unconstrained."""
+
+    @pytest.mark.asyncio
+    async def test_bin_probability_list_wrapper_unwrap(self, parser_llm) -> None:
+        canned = (
+            '{"bins": ['
+            '{"label": "below_range", "probability": 0.1},'
+            '{"label": "2026-09-16", "probability": 0.6},'
+            '{"label": "above_range", "probability": 0.3}'
+            "]}"
+        )
+        constrained = _patch_build_constrained_llm(canned)
+        with patch.object(sp, "_build_constrained_llm", return_value=constrained) as build_mock:
+            result = await parse_structured("txt", list[BinProbability], parser_llm)
+
+        assert [type(item) for item in result] == [BinProbability] * 3
+        assert [(item.label, item.probability) for item in result] == [
+            ("below_range", 0.1),
+            ("2026-09-16", 0.6),
+            ("above_range", 0.3),
+        ]
+        schema_model, _ = build_mock.call_args[0]
+        assert schema_model is BinProbabilityListWrapper
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_bin_list_falls_back_on_the_same_output_type(self, parser_llm) -> None:
+        constrained = _patch_build_constrained_llm('{"bins": [{"label": "0"}]}')
+        fallback = AsyncMock(return_value=[])
+        with (
+            patch.object(sp, "_build_constrained_llm", return_value=constrained),
+            patch.object(sp, "structure_output", new=fallback),
+        ):
+            await parse_structured("t", list[BinProbability], parser_llm)
+        fallback.assert_awaited_once()
+        assert fallback.await_args is not None
+        assert fallback.await_args.kwargs["output_type"] == list[BinProbability]
+
+    def test_wrapper_shape_and_dispatch(self) -> None:
+        w = BinProbabilityListWrapper.model_validate({"bins": [{"label": "7", "probability": 1.0}]})
+        assert w.bins[0].label == "7"
+        assert w.bins[0].probability == 1.0
+        assert sp._get_wrapper_type(list[BinProbability]) is BinProbabilityListWrapper

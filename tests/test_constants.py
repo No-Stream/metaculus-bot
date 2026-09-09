@@ -18,6 +18,7 @@ from metaculus_bot.constants import (
     GAP_FILL_V2_READER_MODEL,
     GEMINI_SEARCH_DEFAULT_MODEL,
     MANTIC_API_BASE_URL,
+    MANTIC_BOT_USER_ID,
     MANTIC_HOST,
     MANTIC_SITE_URL,
     MC_PROB_MAX,
@@ -269,3 +270,7 @@ class TestQuestionPlatformHosts:
         """The one list behind the publish-timeout scope, the self-reference refusal and the
         gap-fill v2 driver text; an added platform lands here and nowhere else."""
         assert QUESTION_PLATFORM_HOSTS == ("metaculus.com", "competitions.mantic.com")
+
+    def test_the_bots_own_mantic_account_id(self):
+        """``nostreambot-bot``, ``is_bot`` true, read off the public ``/api/users/81/`` on 2026-09-08."""
+        assert MANTIC_BOT_USER_ID == 81

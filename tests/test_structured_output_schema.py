@@ -7,11 +7,12 @@ from __future__ import annotations
 import json
 import logging
 from datetime import UTC, datetime
-from typing import get_args, get_type_hints
+from typing import ClassVar, get_args, get_type_hints
 
 import pytest
 from pydantic import ValidationError
 
+import metaculus_bot.structured_output_schema as schema
 from metaculus_bot import structured_output_schema
 from metaculus_bot.question_types import QuestionType
 from metaculus_bot.structured_output_schema import (
@@ -20,6 +21,7 @@ from metaculus_bot.structured_output_schema import (
     _QUESTION_TYPE_TO_MODEL,
     BaseRateAnchor,
     BinaryStructured,
+    BlockType,
     CriteriaClause,
     DateStructured,
     DiscreteCountStructured,
@@ -27,6 +29,7 @@ from metaculus_bot.structured_output_schema import (
     MultipleChoiceStructured,
     NumericOutcomeType,
     NumericStructured,
+    PmfStructured,
     ScenarioBranch,
     StatedBaseRate,
     StatedHazard,
@@ -176,10 +179,8 @@ class TestBinaryStructuredHappyPath:
             BinaryStructured(question_type="binary", posterior_prob=1.5)
 
     def test_extra_fields_forbidden(self) -> None:
+        """extra="forbid" rejects an unknown field at runtime, so the static-typing complaint is expected."""
         with pytest.raises(ValidationError):
-            # The unknown_field is intentionally invalid — this test asserts
-            # Pydantic's extra="forbid" rejects it. Static-typing complaint is
-            # expected and correct; we care about the runtime behavior.
             BinaryStructured(question_type="binary", posterior_prob=0.5, unknown_field="oops")  # type: ignore[call-arg]
 
 
@@ -254,11 +255,12 @@ class TestBinaryTelemetryStripAndRetry:
     """
 
     def test_criteria_clauses_null_recovers_core_block(self, caplog: pytest.LogCaptureFixture) -> None:
-        # Canonical failure: prompt says "omit" criteria_clauses when there
-        # isn't a conjunctive breakdown, but LLMs frequently emit `null`
-        # instead. Old behavior: whole block dropped, base-rate blend and
-        # prior/posterior contributions vanish. New behavior: warn + keep
-        # the core binary block.
+        """A ``criteria_clauses: null`` block warns and keeps its core binary fields.
+
+        The prompt says to omit the key without a conjunctive breakdown, but models emit ``null``
+        instead, and dropping the whole block lost the base-rate blend and the prior/posterior
+        contributions with it.
+        """
         rationale = (
             "```json\n"
             + json.dumps(
@@ -290,9 +292,11 @@ class TestBinaryTelemetryStripAndRetry:
         )
 
     def test_reversed_anchor_recovers_core_block(self, caplog: pytest.LogCaptureFixture) -> None:
-        # Canonical failure: {low: 0.6, high: 0.2} is rejected by
-        # BaseRateAnchor's ordering validator. Same recovery contract as
-        # criteria_clauses=null.
+        """A reversed ``base_rate_anchor`` warns and keeps the core binary fields.
+
+        BaseRateAnchor's ordering validator rejects ``{low: 0.6, high: 0.2}``; same recovery
+        contract as ``criteria_clauses: null``.
+        """
         rationale = (
             "```json\n"
             + json.dumps(
@@ -314,7 +318,7 @@ class TestBinaryTelemetryStripAndRetry:
         )
 
     def test_both_telemetry_fields_malformed_recovers(self, caplog: pytest.LogCaptureFixture) -> None:
-        # Both telemetry keys present and malformed: strip both, keep core.
+        """Both telemetry keys present and malformed: strip both, keep the core block."""
         rationale = (
             "```json\n"
             + json.dumps(
@@ -338,9 +342,7 @@ class TestBinaryTelemetryStripAndRetry:
         assert "criteria_clauses" in message_text
 
     def test_bad_core_field_still_returns_none(self, caplog: pytest.LogCaptureFixture) -> None:
-        # posterior_prob=1.5 is a core-field violation. Even with valid
-        # telemetry alongside, the block must still be dropped — strip-and-
-        # retry MUST NOT rescue a bad core field.
+        """Strip-and-retry must not rescue a bad core field: a posterior_prob of 1.5 still drops the block."""
         rationale = (
             "```json\n"
             + json.dumps(
@@ -361,8 +363,7 @@ class TestBinaryTelemetryStripAndRetry:
         assert not any("malformed telemetry fields" in rec.message for rec in caplog.records)
 
     def test_bad_core_and_bad_telemetry_still_none(self) -> None:
-        # Neither retry variant is valid — bad core, bad telemetry. Must
-        # return None (fall through to the original None return).
+        """Bad core plus bad telemetry: neither retry variant validates, so the result is None."""
         rationale = (
             "```json\n"
             + json.dumps(
@@ -378,12 +379,11 @@ class TestBinaryTelemetryStripAndRetry:
         assert result is None
 
     def test_recovered_block_feeds_cross_model_aggregation(self) -> None:
-        # Guard the invariant end-to-end: a forecaster whose ONLY validation
-        # error is malformed telemetry must still contribute its base_rate
-        # to the cross-model aggregation. Uses tool_runner's internal
-        # _parse_all_blocks + _aggregate_binary_lines directly to keep the
-        # test independent of feature-flag env state.
+        """A forecaster whose only validation error is malformed telemetry still contributes its base rate.
 
+        Calls ``_parse_all_blocks`` and ``_aggregate_binary_lines`` directly so the test does not
+        depend on feature-flag env state.
+        """
         good = (
             "```json\n"
             + json.dumps(
@@ -395,9 +395,7 @@ class TestBinaryTelemetryStripAndRetry:
             )
             + "\n```"
         )
-        # This rationale would previously drop entirely because of the null
-        # criteria_clauses; after strip-and-retry it contributes to the
-        # base_rate blend.
+        # Previously dropped entirely on the null criteria_clauses; strip-and-retry keeps it.
         recovered = (
             "```json\n"
             + json.dumps(
@@ -436,17 +434,13 @@ class TestNumericStructuredHappyPath:
         assert n.scenarios == []
 
     def test_tails_field_removed(self) -> None:
-        # The dead `tails` / TailMass slot was removed (W2). NumericStructured
-        # uses extra="forbid", so passing a `tails` key must now raise, and
-        # TailMass must no longer be importable from the schema module.
+        """The dead ``tails`` / ``TailMass`` slot is gone: the key is rejected and the name is unimportable."""
         with pytest.raises(ValidationError):
             NumericStructured(
                 question_type="numeric",
                 declared_percentiles={0.1: 1.0, 0.5: 5.0, 0.9: 9.0},
                 tails={"below_min_expected": 0.05, "above_max_expected": 0.05},  # type: ignore[call-arg]
             )
-        import metaculus_bot.structured_output_schema as schema
-
         assert not hasattr(schema, "TailMass")
 
     def test_outcome_type_discrete(self) -> None:
@@ -495,8 +489,7 @@ class TestNumericStructuredHappyPath:
             )
         assert n.outcome_type is None
         assert n.declared_percentiles == {0.1: 1.0, 0.5: 5.0, 0.9: 9.0}
-        # The raw value rides the WARNING: a spelling the roster starts using is a prompt
-        # signal, not noise.
+        # The raw value rides the WARNING: a spelling the roster starts using is a prompt signal.
         assert any(repr(declared) in rec.getMessage() for rec in caplog.records)
 
     @pytest.mark.parametrize(
@@ -560,7 +553,7 @@ class TestMultipleChoiceStructuredHappyPath:
         assert m.concentration is None
 
     def test_sum_within_tolerance(self) -> None:
-        # 0.99 sum is within 0.02 tolerance of 1.0
+        """A 0.99 option_probs sum is within the 0.02 tolerance of 1.0."""
         m = MultipleChoiceStructured(
             question_type="multiple_choice",
             option_probs={"A": 0.33, "B": 0.33, "C": 0.33},
@@ -649,7 +642,7 @@ class TestStatedHazardValidators:
             )
 
     def test_fractions_sum_within_tolerance_ok(self) -> None:
-        # 0.49 + 0.505 = 0.995, within 0.01 tolerance
+        """0.49 + 0.505 = 0.995, within the 0.01 tolerance."""
         h = StatedHazard(
             rate_per_unit=0.1,
             unit="day",
@@ -717,9 +710,8 @@ class TestEvidenceItemValidators:
         assert e.likelihood_ratio == pytest.approx(2.5)
 
     def test_invalid_direction_raises(self) -> None:
+        """A direction outside the Literal is rejected at runtime, so the type-ignore is expected."""
         with pytest.raises(ValidationError):
-            # "sideways" is intentionally outside the Literal — this test
-            # asserts Pydantic rejects it at runtime.
             EvidenceItem(summary="x", direction="sideways", strength="weak")  # type: ignore[arg-type]
 
     def test_empty_summary_raises(self) -> None:
@@ -770,13 +762,13 @@ class TestScenarioSumValidator:
         assert n.scenarios == []
 
     def test_binary_scenarios_within_tolerance_ok(self) -> None:
-        # 0.49 + 0.52 = 1.01, within 0.02 tolerance
+        """0.49 + 0.52 = 1.01, within the 0.02 tolerance."""
         scenarios = [ScenarioBranch(name="a", prob=0.49), ScenarioBranch(name="b", prob=0.52)]
         b = BinaryStructured(question_type="binary", posterior_prob=0.5, scenarios=scenarios)
         assert sum(s.prob for s in b.scenarios) == pytest.approx(1.01)
 
     def test_numeric_scenarios_within_tolerance_ok(self) -> None:
-        # 0.5 + 0.485 = 0.985, within 0.02 tolerance of 1.0
+        """0.5 + 0.485 = 0.985, within the 0.02 tolerance of 1.0."""
         scenarios = [ScenarioBranch(name="a", prob=0.5), ScenarioBranch(name="b", prob=0.485)]
         n = NumericStructured(
             question_type="numeric",
@@ -814,9 +806,11 @@ class TestNumericDeclaredPercentiles:
             )
 
     def test_a_decrease_with_rising_percentile_still_raises(self) -> None:
-        # Incoherent by construction, and unsalvageable: sort_by_percentile_level orders by
-        # LABEL, so a value-disordered set is force-monotonized rather than reordered, which
-        # on one stray value pins most of the curve at a bound.
+        """A value-disordered percentile set is incoherent by construction and unsalvageable.
+
+        ``sort_by_percentile_level`` orders by LABEL, so such a set is force-monotonized rather
+        than reordered, and one stray value pins most of the curve at a bound.
+        """
         with pytest.raises(ValidationError, match="non-decreasing"):
             NumericStructured(
                 question_type="numeric",
@@ -1128,7 +1122,6 @@ class TestExtractJsonBlock:
         assert extract_json_block("") is None
 
     def test_unclosed_fence_returns_none(self) -> None:
-        # Opening fence without closing fence should not match
         text = '```json\n{"question_type": "binary"}\n'
         assert extract_json_block(text) is None
 
@@ -1160,7 +1153,7 @@ class TestExtractJsonBlock:
         assert extract_json_block(text) is None
 
     def test_prefers_tagged_over_untagged(self) -> None:
-        # Untagged code fence (with JSON-like content) should be ignored when a tagged json block exists.
+        """An untagged fence with JSON-like content is ignored when a tagged json block exists."""
         text = '```\n{"untagged": true}\n```\nsome text\n```json\n{"tagged": true}\n```\n'
         body = extract_json_block(text)
         assert body is not None
@@ -1192,8 +1185,7 @@ class TestExtractFirstBalancedBraces:
         assert extract_first_balanced_braces(text) == '{"gap": "g"}'
 
     def test_brace_inside_string_value_not_counted(self) -> None:
-        # The crux of F11: a naive brace counter closes the object at the `}`
-        # inside the string value, producing '{"foo": "has a }'.
+        """The crux of F11: a naive brace counter would close the object at the ``}`` inside the string."""
         text = '{"foo": "has a } brace", "b": 1}'
         assert extract_first_balanced_braces(text) == text
 
@@ -1206,15 +1198,12 @@ class TestExtractFirstBalancedBraces:
         assert extract_first_balanced_braces(text) == text
 
     def test_escaped_quote_inside_string(self) -> None:
-        # `\"` should NOT exit the string, so the `}` that follows is still
-        # inside the string literal.
+        """An escaped quote does not exit the string, so the ``}`` that follows is still inside it."""
         text = '{"a": "quote \\" then } brace", "b": 1}'
         assert extract_first_balanced_braces(text) == text
 
     def test_escaped_backslash_then_quote_exits_string(self) -> None:
-        # `\\` is an escaped backslash; the following `"` then exits the
-        # string. Without correct escape handling we'd stay inside and miss
-        # the final `}`.
+        """An escaped backslash lets the next quote exit the string, so the final ``}`` is still found."""
         text = '{"a": "trailing slash \\\\", "b": 1}'
         assert extract_first_balanced_braces(text) == text
 
@@ -1223,7 +1212,7 @@ class TestExtractFirstBalancedBraces:
         assert extract_first_balanced_braces(text) == text
 
     def test_returns_first_balanced_block_only(self) -> None:
-        # Trailing second object is not part of the first balanced block.
+        """A trailing second object is not part of the first balanced block."""
         text = '{"first": 1} then {"second": 2}'
         assert extract_first_balanced_braces(text) == '{"first": 1}'
 
@@ -1246,7 +1235,7 @@ class TestExtractJsonBlockCandidates:
         assert extract_json_block_candidates(text) == ['{"b": 2}', '{"a": 1}']
 
     def test_tagged_ranked_ahead_of_untagged(self) -> None:
-        # Untagged appears LATER in the text but still ranks below the tagged one.
+        """An untagged fence appearing LATER in the text still ranks below the tagged one."""
         text = '```json\n{"tagged": 1}\n```\n```\n{"untagged": 2}\n```\n'
         assert extract_json_block_candidates(text) == ['{"tagged": 1}', '{"untagged": 2}']
 
@@ -1272,7 +1261,7 @@ class TestIterBalancedBraces:
         assert list(iter_balanced_braces("plain prose")) == []
 
     def test_stops_after_unbalanced_run(self) -> None:
-        # First blob closes; the second run is unbalanced, so nothing further.
+        """The first blob closes and the second run is unbalanced, so nothing further is yielded."""
         text = '{"ok": 1} then {"unbalanced": '
         assert list(iter_balanced_braces(text)) == ['{"ok": 1}']
 
@@ -1291,14 +1280,89 @@ class TestIterBalancedBraces:
 
 
 class TestQuestionTypeVocabulary:
-    def test_the_parsers_accept_exactly_the_shared_question_types(self) -> None:
-        """One vocabulary, one definition: the ``question_type`` a block may declare is
-        ``question_types.QuestionType``, not a restated copy, and every token in it has a model.
-        A restated copy fails asymmetrically (adding ``date`` cost four synchronized edits)."""
-        assert set(_QUESTION_TYPE_TO_MODEL) == set(get_args(QuestionType))
+    def test_the_parsers_accept_exactly_the_shared_question_types_plus_pmf(self) -> None:
+        """One vocabulary, one definition: the ``question_type`` a block may declare is ``BlockType``,
+        a WIDENING of ``question_types.QuestionType`` by the per-bin block and never a restated copy
+        (a restated copy fails asymmetrically: adding ``date`` cost four synchronized edits). ``pmf``
+        is an elicitation of a numeric or date question, not a question type, so ``QuestionType``
+        itself stays as it is and every token of the widened vocabulary has a model."""
+        assert set(_QUESTION_TYPE_TO_MODEL) == set(get_args(QuestionType)) | {"pmf"}
+        assert "pmf" not in get_args(QuestionType)
         for parser in (parse_structured_block, parse_structured_payload):
-            assert get_type_hints(parser)["question_type"] is QuestionType
+            assert get_type_hints(parser)["question_type"] is BlockType
         assert not hasattr(structured_output_schema, "StructuredQuestionType"), "the restated copy is back"
+
+
+class TestPmfStructured:
+    """The per-bin block: one probability per bin label plus the reserved out-of-range keys."""
+
+    EXAMPLE: ClassVar[dict[str, object]] = {
+        "question_type": "pmf",
+        "bin_probs": {"below_range": 0.05, "0": 0.6, "1": 0.25, "2": 0.05, "above_range": 0.05},
+    }
+
+    def test_accepts_the_example_block(self) -> None:
+        block = PmfStructured.model_validate(self.EXAMPLE)
+        assert block.question_type == "pmf"
+        assert block.bin_probs == self.EXAMPLE["bin_probs"]
+
+    def test_parses_through_the_shared_payload_parser(self) -> None:
+        parsed = parse_structured_payload(json.dumps(self.EXAMPLE), "pmf")
+        assert isinstance(parsed, PmfStructured)
+        assert parsed.bin_probs["above_range"] == 0.05
+
+    def test_a_missing_question_type_is_injected_by_the_parser(self) -> None:
+        payload = {"bin_probs": self.EXAMPLE["bin_probs"]}
+        assert isinstance(parse_structured_payload(json.dumps(payload), "pmf"), PmfStructured)
+
+    def test_the_sum_tolerance_is_the_ballot_floor_or_the_per_key_drift(self) -> None:
+        """0.005 a key (two-decimal rounding), never below the multiple-choice ballot's 0.02."""
+        assert structured_output_schema.pmf_prob_sum_tolerance(3) == 0.02
+        assert structured_output_schema.pmf_prob_sum_tolerance(4) == 0.02
+        assert structured_output_schema.pmf_prob_sum_tolerance(14) == pytest.approx(0.07)
+        assert structured_output_schema.pmf_prob_sum_tolerance(33) == pytest.approx(0.165)
+
+    def test_a_fourteen_key_block_off_by_0_06_is_accepted_and_off_by_0_08_is_rejected(self) -> None:
+        """Fourteen keys earn 0.07 of slack: thirteen at 0.07 plus 0.15 sums to 1.06 and passes, plus 0.17 sums
+        to 1.08 and fails."""
+        thirteen = {str(k): 0.07 for k in range(13)}
+        block = PmfStructured(question_type="pmf", bin_probs={**thirteen, "13": 0.15})
+        assert sum(block.bin_probs.values()) == pytest.approx(1.06)
+        with pytest.raises(ValidationError, match="must sum to"):
+            PmfStructured(question_type="pmf", bin_probs={**thirteen, "13": 0.17})
+
+    def test_a_three_key_block_off_by_0_03_is_rejected_by_the_floor(self) -> None:
+        with pytest.raises(ValidationError, match="must sum to"):
+            PmfStructured(question_type="pmf", bin_probs={"0": 0.5, "1": 0.3, "2": 0.23})
+        block = PmfStructured(question_type="pmf", bin_probs={"0": 0.5, "1": 0.3, "2": 0.21})
+        assert sum(block.bin_probs.values()) == pytest.approx(1.01)
+
+    def test_an_unknown_top_level_key_raises(self) -> None:
+        with pytest.raises(ValidationError, match="extra_forbidden"):
+            PmfStructured.model_validate({**self.EXAMPLE, "prior": {"prob": 0.5, "source": "x"}})
+
+    def test_empty_bin_probs_raises(self) -> None:
+        with pytest.raises(ValidationError, match="must be non-empty"):
+            PmfStructured(question_type="pmf", bin_probs={})
+
+    def test_a_blank_key_raises(self) -> None:
+        with pytest.raises(ValidationError, match="non-empty strings"):
+            PmfStructured(question_type="pmf", bin_probs={"  ": 0.5, "1": 0.5})
+
+    def test_a_probability_outside_the_unit_interval_raises(self) -> None:
+        with pytest.raises(ValidationError, match="values must be in"):
+            PmfStructured(question_type="pmf", bin_probs={"0": 1.5, "1": -0.5})
+
+    def test_a_non_finite_probability_raises(self) -> None:
+        """``json.loads`` admits ``NaN`` and ``Infinity`` literals; neither is a probability."""
+        for literal in ("NaN", "Infinity"):
+            payload = f'{{"question_type": "pmf", "bin_probs": {{"0": {literal}, "1": 0.5}}}}'
+            assert parse_structured_payload(payload, "pmf", log_failures=False) is None
+
+    def test_the_other_block_types_refuse_a_pmf_payload(self) -> None:
+        """The discriminator keeps ``pmf`` out of the percentile and ballot models."""
+        for other in ("numeric", "date", "multiple_choice", "binary"):
+            assert parse_structured_payload(json.dumps(self.EXAMPLE), other, log_failures=False) is None
 
 
 class TestParseStructuredBlock:
@@ -1354,8 +1418,7 @@ class TestParseStructuredBlock:
         assert result.other_mass == pytest.approx(0.0)
 
     def test_discrete_count_class_still_constructable(self) -> None:
-        # Discrete-count dispatch is phase-3, but the class remains available
-        # so prompts and future runtime wiring can use it.
+        """Discrete-count dispatch is phase-3, but the class stays constructable for prompts and wiring."""
         d = DiscreteCountStructured(question_type="discrete_count", mean_estimate=2.0, dispersion="poisson")
         assert d.mean_estimate == pytest.approx(2.0)
 
@@ -1368,8 +1431,7 @@ class TestParseStructuredBlock:
         assert any(
             record.levelno == logging.INFO and "No JSON block found" in record.message for record in caplog.records
         )
-        # Scoped to our own loggers: caplog.records spans every logger that propagates
-        # to root, so an unrelated third-party WARNING would otherwise fail this.
+        # Scoped to our own loggers: caplog.records spans every logger propagating to root.
         our_warnings = [
             r for r in caplog.records if r.levelno >= logging.WARNING and r.name.startswith("metaculus_bot")
         ]
@@ -1384,7 +1446,7 @@ class TestParseStructuredBlock:
         assert any(record.levelno == logging.WARNING for record in caplog.records)
 
     def test_missing_required_field_returns_none_and_warns(self, caplog: pytest.LogCaptureFixture) -> None:
-        # Missing posterior_prob
+        """A payload missing posterior_prob returns None and warns."""
         payload = {"question_type": "binary"}
         rationale = f"```json\n{json.dumps(payload)}\n```"
         with caplog.at_level(logging.WARNING, logger="metaculus_bot.structured_output_schema"):
@@ -1403,7 +1465,6 @@ class TestParseStructuredBlock:
         assert any(record.levelno == logging.WARNING for record in caplog.records)
 
     def test_missing_question_type_in_payload_injected(self) -> None:
-        # question_type missing in payload — parser should inject it.
         payload = {"posterior_prob": 0.42}
         rationale = f"```json\n{json.dumps(payload)}\n```"
         result = parse_structured_block(rationale, "binary")
@@ -1440,8 +1501,7 @@ class TestParseStructuredBlock:
         assert result.model_dump() == valid_mc_block.model_dump()
 
     def test_discrete_count_roundtrip_via_model(self, valid_discrete_block: DiscreteCountStructured) -> None:
-        # Discrete-count does not flow through parse_structured_block (phase-3),
-        # but the pydantic class must still round-trip via JSON on its own.
+        """Discrete-count skips parse_structured_block (phase-3), so the class must round-trip on its own."""
         dumped = valid_discrete_block.model_dump_json()
         loaded = DiscreteCountStructured.model_validate_json(dumped)
         assert loaded.model_dump() == valid_discrete_block.model_dump()
@@ -1460,10 +1520,11 @@ class TestValidityAwareBlockSelection:
     """
 
     def test_valid_block_then_malformed_trailing_block_selects_valid(self) -> None:
-        # The team lead's reproduction, adapted to the real schema field
-        # (``posterior_prob`` — the verbatim repro used ``prediction_in_decimal``,
-        # which is not a BinaryStructured field, so BOTH its blocks are invalid).
-        # A valid forecast block followed by a malformed schema-recap.
+        """A valid forecast block followed by a malformed schema-recap selects the valid one.
+
+        Adapted from the original repro, which used ``prediction_in_decimal``: not a
+        BinaryStructured field, so both of its blocks were invalid.
+        """
         text = (
             "reasoning here\n"
             '```json\n{"question_type": "binary", "posterior_prob": 0.42}\n```\n'
@@ -1475,8 +1536,7 @@ class TestValidityAwareBlockSelection:
         assert result.posterior_prob == pytest.approx(0.42)
 
     def test_valid_block_then_schema_invalid_trailing_selects_valid(self) -> None:
-        # Trailing block is well-formed JSON but fails schema validation
-        # (posterior_prob outside [0, 1]); the valid earlier block is kept.
+        """A trailing block that parses but fails validation loses to the earlier valid one."""
         text = (
             '```json\n{"question_type": "binary", "posterior_prob": 0.42}\n```\n'
             '```json\n{"question_type": "binary", "posterior_prob": 1.5}\n```\n'
@@ -1496,8 +1556,7 @@ class TestValidityAwareBlockSelection:
         assert result.posterior_prob == pytest.approx(0.42)
 
     def test_two_valid_blocks_last_by_position_wins(self) -> None:
-        # Tiebreak preserved: among VALID blocks the last by position wins
-        # (the prompt asks for the forecast block last).
+        """Among VALID blocks the last by position wins, because the prompt asks for the forecast last."""
         text = (
             '```json\n{"question_type": "binary", "posterior_prob": 0.1}\n```\n'
             '```json\n{"question_type": "binary", "posterior_prob": 0.9}\n```\n'
@@ -1507,7 +1566,7 @@ class TestValidityAwareBlockSelection:
         assert result.posterior_prob == pytest.approx(0.9)
 
     def test_only_malformed_block_returns_none_and_warns(self, caplog: pytest.LogCaptureFixture) -> None:
-        # Honest-failure path unchanged: no valid candidate → None at WARNING.
+        """The honest-failure path is unchanged: no valid candidate returns None at WARNING."""
         text = "```json\n{this is not valid json\n```"
         with caplog.at_level(logging.WARNING, logger="metaculus_bot.structured_output_schema"):
             result = parse_structured_block(text, "binary")
@@ -1515,8 +1574,10 @@ class TestValidityAwareBlockSelection:
         assert any(record.levelno == logging.WARNING for record in caplog.records)
 
     def test_valid_untagged_recovered_when_tagged_all_invalid(self) -> None:
-        # Tagged blocks are tried first; when none validate, a valid untagged
-        # ``` fence is recovered (previously any tagged block suppressed untagged).
+        """Tagged blocks are tried first, and a valid untagged fence is recovered when none validate.
+
+        Previously any tagged block at all suppressed the untagged ones.
+        """
         text = (
             '```json\n{"question_type": "binary", "posterior_prob": <bad>}\n```\n'
             '```\n{"question_type": "binary", "posterior_prob": 0.42}\n```\n'
@@ -1526,8 +1587,7 @@ class TestValidityAwareBlockSelection:
         assert result.posterior_prob == pytest.approx(0.42)
 
     def test_valid_tagged_outranks_valid_untagged(self) -> None:
-        # Preference order preserved: a valid tagged block wins over a valid
-        # untagged one even when the untagged appears later in the text.
+        """A valid tagged block beats a valid untagged one even when the untagged appears later."""
         text = (
             '```json\n{"question_type": "binary", "posterior_prob": 0.42}\n```\n'
             '```\n{"question_type": "binary", "posterior_prob": 0.9}\n```\n'
@@ -1544,19 +1604,16 @@ class TestValidityAwareBlockSelection:
         with caplog.at_level(logging.INFO, logger="metaculus_bot.structured_output_schema"):
             result = parse_structured_block(text, "binary")
         assert isinstance(result, BinaryStructured)
-        # A skipped-then-recovered trailing block is an INFO signal (the prompt
-        # contract eroding), never a scary WARNING — extraction succeeded.
+        # A skipped-then-recovered block is an INFO signal, never a WARNING: extraction succeeded.
         assert any(record.levelno == logging.INFO and "skip" in record.message.lower() for record in caplog.records)
-        # Scoped to our own loggers: caplog.records spans every logger that propagates
-        # to root, so an unrelated third-party WARNING would otherwise fail this.
+        # Scoped to our own loggers: caplog.records spans every logger propagating to root.
         our_warnings = [
             r for r in caplog.records if r.levelno >= logging.WARNING and r.name.startswith("metaculus_bot")
         ]
         assert not our_warnings, [r.getMessage() for r in our_warnings]
 
     def test_truncated_closed_final_block_skipped_for_valid(self) -> None:
-        # Model hit its token limit mid-block but the fence still closed: the
-        # truncated JSON fails to parse and the earlier valid block is kept.
+        """A block truncated at the token limit with its fence still closed loses to the earlier valid one."""
         text = (
             '```json\n{"question_type": "binary", "posterior_prob": 0.42}\n```\n'
             '```json\n{"question_type": "binary", "posterior_pr\n```\n'
@@ -1566,8 +1623,7 @@ class TestValidityAwareBlockSelection:
         assert result.posterior_prob == pytest.approx(0.42)
 
     def test_truncated_unclosed_final_fence_ignored(self) -> None:
-        # An unclosed final fence never matches the fence pattern, so it can't
-        # shadow the valid earlier block.
+        """An unclosed final fence never matches the fence pattern, so it cannot shadow the valid block."""
         text = (
             '```json\n{"question_type": "binary", "posterior_prob": 0.42}\n```\n'
             '```json\n{"question_type": "binary", "posterior_pr'
@@ -1660,22 +1716,19 @@ class TestRealisticRationale:
 
 class TestSchemaRobustness:
     def test_deeply_nested_json_parses_without_crash(self) -> None:
-        # Pydantic accepts extra fields from the nested block at the top level
-        # only for fields it recognizes. Since BinaryStructured has
-        # ``extra="forbid"``, put the nested dict under an unknown key → it
-        # will fail validation, which is fine; we're testing the extractor
-        # handles deeply nested JSON without blowing up Python's parser.
+        """The extractor handles deeply nested JSON without blowing up Python's parser.
+
+        The nested dict rides on an unknown key, which ``extra="forbid"`` would reject, so only
+        extraction and the preserved depth are under test.
+        """
         nested: dict[str, object] = {"leaf": 1}
         for _ in range(100):
             nested = {"next": nested}
         outer = {"question_type": "binary", "posterior_prob": 0.3, "nested_payload": nested}
         rationale = f"```json\n{json.dumps(outer)}\n```"
-        # The block should extract cleanly (no recursion-limit crash). Pydantic
-        # will then reject the unknown field, which is not what we're testing.
         body = extract_json_block(rationale)
         assert body is not None
         parsed = json.loads(body)
-        # Verify nesting depth preserved.
         cursor = parsed["nested_payload"]
         depth = 0
         while isinstance(cursor, dict) and "next" in cursor:
@@ -1684,9 +1737,11 @@ class TestSchemaRobustness:
         assert depth == 100
 
     def test_size_cap_rejects_huge_well_formed_block(self, caplog: pytest.LogCaptureFixture) -> None:
-        # Pad a legitimate payload with a huge string field beyond the cap
-        # (200KB). The schema has ``extra="forbid"``, so an unknown field
-        # would fail — but the size cap kicks in BEFORE pydantic validation.
+        """The size cap fires before pydantic validation on a payload padded past it.
+
+        The padding rides on an unknown field, which ``extra="forbid"`` would reject, so a size-cap
+        warning proves the cap ran first.
+        """
         huge_body = {"question_type": "binary", "posterior_prob": 0.5, "padding": "x" * 250_000}
         rationale = f"```json\n{json.dumps(huge_body)}\n```"
         with caplog.at_level(logging.WARNING, logger="metaculus_bot.structured_output_schema"):
@@ -1695,7 +1750,7 @@ class TestSchemaRobustness:
         assert any("size cap" in rec.message for rec in caplog.records)
 
     def test_unicode_field_values_parse(self) -> None:
-        # Non-ASCII characters in strings and dict keys should round-trip fine.
+        """Non-ASCII characters in string values round-trip through the parser."""
         payload = {
             "question_type": "binary",
             "prior": {"prob": 0.3, "source": "日本の基準"},
@@ -1719,8 +1774,7 @@ class TestSchemaRobustness:
         assert "🔵 blue" in result.option_probs
 
     def test_multiple_fenced_blocks_last_wins(self) -> None:
-        # Two valid blocks with different posteriors — the extractor should
-        # return the last (per docstring contract).
+        """Two valid blocks with different posteriors: the extractor returns the last one."""
         first = {"question_type": "binary", "posterior_prob": 0.1}
         last = {"question_type": "binary", "posterior_prob": 0.9}
         rationale = f"Draft:\n```json\n{json.dumps(first)}\n```\nRevision:\n```json\n{json.dumps(last)}\n```"
@@ -1729,8 +1783,7 @@ class TestSchemaRobustness:
         assert result.posterior_prob == pytest.approx(0.9)
 
     def test_untagged_fence_with_json_body_parses(self) -> None:
-        # Per extract_json_block docstring: untagged ``` fence with a body
-        # starting with `{` should still match (fallback to tagged).
+        """An untagged fence whose body starts with ``{`` still matches, as the fallback to tagged."""
         payload = {"question_type": "binary", "posterior_prob": 0.42}
         rationale = f"```\n{json.dumps(payload)}\n```"
         result = parse_structured_block(rationale, "binary")
@@ -1742,8 +1795,7 @@ class TestSizeCapBoundary:
     """Boundary coverage for the _MAX_STRUCTURED_BLOCK_BYTES guard."""
 
     def _padded_binary_payload(self, padding_size: int) -> str:
-        # ref_class on StatedBaseRate has no max_length, so padding it is
-        # a safe way to hit the size cap without tripping extra="forbid".
+        """Pad ``ref_class``, which has no max_length, to hit the size cap without tripping extra="forbid"."""
         payload = {
             "question_type": "binary",
             "posterior_prob": 0.5,
@@ -1752,7 +1804,7 @@ class TestSizeCapBoundary:
         return json.dumps(payload)
 
     def test_just_below_cap_parses_ok(self) -> None:
-        # Pad to land just under the cap (leave ~1KB slack for JSON overhead).
+        """Pad to land just under the cap, leaving about 1KB of slack for JSON overhead."""
         padding = _MAX_STRUCTURED_BLOCK_BYTES - 1000
         raw = self._padded_binary_payload(padding)
         assert len(raw) < _MAX_STRUCTURED_BLOCK_BYTES

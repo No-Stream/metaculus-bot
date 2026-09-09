@@ -30,6 +30,7 @@ from metaculus_bot.aggregation_pipeline import AggregationPipeline
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.constants import (
     CONDITIONAL_STACKING_NUMERIC_NORMALIZED_THRESHOLD,
+    MANTIC_SITE_URL,
     NUMERIC_STACKING_ENABLED_ENV,
 )
 from metaculus_bot.exceptions import UnitMismatchError
@@ -38,16 +39,22 @@ from metaculus_bot.forecaster_runners import (
     build_date_parse_notes,
     run_date_forecast,
 )
-from metaculus_bot.numeric.config import STANDARD_PERCENTILES
+from metaculus_bot.numeric.config import STANDARD_PERCENTILES, elicit_per_bin
 from metaculus_bot.numeric.date_axis import as_epoch_question, parse_forecast_date, to_epoch
 from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
+from metaculus_bot.numeric.pmf_grid import pmf_grid
 from metaculus_bot.prompts import MARKET_SNAPSHOT_SECTION_HEADER
 from metaculus_bot.research.agentic.driver_prompt import _question_header, _template_skeleton
 from metaculus_bot.research.agentic.loop import _summarize_ghost
 from metaculus_bot.spread_metrics import compute_spread
 from metaculus_bot.stacking_route import _conditional_stacking_verdict, _type_gate_enabled
 from tests.mantic_fakes import load_legacy_date_question, load_preseason_date_question
-from tests.pipeline_test_helpers import assert_server_accepts_cdf, make_e2e_bot, make_real_date_question
+from tests.pipeline_test_helpers import (
+    assert_server_accepts_cdf,
+    make_e2e_bot,
+    make_real_date_question,
+    server_min_step,
+)
 
 _DAY = timedelta(days=1)
 _EPOCH_FLOAT_PATTERN = "17"  # every epoch second in 2026 starts with these digits
@@ -125,7 +132,9 @@ class TestTheRunner:
         self, q651: DateQuestion, test_llm: GeneralLlm, caplog: pytest.LogCaptureFixture
     ) -> None:
         """The whole runner with only the LLM stubbed: the prompt reads as dates, the block rung
-        extracts the ISO dates, and the guarded numeric build runs on the epoch view."""
+        extracts the ISO dates, and the guarded numeric build runs on the epoch view. The recorded
+        loader carries a metaculus.com ``page_url``, so this is the percentile path a 12-bin grid
+        takes off Mantic; ``TestThePerBinRunner`` below is the same question on its own host."""
         caplog.set_level(logging.INFO, logger="metaculus_bot")
         day = datetime(2026, 9, 16, tzinfo=UTC)
         reasoning = _date_reasoning(_spread_over(day + timedelta(hours=2), day + timedelta(hours=22)))
@@ -500,3 +509,87 @@ class TestGapFillV2:
         assert forecast["median"] == to_epoch(parse_forecast_date(declared["0.5"]))
         assert summary == f"median={declared['0.5']}"
         assert set(forecast["declared_percentiles"]) == set(STANDARD_PERCENTILES)
+
+
+def _pmf_block(bin_probs: dict[str, float]) -> str:
+    return "```json\n" + json.dumps({"question_type": "pmf", "bin_probs": bin_probs}) + "\n```\n"
+
+
+def _per_bin_reasoning(bin_probs: dict[str, float]) -> str:
+    return f"## Analysis\n\nThe session after the FOMC statement is the modal largest move.\n\n{_pmf_block(bin_probs)}"
+
+
+@pytest.fixture
+def q651_on_mantic(q651: DateQuestion) -> DateQuestion:
+    """Post 651 on its own host: the framework parses every payload with a metaculus.com ``page_url``
+    and ``ManticClient`` rewrites it, so the recorded loader alone reads as a Metaculus question."""
+    return q651.model_copy(update={"page_url": f"{MANTIC_SITE_URL}/questions/{q651.id_of_post}/"})
+
+
+class TestThePerBinRunner:
+    """On its own host the 12-bin date question takes the per-bin path (``elicit_per_bin`` is true).
+
+    The whole runner with only the LLM stubbed: the prompt asks for one probability per calendar
+    day, the ``pmf`` ladder reads the block on its first rung, and ``numeric.pmf_cdf`` builds the
+    13-value CDF straight from the declaration, with no percentile in sight. The percentile test
+    above keeps the Metaculus-hosted copy on the percentile path, which is the platform gate.
+    """
+
+    @pytest.mark.asyncio
+    async def test_run_date_forecast_builds_the_distribution_off_the_per_bin_block(
+        self, q651_on_mantic: DateQuestion, test_llm: GeneralLlm, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.INFO, logger="metaculus_bot")
+        grid = pmf_grid(as_epoch_question(q651_on_mantic))
+        weekend = {"2026-09-12", "2026-09-13", "2026-09-19"}
+        trading_days = [label for label in grid.labels if label not in weekend]
+        bin_probs = dict.fromkeys(grid.labels, 0.0)
+        for label in trading_days:
+            bin_probs[label] = 0.0125
+        bin_probs["2026-09-16"] = 1.0 - 0.0125 * (len(trading_days) - 1)
+        invoke = AsyncMock(return_value=_per_bin_reasoning(bin_probs))
+        with (
+            patch.object(test_llm, "invoke", new=invoke),
+            patch("metaculus_bot.forecaster_runners.parse_structured", new=AsyncMock()) as parser,
+        ):
+            result = await run_date_forecast(q651_on_mantic, "research", test_llm, test_llm)
+
+        prompt = invoke.call_args.args[0]
+        assert '"question_type": "pmf"' in prompt
+        assert '"2026-09-08"' in prompt
+        assert '"2026-09-19"' in prompt
+        assert "percentile" not in prompt.lower()
+        assert _TEN_DIGIT_EPOCH.search(prompt) is None
+        parser.assert_not_called()  # the block rung read the declaration; no vote, no salvage
+
+        prediction = result.prediction_value
+        assert isinstance(prediction, NumericDistribution)
+        assert prediction.is_date is True
+        heights = _cdf_heights(prediction)
+        assert len(heights) == 13
+        assert heights[0] == 0.0
+        assert heights[-1] == 1.0
+        assert_server_accepts_cdf(heights, cdf_size=13, open_lower=False, open_upper=False)
+        mass = np.diff(heights)
+        assert int(np.argmax(mass)) == 8
+        assert mass[8] > 0.88
+        for weekend_bin in (4, 5, 11):
+            assert mass[weekend_bin] == pytest.approx(server_min_step(12), abs=2e-9)
+
+        (member_line,) = [r.getMessage() for r in caplog.records if r.getMessage().startswith("MEMBER_FORECAST:")]
+        assert f"question={q651_on_mantic.id_of_question} " in member_line
+        assert " qtype=date " in member_line
+        assert member_line.endswith(" oor_low=0.000000 oor_high=0.000000 elicitation=pmf")
+        raw = json.loads(member_line.split(" raw=", 1)[1].split(" ", 1)[0])
+        published = json.loads(member_line.split(" published=", 1)[1].split(" ", 1)[0])
+        assert len(raw) == len(published) == 14
+        assert raw == [0.0, *(bin_probs[label] for label in grid.labels), 0.0]
+        assert published[1:-1] == pytest.approx(mass.tolist())
+
+        (rung_line,) = [r.getMessage() for r in caplog.records if r.getMessage().startswith("EXTRACTION_RUNG:")]
+        assert " qtype=pmf " in rung_line
+        assert " rung=block " in rung_line
+
+    def test_the_gate_is_the_host(self, q651: DateQuestion, q651_on_mantic: DateQuestion) -> None:
+        assert elicit_per_bin(as_epoch_question(q651)) is False
+        assert elicit_per_bin(as_epoch_question(q651_on_mantic)) is True

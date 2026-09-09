@@ -6,6 +6,11 @@ the appropriate ReasonedPrediction.
 
 These are stateless — the caller is responsible for storing any side-effects
 (like discrete integer votes for numeric questions).
+
+The numeric and date runners share one branch: a question ``numeric.config.elicit_per_bin``
+admits (a Mantic grid of 31 bins or fewer) is elicited PER BIN by ``_run_pmf_forecast``, one
+probability per labelled bin, and its distribution is built straight from that declaration
+(``numeric.pmf_cdf``) with none of the percentile machinery in between.
 """
 
 from __future__ import annotations
@@ -27,27 +32,36 @@ from forecasting_tools.ai_models.ai_utils.openai_utils import VisionMessageData
 from forecasting_tools.data_models.questions import DateQuestion
 from pydantic import ValidationError
 
-from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN, FORECASTER_SOFT_DEADLINE
+from metaculus_bot.constants import (
+    BINARY_PROB_MAX,
+    BINARY_PROB_MIN,
+    FORECASTER_SOFT_DEADLINE,
+    PMF_ABOVE_RANGE_KEY,
+    PMF_BELOW_RANGE_KEY,
+)
 from metaculus_bot.exceptions import UnitMismatchError
 from metaculus_bot.llm_retry import invoke_with_broad_retry
 from metaculus_bot.member_forecast import (
+    ELICITATION_PMF,
     MEMBER_FORECAST_ROLE_MEMBER,
     format_member_forecast_marker,
     option_vector,
     out_of_range_mass,
     percentile_pairs,
 )
-from metaculus_bot.numeric.config import EXPECTED_PERCENTILE_COUNT, STANDARD_PERCENTILES_CSV
+from metaculus_bot.numeric.config import EXPECTED_PERCENTILE_COUNT, STANDARD_PERCENTILES_CSV, elicit_per_bin
 from metaculus_bot.numeric.date_axis import EpochDateQuestion, as_epoch_question, format_epoch, numeric_qtype
 from metaculus_bot.numeric.diagnostics import log_final_prediction, log_open_bound_piling_diagnostics
 from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
 from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
-from metaculus_bot.numeric.utils import bound_messages, clamp_and_renormalize_mc
+from metaculus_bot.numeric.pmf_cdf import build_pmf_distribution, published_pmf
+from metaculus_bot.numeric.pmf_grid import PmfGrid, pmf_grid
+from metaculus_bot.numeric.utils import bound_messages, clamp_and_renormalize_mc, pmf_bound_messages
 from metaculus_bot.numeric.validation import detect_unit_mismatch
-from metaculus_bot.prompts import binary_prompt, date_prompt, multiple_choice_prompt, numeric_prompt
+from metaculus_bot.prompts import binary_prompt, date_prompt, multiple_choice_prompt, numeric_prompt, pmf_prompt
 from metaculus_bot.structured_output_schema import NumericStructured, parse_structured_block
 from metaculus_bot.structured_parse import parse_structured
-from metaculus_bot.value_extraction import extract_binary, extract_date, extract_mc, extract_numeric
+from metaculus_bot.value_extraction import extract_binary, extract_date, extract_mc, extract_numeric, extract_pmf
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +184,31 @@ def build_date_parse_notes(question: EpochDateQuestion) -> str:
     )
 
 
+def build_pmf_parse_notes(grid: PmfGrid) -> str:
+    """The parser LLM's extraction instructions for a per-bin declaration.
+
+    The per-bin sibling of ``build_parse_notes``, with the same one job: EXTRACT the probability the
+    forecaster stated for each key, never interpret or rebalance it. The salvage rung has nothing
+    else to spell the keys from, so they are listed verbatim: a label that matches no grid key fails
+    the conversion, and every key must be present (``value_extraction.extract_pmf``).
+    """
+    keys = ", ".join(f"'{key}'" for key in grid.keys)
+    reserved: list[str] = []
+    if grid.open_lower_bound:
+        reserved.append(f"'{PMF_BELOW_RANGE_KEY}' is the probability that the outcome falls below the displayed range")
+    if grid.open_upper_bound:
+        reserved.append(f"'{PMF_ABOVE_RANGE_KEY}' is the probability that the outcome falls above the displayed range")
+    reserved_note = f" {'; '.join(reserved)}." if reserved else ""
+    return (
+        f"Return a JSON array of exactly {len(grid.keys)} objects, one per key, each with exactly two fields: "
+        f"'label' (string) and 'probability' (decimal in [0,1]). Use these labels verbatim, in this order, and no "
+        f"others: {keys}. Each label names one bin of the question's grid, spelled exactly as listed.{reserved_note} "
+        "Read each probability as the forecaster stated it (a percentage becomes a decimal: 35% -> 0.35); never "
+        "interpret, rebalance or fill it in. A key the forecaster gave no probability, or ruled out, is 0. The "
+        "probabilities should sum to about 1.0."
+    )
+
+
 async def run_binary_forecast(
     question: BinaryQuestion,
     research: str,
@@ -180,10 +219,7 @@ async def run_binary_forecast(
 ) -> ReasonedPrediction[float]:
     prompt = binary_prompt(question, research)
     forecaster_input = _forecaster_input(prompt, chart_b64)
-    # Broad, 30s-gated retry (forecaster instances are allowed_tries=1 in
-    # llm_configs.py): recovers a fast blip / empty-response while obeying the
-    # universal "no retry after 30s" deadline rule. wall_timeout mirrors the outer
-    # FORECASTER_SOFT_DEADLINE that _forecaster_with_soft_deadline already enforces.
+    # The forecasters' SOLE retry layer (allowed_tries=1 in llm_configs.py); the 30s gate is in llm_retry.py.
     reasoning = await invoke_with_broad_retry(
         lambda: forecaster_llm.invoke(forecaster_input),
         wall_timeout=FORECASTER_SOFT_DEADLINE,
@@ -285,8 +321,16 @@ async def run_numeric_forecast(
     """Run a numeric forecast and return (prediction, discrete_vote).
 
     The caller is responsible for storing the discrete_vote in
-    _discrete_integer_votes if needed.
+    _discrete_integer_votes if needed. A question elicited per bin (``elicit_per_bin``) casts no
+    vote: a per-bin block has no ``outcome_type``, and the discrete snap is already skipped on every
+    outcome-space grid.
     """
+    if elicit_per_bin(question):
+        per_bin = await _run_pmf_forecast(
+            question, research, forecaster_llm, parser_llm, chart_b64=chart_b64, label="forecaster_numeric"
+        )
+        return per_bin, None
+
     upper_bound_message, lower_bound_message = bound_messages(question)
     prompt = numeric_prompt(question, research, lower_bound_message, upper_bound_message)
     forecaster_input = _forecaster_input(prompt, chart_b64)
@@ -329,9 +373,15 @@ async def run_date_forecast(
     and go through the SAME guarded numeric build as a numeric question, on the adapter
     (``numeric.date_axis.as_epoch_question``), so the published distribution carries
     ``is_date`` and the comment renders dates. No discrete-integer vote: integer snapping on an
-    epoch axis is meaningless.
+    epoch axis is meaningless. A coarse Mantic date grid (``elicit_per_bin`` on the epoch view,
+    which carries ``page_url``) is elicited per calendar-day bin instead.
     """
     epoch_question = as_epoch_question(question)
+    if elicit_per_bin(epoch_question):
+        return await _run_pmf_forecast(
+            epoch_question, research, forecaster_llm, parser_llm, chart_b64=chart_b64, label="forecaster_date"
+        )
+
     upper_bound_message, lower_bound_message = bound_messages(epoch_question)
     prompt = date_prompt(epoch_question, research, lower_bound_message, upper_bound_message)
     forecaster_input = _forecaster_input(prompt, chart_b64)
@@ -351,6 +401,65 @@ async def run_date_forecast(
         model_name=forecaster_llm.model,
     )
     prediction = _build_guarded_numeric_distribution(outcome.value, epoch_question, forecaster_llm)
+    return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
+
+
+async def _run_pmf_forecast(
+    view: NumericQuestion,
+    research: str,
+    forecaster_llm: GeneralLlm,
+    parser_llm: GeneralLlm,
+    *,
+    chart_b64: str | None,
+    label: str,
+) -> ReasonedPrediction[NumericDistribution]:
+    """Elicit ``view`` per bin and build the distribution straight from the declared PMF.
+
+    ``view`` is the numeric-pipeline view of the question: the epoch adapter for a date question
+    (so the marker says ``qtype=date`` and the distribution carries ``is_date``), the question
+    itself otherwise. The grid, the prompt, the ladder, the build and the marker all read it.
+
+    Nothing that consumes percentiles runs here, each for a reason. The discrete vote is a paid
+    parser call on a block that has no ``outcome_type``, and the snap it feeds is already skipped
+    on every outcome-space grid. ``sanitize_percentiles`` requires the 13 standard percentiles; the
+    one repair a per-bin declaration needs, lifting a declared zero to the platform minimum, is the
+    floor blend inside ``build_pmf_distribution``. ``detect_unit_mismatch`` guards values declared
+    in the wrong unit; a per-bin declaration states no values, only mass on labelled bins, and on
+    grid input its ratios pass trivially, so routing the grid through it would be a fail-open guard.
+    The soft deadline, the broad retry and the drop classification are the percentile runners' own.
+    """
+    grid = pmf_grid(view)
+    upper_bound_message, lower_bound_message = pmf_bound_messages(view)
+    prompt = pmf_prompt(view, research, lower_bound_message, upper_bound_message)
+    forecaster_input = _forecaster_input(prompt, chart_b64)
+    # Broad, 30s-gated retry — see run_binary_forecast for the rationale.
+    reasoning = await invoke_with_broad_retry(
+        lambda: forecaster_llm.invoke(forecaster_input), wall_timeout=FORECASTER_SOFT_DEADLINE, label=label
+    )
+    _log_llm_output(forecaster_llm.model, view.id_of_question, reasoning)
+
+    outcome = await extract_pmf(
+        reasoning,
+        grid,
+        parser_llm,
+        prompt_notes=build_pmf_parse_notes(grid),
+        question_id=view.id_of_question,
+        model_name=forecaster_llm.model,
+    )
+    prediction = build_pmf_distribution(outcome.value.declared, view, model_name=forecaster_llm.model)
+    logger.info(
+        format_member_forecast_marker(
+            question_id=view.id_of_question,
+            model=forecaster_llm.model,
+            role=MEMBER_FORECAST_ROLE_MEMBER,
+            qtype=numeric_qtype(view),
+            raw=outcome.value.declared,
+            published=published_pmf(prediction),
+            out_of_range=out_of_range_mass(prediction),
+            elicitation=ELICITATION_PMF,
+        )
+    )
+    log_final_prediction(prediction, view)
     return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
 
 

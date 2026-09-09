@@ -72,6 +72,8 @@ MANTIC_TOURNAMENT_END_DATE: str = "2026-09-20"  # forecasting_end_date on projec
 # the fetch passes error_if_question_target_missed=False. Five pages; the most Mantic has ever held
 # open at once is three questions, and the Series 2 rules allow batch releases.
 MANTIC_FETCH_QUESTION_CEILING: int = 500
+# The bot's own account (``nostreambot-bot``, public ``/api/users/81/``): an unauthenticated read has no ``my_forecasts``.
+MANTIC_BOT_USER_ID: int = 81
 # The least mass a PUBLISHED Mantic numeric, discrete or date aggregate carries beyond each OPEN bound
 # (``numeric/out_of_range_floor.py``; Metaculus aggregates are untouched). Mantic scores an
 # out-of-range resolution against a fixed 0.05 reference, ``50 * ln(mass / 0.05)``: 5% there scores
@@ -560,6 +562,10 @@ THIN_PUBLISH_BINARY_CEIL: float = EXTREME_CALL_HIGH
 # PredictedOptionList construction.
 MC_PROB_MIN: float = 0.01
 MC_PROB_MAX: float = 0.99
+
+# Per-bin block keys, present only where that bound is OPEN; they share ``bin_probs`` with the labels so one object sums to 1.
+PMF_BELOW_RANGE_KEY: str = "below_range"
+PMF_ABOVE_RANGE_KEY: str = "above_range"
 
 # --- Post-hoc Platt calibration of the final published probability ---
 # Final-output logistic recalibration following Metaculus's notebook

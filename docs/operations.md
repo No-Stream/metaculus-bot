@@ -120,7 +120,9 @@ session does not run them — it proposes, the operator runs and decides.
   anything whose `visibility` is `unlisted`, which is the state a new season sits
   in before its first question, so ABSENCE from that list is not evidence a
   project does not exist — fetch the candidate directly, or walk the id space.
-- **Take a question-supply census with `make supply_probe`.** It counts posts and
+- **Take a question-supply census with `make supply_probe`** (Metaculus), or
+  `make supply_probe_mantic` for the Crucible tournament (see "Scheduling reliability" under
+  the Mantic workflow for its per-release-hour miss table). It counts posts and
   questions at each status per tournament slug, and unlike the two scratch probes
   it replaces it counts post status `closed` — closed to forecasting but not yet
   resolved — which is what made two consecutive residual rounds' supply
@@ -860,7 +862,10 @@ backend both treat a date question. The forecaster dispatches `DateQuestion` to
 `run_date_forecast` (`forecaster_runners.py`); `date_prompt` (`prompts.py`) asks for ISO dates
 and names the bin granularity; `DateStructured` (`structured_output_schema.py`) carries the
 declared percentiles as datetimes; then the same PCHIP pipeline, CDF-space aggregation and
-publish path run with `is_date` set so the comment renders dates. Two conventions live in the
+publish path run with `is_date` set so the comment renders dates. On a coarse grid (post 651's
+twelve daily bins) the date question is instead elicited per bin, one probability per calendar
+day, and its members are pooled by the mean; see "Per-bin elicitation" under
+"Mantic-optimized forecasting" below. Two conventions live in the
 adapter and nowhere else: nominal bounds are read from the API's `scaling` block, never
 derived (Mantic sets `nominal_max` to the last bin's left edge), and a date-only value means
 noon UTC of that day, so its mass lands inside that day's bin under the platform's
@@ -946,6 +951,35 @@ prompts already carried the same wording: `_scoring_sentence` renders in all thr
 - **Bounds clamp on bin-defined grids** (item 11). The clamp buffer is at least one bin width, so
   a date one day outside a closed bound clamps instead of dropping the member; a scale error
   still raises.
+- **Per-bin elicitation on enumerable grids** (Wave C, built 2026-09-09). A Mantic numeric or
+  date question whose published bins are its outcome space and number 31 or fewer
+  (`elicit_per_bin` in `numeric/config.py`: `PMF_ELICITATION_PLATFORMS` is Mantic-only,
+  `PMF_ELICITATION_MAX_BINS` is 31) is asked for one probability per bin, keyed by a
+  human-readable label (`numeric/pmf_grid.py`: the calendar day on a day or week grid, the bin
+  centre on a count grid, `a to b` otherwise) plus `below_range` / `above_range` where a bound is
+  open, instead of 13 percentiles. Motivation: post 651 names nine eligible trading days in a
+  12-day window, and a percentile declaration cannot say "zero on the three weekend days";
+  PCHIP spreads about a quarter of the mass onto them, 14.4 baseline points lost with zero
+  information (11.6 under the Series 2 categorical form), and a count grid of 13 bins or fewer
+  cannot carry 13 distinct percentiles at all (18 of the 46 coarse Series 1 discrete grids).
+  The runner branch (`_run_pmf_forecast`, `forecaster_runners.py`) builds `pmf_prompt`, reads the
+  `pmf` block through the extraction ladder and hands the `N + 2` declaration to
+  `numeric/pmf_cdf.py`, which normalizes it, blends it to the server's per-cell floors (a bin the
+  model set to 0 lands at exactly the platform minimum, a certain member keeps about 0.99 on its
+  bin), assembles the CDF, runs `safe_cdf_bounds` and a fail-shut replica of the server's rules;
+  the percentile sanitizer, the PCHIP repair tiers, the discrete vote and the unit-mismatch guard
+  are not on this path (`docs/numeric_pipeline.md` "Per-bin elicitation" gives each reason).
+  Per-bin members are aggregated by the linear opinion pool, the pointwise MEAN of their CDFs,
+  because the pointwise median of three sharp members is the middle member's CDF outright and
+  the platform floor on the bins the other two believed (about -230 baseline points when one of
+  those resolves; the pool gives each believed bin a third); percentile members keep the MEDIAN.
+  Telemetry: the `MEMBER_FORECAST` line carries `elicitation=pmf` with the `N + 2` PMF as `raw`
+  and `published` (an absent field means percentiles), `NUMERIC_AGGREGATE` ends
+  `method=mean|median|stacked|single`, and `EXTRACTION_RUNG` reads `qtype=pmf` for this ladder.
+  The Metaculus switch is adding `PLATFORM_METACULUS` to `PMF_ELICITATION_PLATFORMS`, its own
+  config-era change (it would move about half of all Metaculus discrete questions), once a
+  Mantic season shows the per-bin declaration is faithful. The paid smoke and its verification
+  list are under "Running it" below.
 
 ### Personal keys only, and the switch fails shut
 
@@ -1025,6 +1059,20 @@ Unlike the cup and minibench workflows, this one is not `disabled_manually`: Git
 runs a new scheduled workflow as soon as its file is on the default branch, so
 merging the branch to `main` starts the hourly crons with no further UI step.
 
+The instrument that settles the cadence question is `make supply_probe_mantic` (free,
+read-only; `ARGS="--slugs <series-2-slug> --output scratch/mantic_supply_$(date -u +%Y%m%d).json"`
+after the first Series 2 week). It pages the tournament's closed and resolved posts, classifies
+each question as forecast, no_forecast or unknown, and prints the miss rate per UTC release hour
+(the hour of `open_time`, which on a 60-minute window is the hour a run had to land in) plus the
+realized open-to-close window distribution, so the 60-minute assumption is checked by the same
+run. `MANTIC_TOKEN` is the primary instrument: with it every list page carries `my_forecasts`
+(`with_cp=true`), so closed-but-unresolved questions classify too. Without it the probe still runs
+off the public API and classifies every RESOLVED question from the platform's spot-time snapshot
+(`score_data.disagreement_forecasts.forecasts[]`, author id against `MANTIC_BOT_USER_ID`), which is
+exactly what is scored; a closed-but-unresolved question then reads `unknown`. One caveat, stated
+in the report header rather than modelled: a forecast withdrawn before spot time reads as
+`no_forecast` in that snapshot.
+
 ### Running it, and what is left for the operator
 
 The local QA run is paid and publishes. It spends about $2.60 per question on the
@@ -1047,17 +1095,29 @@ DONATED_OPENROUTER_KEY_ENABLED=false uv run python main.py --mode mantic --only-
 # or: make run_mantic_one POST=650
 ```
 
-The date smoke is the same command on the preseason's date question, post 651 (twelve
-daily bins, both bounds closed). It is approved but has not run yet, and like every paid
-run it fires once per approval:
+The per-bin smoke (Wave C) is the same command on the preseason's date question, post 651
+(twelve daily bins, both bounds closed), which the gate now elicits per bin. About $3, it
+publishes, and like every paid run it fires once per approval:
 
 ```bash
 DONATED_OPENROUTER_KEY_ENABLED=false uv run python main.py --mode mantic --only-posts 651
 # or: make run_mantic_one POST=651
 ```
 
-Verify it on the API afterwards: a 13-value CDF accepted, the comment rendering ISO dates,
-and `my_forecasts.history` populated on the question.
+Verify it afterwards with the authenticated read
+`curl -s -H "Authorization: Token $MANTIC_TOKEN" "https://competitions.mantic.com/api/posts/651/?with_cp=true"`
+and the run log:
+
+- `my_forecasts.latest.forecast_values` is a 13-value CDF the server accepted, with
+  `cdf[0] == 0.0` and `cdf[12] == 1.0` (both bounds closed);
+- the weekend bins, 12, 13 and 19 September (bins 4, 5 and 11), each carry the platform minimum,
+  `round(0.01 / 12, 9)` plus the 1e-9 margin, and nothing more;
+- the run log has three `MEMBER_FORECAST ... qtype=date ... elicitation=pmf` lines whose `raw` and
+  `published` are 14-entry vectors, and one `NUMERIC_AGGREGATE ... method=mean` line;
+- the comment renders ISO dates and no epoch second.
+
+The Phase 2 percentile date smoke on 651 that earlier notes list is no longer a prerequisite for
+anything; the per-bin smoke supersedes it.
 
 The flag works in every tournament-shaped mode (`tournament`, `minibench`,
 `metaculus_cup`, `mantic`) and is refused with `test_questions`. It fetches the

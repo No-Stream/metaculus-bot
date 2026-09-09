@@ -66,7 +66,7 @@ from metaculus_bot.forecaster_runners import (
     run_numeric_forecast,
 )
 from metaculus_bot.llm_setup import prepare_llm_config
-from metaculus_bot.member_forecast import format_numeric_aggregate_marker
+from metaculus_bot.member_forecast import NUMERIC_COMBINE_METHOD_UNRECORDED, format_numeric_aggregate_marker
 from metaculus_bot.numeric.date_axis import numeric_qtype, numeric_view
 from metaculus_bot.numeric.out_of_range_floor import floor_published_tails
 from metaculus_bot.numeric.pchip_processing import log_pchip_summary, reset_pchip_stats
@@ -1041,9 +1041,12 @@ class TemplateForecaster(CompactLoggingForecastBot):
             aggregated = self._pipeline.simple_combine(predictions, question)
         # The one seam every aggregation path (stacked, base-combine, median fallback, single
         # survivor, simple) returns through: the platform tail floor is applied to the PUBLISHED
-        # distribution here, and its tails are logged once, raw and as published.
+        # distribution here, and its tails and combine method are logged once (member_forecast.py).
         if isinstance(aggregated, NumericDistribution):
             floored = floor_published_tails(aggregated, question)
+            method = NUMERIC_COMBINE_METHOD_UNRECORDED
+            if question.id_of_question is not None:
+                method = self._pipeline.numeric_combine_methods.pop(question.id_of_question, method)
             logger.info(
                 format_numeric_aggregate_marker(
                     question_id=question.id_of_question,
@@ -1052,6 +1055,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
                     out_of_range=floored.published,
                     out_of_range_raw=floored.raw,
                     tail_floor=floored.floor,
+                    method=method,
                 )
             )
             return floored.distribution

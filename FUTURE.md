@@ -78,7 +78,7 @@ for new questions. Details and receipts: `docs/operations.md` "Fall 2026 season"
    warning for this state; the way to notice is a supply-probe row showing cup questions with no bot
    forecasts.
 
-### Mantic Crucible: Phases 1 and 2 shipped 2026-09-08, what is deferred to Wave C (added 2026-09-08)
+### Mantic Crucible: Phases 1, 2 and Wave C shipped 2026-09-08 and 2026-09-09, what awaits live data (added 2026-09-08, updated 2026-09-09)
 
 Mantic runs a bot-only forecasting competition (Crucible, competitions.mantic.com) on a fork of
 the Metaculus platform and pays $3 per forecast. `--mode mantic` and `run_bot_on_mantic.yaml`
@@ -90,23 +90,66 @@ Mantic-optimized prompt and numeric fixes, and the robustness rules from the rea
 in `mantic_research_2026-09-08/`). Three later documents from the same day carry the next round:
 `mantic_adversarial_candidates_2026-09-08.md` (written; the corpus read behind the corrected
 out-of-range base rates, the tail-floor decision and the day-bin evidence below),
-`units_investigation_2026-09-08.md` and `mantic_wave_c_plan_2026-09-08.md` (both being written on
-the night of 2026-09-08). The `MANTIC_TOKEN` repository secret was set by the operator on
+`units_investigation_2026-09-08.md` and `mantic_wave_c_plan_2026-09-08.md` (the Wave C design,
+reviewed in `mantic_wave_c_plan_review_2026-09-08.md` and built on 2026-09-09; the two items it
+shipped and the four it left for live data are below). The `MANTIC_TOKEN` repository secret was set by the operator on
 2026-09-08 (`gh secret list --repo No-Stream/metaculus-bot` shows it), so the one operator step
 left is the merge; the schedule is live once the file is on `main`.
 
-**Wave C, before Series 2, with live data** (from the Phase 2 plan; each item's receipt is in
-the research dossier):
+**Wave C** (plan `mantic_wave_c_plan_2026-09-08.md`; items C1 and C2 SHIPPED 2026-09-09, C3 to
+C6 await live data, each with its read-only command):
 
-- **Per-bin PMF elicitation for enumerable grids** (about 31 bins or fewer). Forecasters would
-  emit a probability per bin, as they do for multiple choice, the CDF built from the PMF and
-  aggregation left in CDF space. Motivation: impossible bins (weekends on a trading-day date
-  question) cost 14.4 baseline points with zero information under percentile-to-PCHIP, and
-  Series 2 makes coarse grids the default. Needs its own design and e2e.
-- **Supply probe Mantic mode** (free, unauthenticated). Page the tournament for closed and
-  resolved posts, count how many carry a forecast from the bot's user, report the miss rate
-  per release hour. This is the instrument for the cadence decision below; today Mantic
-  forfeits leave no trace at all.
+- **C1, per-bin PMF elicitation for enumerable grids: SHIPPED 2026-09-09.** On a Mantic numeric
+  or date question whose bins are its outcome space and number 31 or fewer, each forecaster
+  declares one probability per bin label (a `pmf` block, plus `below_range` / `above_range` where
+  a bound is open) instead of 13 percentiles; `numeric/pmf_cdf.py` normalizes the declaration,
+  blends it to the server's per-cell floors and assembles the CDF, and the percentile sanitizer,
+  the PCHIP repair tiers, the discrete vote and the unit-mismatch guard are bypassed on that path
+  (each bypass reasoned in `docs/numeric_pipeline.md` "Per-bin elicitation"). Motivation:
+  impossible bins (three weekend days in post 651's 12-day trading-day window) cost 14.4 baseline
+  points with zero information under percentile-to-PCHIP, a count grid of 13 bins or fewer
+  cannot carry 13 distinct percentiles at all, and Series 2 makes coarse grids the default.
+  Decisions, all operator-taken 2026-09-08: the threshold is `PMF_ELICITATION_MAX_BINS = 31`
+  (`numeric/config.py`; a month of daily bins, 29% of Series 1 discrete grids at or below it;
+  the alternative 51 would also take the nine 51-bin Series 1 questions, raise only after live
+  per-bin data shows the ask stays faithful at 31); the gate is Mantic-only
+  (`PMF_ELICITATION_PLATFORMS = frozenset({PLATFORM_MANTIC})`), and the Metaculus switch is
+  adding `PLATFORM_METACULUS` to that one constant as its own config-era change, because it
+  would move about half of all Metaculus discrete questions (141 of 300 sampled have 31 bins or
+  fewer; modal grids 41, 31, 101 and 11 bins) with no live evidence yet that the per-bin
+  declaration is faithful; per-bin members are aggregated by the linear opinion pool, the
+  pointwise MEAN of their CDFs (`_numeric_combine_strategy`, `aggregation_pipeline.py`), while
+  percentile members keep the MEDIAN on both platforms. The pool arithmetic on post 651's 12-bin
+  grid, three members certain of bins 3, 5 and 7: today's pointwise median publishes 0.99 on bin
+  5 and the platform floor on bins 3 and 7 (about -230 Series 1 / -185 Series 2 points if bin 3
+  resolves, expected -112 over the three bins), the multiple-choice-style per-bin median goes
+  uniform (0), the pool gives each believed bin 0.33 (+69 / +56, expected +69); with two members
+  on bin 5 and one on bin 3 the pool's expected score is +92 against +6 for the median. This
+  revives, for per-bin members only, the median-over-mean decision the repo recorded as
+  benchmarked and rejected for percentile members. Telemetry: `MEMBER_FORECAST` gains the
+  additive `elicitation=pmf` field (its `raw` and `published` are then the `N + 2` PMF, and an
+  absent field means percentiles), `NUMERIC_AGGREGATE` gains `method=mean|median|stacked|single`,
+  and `EXTRACTION_RUNG` logs `qtype=pmf` for the ladder that parsed the block (the question type
+  is joined from the member line). Left as is, deliberately: the published comment (the
+  framework's six-row rendering interpolated between bin edges; the per-bin declaration survives
+  in the rationale's fenced block and on the member line), the stacker (`_run_stacking_numeric`
+  re-elicits percentiles and is off in production; re-enabling numeric stacking on a coarse grid
+  would mix a percentile stacker with per-bin members, which the aggregation handles but the
+  stacker prompt does not teach), and the gap-fill v2 template skeleton (research needs are
+  identical). The flat 0.59 max step in Mantic's OpenAPI text is slider text, not a server rule:
+  34 of 4,318 stored competitor forecasts exceed it, none exceed `0.2 * 200 / N`, and the
+  upstream validator has no such constant, so a certain per-bin forecast is legal on every grid
+  this covers. **Operator step, paid:** ONE per-bin smoke on post 651 (`make run_mantic_one
+  POST=651`, about $3, publishes), verified with the authenticated `with_cp=true` read; the
+  checklist is in `docs/operations.md` "Running it".
+- **C2, supply probe Mantic mode: SHIPPED 2026-09-09** as `make supply_probe_mantic`
+  (`scripts/supply_probe.py --platform mantic`). The token path is primary (`with_cp=true` puts
+  `my_forecasts` on every list page, so closed-but-unresolved questions classify), the public
+  spot-time snapshot (`score_data.disagreement_forecasts.forecasts[]` against
+  `MANTIC_BOT_USER_ID`) classifies every resolved question without a secret, and the report adds
+  the miss rate per UTC release hour plus the realized window-length distribution. This is the
+  instrument for the cadence decision below; the command that settles it after the first Series
+  2 week is in `docs/operations.md` "Scheduling reliability".
 - **External dispatcher: OPEN operator decision** (review item 2). GitHub delivered about 22%
   of this repo's scheduled firings from 2026-08-27 to 2026-09-07 (7 to 23 of 72 a day). The
   Mantic workflow runs three crons at :05/:15/:25, not six: a pickup after about :30 of a
@@ -138,15 +181,50 @@ the research dossier):
   telemetry has accumulated, benchmark the floor on this bot's OWN forecasts rather than the
   field's: replay the archived Mantic aggregate and per-member CDFs with and without the floor
   under Mantic's baseline formula, 50 ln(mass / 0.05) for the out-of-range bucket, and read the
-  delta by question type.
-- **Fast-path alertability in mantic mode** (item 13). The `time_budget_fast_path` counter is
-  alertable and would fire routinely under 60-minute windows; decide once the Series 2 window
-  length is known.
-- **Median versus mean aggregation under the baseline formula** (item 18). Replay the archived
-  per-member CDFs under Mantic's baseline score; about +5 points per question if the mechanism
-  transfers. A re-measurement of a recorded decision, not a re-litigation.
-- **Starved outer tail** (item 19) stays a documented watch item, not bundled with the
-  min-step tolerance fix.
+  delta by question type. The floor does not interact with the Wave C pool: a per-bin member
+  who puts mass on `above_range` lifts the pooled tail to at least a third of it, usually past
+  0.05, so the floor is inert exactly when the members already believe in the escape, and when
+  every member gives the tail about 0 the floor raises it to 0.05 as it does for a percentile
+  aggregate.
+- **C3, fast-path alertability in mantic mode** (item 13). The `time_budget_fast_path` counter
+  is alertable and would fire routinely under 60-minute windows (any pickup after about :28:45
+  is fast path, roughly a fifth of runs); decide once the Series 2 window length is known, which
+  no API field announces before the first question opens. If windows are 60 minutes, subtract
+  the fast-path count from `bot_alertable` in mantic mode only, keeping the counter, the WARNING
+  and the `TIME_BUDGET` marker, with a pin that Metaculus modes are unchanged. Read-only, once
+  Series 2 has run a day, after `make sync_all`: join `mantic_question.jsonl` qids against
+  `time_budget.jsonl` and read `fast_path` and the smallest `budget_s` values, which reveal the
+  window length directly since every question is picked up inside its own window.
+- **C4, median versus mean aggregation under the baseline formula, reframed** (item 18). The
+  archived members are percentile-elicited, so this replay cannot answer the per-bin question
+  (decided by construction in C1). What it can measure is whether the pointwise MEAN also beats
+  the MEDIAN for PERCENTILE members under a bin log score, which is what Mantic scores every grid
+  above 31 bins by. Nothing is blocked: `_score_member_curve` (`performance_analysis/audit.py`)
+  rebuilds each member's CDF on the record's own grid and `_postprocess_ensemble_cdf` takes
+  either method; the candidate is a small `performance_analysis/aggregation_replay.py` that
+  aggregates both ways, scores under the Series 1 form `50 * ln(p / baseline)` and the Series 2
+  form `100 * (log_N(p) + 1)`, era-buckets on merge dates and prints the mean delta with a
+  bootstrap interval. NOT built in Wave C; the Mantic-specific run waits for about thirty
+  resolved Mantic percentile questions with `MEMBER_FORECAST` lines. A flip would extend the
+  C1 combine helper to percentile members on Mantic, one branch, not a new mechanism.
+- **C5, after 2026-09-20 12:00 UTC.** Question 651 closes, resolves and is spot-scored at that
+  instant. Two free reads: the public
+  `curl -s https://competitions.mantic.com/api/posts/651/ | jq '.question.resolution, .question.aggregations.recency_weighted.score_data.disagreement_forecasts.forecasts[] | select(.author_id == 81) | .pmf'`
+  gives the resolution string and our own spot-time PMF, and
+  `scoring_common.resolution_to_bucket_index` against the fixture's `continuous_range` says which
+  bin the platform charged, closing the day-bin edge question below; the authenticated
+  `curl -s -H "Authorization: Token $MANTIC_TOKEN" "https://competitions.mantic.com/api/posts/651/?with_cp=true" | jq '.question.my_forecasts.score_data'`
+  reads our reported spot baseline score, and comparing it with `50 * ln(p / (1/12))` and
+  `100 * (log_12(p) + 1)` on our published bin mass tells which coefficient Mantic applies.
+  Repeat the second read on the first resolved Series 2 question.
+- **C6, starved outer tail** (item 19) stays a documented watch item, not bundled with the
+  min-step tolerance fix. Per-bin elicitation removes the mechanism on every grid it covers (the
+  model states the outer bins' probability directly, the floor blend keeps every bin at the
+  platform minimum, and the pool keeps every bin any member believed); on percentile grids the
+  cliff stays as it is. Blocked on a Mantic residual dataset (`performance_analysis` is
+  date-free and Metaculus-only). Read-only until then: `oor_high` on the `MEMBER_FORECAST` lines
+  of open-upper Mantic questions, `jq 'select(.oor_high != null)'
+  backtests/telemetry_archive/member_forecast.jsonl`.
 - **Log-scaled discrete grids are untested.** No `zero_point` (log-scaled) discrete question
   exists in the Mantic corpus, so the plateau cap's use of the linear mean bin width on such a
   grid has no live or recorded case behind it; check the first one that appears.

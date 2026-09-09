@@ -16,6 +16,10 @@ under ``aggregations.recency_weighted.score_data.disagreement_forecasts`` are dr
 here reads); everything else, including the community's last CDF, is the wire payload verbatim. It
 carries no ``my_forecasts`` block because the pull was unauthenticated.
 
+``tests/data/mantic_series1_discrete_post_643_2026_09_08.json`` is the coarse quantity fixture, post 643
+(21 count bins, open ceiling) RESHAPED from its resolved Series 1 record into an open preseason post,
+because the preseason set has no grid per-bin elicitation admits; :func:`load_coarse_discrete_post` says what changed.
+
 Not named ``test_*`` on purpose: pytest imports it without collecting it, and consumers bind what
 they need by import. Nothing here opens a socket.
 
@@ -34,10 +38,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from forecasting_tools.data_models.questions import DateQuestion
+from forecasting_tools.data_models.questions import DateQuestion, DiscreteQuestion
 
 PRESEASON_FIXTURE_PATH = Path(__file__).parent / "data" / "mantic_preseason2_posts_2026_09_08.json"
 LEGACY_DATE_FIXTURE_PATH = Path(__file__).parent / "data" / "mantic_series1_date_post_500_2026_09_08.json"
+COARSE_DISCRETE_FIXTURE_PATH = Path(__file__).parent / "data" / "mantic_series1_discrete_post_643_2026_09_08.json"
 
 BINARY_POST_ID = 648
 MULTIPLE_CHOICE_POST_ID = 649
@@ -45,6 +50,7 @@ DISCRETE_POST_ID = 650
 DATE_POST_ID = 651
 PRESEASON_POST_IDS = (BINARY_POST_ID, MULTIPLE_CHOICE_POST_ID, DISCRETE_POST_ID, DATE_POST_ID)
 LEGACY_DATE_POST_ID = 500
+COARSE_DISCRETE_POST_ID = 643
 
 # Shaped like a platform user id; the real bot account's id is not in the fixture and nothing reads it.
 _FAKE_BOT_USER_ID = 9001
@@ -69,6 +75,26 @@ def load_legacy_date_post() -> dict[str, Any]:
     with LEGACY_DATE_FIXTURE_PATH.open() as f:
         payload = json.load(f)
     return copy.deepcopy(payload["results"][0])
+
+
+def load_coarse_discrete_post() -> dict[str, Any]:
+    """Post 643 ("How many public releases will U.S. Central Command publish ..."), reshaped as open.
+
+    The 2026-09-08 public corpus pull recorded it RESOLVED (Series 1, 21 count bins 0 through 20,
+    closed lower bound, open upper bound). The fixture is that record in the state the preseason
+    list endpoint serves for a forecastable question: status ``open``, ``resolved`` false, no
+    resolution, an empty ``aggregations`` block, an empty ``my_forecasts`` block, and ``projects``
+    pointing at ``preseason-2`` (copied from post 650). Title, criteria, scaling and grid are the
+    wire payload verbatim; the end-to-end run re-dates it like the other posts.
+    """
+    with COARSE_DISCRETE_FIXTURE_PATH.open() as f:
+        payload = json.load(f)
+    return copy.deepcopy(payload["results"][0])
+
+
+def load_coarse_discrete_question() -> DiscreteQuestion:
+    """Post 643 as the ``DiscreteQuestion`` the framework parses: counts 0 to 20, open upper bound."""
+    return DiscreteQuestion.from_metaculus_api_json(load_coarse_discrete_post())
 
 
 def load_preseason_date_question() -> DateQuestion:

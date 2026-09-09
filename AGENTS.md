@@ -110,7 +110,8 @@ Free and safe — run freely:
 - Read-only Metaculus and artifact pulls: `make sync_all` and its parts (`sync_research`,
   `sync_telemetry`, `sync_raw_research`, `download_*`, `backfill_*`), the `performance_analysis`
   package, `make score_ghosts`, `make close_margin_watch`, `make ablation_score`,
-  `make supply_probe`, `make benchmark_display`. These hit only the Metaculus API and GitHub
+  `make supply_probe`, `make supply_probe_mantic` (public Mantic reads; `MANTIC_TOKEN` optional),
+  `make benchmark_display`. These hit only the Metaculus API, Mantic's public API and GitHub
   artifacts.
 - `make check_credits` — reads both OpenRouter key balances.
 - `uv run python scripts/probes/fetch_diagnostic.py` — probes A/B/C are public GETs, and column D
@@ -186,6 +187,7 @@ Inside `metaculus_bot/`:
 | Value extraction ladder | `value_extraction.py`, `structured_parse.py`, `structured_output_schema.py` |
 | Numeric percentiles → CDF | `numeric/` |
 | Date question as a numeric question on the epoch-seconds axis | `numeric/date_axis.py` |
+| Per-bin PMF elicitation on enumerable grids (Mantic, 31 bins or fewer): the gate, the bin labels, the PMF → CDF build | `numeric/config.py` (`elicit_per_bin`), `numeric/pmf_grid.py`, `numeric/pmf_cdf.py` |
 | MC clamp / renormalize | `mc_processing.py` |
 | Aggregation routing and stacking | `stacking_route.py`, `aggregation_pipeline.py`, `stacking.py`, `spread_metrics.py` |
 | Publish hardening and close gate | `publish_hardening.py`, `publish_gate.py` |
@@ -197,7 +199,8 @@ Inside `metaculus_bot/`:
 | Probability math, dormant in prod | `probabilistic_tools/`, `tool_runner.py` |
 
 `scripts/` holds the read-only sync and analysis tooling: `sync_all.py`, `download_*.py`,
-`backfill_*.py`, `supply_probe.py`, `score_ghosts.py`, `reconcile_credit_spend.py`,
+`backfill_*.py`, `supply_probe.py` and `supply_probe_platforms.py` (the per-platform probe table and the two
+forecast-state classifiers), `score_ghosts.py`, `reconcile_credit_spend.py`,
 `derive_mini_comment_fixture.py`, the `telemetry/` marker registry, `probes/`, and the
 `research_sync/` launchd job.
 
@@ -219,8 +222,12 @@ Per question, inside `forecaster.py:_research_and_make_predictions`. Detail:
 2. **Forecaster fan-out** — N forecaster LLMs in parallel via `_forecaster_with_soft_deadline`
    (capped per model by `FORECASTER_SOFT_DEADLINE`) → `_make_prediction` → the type-specific
    runner in `forecaster_runners.py`. Each forecaster emits its value inside a fenced ```json
-   STRUCTURED FORECAST block, read by the extraction ladder in `value_extraction.py`. Detail:
-   `docs/value_extraction.md`, `docs/prompts.md`.
+   STRUCTURED FORECAST block, read by the extraction ladder in `value_extraction.py`. A Mantic
+   numeric or date question with 31 bins or fewer (`elicit_per_bin`, `numeric/config.py`) is
+   elicited PER BIN instead of as percentiles: a `pmf` block with one probability per bin label,
+   built into a CDF by `numeric/pmf_cdf.py` with none of the percentile sanitizing, PCHIP repair
+   or unit-mismatch guard, and the `MEMBER_FORECAST` line carries `elicitation=pmf`. Detail:
+   `docs/value_extraction.md`, `docs/prompts.md`, `docs/numeric_pipeline.md`.
 3. **Min-forecasters guard** — drops the question below `MIN_FORECASTERS_TO_PUBLISH`
    (`constants.py`). With the floor at 1 a lone survivor publishes, and `route_after_forecasts`
    (`stacking_route.py`) short-circuits n == 1 before spread computation, because the
@@ -229,9 +236,12 @@ Per question, inside `forecaster.py:_research_and_make_predictions`. Detail:
 4. **Aggregation** — `aggregation_pipeline.py`. Spread below the per-type threshold gives the
    MEDIAN; above it, a crux extraction plus targeted search plus a stacker rewrite, with a
    second stacker and then MEDIAN as fallbacks. In prod the per-type gates are off, so this is
-   always MEDIAN. Numeric aggregation happens pointwise in CDF space
-   (`aggregate_numeric`, `numeric/utils.py`), not in percentile space. Detail:
-   `docs/architecture.md`, `docs/numeric_pipeline.md`.
+   always MEDIAN, with one exception: per-bin members (the Mantic coarse grids above) are pooled
+   by the pointwise MEAN of their CDFs, because the median of sharp per-bin members is one
+   member's CDF outright and a log score in the resolved bin punishes that cliff;
+   `NUMERIC_AGGREGATE ... method=mean|median` records which rule ran. Numeric aggregation happens
+   pointwise in CDF space (`aggregate_numeric`, `numeric/utils.py`), not in percentile space.
+   Detail: `docs/architecture.md`, `docs/numeric_pipeline.md`.
 5. **Publish, behind a close-time gate** (`publish_gate.py`, layer 4 of `publish_hardening.py`).
    A question whose window has passed is skipped entirely, prediction and comment together, and
    the skip is alertable. Detail: `docs/architecture.md`.
@@ -444,4 +454,5 @@ After pushing, check the run:
 | `docs/performance_analysis.md` | Residual-analysis conventions: era bucketing and the merge-date rule, the exclusion cohorts, the archive's record classes, the PIT and spot-peer conventions, `spot_peer_delta`, the starved outer tail, per-model recovery, and the clip-threshold sweep. |
 | `README.md` | Human quick-start: install, configure, run. |
 | `FUTURE.md` | The design log — intent, history, and rejected ideas. Read it for the why, not for current state. |
+| `docs/supply_probe.md` | The question-supply probe: why it exists, what each report block means, the Mantic mode and its public-snapshot caveat, the API facts it is built around. |
 | `scratch_docs_and_planning/residual_analysis_playbook.md` | The per-round residual procedure. |

@@ -45,6 +45,7 @@ from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN, MC_PROB_MI
 from metaculus_bot.exceptions import UnitMismatchError
 from metaculus_bot.forecaster_runners import run_binary_forecast, run_mc_forecast, run_numeric_forecast
 from metaculus_bot.member_forecast import (
+    ELICITATION_PMF,
     MEMBER_FORECAST_ROLE_MEMBER,
     MEMBER_FORECAST_ROLE_STACKER,
     format_member_forecast_marker,
@@ -53,7 +54,7 @@ from metaculus_bot.member_forecast import (
     out_of_range_mass,
     percentile_pairs,
 )
-from metaculus_bot.numeric.config import STANDARD_PERCENTILES
+from metaculus_bot.numeric.config import STANDARD_PERCENTILES, grid_step_constraints
 from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
 from metaculus_bot.simple_types import OptionProbability
 from metaculus_bot.value_extraction import ExtractionOutcome, McForecast, extract_mc
@@ -72,6 +73,12 @@ _DECLARED = [Percentile(percentile=p, value=8.7 + 0.8729999999999905 * i) for i,
 _SANITIZED = [Percentile(percentile=p.percentile, value=p.value + 0.001) for p in _DECLARED]
 # A built CDF with mass beyond both bounds: 0.2% below the lower, 3.75% above the upper.
 _BUILT_CDF = [0.002, 0.1, 0.3, 0.5, 0.7, 0.9, 0.9625]
+
+# A per-bin member of post 651 certain of bin 8, as the platform's N + 2 vector: raw as read, published after the floor blend.
+_PMF_BINS = 12
+_PMF_FLOOR = grid_step_constraints(_PMF_BINS + 1)[0] + 1e-9
+_PMF_RAW = [0.0] + [1.0 if k == 8 else 0.0 for k in range(_PMF_BINS)] + [0.0]
+_PMF_PUBLISHED = [0.0] + [1.0 - 11 * _PMF_FLOOR if k == 8 else _PMF_FLOOR for k in range(_PMF_BINS)] + [0.0]
 
 
 def _fake_distribution(cdf_heights: list[float]) -> MagicMock:
@@ -224,7 +231,40 @@ class TestFormatter:
         )
         assert "oor_" not in without
 
-    def test_numeric_aggregate_marker_names_grid_and_tails(self):
+    def test_a_pmf_line_ends_with_the_elicitation_field_after_the_tails(self):
+        """On a per-bin line ``raw`` and ``published`` are the platform's N + 2 vector, and the
+        field that says so comes LAST, after the tails, so every older consumer reads the same
+        positions it always did and a new one reads ``elicitation`` before interpreting ``raw``."""
+        line = format_member_forecast_marker(
+            question_id=651,
+            model=MODEL,
+            role=MEMBER_FORECAST_ROLE_MEMBER,
+            qtype="date",
+            raw=_PMF_RAW,
+            published=_PMF_PUBLISHED,
+            out_of_range=(_PMF_PUBLISHED[0], _PMF_PUBLISHED[-1]),
+            elicitation=ELICITATION_PMF,
+        )
+        assert line.startswith(f"MEMBER_FORECAST: question=651 model={MODEL} role=member qtype=date raw=[0.0,")
+        assert line.endswith(" oor_low=0.000000 oor_high=0.000000 elicitation=pmf")
+        assert json.loads(line.split(" raw=", 1)[1].split(" ", 1)[0]) == _PMF_RAW
+        assert len(json.loads(line.split(" published=", 1)[1].split(" ", 1)[0])) == _PMF_BINS + 2
+
+    def test_the_elicitation_field_is_absent_unless_given(self):
+        """Absent means percentiles: the meaning every archived numeric and date line already has."""
+        line = format_member_forecast_marker(
+            question_id=QID,
+            model=MODEL,
+            role=MEMBER_FORECAST_ROLE_MEMBER,
+            qtype="numeric",
+            raw=percentile_pairs(_DECLARED[:2]),
+            published=percentile_pairs(_SANITIZED[:2]),
+            out_of_range=(0.002, 0.0375),
+        )
+        assert "elicitation" not in line
+        assert ELICITATION_PMF == "pmf"
+
+    def test_numeric_aggregate_marker_names_grid_tails_and_method(self):
         line = format_numeric_aggregate_marker(
             question_id=651,
             qtype="date",
@@ -232,15 +272,30 @@ class TestFormatter:
             out_of_range=(0.0, 0.0),
             out_of_range_raw=(0.0, 0.0),
             tail_floor=0.0,
+            method="mean",
         )
         assert line == (
             "NUMERIC_AGGREGATE: question=651 qtype=date cdf_size=13 oor_low=0.000000 oor_high=0.000000"
-            " oor_low_raw=0.000000 oor_high_raw=0.000000 tail_floor=0.000000"
+            " oor_low_raw=0.000000 oor_high_raw=0.000000 tail_floor=0.000000 method=mean"
         )
         rec = _harvest_any(line)
         assert rec["marker"] == "numeric_aggregate"
         assert rec["qid"] == 651
         assert rec["cdf_size"] == 13
+        assert rec["method"] == "mean"
+
+    def test_the_aggregate_marker_requires_a_method(self):
+        """Written on EVERY numeric and date question, so the combine rule is auditable per question:
+        a caller cannot leave it out."""
+        with pytest.raises(TypeError, match="method"):
+            format_numeric_aggregate_marker(  # type: ignore[call-arg]
+                question_id=651,
+                qtype="date",
+                cdf_size=13,
+                out_of_range=(0.0, 0.0),
+                out_of_range_raw=(0.0, 0.0),
+                tail_floor=0.0,
+            )
 
 
 class TestRoundTripThroughMarkerSpec:
@@ -268,6 +323,47 @@ class TestRoundTripThroughMarkerSpec:
         assert rec["qtype"] == qtype
         assert json.loads(rec["raw"]) == raw
         assert json.loads(rec["published"]) == published
+
+    def test_a_pmf_line_round_trips_with_its_elicitation_and_tails(self):
+        rec = _harvest(
+            format_member_forecast_marker(
+                question_id=651,
+                model=MODEL,
+                role=MEMBER_FORECAST_ROLE_MEMBER,
+                qtype="date",
+                raw=_PMF_RAW,
+                published=_PMF_PUBLISHED,
+                out_of_range=(_PMF_PUBLISHED[0], _PMF_PUBLISHED[-1]),
+                elicitation=ELICITATION_PMF,
+            )
+        )
+        assert rec["qtype"] == "date"
+        assert rec["elicitation"] == "pmf"
+        assert json.loads(rec["raw"]) == _PMF_RAW
+        assert json.loads(rec["published"]) == pytest.approx(_PMF_PUBLISHED)
+        assert (rec["oor_low"], rec["oor_high"]) == (0.0, 0.0)
+
+    @pytest.mark.parametrize(
+        ("qtype", "raw", "published"),
+        [
+            ("binary", 0.005, BINARY_PROB_MIN),
+            ("multiple_choice", [0.9, 0.005, 0.095], [0.891, 0.01, 0.099]),
+            ("numeric", percentile_pairs(_DECLARED), percentile_pairs(_SANITIZED)),
+        ],
+    )
+    def test_a_line_without_the_field_reads_percentiles(self, qtype, raw, published):
+        """``None``, never a default token: absent is what every archived line says."""
+        rec = _harvest(
+            format_member_forecast_marker(
+                question_id=QID,
+                model=MODEL,
+                role=MEMBER_FORECAST_ROLE_MEMBER,
+                qtype=qtype,
+                raw=raw,
+                published=published,
+            )
+        )
+        assert rec["elicitation"] is None
 
     def test_values_are_kept_verbatim_so_a_consumer_always_json_loads(self):
         """Without the spec's raw_fields the binary line would coerce to a float while the

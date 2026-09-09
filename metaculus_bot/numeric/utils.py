@@ -16,7 +16,7 @@ from forecasting_tools.data_models.numeric_report import (
 )
 from forecasting_tools.data_models.questions import NumericQuestion
 
-from metaculus_bot.constants import NUM_RAMP_K_FACTOR
+from metaculus_bot.constants import NUM_RAMP_K_FACTOR, PMF_ABOVE_RANGE_KEY, PMF_BELOW_RANGE_KEY
 from metaculus_bot.mc_processing import clamp_and_renormalize_probs
 from metaculus_bot.numeric.config import PCHIP_CDF_POINTS, grid_step_constraints
 from metaculus_bot.numeric.date_axis import EpochDateQuestion, format_epoch
@@ -30,6 +30,7 @@ __all__ = [
     "bound_messages",
     "clamp_and_renormalize_mc",
     "nominal_bounds",
+    "pmf_bound_messages",
 ]
 
 
@@ -68,19 +69,15 @@ def _postprocess_ensemble_cdf(
 ) -> NumericDistribution:
     """Shared CDF post-processing for both mean and median aggregation.
 
-    Pins the endpoints, enforces monotonicity, ramp-smooths any sub-min-step bin and
-    routes the result through ``safe_cdf_bounds`` with the step limits of the grid the
-    CDF is on. That last pass is load-bearing: the ramp (or a raw concentrated median)
-    can push interior values above 1.0 and leave bins over the grid-scaled max step
-    (binding once ``cdf_size >= 42``), which would otherwise crash ``Percentile``
-    validation downstream and drop the question. Nothing is resampled here:
-    ``aggregate_numeric`` aligns every member to the question's own grid first, so a
-    discrete question's ensemble already sits on its ``cdf_size`` points and simply
-    gets that coarse grid's limits. The value axis the result is labelled with is the
-    question's own (``build_cdf_value_grid`` on the same ``zero_point`` the per-model
-    builds resolve), so ``declared_percentiles`` and ``get_cdf()`` agree with each other
-    and with every member. ``method_label`` is used only in log and marker text (e.g.
-    ``"mean"`` or ``"median"``).
+    Pins the endpoints, enforces monotonicity, ramp-smooths any sub-min-step bin and routes
+    the result through ``safe_cdf_bounds`` with the step limits of the grid the CDF is on;
+    that last pass is load-bearing, since the ramp (or a raw concentrated median) can leave
+    bins over the grid-scaled max step and crash ``Percentile`` validation downstream.
+    Nothing is resampled: ``aggregate_numeric`` already aligned every member to the
+    question's own grid. The result is labelled with the question's own value axis (the
+    same ``zero_point`` the per-model builds resolve), so ``declared_percentiles`` and
+    ``get_cdf()`` agree with each other and with every member. ``method_label`` is used
+    only in log and marker text. Detail: ``docs/numeric_pipeline.md``, Step 9.
     """
     p_vals = np.clip(p_vals, 0.0, 1.0)
     p_vals = np.maximum.accumulate(p_vals)
@@ -184,28 +181,16 @@ def aggregate_numeric(
     question: NumericQuestion,
     method: str | Literal["mean", "median"] = "mean",
 ) -> NumericDistribution:
-    """Aggregate numeric distributions by mean or median, pointwise in CDF space.
+    """Aggregate ``predictions`` by ``method`` (``"mean"`` or ``"median"``), pointwise in CDF space.
 
-    Every model contributes to every grid point. The aggregation is POSITIONAL
-    (grid index i across all models), because grouping on the float ``value``
-    axis silently medianed over a SUBSET: the PCHIP path's ``np.linspace`` grid
-    and forecasting-tools' fallback ``min + span*i/(n-1)`` grid are equal in
-    exact arithmetic but differ in the last bits, so a mixed-path ensemble
-    produced ~225 distinct x-values for 201 buckets and roughly a quarter of them
-    had fewer than n contributors — with nothing recording the partial
-    membership, and the resulting length mismatch misrouting the ensemble through
-    a discrete-resample branch (since removed: alignment made it unreachable). A
-    model that genuinely arrives on a different-length grid is resampled first
-    (logged, see ``_cdf_heights_on_canonical_grid``).
-
-    Parameters
-    ----------
-    predictions
-        List of `NumericDistribution` objects as produced by individual LLMs.
-    question
-        The original `NumericQuestion` - needed for bounds metadata.
-    method
-        "mean" (default) or "median" to pick aggregation strategy.
+    Every model contributes to every grid point, and the aggregation is POSITIONAL (grid
+    index ``i`` across all models): grouping on the float ``value`` axis silently medianed
+    over a SUBSET, because the PCHIP grid and forecasting-tools' fallback grid agree in exact
+    arithmetic but not in the last bits (about 225 distinct x-values for 201 buckets, a
+    quarter of them short of ``n`` contributors, nothing recording it). A model that
+    genuinely arrives on a different-length grid is resampled first (logged, see
+    ``_cdf_heights_on_canonical_grid``). ``question`` supplies the grid and the bound
+    flags. Detail: ``docs/numeric_pipeline.md``, Step 9.
     """
 
     if not predictions:
@@ -250,6 +235,17 @@ def nominal_bounds(question: NumericQuestion) -> tuple[float, float]:
     return upper, lower
 
 
+def _displayed_bounds(question: NumericQuestion) -> tuple[str | float, str | float]:
+    """``(upper, lower)`` as a forecaster reads them: the nominal bounds, rendered as dates on the epoch adapter."""
+    upper_bound_value, lower_bound_value = nominal_bounds(question)
+    if isinstance(question, EpochDateQuestion):
+        return (
+            format_epoch(upper_bound_value, question.date_granularity),
+            format_epoch(lower_bound_value, question.date_granularity),
+        )
+    return upper_bound_value, lower_bound_value
+
+
 def bound_messages(question: NumericQuestion) -> tuple[str, str]:
     """Return upper & lower bound helper messages for numeric prompts.
 
@@ -257,12 +253,7 @@ def bound_messages(question: NumericQuestion) -> tuple[str, str]:
     On the epoch adapter of a date question the bounds read as dates, not epoch floats.
     """
 
-    upper_bound_value, lower_bound_value = nominal_bounds(question)
-    upper_bound_number: str | float = upper_bound_value
-    lower_bound_number: str | float = lower_bound_value
-    if isinstance(question, EpochDateQuestion):
-        upper_bound_number = format_epoch(upper_bound_value, question.date_granularity)
-        lower_bound_number = format_epoch(lower_bound_value, question.date_granularity)
+    upper_bound_number, lower_bound_number = _displayed_bounds(question)
 
     if question.open_upper_bound:
         upper_bound_message = (
@@ -291,6 +282,42 @@ def bound_messages(question: NumericQuestion) -> tuple[str, str]:
         )
     else:
         lower_bound_message = f"The lower bound is closed: the outcome can not be lower than {lower_bound_number}."
+    return upper_bound_message, lower_bound_message
+
+
+def pmf_bound_messages(question: NumericQuestion) -> tuple[str, str]:
+    """The ``(upper, lower)`` bound messages of a per-bin prompt, where the reserved keys carry out-of-range mass.
+
+    The twin of :func:`bound_messages` for a question elicited per bin (``config.elicit_per_bin``):
+    same displayed bounds, same order, but the percentile wording ("your percentiles are the ONLY way
+    you express probability mass") would be wrong here, since an open bound's mass is the
+    ``above_range`` / ``below_range`` key and a closed bound has no such key at all.
+    """
+    upper, lower = _displayed_bounds(question)
+
+    if question.open_upper_bound:
+        upper_bound_message = (
+            f"The upper bound is open: {upper} is the top of the displayed range, not a hard limit. "
+            f"`{PMF_ABOVE_RANGE_KEY}` is the probability that the outcome resolves above {upper}; it is scored as "
+            f"its own outcome, so give it your honest probability, however large."
+        )
+    else:
+        upper_bound_message = (
+            f"The upper bound is closed: the outcome cannot be higher than {upper}, "
+            f"and there is no `{PMF_ABOVE_RANGE_KEY}` key."
+        )
+
+    if question.open_lower_bound:
+        lower_bound_message = (
+            f"The lower bound is open: {lower} is the bottom of the displayed range, not a hard limit. "
+            f"`{PMF_BELOW_RANGE_KEY}` is the probability that the outcome resolves below {lower}; it is scored as "
+            f"its own outcome, so give it your honest probability, however large."
+        )
+    else:
+        lower_bound_message = (
+            f"The lower bound is closed: the outcome cannot be lower than {lower}, "
+            f"and there is no `{PMF_BELOW_RANGE_KEY}` key."
+        )
     return upper_bound_message, lower_bound_message
 
 

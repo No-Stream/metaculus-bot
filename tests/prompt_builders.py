@@ -15,11 +15,11 @@ import re
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
-from forecasting_tools.data_models.questions import DateQuestion
+from forecasting_tools.data_models.questions import DateQuestion, DiscreteQuestion
 
 from metaculus_bot.constants import MANTIC_HOST, METACULUS_HOST
 from metaculus_bot.numeric.date_axis import as_epoch_question
-from metaculus_bot.numeric.utils import bound_messages
+from metaculus_bot.numeric.utils import bound_messages, pmf_bound_messages
 from metaculus_bot.prompts import (
     MARKET_SNAPSHOT_SECTION_HEADER,
     asknews_summarizer_prompt,
@@ -27,6 +27,7 @@ from metaculus_bot.prompts import (
     date_prompt,
     multiple_choice_prompt,
     numeric_prompt,
+    pmf_prompt,
     stacking_binary_prompt,
     stacking_multiple_choice_prompt,
     stacking_numeric_prompt,
@@ -128,6 +129,60 @@ def _open_upper_date_q() -> DateQuestion:
             }
         },
     )
+
+
+def _pmf_q(
+    *,
+    cdf_size: int = 22,
+    lower_bound: float = -0.5,
+    upper_bound: float = 20.5,
+    nominal_lower: float = 0.0,
+    nominal_upper: float = 20.0,
+    open_lower: bool = False,
+    open_upper: bool = True,
+    unit_of_measure: str = "releases",
+    page_url: str = MANTIC_PAGE_URL,
+) -> DiscreteQuestion:
+    """A coarse Mantic discrete question in the shape of Series 1 post 643: counts 0 to 20, open ceiling.
+
+    Twenty-one centre-aligned bins (``range_min = nominal_min - step / 2``), the platform's discrete
+    convention, so the per-bin prompt labels them ``0`` through ``20`` and adds ``above_range``. A
+    real ``DiscreteQuestion`` rather than a MagicMock because ``pmf_prompt`` builds the labelled grid
+    from the typed bounds and reads the nominal bounds through ``getattr``, which a MagicMock would
+    answer with another MagicMock. The defaults are overridable so a test can render the other
+    corpus shapes (a closed 3-bin count, a 30-bin numeric grid whose nominal bounds are its edges).
+    """
+    return DiscreteQuestion(
+        id_of_question=643,
+        id_of_post=643,
+        page_url=page_url,
+        question_text="How many public releases will U.S. Central Command publish?",
+        background_info="bg",
+        resolution_criteria="rc",
+        fine_print="fp",
+        published_time=None,
+        close_time=None,
+        open_time=datetime.now(UTC) - timedelta(days=30),
+        scheduled_resolution_time=datetime.now(UTC) + timedelta(days=365),
+        lower_bound=lower_bound,
+        upper_bound=upper_bound,
+        open_lower_bound=open_lower,
+        open_upper_bound=open_upper,
+        unit_of_measure=unit_of_measure,
+        zero_point=None,
+        cdf_size=cdf_size,
+        nominal_lower_bound=nominal_lower,
+        nominal_upper_bound=nominal_upper,
+        api_json={"question": {}},
+    )
+
+
+def _pmf_prompt_text(question: DiscreteQuestion | DateQuestion | None = None, research: str = "r") -> str:
+    """``pmf_prompt`` on ``question`` (default the post-643 count grid) with its real, per-bin-worded bound messages."""
+    q = question if question is not None else _pmf_q()
+    view = as_epoch_question(q) if isinstance(q, DateQuestion) else q
+    upper_message, lower_message = pmf_bound_messages(view)
+    return pmf_prompt(q, research=research, lower_bound_message=lower_message, upper_bound_message=upper_message)
 
 
 def _date_prompt_text(question: DateQuestion | None = None, research: str = "r") -> str:

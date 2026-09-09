@@ -11,13 +11,12 @@ import math
 
 from forecasting_tools.data_models.questions import DiscreteQuestion, NumericQuestion
 
-from metaculus_bot.constants import NUM_MAX_STEP
+from metaculus_bot.constants import NUM_MAX_STEP, PLATFORM_MANTIC
+from metaculus_bot.question_platform import question_platform
 
 # --- Percentile Processing Constants ---
 
-# Expressed as decimals in [0,1]. P1 (0.01) and P99 (0.99) give forecasters finer tail
-# anchors so they can express probability mass below an open lower bound / above an open
-# upper bound (the Minions & Monsters miss).
+# Decimals in [0, 1]; P1 and P99 are the tail anchors that let a forecaster place mass beyond an open bound.
 STANDARD_PERCENTILES: list[float] = [
     0.01,
     0.025,
@@ -36,53 +35,33 @@ STANDARD_PERCENTILES: list[float] = [
 
 EXPECTED_PERCENTILE_COUNT: int = len(STANDARD_PERCENTILES)
 
-# Human-readable label CSV (percentile * 100, e.g. "1,2.5,5,...,97.5,99"). The single
-# source for the label string embedded in prompts and validation errors — never hardcode
-# the list elsewhere so it stays in lockstep with STANDARD_PERCENTILES.
+# The one source of the percentile label CSV for prompts and validation errors; never restate the list elsewhere.
 STANDARD_PERCENTILES_CSV: str = ",".join(f"{p * 100:g}" for p in STANDARD_PERCENTILES)
 
 MIN_PERCENTILES_REQUIRED: int = 3
 
 # --- PCHIP CDF Configuration ---
 
-# The standard grid. ``NumericQuestion.cdf_size`` (and ``DateQuestion.cdf_size``) is a
-# non-optional int on the forecasting-tools model, defaulting to this, so no reader in the
-# pipeline normalises an absent value: a test double that wants the standard grid passes it.
+# The standard grid; ``cdf_size`` is a non-optional int defaulting to this, so no reader normalises an absent value.
 PCHIP_CDF_POINTS: int = 201
 
-# The 201-grid max step by name: the reference the open-bound piling threshold is calibrated
-# against (numeric/diagnostics.py) and the pre-scaling cap the residual analysis reads back
-# (performance_analysis/analysis.py). Every live grid limit comes from grid_step_constraints.
+# The 201-grid cap by name for the piling threshold and the residual analysis; live limits come from grid_step_constraints.
 MAX_CDF_PROB_STEP: float = NUM_MAX_STEP
 
 
 def grid_step_constraints(num_points: int) -> tuple[float, float]:
-    """Return ``(min_step, max_step)`` for a ``num_points``-point CDF grid.
+    """Return ``(min_step, max_step)`` for a ``num_points``-point CDF grid, as the server enforces them.
 
-    The server's per-bin rules (``questions/serializers/common.py`` in the open-source
-    Metaculus backend, which Mantic forked with the same constants) scale with the bin
-    count ``inbound = num_points - 1``, and the server checks them against a PMF it has
-    rounded to 9 decimals (``np.round(np.diff(cdf), 9)``), so both limits here are the
-    9-decimal values that survive that rounding:
-
-    * min step ``round(0.01 / inbound, 9)``, the server's own rounded floor.
-    * max step: the largest 9-decimal value not exceeding ``0.2 * 200 / inbound``, clamped
-      at ``1.0`` (a probability step can never exceed 1.0). The server compares the ROUNDED
-      pmf against the UNROUNDED cap, and the max-step repair clips over-cap bins to exactly
-      this value, so wherever the cap is not 9-decimal exact a bin clipped to the raw cap
-      rounds above it and the submission is rejected (450 bins: 0.0888... rounds to
-      0.088888889). Flooring is a no-op wherever the cap is 9-decimal exact, which covers
-      every grid of 41 points or fewer and the 51, 101, 201 and 2,001-point grids.
-
-    There is deliberately no floor at the 201-grid min step. Such a floor was a no-op for
-    ``inbound <= 200`` and stricter than the server above it (2.25x at 450 bins, 10x at
-    2,000), which forced a uniform mixture several times larger than the server requires
-    into the tails of every fine-grid forecast. At the standard 201-point grid this returns
-    exactly ``(NUM_MIN_PROB_STEP, NUM_MAX_STEP)``, the constants the 201-point builders
-    default to. On a coarse discrete grid (``num_points < 201``) the max step relaxes above
-    0.2 (1.0 at ``num_points=9``), which lets a small-count distribution keep its mass
-    concentrated on the low integers instead of being clipped to the 201-grid cap; on a
-    finer grid both limits tighten.
+    The server's per-bin rules scale with the bin count ``inbound = num_points - 1`` and are
+    checked against a PMF rounded to 9 decimals, so both limits are the 9-decimal values that
+    survive that rounding: the min step is the server's own ``round(0.01 / inbound, 9)``; the
+    max step is the largest 9-decimal value not exceeding ``0.2 * 200 / inbound``, clamped at
+    1.0, because a bin clipped to the raw cap rounds above it wherever the cap is not 9-decimal
+    exact (450 bins: 0.0888... rounds to 0.088888889 and the submission is rejected). There is
+    deliberately no floor at the 201-grid min step: it was a no-op below 200 bins and 2.25x to
+    10x stricter than the server above them. At 201 points this is exactly
+    ``(NUM_MIN_PROB_STEP, NUM_MAX_STEP)``; a coarse grid relaxes the cap, a fine grid tightens
+    both. Detail: ``docs/numeric_pipeline.md``, "Server-side constraints".
     """
     inbound = max(1, num_points - 1)
     min_step = round(0.01 / inbound, 9)
@@ -107,21 +86,53 @@ def grid_is_outcome_space(question: NumericQuestion) -> bool:
     """True when the question's published bins are its outcome space and nothing downstream reshapes them.
 
     Two shapes qualify: a natively discrete question (``DiscreteQuestion``: every Metaculus
-    discrete question and every Mantic quantitative question, whose wire type the Mantic
-    client rewrites to ``discrete``) and any non-201 grid. On both, the vote-gated discrete
-    snap never runs (``discrete_snap`` skips on exactly this predicate), so what the
-    sanitizer's cluster spreader publishes is the final word and a plateau is kept inside
-    its bin (``cluster_processing``). On the 201-point continuous grid of a
-    ``NumericQuestion`` the count-like unit spread is a pre-processing step the snap can
-    re-concentrate afterwards, so that grid stays byte-identical. ``cdf_size`` alone cannot
-    carry the distinction: a 200-bin Mantic discrete question has ``cdf_size == 201``.
-
-    The ablation harness rehydrates archived questions as plain ``NumericQuestion`` with the
-    recorded ``cdf_size``, so its replay of a 200-bin discrete question would take the
-    continuous branch here. That divergence bites only on Mantic 200-bin discrete questions,
-    which do not exist in the Metaculus archives the harness replays.
+    discrete question and every Mantic quantitative question, whose wire type the Mantic client
+    rewrites to ``discrete``) and any non-201 grid. On both, the vote-gated discrete snap never
+    runs (``discrete_snap`` skips on exactly this predicate), so the cluster spreader's plateau
+    inside its bin is the final word; on the 201-point continuous grid the count-like spread is
+    a pre-processing step the snap can re-concentrate, so that grid stays byte-identical.
+    ``cdf_size`` alone cannot carry the distinction: a 200-bin Mantic discrete question has
+    ``cdf_size == 201``. The ablation harness's replay caveat: ``docs/numeric_pipeline.md``, Step 7.
     """
     return isinstance(question, DiscreteQuestion) or question.cdf_size != PCHIP_CDF_POINTS
+
+
+# --- Per-bin elicitation on enumerable grids ---
+
+# A month of daily bins: the natural coarse Series 2 date shape, and 29% of Series 1 discrete grids sit at or below it.
+PMF_ELICITATION_MAX_BINS: int = 31
+
+# Mantic only until one season shows the per-bin declaration is faithful; adding PLATFORM_METACULUS is the whole switch.
+PMF_ELICITATION_PLATFORMS: frozenset[str] = frozenset({PLATFORM_MANTIC})
+
+# Added to every non-zero cell floor of a per-bin build so the server's 9-decimal PMF rounding can never land a cell under it.
+PMF_FLOOR_MARGIN: float = 1e-9
+
+# The server's minimum mass beyond an OPEN bound: ``cdf[0] >= 0.001`` and ``cdf[-1] <= 1 - 0.001``.
+OPEN_TAIL_MIN_MASS: float = 0.001
+
+
+def elicit_per_bin(question: NumericQuestion) -> bool:
+    """True when ``question`` is forecast as one probability per bin instead of as percentiles.
+
+    Per bin because on a coarse grid the bins ARE the outcome space: 13 percentile anchors cannot
+    say "zero on this bin", and PCHIP spreads mass onto bins the criteria exclude (question 651:
+    three weekend days in a 12-day trading-day window, a quarter of the mass, -14.4 baseline
+    points). Above ``PMF_ELICITATION_MAX_BINS`` the per-bin ask grows long and noisy and the
+    13-anchor curve is the better instrument. Mantic-only because the ask is unproven live and on
+    Metaculus it would move about half of all discrete questions (141 of 300 sampled have 31 bins
+    or fewer), a config-era change of its own.
+
+    ``cdf_size - 1`` is the bin count (``inbound_outcome_count + 1`` on every real question). False
+    by construction on the 201-point continuous grid (not an outcome-space grid) and on a 200-bin
+    Mantic discrete question (far above the threshold), so both keep the percentile path
+    byte-identical. A date question is gated on its epoch view, which carries ``page_url``.
+    """
+    return (
+        question_platform(question) in PMF_ELICITATION_PLATFORMS
+        and grid_is_outcome_space(question)
+        and (question.cdf_size - 1) <= PMF_ELICITATION_MAX_BINS
+    )
 
 
 # Higher = more aggressive smoothing
@@ -178,10 +189,7 @@ MAX_DIAGNOSTIC_PERCENTILES: int = 5
 
 EXTREME_STEP_THRESHOLD: float = NUM_MAX_STEP * 0.9
 
-# Top/bottom-bin mass at or above this fraction, with no percentile placed beyond the open
-# edge, flags open-bound percentile piling (models treating an open edge as a hard cap).
-# n=1 calibration: fires on the two observed crammers (0.20 and 0.126 top-bin mass) but not
-# the four correct handlers (all <= 0.073). K is intentionally tunable as more data arrives.
+# Terminal-bin mass that flags open-bound piling: fires on the two observed crammers (0.20, 0.126), not the four correct handlers (<= 0.073).
 OPEN_BOUND_PILING_THRESHOLD: float = 0.10
 
 # --- PCHIP Fallback Configuration ---
@@ -206,23 +214,11 @@ MAX_PERCENTILE_RELATIVE_ERROR: float = 1e-6
 # Enable/disable transform-space tail widening of declared percentiles before CDF generation
 TAIL_WIDENING_ENABLE: bool = True
 
-# Tail widening stretch factor applied in transformed space around the median in tails.
-# e.g., 1.25 means 25% stretch at the deepest tails, ramping to 0% near the center.
-# Default is 1.0 (identity pass, no widening) per the 2026-05-12 empirical calibration
-# on 43 resolved numerics: k_tail=1.0 produced PIT std closest to the uniform ideal
-# (0.289) in every segment; k_tail=1.25 moved away from ideal in every segment. See
-# scratch_docs_and_planning/tail_widening_empirical_calibration.md.
+# Deepest-tail stretch factor; 1.0 is the identity pass, since 1.25 moved PIT std away from ideal in every segment (docs, Step 4).
 TAIL_WIDEN_K_TAIL: float = 1.0
 
-# Tail start region (fraction of percentile distance from median where widening begins)
-# Example: 0.2 means no widening for p in [0.3, 0.7], linearly ramp to full widening by p<=0.1 or p>=0.9
+# Widening starts this far from the median: none for p in [0.3, 0.7], full at p <= 0.1 or p >= 0.9.
 TAIL_WIDEN_TAIL_START: float = 0.2
 
-# Span floor gamma to ensure tail spans are at least gamma times adjacent inner spans.
-# Applies to (p05 - p02.5) vs (p10 - p05) and (p97.5 - p95) vs (p95 - p90).
-# Floor enforcement (tail_widening.py:171/178) is gated on `> 0`. Default disabled
-# because in all 2026 data the floor never bound (see
-# scratch_docs_and_planning/tail_widening_empirical_calibration.md section 3).
-# Setting this to any positive value re-enables the existing floor enforcement —
-# kept configurable for future models with unusually sharp declared tails.
+# Tail spans at least this multiple of the adjacent inner span; 0 disables the floor, which never bound in 2026 data.
 TAIL_WIDEN_SPAN_FLOOR_GAMMA: float = 0.0

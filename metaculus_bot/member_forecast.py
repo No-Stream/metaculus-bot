@@ -7,12 +7,22 @@ for every ensemble member and for the stacker::
 
 A numeric or date line carries two additive trailing fields, ``oor_low=<f> oor_high=<f>``:
 the OUT-OF-RANGE mass of the CDF the runner built from ``published``, i.e. ``cdf[0]`` (below
-the lower bound) and ``1 - cdf[-1]`` (above the upper). The per-question aggregate marker
-carries the same pair for the PUBLISHED distribution, then the pair as it stood before the
-platform tail floor and the level the floor raised them to::
+the lower bound) and ``1 - cdf[-1]`` (above the upper). A member elicited PER BIN (a Mantic
+enumerable grid, ``numeric.config.elicit_per_bin``) ends with a third field, ``elicitation=pmf``,
+which changes how ``raw`` and ``published`` read (below). The per-question aggregate marker
+carries the same tail pair for the PUBLISHED distribution, then the pair as it stood before the
+platform tail floor, the level the floor raised them to, and the rule the members were combined
+by::
 
     NUMERIC_AGGREGATE: question=<id> qtype=numeric|date cdf_size=<n> oor_low=<f> oor_high=<f>
-        oor_low_raw=<f> oor_high_raw=<f> tail_floor=<f>
+        oor_low_raw=<f> oor_high_raw=<f> tail_floor=<f> method=mean|median|stacked|single
+
+``method`` is written on EVERY numeric and date question: ``mean`` is the linear opinion pool
+(the pointwise mean of the members' CDFs) that per-bin members are combined by, ``median`` the
+pointwise median percentile members keep on both platforms, ``stacked`` a stacker-adopted
+distribution and ``single`` the lone raw member the min-forecasters=1 short-circuit hands
+through. ``unrecorded`` means a combine path forgot to record itself: a bug signal, never an
+expected value.
 
 Why the tails: the platform scores an out-of-range resolution against a fixed 0.05
 reference, and on Mantic half of all resolved date questions and a quarter of discrete ones
@@ -41,6 +51,12 @@ with ``\\S+`` and a consumer always ``json.loads`` them, whatever the type:
 * ``numeric`` — the declared ``[percentile, value]`` pairs with the percentile as the
   decimal in (0, 1) the block declares (``0.025``, not ``2.5``), ``published`` being
   the post-``sanitize_percentiles`` list: ``raw=[[0.025,9.2],[0.05,9.6],...]``
+* ``numeric`` or ``date`` with ``elicitation=pmf`` — the platform's PMF vector with ``N + 2``
+  entries, ``[below, p_0, ..., p_{N-1}, above]`` for ``N`` bins: ``raw`` as the ladder read it
+  (before the floor blend), ``published`` the built distribution's own per-bin mass, so
+  ``oor_low == published[0]`` and ``oor_high == published[-1]``. A consumer reads
+  ``elicitation`` BEFORE interpreting ``raw``; an absent field means percentiles, the meaning
+  every archived line already has.
 
 Why this exists (2026-09-02). Before it, no run-log marker carried a member's forecast
 value: ``EXTRACTION_RUNG`` says which rung read the value, ``FORECASTERS_SURVIVED`` who
@@ -83,6 +99,14 @@ from metaculus_bot.question_types import QuestionType
 
 MEMBER_FORECAST_ROLE_MEMBER = "member"
 MEMBER_FORECAST_ROLE_STACKER = "stacker"
+
+# The one ``elicitation`` token: a per-bin member. Percentile members carry no field at all.
+ELICITATION_PMF = "pmf"
+
+# NUMERIC_AGGREGATE ``method`` tokens beyond the combiner's own ``mean`` / ``median`` (module docstring).
+NUMERIC_COMBINE_METHOD_STACKED = "stacked"
+NUMERIC_COMBINE_METHOD_SINGLE = "single"
+NUMERIC_COMBINE_METHOD_UNRECORDED = "unrecorded"
 
 MemberValue = float | Sequence[float] | Sequence[Sequence[float]]
 OutOfRangeMass = tuple[float, float]
@@ -128,11 +152,13 @@ def format_member_forecast_marker(
     raw: MemberValue,
     published: MemberValue,
     out_of_range: OutOfRangeMass | None = None,
+    elicitation: str | None = None,
 ) -> str:
     """Build one MEMBER_FORECAST line. Pure: reads values, returns the string.
 
     ``out_of_range`` is the built CDF's tail mass on a numeric or date question (module
-    docstring); binary and MC lines have no CDF and carry no such fields.
+    docstring); binary and MC lines have no CDF and carry no such fields. ``elicitation`` is
+    ``ELICITATION_PMF`` when ``raw`` and ``published`` are per-bin vectors, else absent.
     """
     line = (
         f"MEMBER_FORECAST: question={question_id} model={model} role={role} qtype={qtype} "
@@ -140,6 +166,8 @@ def format_member_forecast_marker(
     )
     if out_of_range is not None:
         line += _out_of_range_suffix(out_of_range)
+    if elicitation is not None:
+        line += f" elicitation={elicitation}"
     return line
 
 
@@ -151,15 +179,18 @@ def format_numeric_aggregate_marker(
     out_of_range: OutOfRangeMass,
     out_of_range_raw: OutOfRangeMass,
     tail_floor: float,
+    method: str,
 ) -> str:
     """Build the per-question NUMERIC_AGGREGATE line for the published distribution.
 
     ``out_of_range`` is the PUBLISHED distribution's tail mass, ``out_of_range_raw`` the same pair
-    before the platform tail floor, ``tail_floor`` the level the moved tails were raised to (module docstring).
+    before the platform tail floor, ``tail_floor`` the level the moved tails were raised to, and
+    ``method`` the rule the members were combined by (module docstring). Required, not defaulted:
+    the rule is recorded on every numeric and date question so the pool stays auditable.
     """
     raw_low, raw_high = out_of_range_raw
     return (
         f"NUMERIC_AGGREGATE: question={question_id} qtype={qtype} cdf_size={cdf_size}"
         f"{_out_of_range_suffix(out_of_range)}"
-        f" oor_low_raw={raw_low:.6f} oor_high_raw={raw_high:.6f} tail_floor={tail_floor:.6f}"
+        f" oor_low_raw={raw_low:.6f} oor_high_raw={raw_high:.6f} tail_floor={tail_floor:.6f} method={method}"
     )

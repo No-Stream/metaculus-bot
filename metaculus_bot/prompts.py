@@ -3,7 +3,7 @@ import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Literal, NamedTuple
 
 import numpy as np
 from forecasting_tools import (
@@ -16,9 +16,16 @@ from forecasting_tools import (
 from forecasting_tools.data_models.questions import DateQuestion
 
 from metaculus_bot.constants import MC_PROB_MIN, PLATFORM_MANTIC
-from metaculus_bot.numeric.config import EXPECTED_PERCENTILE_COUNT, STANDARD_PERCENTILES
+from metaculus_bot.numeric.config import (
+    EXPECTED_PERCENTILE_COUNT,
+    STANDARD_PERCENTILES,
+    grid_bin_width,
+    grid_step_constraints,
+)
 from metaculus_bot.numeric.date_axis import EpochDateQuestion, as_epoch_question, format_epoch, question_json
+from metaculus_bot.numeric.pmf_grid import BinLabelStyle, PmfGrid, pmf_grid
 from metaculus_bot.numeric.utils import nominal_bounds
+from metaculus_bot.numeric.validation import resolve_zero_point
 from metaculus_bot.question_platform import question_platform
 from metaculus_bot.time_utils import _as_utc
 
@@ -82,6 +89,7 @@ __all__ = [
     "gap_fill_search_prompt",
     "multiple_choice_prompt",
     "numeric_prompt",
+    "pmf_prompt",
     "stacking_binary_prompt",
     "stacking_multiple_choice_prompt",
     "stacking_numeric_prompt",
@@ -1142,31 +1150,52 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
 # The continuous (numeric and date) forecaster prompt
 # ---------------------------------------------------------------------------
 #
-# ``numeric_prompt`` and ``date_prompt`` render ONE template, ``_continuous_prompt``, with the
-# axis-specific text handed in as a ``_ContinuousAxis``. A date question is a numeric question on
-# the epoch-seconds axis (``numeric.date_axis``), so every reasoning step that is about a
-# distribution applies verbatim; what differs is how the axis is described (units versus calendar
-# dates), what the status quo means (a latest measurement versus "it has not happened"), and the
-# STRUCTURED FORECAST schema (floats versus ISO-8601 strings). Copying the template would have
-# put every shared rule in two places, which is what docs/prompts.md's one-statement rule forbids.
+# One template, ``_continuous_prompt``, varied along two axes: the question kind (``_ContinuousAxis``)
+# and the elicitation (``_Elicitation``); the design and every slot are in docs/prompts.md.
 
 
 @dataclass(frozen=True)
 class _ContinuousAxis:
-    """The text that differs between the numeric and date renderings of the continuous template.
+    """The text that differs between a quantity and a date in the continuous template.
 
-    Each field is one slot of ``_continuous_prompt``; every line of the template not named here
-    is shared. Multi-line blocks are pre-indented to the template's 8-space baseline so
-    ``clean_indents`` nests them the way it nests the template's own lines.
+    Each field is one slot of ``_continuous_prompt``; every line of the template not named here or
+    in ``_Elicitation`` is shared. Multi-line blocks are pre-indented to the template's 8-space
+    baseline so ``clean_indents`` nests them the way it nests the template's own lines.
     """
 
-    axis_block: str
     status_quo_question: str
     reference_class_rules: str
     tail_scenarios: str
     forecastability_bullet: str
+
+
+@dataclass(frozen=True)
+class _Elicitation:
+    """The text that differs between the two ways the template asks for a distribution.
+
+    ``_percentile_elicitation`` is today's text verbatim: the Metaculus render of the numeric and
+    date prompts is pinned byte for byte (``tests/prompts/test_pmf_prompt.py``), so a percentile
+    fill changes only with the operator's say. ``_pmf_elicitation`` is the per-bin wording, which
+    never names a percentile. The slots whose text also depends on the question kind (the axis
+    block, the schema, the final-check lead, the Mantic out-of-range sentence) are built inside
+    each elicitation from the view's type.
+    """
+
+    spread_noun: str
+    spread_short: str
+    market_anchor_tail: str
+    axis_block: str
+    scoring_rule: str
+    multi_resolution_rule: str
+    out_of_range_clause: str
+    timeline_shift: str
+    small_delta_check: str
+    anchor_adherence: str
+    width_bullet: str
+    tails_bullet: str
     outcome_type_step: str
     final_check_lead: str
+    consistency_line: str
     schema_block: str
 
 
@@ -1184,6 +1213,54 @@ _CONTINUOUS_SCORING_RULE = (
     "at the realized value x*. Mass beyond an open bound is scored as its own outcome against a reference of a "
     "few percent, so starving it is heavily punished. This is a proper scoring rule: to maximize expected score, "
     "report your true uncertainty and resist overconfident, narrow shapes."
+)
+
+# Per-bin scoring: mass on a bin the criteria exclude is lost (651's weekend days, -14.4 points), so say so.
+_PER_BIN_SCORING_RULE = (
+    "This question is scored on the bin the outcome falls in: the score is the logarithm of the probability you "
+    "gave that bin (or the `below_range` / `above_range` key when the outcome falls beyond an open bound, scored as "
+    "its own outcome against a reference of a few percent, so starving it is heavily punished). This is a proper "
+    "scoring rule: to maximize expected score, report your true probability for every bin. Probability on a bin "
+    "the resolution criteria exclude (a weekend on a trading-day question, a count the rules rule out) is simply "
+    "lost, so give such a bin 0."
+)
+
+# The block rung fails on a missing key; ``min_step`` is THIS grid's floor, not the aggregate's 5% tail floor.
+_PER_BIN_OUTPUT_RULE = (
+    "Give one probability for EVERY key listed in the schema below, spelled exactly as listed and in that order, "
+    "so that the probabilities sum to 1.0. Use 0 for a bin you are certain cannot occur; the platform's per-bin "
+    "minimum (about {min_step} on this grid) is added to every bin for you."
+)
+
+# Only where the labels are intervals: the platform's bins are right-closed, so a key must say which edge it owns.
+_PMF_INTERVAL_KEY_RULE = (
+    "Each key `a to b` is a right-closed interval: it contains everything above a up to and including b, and the "
+    "first bin also contains its own lower edge."
+)
+
+# The percentile final check asks which percentile is the status quo; per bin it is which bin, and how much.
+_PMF_CONSISTENCY_LINE = (
+    "which bin holds the status quo or trend value, how much probability did you give it, and is that sensible?"
+)
+
+# The percentile leads talk about the values the model outputs; per bin it outputs none, only probability.
+_PMF_QUANTITY_FINAL_CHECK = (
+    "Units: the bin labels are in the base unit named above; does the quantity you reasoned about match that unit? "
+    "A misread unit puts your probability on the wrong bins."
+)
+_PMF_DATE_FINAL_CHECK = (
+    "Calendar check: does every bin you gave probability to fall on a day the resolution criteria allow (a trading "
+    "session, a business day, a scheduled release), and is the UTC day the one you mean?"
+)
+
+# Step 8's width and tails bullets, stated once with the elicited object as the slot so the fills cannot drift.
+_WIDTH_BULLET = (
+    "Match {width_object} to what your reasoning actually supports, and do not pad or sharpen out of a generic "
+    "disposition. Log score punishes {narrow_shape} that misses far more than {wide_shape_short} that covers, but "
+    "{wide_shape} on a predictable quantity also bleeds points."
+)
+_UNKNOWN_UNKNOWNS_BULLET = (
+    "{tail_instruction} to cover unknown unknowns you can actually name — but not padded out of generic caution."
 )
 
 
@@ -1212,21 +1289,34 @@ _MANTIC_OUT_OF_RANGE_RATE_QUANTITY = (
     "range asserts a 1% chance of an out-of-range outcome; if your view puts more than that beyond an open bound, "
     "place percentiles beyond it."
 )
+# The same measured facts for a per-bin question; the action differs (a reserved key, not a percentile), so not a slot fill.
+_MANTIC_OUT_OF_RANGE_RATE_DATE_PMF = (
+    "On this platform about half of past date questions with an open upper bound resolved AFTER it (101 of 188 "
+    'in Series 1), so treat "the event has not happened by the upper bound" as a live central case and not a '
+    "tail: if that is your view, most of your probability belongs on `above_range`, and a token probability there "
+    "asserts a near-zero chance of an out-of-range outcome."
+)
+_MANTIC_OUT_OF_RANGE_RATE_QUANTITY_PMF = (
+    "On this platform about one in five past quantitative questions resolved outside the displayed range (one "
+    "in four of the discrete ones, one in eight of the continuous ones), so give the out-of-range key of each "
+    "open bound (`below_range`, `above_range`) your honest probability: a token probability there asserts a "
+    "near-zero chance of an out-of-range outcome."
+)
 
 
-def _mantic_out_of_range_clause(question: NumericQuestion) -> str:
+def _mantic_out_of_range_clause(question: NumericQuestion, *, date_rate: str, quantity_rate: str) -> str:
     """The Mantic base-rate sentence for ``question``'s open bound, or ``""``.
 
     Appended after the bound messages so ``numeric.utils.bound_messages`` stays platform-agnostic.
     The date sentence is about the open UPPER bound specifically (that is where the measured half
     lands; 10 of 520 Series 1 questions resolved below a lower bound), so a date question open
-    only at the bottom renders nothing.
+    only at the bottom renders nothing. Each elicitation passes its own pair of sentences.
     """
     if question_platform(question) != PLATFORM_MANTIC:
         return ""
     if isinstance(question, EpochDateQuestion):
-        return _MANTIC_OUT_OF_RANGE_RATE_DATE if question.open_upper_bound else ""
-    return _MANTIC_OUT_OF_RANGE_RATE_QUANTITY if (question.open_lower_bound or question.open_upper_bound) else ""
+        return date_rate if question.open_upper_bound else ""
+    return quantity_rate if (question.open_lower_bound or question.open_upper_bound) else ""
 
 
 # Mantic Series 2 "one forecast, many resolutions" (rules doc section 7; live on Preseason 2 post
@@ -1242,12 +1332,17 @@ def _mantic_out_of_range_clause(question: NumericQuestion) -> str:
 # while the question is open and the count lives only in the criteria prose. Base prompts only,
 # per docs/prompts.md; a stacker on a multi-resolution question would never learn this, which
 # is a FUTURE.md note against re-enabling numeric stacking.
-_MULTI_RESOLUTION_CONTINUOUS_RULE = (
+_MULTI_RESOLUTION_CONTINUOUS_TEMPLATE = (
     "This question is scored against EVERY resolution value its resolution criteria name, with the scores "
     "averaged, so describe how the quantity is distributed ACROSS those values rather than where any one of them "
-    "lands: forecast each resolution instance, then pool those forecasts into a single mixture and report the "
-    "mixture's percentiles (a distribution fitted to one instance is scored as though it had excluded every other "
-    "value in the set)."
+    "lands: forecast each resolution instance, then pool those forecasts into a single mixture and {mixture_report} "
+    "(a distribution fitted to one instance is scored as though it had excluded every other value in the set)."
+)
+_MULTI_RESOLUTION_CONTINUOUS_RULE = _MULTI_RESOLUTION_CONTINUOUS_TEMPLATE.format(
+    mixture_report="report the mixture's percentiles"
+)
+_MULTI_RESOLUTION_PMF_RULE = _MULTI_RESOLUTION_CONTINUOUS_TEMPLATE.format(
+    mixture_report="report that mixture as your per-bin probabilities"
 )
 _MULTI_RESOLUTION_MC_RULE = (
     "This question is scored against EVERY resolution its resolution criteria name, with the scores averaged, so "
@@ -1302,14 +1397,87 @@ def _bullet_lines(*sentences: str, indent: int = 8) -> str:
     return "\n".join(f"{' ' * indent}• {sentence}" for sentence in sentences if sentence)
 
 
+def _unit_str(question: NumericQuestion) -> str:
+    return question.unit_of_measure or "unknown units, assume unitless (e.g. raw count)"
+
+
 def _numeric_axis(question: NumericQuestion) -> _ContinuousAxis:
-    unit_str = question.unit_of_measure or "unknown units, assume unitless (e.g. raw count)"
+    return _ContinuousAxis(
+        status_quo_question=(
+            'If nothing changed between now and resolution, what value would it resolve at?" Derive that value '
+            "from the platform state and the most recent authoritative measurement alone. Note: an open question "
+            "generally means the resolution criteria have not yet been satisfied, with one exception — if a "
+            "qualifying event or measurement is so recent that resolution simply lags, treat that recent value as "
+            "the anchor and weight your distribution accordingly."
+        ),
+        reference_class_rules=_COUNT_IN_PERIOD_REFERENCE_CLASS,
+        tail_scenarios=(
+            "            - Coherent pathway for unusually low results.\n"
+            "            - Coherent pathway for unusually high results."
+        ),
+        forecastability_bullet=(
+            "Decide how forecastable this quantity is from current information on this horizon. An administered or "
+            "slow-moving series (a policy rate, a home-price index, a monthly unemployment print) is largely "
+            "predictable from its latest value and historical variance: anchor tightly on recent observations. A "
+            "traded price, a volatile count or a novel metric on a short horizon is close to a random walk: center "
+            "on the current value, take the width from its realized variability over comparable windows, and do not "
+            "expect movement you cannot source to a named cause."
+        ),
+    )
+
+
+def _date_axis(question: EpochDateQuestion) -> _ContinuousAxis:
+    return _ContinuousAxis(
+        status_quo_question=(
+            'If nothing changed between now and resolution, on what date would it resolve?" Derive that date from '
+            'the platform state alone. For a "when will X happen" question, open means X has not happened yet, so '
+            "the status quo is that it does not happen within the displayed window: that region lies above the "
+            "upper bound when it is open, and every date you place earlier is a claim that something changes. For "
+            'a "which date will Y fall on" question, the status-quo date is the one the most recent authoritative '
+            "measurement points to. The one exception is a qualifying event so recent that resolution simply lags: "
+            "treat its date as the anchor."
+        ),
+        # The soft-clock rule is the date question's natural home: a "when will X happen" question
+        # with an announced target date is the announced-but-unbound shape the rule was measured on
+        # (binary forecasts averaged 44% on events that happened 8% of the time), and here the
+        # mass on the target date IS the timing term the rule asks to price separately.
+        reference_class_rules=f"{_COUNT_IN_PERIOD_REFERENCE_CLASS}{_SOFT_CLOCK_RULE}",
+        tail_scenarios=(
+            "            - Coherent pathway for an unusually early date.\n"
+            "            - Coherent pathway for an unusually late date, including not within the displayed window."
+        ),
+        forecastability_bullet=(
+            "Decide how forecastable this date is from current information. An event on a binding clock (a "
+            "statutory deadline, a contracted delivery, a published schedule the actor has a measured record of "
+            "meeting) is largely predictable from that clock and the actor's slip record: anchor tightly on it. An "
+            'event with no clock, a first-ever occurrence, or a "largest move in the window" question is close to '
+            "unforecastable: spread your mass over the eligible dates in proportion to whatever base rate you can "
+            'source, put the "not within the window" mass beyond an open upper bound, and do not expect a date you '
+            "cannot source to a named cause."
+        ),
+    )
+
+
+def _kind_axis(view: NumericQuestion) -> _ContinuousAxis:
+    return _date_axis(view) if isinstance(view, EpochDateQuestion) else _numeric_axis(view)
+
+
+class _PercentileBlocks(NamedTuple):
+    """The percentile slots whose text also depends on the question kind."""
+
+    axis_block: str
+    schema_block: str
+    outcome_type_step: str
+    final_check_lead: str
+
+
+def _numeric_percentile_blocks(question: NumericQuestion) -> _PercentileBlocks:
     nom_upper, nom_lower = nominal_bounds(question)
     axis_block = "\n".join(
         [
             "        ── Units & Bounds ──",
             _bullet_lines(
-                f"Base units for output values: {unit_str}",
+                f"Base units for output values: {_unit_str(question)}",
                 f"Displayed range (in base units): [{nom_lower}, {nom_upper}]",
                 "Note: displayed range is suggestive of units! If needed, you may use it to infer units.",
                 f"All {EXPECTED_PERCENTILE_COUNT} percentiles you output must be numeric values in the base unit. "
@@ -1342,28 +1510,9 @@ def _numeric_axis(question: NumericQuestion) -> _ContinuousAxis:
         - `outcome_type`: set to "discrete_integer" if the quantity is inherently a
           whole number (counts, rankings, number of events, number of countries),
           "continuous" otherwise (temperatures, percentages, dollar amounts, ratios)."""
-    return _ContinuousAxis(
+    return _PercentileBlocks(
         axis_block=axis_block,
-        status_quo_question=(
-            'If nothing changed between now and resolution, what value would it resolve at?" Derive that value '
-            "from the platform state and the most recent authoritative measurement alone. Note: an open question "
-            "generally means the resolution criteria have not yet been satisfied, with one exception — if a "
-            "qualifying event or measurement is so recent that resolution simply lags, treat that recent value as "
-            "the anchor and weight your distribution accordingly."
-        ),
-        reference_class_rules=_COUNT_IN_PERIOD_REFERENCE_CLASS,
-        tail_scenarios=(
-            "            - Coherent pathway for unusually low results.\n"
-            "            - Coherent pathway for unusually high results."
-        ),
-        forecastability_bullet=(
-            "Decide how forecastable this quantity is from current information on this horizon. An administered or "
-            "slow-moving series (a policy rate, a home-price index, a monthly unemployment print) is largely "
-            "predictable from its latest value and historical variance: anchor tightly on recent observations. A "
-            "traded price, a volatile count or a novel metric on a short horizon is close to a random walk: center "
-            "on the current value, take the width from its realized variability over comparable windows, and do not "
-            "expect movement you cannot source to a named cause."
-        ),
+        schema_block=schema_block,
         outcome_type_step=(
             "        (9) Outcome type: decide whether the resolution value is inherently a whole integer and record "
             "it in `outcome_type` in the block below (definition in the schema notes).\n"
@@ -1372,11 +1521,10 @@ def _numeric_axis(question: NumericQuestion) -> _ContinuousAxis:
             "Units: what are the units of the output values and why? Incorrect units can cause severe penalties in "
             "log score."
         ),
-        schema_block=schema_block,
     )
 
 
-def _date_axis(question: EpochDateQuestion) -> _ContinuousAxis:
+def _date_percentile_blocks(question: EpochDateQuestion) -> _PercentileBlocks:
     nom_upper, nom_lower = nominal_bounds(question)
     granularity = question.date_granularity
     lower_date = format_epoch(nom_lower, granularity)
@@ -1426,41 +1574,134 @@ def _date_axis(question: EpochDateQuestion) -> _ContinuousAxis:
           all of your mass on one day, give increasing UTC timestamps inside that day (e.g.
           {one_day}T02:00:00Z through {one_day}T22:00:00Z). A decrease is rejected, as are a bare
           year, a month, or a number; write the full calendar date (or UTC timestamp)."""
-    return _ContinuousAxis(
+    return _PercentileBlocks(
         axis_block=axis_block,
-        status_quo_question=(
-            'If nothing changed between now and resolution, on what date would it resolve?" Derive that date from '
-            'the platform state alone. For a "when will X happen" question, open means X has not happened yet, so '
-            "the status quo is that it does not happen within the displayed window: that region lies above the "
-            "upper bound when it is open, and every date you place earlier is a claim that something changes. For "
-            'a "which date will Y fall on" question, the status-quo date is the one the most recent authoritative '
-            "measurement points to. The one exception is a qualifying event so recent that resolution simply lags: "
-            "treat its date as the anchor."
-        ),
-        # The soft-clock rule is the date question's natural home: a "when will X happen" question
-        # with an announced target date is the announced-but-unbound shape the rule was measured on
-        # (binary forecasts averaged 44% on events that happened 8% of the time), and here the
-        # mass on the target date IS the timing term the rule asks to price separately.
-        reference_class_rules=f"{_COUNT_IN_PERIOD_REFERENCE_CLASS}{_SOFT_CLOCK_RULE}",
-        tail_scenarios=(
-            "            - Coherent pathway for an unusually early date.\n"
-            "            - Coherent pathway for an unusually late date, including not within the displayed window."
-        ),
-        forecastability_bullet=(
-            "Decide how forecastable this date is from current information. An event on a binding clock (a "
-            "statutory deadline, a contracted delivery, a published schedule the actor has a measured record of "
-            "meeting) is largely predictable from that clock and the actor's slip record: anchor tightly on it. An "
-            'event with no clock, a first-ever occurrence, or a "largest move in the window" question is close to '
-            "unforecastable: spread your mass over the eligible dates in proportion to whatever base rate you can "
-            'source, put the "not within the window" mass beyond an open upper bound, and do not expect a date you '
-            "cannot source to a named cause."
-        ),
+        schema_block=schema_block,
         outcome_type_step="",
         final_check_lead=(
             "Calendar check: does every date you output fall on a day the resolution criteria allow (a trading "
             "session, a business day, a scheduled release), and is the UTC day the one you mean?"
         ),
-        schema_block=schema_block,
+    )
+
+
+def _percentile_elicitation(view: NumericQuestion) -> _Elicitation:
+    """Thirteen percentiles on the axis: today's text, verbatim."""
+    blocks = _date_percentile_blocks(view) if isinstance(view, EpochDateQuestion) else _numeric_percentile_blocks(view)
+    return _Elicitation(
+        spread_noun="the width of your prediction interval",
+        spread_short="that width",
+        market_anchor_tail="your percentiles should center on it",
+        axis_block=blocks.axis_block,
+        scoring_rule=_CONTINUOUS_SCORING_RULE,
+        multi_resolution_rule=_MULTI_RESOLUTION_CONTINUOUS_RULE,
+        out_of_range_clause=_mantic_out_of_range_clause(
+            view, date_rate=_MANTIC_OUT_OF_RANGE_RATE_DATE, quantity_rate=_MANTIC_OUT_OF_RANGE_RATE_QUANTITY
+        ),
+        timeline_shift="shift percentiles",
+        small_delta_check="would +/- 10 percent on key percentiles still fit the reasoning?",
+        anchor_adherence="your percentiles should stay close to it",
+        width_bullet=_WIDTH_BULLET.format(
+            width_object="your interval width",
+            narrow_shape="a narrow interval",
+            wide_shape_short="a wide one",
+            wide_shape="a wide interval",
+        ),
+        tails_bullet=_UNKNOWN_UNKNOWNS_BULLET.format(
+            tail_instruction="Keep your extreme tails (P1 and P99) wide enough"
+        ),
+        outcome_type_step=blocks.outcome_type_step,
+        final_check_lead=blocks.final_check_lead,
+        consistency_line="which percentile corresponds to the status quo or trend, and is that sensible?",
+        schema_block=blocks.schema_block,
+    )
+
+
+# How a per-bin prompt describes its keys, per label style; a centre-labelled key is the value itself and needs none.
+_PMF_KEY_RULES: dict[BinLabelStyle, str] = {
+    "day": "Every key is a UTC calendar date and names the whole day it covers.",
+    "week": "Every key is a UTC calendar date and names the seven days beginning on it.",
+    "interval": _PMF_INTERVAL_KEY_RULE,
+    "timestamp": _PMF_INTERVAL_KEY_RULE,
+}
+
+
+def _pmf_grid_clause(view: NumericQuestion, grid: PmfGrid) -> str:
+    """The bin count and geometry of ``grid``, from the grid itself rather than a platform flag."""
+    bins = len(grid.labels)
+    if isinstance(view, EpochDateQuestion):
+        if grid.style in ("day", "week"):
+            return f"Scoring grid: {bins} bins of one calendar {view.date_granularity} each."
+        return f"Scoring grid: {bins} bins."
+    if resolve_zero_point(view) is not None:
+        return f"Scoring grid: {bins} bins, log-spaced."
+    step = grid_bin_width(view.lower_bound, view.upper_bound, view.cdf_size)
+    return f"Scoring grid: {bins} bins of width {step:g} {view.unit_of_measure or 'base units'}."
+
+
+def _pmf_axis_block(view: NumericQuestion, grid: PmfGrid, min_step: float) -> str:
+    unit_line = "" if isinstance(view, EpochDateQuestion) else f"Base unit of the bin labels: {_unit_str(view)}"
+    return "\n".join(
+        [
+            "        ── Bins & Bounds ──",
+            _bullet_lines(
+                unit_line,
+                _PMF_KEY_RULES.get(grid.style, ""),
+                _pmf_grid_clause(view, grid),
+                _PER_BIN_OUTPUT_RULE.format(min_step=f"{min_step:g}"),
+            ),
+        ]
+    )
+
+
+def _pmf_schema_block(grid: PmfGrid) -> str:
+    """The per-bin STRUCTURED FORECAST example with the grid's real keys, the way the MC example carries real options."""
+    example_probs = _build_example_probs(len(grid.keys))
+    pairs = [f"{json.dumps(key)}: {prob}" for key, prob in zip(grid.keys, example_probs, strict=True)]
+    rows = ",\n            ".join(", ".join(pairs[i : i + 4]) for i in range(0, len(pairs), 4))
+    return f"""\
+        Schema (`bin_probs` is REQUIRED and MUST contain every key below, spelled exactly and in this order):
+
+        ```json
+        {{
+          "question_type": "pmf",
+          "bin_probs": {{
+            {rows}
+          }}
+        }}
+        ```"""
+
+
+def _pmf_elicitation(view: NumericQuestion, grid: PmfGrid) -> _Elicitation:
+    """One probability per bin of ``grid``: the per-bin wording, which never names a percentile."""
+    is_date = isinstance(view, EpochDateQuestion)
+    min_step, _ = grid_step_constraints(view.cdf_size)
+    return _Elicitation(
+        spread_noun="how far your probability spreads across the bins",
+        spread_short="that spread",
+        market_anchor_tail="your probability should center on it",
+        axis_block=_pmf_axis_block(view, grid, min_step),
+        scoring_rule=_PER_BIN_SCORING_RULE,
+        multi_resolution_rule=_MULTI_RESOLUTION_PMF_RULE,
+        out_of_range_clause=_mantic_out_of_range_clause(
+            view, date_rate=_MANTIC_OUT_OF_RANGE_RATE_DATE_PMF, quantity_rate=_MANTIC_OUT_OF_RANGE_RATE_QUANTITY_PMF
+        ),
+        timeline_shift="move probability between bins",
+        small_delta_check="would moving ten points of probability to a neighbouring bin still fit the reasoning?",
+        anchor_adherence="your probability should stay concentrated around it",
+        width_bullet=_WIDTH_BULLET.format(
+            width_object="the spread of your probability across the bins",
+            narrow_shape="a concentrated forecast",
+            wide_shape_short="a spread-out one",
+            wide_shape="a spread-out forecast",
+        ),
+        tails_bullet=_UNKNOWN_UNKNOWNS_BULLET.format(
+            tail_instruction="Keep enough probability on the outer bins (and on `below_range` / `above_range` where they exist)"
+        ),
+        outcome_type_step="",
+        final_check_lead=_PMF_DATE_FINAL_CHECK if is_date else _PMF_QUANTITY_FINAL_CHECK,
+        consistency_line=_PMF_CONSISTENCY_LINE,
+        schema_block=_pmf_schema_block(grid),
     )
 
 
@@ -1471,8 +1712,9 @@ def _continuous_prompt(
     lower_bound_message: str,
     upper_bound_message: str,
     axis: _ContinuousAxis,
+    elicitation: _Elicitation,
 ) -> str:
-    """The one continuous template; ``numeric_prompt`` and ``date_prompt`` fill its axis slots.
+    """The one continuous template; the three continuous prompts fill its kind and elicitation slots.
 
     ``question`` is the question the numeric math runs on: the ``NumericQuestion`` itself, or a
     ``DateQuestion``'s ``numeric.date_axis`` view, which carries every field read here (the platform
@@ -1482,12 +1724,12 @@ def _continuous_prompt(
     # the same cheap substring gate ``_strong_evidence_market_clause`` applies to the market
     # clause, so neither clause spends prompt on a table the forecaster does not have.
     ts_anchor_clause = f"\n        {_ts_anchor_evidence_clause()}" if TS_ANCHOR_SECTION_HEADER in research else ""
-    final_checks_step = "(10)" if axis.outcome_type_step else "(9)"
+    final_checks_step = "(10)" if elicitation.outcome_type_step else "(9)"
     return clean_indents(
         f"""
         You are a **senior forecaster** writing a public report for expert peers.
         {_scoring_sentence(question)} Accuracy **and** calibration
-        (especially the width of your prediction interval) are critical; how to set that width
+        (especially {elicitation.spread_noun}) are critical; how to set {elicitation.spread_short}
         is step (8) of the template below.
         Use your own expertise and knowledge, not only the provided research — if you know a relevant fact from your
         training that the research reports don't cover, you may rely on it. You are not required to ground every claim
@@ -1497,7 +1739,7 @@ def _continuous_prompt(
                 research=research,
                 subject="quantity",
                 signal_noun="its implied range",
-                anchor_tail="your percentiles should center on it",
+                anchor_tail=elicitation.market_anchor_tail,
                 extrapolate_target="the market's implied value/probability",
                 projection=(
                     "Project from the market's date to ours under a constant-hazard, trend-continuation, or "
@@ -1517,11 +1759,11 @@ def _continuous_prompt(
         {question.resolution_criteria}
         {question.fine_print}
 
-{axis.axis_block}
+{elicitation.axis_block}
 
         ── Scoring Rule ──
-        {_CONTINUOUS_SCORING_RULE}
-        {_multi_resolution_clause(question, _MULTI_RESOLUTION_CONTINUOUS_RULE)}
+        {elicitation.scoring_rule}
+        {_multi_resolution_clause(question, elicitation.multi_resolution_rule)}
 
         ── Intelligence Briefing (assistant research) ────────────────────────
         {research}
@@ -1530,7 +1772,7 @@ def _continuous_prompt(
 
         {lower_bound_message}
         {upper_bound_message}
-        {_mantic_out_of_range_clause(question)}
+        {elicitation.out_of_range_clause}
 
         Reproduce the following analysis template in your answer:
 
@@ -1560,7 +1802,7 @@ def _continuous_prompt(
 {axis.reference_class_rules}
 
         (3) Timeframe and dynamics
-            - Time to resolution; describe how halving or doubling the timeline might shift percentiles.
+            - Time to resolution; describe how halving or doubling the timeline might {elicitation.timeline_shift}.
             - Trend continuation: extrapolate historical data to the closing date.
 
         (4) Expert and market priors
@@ -1582,26 +1824,28 @@ def _continuous_prompt(
         (7) Red team and final rationale — integrate outside→inside view
             - Challenge assumptions and data quality.
             - State your outside-view central estimate and range, then say what the current evidence moved and why.
-            - Small delta check: would +/- 10 percent on key percentiles still fit the reasoning?
-            - Anchor on your math: if you derived a central estimate or range from data (extrapolation, historical trend, explicit formula), your percentiles should stay close to it. Adjust only with specific evidence, not vibe.
+            - Small delta check: {elicitation.small_delta_check}
+            - Anchor on your math: if you derived a central estimate or range from data (extrapolation, historical trend, explicit formula), {
+            elicitation.anchor_adherence
+        }. Adjust only with specific evidence, not vibe.
             - Question-specific base rate: anchor on the historical frequency, trend, or variance for THIS specific indicator (e.g., "how much has this index moved in prior analogous windows"), not a generic "things are usually stable" or "things are usually volatile" prior.
 
         (8) Forecastability and width
             - {axis.forecastability_bullet}
-            - Match your interval width to what your reasoning actually supports, and do not pad or sharpen out of a generic disposition. Log score punishes a narrow interval that misses far more than a wide one that covers, but a wide interval on a predictable quantity also bleeds points.
-            - Keep your extreme tails (P1 and P99) wide enough to cover unknown unknowns you can actually name — but not padded out of generic caution.
+            - {elicitation.width_bullet}
+            - {elicitation.tails_bullet}
 
-{axis.outcome_type_step}
+{elicitation.outcome_type_step}
         {final_checks_step} Final checks
-            - {axis.final_check_lead}
+            - {elicitation.final_check_lead}
             - Bait-and-switch check: does your reasoning address the EXACT question and resolution criteria, not a related-but-different question?
-            - Consistency line: which percentile corresponds to the status quo or trend, and is that sensible?
+            - Consistency line: {elicitation.consistency_line}
 
         ── STRUCTURED FORECAST (machine-readable; REQUIRED) ──
         This block is the ONLY authoritative source of your forecast — a downstream
         deterministic parser reads it and nothing else. Responses without it are
         discarded.
-{axis.schema_block}
+{elicitation.schema_block}
 
         The LAST thing you write MUST be this fenced ```json block. Write nothing after it.
         """
@@ -1621,6 +1865,7 @@ def numeric_prompt(
         lower_bound_message=lower_bound_message,
         upper_bound_message=upper_bound_message,
         axis=_numeric_axis(question),
+        elicitation=_percentile_elicitation(question),
     )
 
 
@@ -1643,6 +1888,32 @@ def date_prompt(
         lower_bound_message=lower_bound_message,
         upper_bound_message=upper_bound_message,
         axis=_date_axis(view),
+        elicitation=_percentile_elicitation(view),
+    )
+
+
+def pmf_prompt(
+    question: NumericQuestion | DateQuestion,
+    research: str,
+    lower_bound_message: str,
+    upper_bound_message: str,
+) -> str:
+    """The forecaster prompt for a numeric, discrete or date question elicited per bin.
+
+    The continuous template with the per-bin fills: the bin list is the question's own labelled
+    grid (``numeric.pmf_grid``), never the bound messages, which arrive already worded for the
+    reserved keys (``numeric.utils.pmf_bound_messages``). Takes a ``DateQuestion`` or its epoch
+    view interchangeably, like ``date_prompt``; the runner decides WHEN to elicit per bin
+    (``numeric.config.elicit_per_bin``), this only renders the ask.
+    """
+    view = as_epoch_question(question) if isinstance(question, DateQuestion) else question
+    return _continuous_prompt(
+        view,
+        research=research,
+        lower_bound_message=lower_bound_message,
+        upper_bound_message=upper_bound_message,
+        axis=_kind_axis(view),
+        elicitation=_pmf_elicitation(view, pmf_grid(view)),
     )
 
 

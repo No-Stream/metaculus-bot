@@ -15,27 +15,44 @@ from datetime import UTC, datetime
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import numpy as np
 import pytest
 from forecasting_tools import (
     BinaryQuestion,
     GeneralLlm,
+    MetaculusQuestion,
     MultipleChoiceQuestion,
     NumericDistribution,
+    NumericQuestion,
     PredictedOptionList,
     ReasonedPrediction,
 )
 from forecasting_tools.data_models.data_organizer import PredictionTypes
 from forecasting_tools.data_models.multiple_choice_report import PredictedOption
 from forecasting_tools.data_models.numeric_report import Percentile
+from forecasting_tools.data_models.questions import DateQuestion, DiscreteQuestion
 
 from metaculus_bot.aggregation_pipeline import AggregationCounters, AggregationPipeline
 from metaculus_bot.aggregation_strategies import AggregationStrategy
-from metaculus_bot.constants import THIN_PUBLISH_BINARY_CEIL, THIN_PUBLISH_BINARY_FLOOR
+from metaculus_bot.constants import MANTIC_SITE_URL, THIN_PUBLISH_BINARY_CEIL, THIN_PUBLISH_BINARY_FLOOR
+from metaculus_bot.member_forecast import (
+    NUMERIC_COMBINE_METHOD_SINGLE,
+    NUMERIC_COMBINE_METHOD_STACKED,
+    NUMERIC_COMBINE_METHOD_UNRECORDED,
+)
 from metaculus_bot.numeric.config import STANDARD_PERCENTILES
-from metaculus_bot.numeric.date_axis import EpochDateQuestion
+from metaculus_bot.numeric.date_axis import EpochDateQuestion, numeric_view
 from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
+from metaculus_bot.numeric.utils import aggregate_numeric
 from tests.conftest import make_mock_numeric_question
 from tests.mantic_fakes import load_preseason_date_question
+from tests.pipeline_test_helpers import (
+    assert_server_accepts_cdf,
+    certain_of_bin,
+    make_e2e_bot,
+    make_real_numeric_question,
+    pmf_of,
+)
 
 
 def _make_binary_question(qid: int = 100) -> BinaryQuestion:
@@ -893,3 +910,382 @@ class TestThinPublishFloorInBaseCombine:
         assert result is snapped
         snap.assert_called_once_with(lone, question, [True])
         assert 909 not in pipeline.discrete_integer_votes
+
+
+# ---------------------------------------------------------------------------
+# Per-bin members: the linear opinion pool, and the NUMERIC_AGGREGATE ``method`` record
+# ---------------------------------------------------------------------------
+
+
+def _on_mantic(question: DateQuestion) -> DateQuestion:
+    """The framework parses every payload with a metaculus.com ``page_url``; ``ManticClient`` rewrites it to the host."""
+    return question.model_copy(update={"page_url": f"{MANTIC_SITE_URL}/questions/{question.id_of_post}/"})
+
+
+def _count_question(bins: int, *, mantic: bool, qid: int = 700) -> DiscreteQuestion:
+    """A count question with ``bins`` integer bins from 0 upward, in the platform's half-step convention."""
+    host = MANTIC_SITE_URL if mantic else "https://www.metaculus.com"
+    return DiscreteQuestion(
+        id_of_question=qid,
+        id_of_post=qid,
+        page_url=f"{host}/questions/{qid}/",
+        question_text="How many?",
+        background_info="",
+        resolution_criteria="",
+        fine_print="",
+        published_time=None,
+        close_time=None,
+        lower_bound=-0.5,
+        upper_bound=bins - 0.5,
+        open_lower_bound=False,
+        open_upper_bound=False,
+        unit_of_measure="",
+        zero_point=None,
+        cdf_size=bins + 1,
+        nominal_lower_bound=0.0,
+        nominal_upper_bound=float(bins - 1),
+    )
+
+
+def _sharp_members(question: MetaculusQuestion, bins: tuple[int, ...]) -> list[NumericDistribution]:
+    """One member certain of each bin in ``bins``, on the question's own grid."""
+    view = numeric_view(question)
+    return [certain_of_bin(view, k) for k in bins]
+
+
+def _percentile_members(question: NumericQuestion) -> list[NumericDistribution]:
+    """Three percentile-elicited members spread over the middle of the question's range."""
+    span = question.upper_bound - question.lower_bound
+    members = []
+    for shift in (0.0, 0.02, -0.015):
+        declared = [
+            Percentile(percentile=p, value=question.lower_bound + span * (0.4 + shift + 0.4 * p))
+            for p in STANDARD_PERCENTILES
+        ]
+        sanitized, zero_point = sanitize_percentiles(declared, question, model_name="test-model")
+        members.append(build_numeric_distribution(sanitized, question, zero_point, model_name="test-model"))
+    return members
+
+
+_MANTIC_DATE_651 = _on_mantic(load_preseason_date_question())
+
+
+class TestNumericCombineStrategy:
+    """Per-bin members are pooled by the pointwise MEAN of their CDFs; everything else keeps its strategy.
+
+    The pointwise MEDIAN of three sharp CDFs that disagree is the middle member's CDF outright:
+    0.99 on its bin and the platform floor on the bins the other two believed, which a log score in
+    the resolved bin punishes hardest (about -230 Series 1 points on post 651's 12-bin grid). The
+    mean of the CDFs is the CDF of the mixture PMF, so every believed bin keeps a third of the mass
+    a member gave it. The elicitation is decided per question (``elicit_per_bin``), so an ensemble
+    never mixes the two kinds of member and the rule is a property of the question alone.
+    """
+
+    @pytest.mark.parametrize(
+        ("question", "expected"),
+        [
+            pytest.param(_MANTIC_DATE_651, AggregationStrategy.MEAN, id="mantic-12-bin-date"),
+            pytest.param(_count_question(11, mantic=True), AggregationStrategy.MEAN, id="mantic-11-bin-count"),
+            pytest.param(_count_question(450, mantic=True), AggregationStrategy.MEDIAN, id="mantic-450-bin-count"),
+            pytest.param(_count_question(11, mantic=False), AggregationStrategy.MEDIAN, id="metaculus-11-bin-count"),
+            pytest.param(make_real_numeric_question(), AggregationStrategy.MEDIAN, id="metaculus-201-point"),
+            pytest.param(load_preseason_date_question(), AggregationStrategy.MEDIAN, id="12-bin-date-off-mantic"),
+            pytest.param(_make_binary_question(), AggregationStrategy.MEDIAN, id="binary"),
+            pytest.param(_make_mc_question(), AggregationStrategy.MEDIAN, id="multiple-choice"),
+        ],
+    )
+    def test_the_median_becomes_the_mean_only_for_a_per_bin_question(self, question, expected) -> None:
+        pipeline = _make_pipeline()
+        assert pipeline._numeric_combine_strategy(question, AggregationStrategy.MEDIAN) is expected
+
+    def test_a_mean_stays_a_mean(self) -> None:
+        pipeline = _make_pipeline(strategy=AggregationStrategy.STACKING)
+        for question in (_MANTIC_DATE_651, make_real_numeric_question(), _make_binary_question()):
+            assert pipeline._numeric_combine_strategy(question, AggregationStrategy.MEAN) is AggregationStrategy.MEAN
+
+    def test_base_combine_pools_three_sharp_per_bin_members(self, caplog) -> None:
+        """Members certain of bins 3, 5 and 7 publish about a third on each; the median would have
+        published 0.99 on bin 5 and the floor on 3 and 7."""
+        caplog.set_level(logging.INFO, logger="metaculus_bot")
+        pipeline = _make_pipeline()
+        question = _MANTIC_DATE_651
+        pipeline.register_expected_base_combine(question)
+        members = _sharp_members(question, (3, 5, 7))
+
+        combined = pipeline.base_combine(cast("list[PredictionTypes]", members), question)
+
+        assert isinstance(combined, NumericDistribution)
+        pooled = pmf_of(combined)
+        assert pooled[[3, 5, 7]] == pytest.approx([0.3308, 0.3308, 0.3308], abs=1e-3)
+        assert pooled[[0, 1, 2, 4, 6, 8, 9, 10, 11]].max() < 0.001
+        heights = np.asarray([p.percentile for p in combined.get_cdf()])
+        assert_server_accepts_cdf(heights, cdf_size=13, open_lower=False, open_upper=False)
+        assert combined.is_date is True
+        assert pipeline.numeric_combine_methods == {question.id_of_question: "mean"}
+        assert "STACKING base combine: numeric mean aggregation" in caplog.text
+
+    def test_base_combine_keeps_the_median_for_a_mantic_percentile_grid(self) -> None:
+        """450 bins is far above the per-bin threshold, so a Mantic question this wide stays on
+        percentiles and its members are medianed byte for byte, exactly as before Wave C."""
+        pipeline = _make_pipeline()
+        question = _count_question(450, mantic=True)
+        members = _percentile_members(question)
+        expected = np.asarray([p.percentile for p in aggregate_numeric(members, question, "median").get_cdf()])
+
+        combined = pipeline.base_combine(cast("list[PredictionTypes]", members), question)
+
+        assert isinstance(combined, NumericDistribution)
+        assert np.array_equal(np.asarray([p.percentile for p in combined.get_cdf()]), expected)
+        assert pipeline.numeric_combine_methods[700] == "median"
+
+    def test_base_combine_keeps_the_median_byte_for_byte_for_percentile_members(self) -> None:
+        pipeline = _make_pipeline()
+        question = make_real_numeric_question()
+        members = _percentile_members(question)
+        expected = np.asarray([p.percentile for p in aggregate_numeric(members, question, "median").get_cdf()])
+
+        combined = pipeline.base_combine(cast("list[PredictionTypes]", members), question)
+
+        assert isinstance(combined, NumericDistribution)
+        assert np.array_equal(np.asarray([p.percentile for p in combined.get_cdf()]), expected)
+        assert pipeline.numeric_combine_methods == {question.id_of_question: "median"}
+
+    def test_the_median_fallback_pools_per_bin_members_too(self) -> None:
+        pipeline = _make_pipeline()
+        question = _MANTIC_DATE_651
+        members = _sharp_members(question, (3, 5, 7))
+
+        combined = pipeline._median_fallback(cast("list[PredictionTypes]", members), question)
+
+        assert isinstance(combined, NumericDistribution)
+        assert pmf_of(combined)[[3, 5, 7]] == pytest.approx([0.3308] * 3, abs=1e-3)
+        assert pipeline.numeric_combine_methods == {question.id_of_question: "mean"}
+
+    def test_simple_combine_pools_per_bin_members_under_the_median_strategy(self) -> None:
+        pipeline = _make_pipeline(strategy=AggregationStrategy.MEDIAN)
+        question = _MANTIC_DATE_651
+        members = _sharp_members(question, (3, 5, 7))
+
+        combined = pipeline.simple_combine(cast("list[PredictionTypes]", members), question)
+
+        assert isinstance(combined, NumericDistribution)
+        assert pmf_of(combined)[[3, 5, 7]] == pytest.approx([0.3308] * 3, abs=1e-3)
+        assert pipeline.numeric_combine_methods == {question.id_of_question: "mean"}
+
+
+class TestNumericCombineMethodRecording:
+    """Every numeric return path writes ``numeric_combine_methods``; the forecaster seam pops it.
+
+    ``mean`` / ``median`` are the combiner's own tokens; ``stacked`` is a stacker-adopted
+    distribution; ``single`` is the lone raw member the min-forecasters=1 short-circuit hands
+    through. A pre-stacked output that re-enters ``base_combine`` keeps the record the stacker path
+    wrote. Binary and MC questions never write it.
+    """
+
+    @staticmethod
+    def _stacked_reasoned() -> list[ReasonedPrediction[PredictionTypes]]:
+        return [
+            ReasonedPrediction(prediction_value=0.5, reasoning="Model: m1\n\nEarly."),
+            ReasonedPrediction(prediction_value=0.5, reasoning="Model: m2\n\nLate."),
+        ]
+
+    def test_base_combine_records_the_median_under_conditional_stacking(self) -> None:
+        pipeline = _make_pipeline()
+        question = make_real_numeric_question()
+        pipeline.base_combine(cast("list[PredictionTypes]", _percentile_members(question)), question)
+        assert pipeline.numeric_combine_methods == {question.id_of_question: "median"}
+
+    def test_base_combine_records_the_mean_under_plain_stacking(self) -> None:
+        pipeline = _make_pipeline(strategy=AggregationStrategy.STACKING)
+        question = make_real_numeric_question()
+        pipeline.base_combine(cast("list[PredictionTypes]", _percentile_members(question)), question)
+        assert pipeline.numeric_combine_methods == {question.id_of_question: "mean"}
+
+    @pytest.mark.parametrize("strategy", [AggregationStrategy.MEAN, AggregationStrategy.MEDIAN])
+    def test_simple_combine_records_its_effective_strategy(self, strategy: AggregationStrategy) -> None:
+        pipeline = _make_pipeline(strategy=strategy)
+        question = make_real_numeric_question()
+        pipeline.simple_combine(cast("list[PredictionTypes]", _percentile_members(question)), question)
+        assert pipeline.numeric_combine_methods == {question.id_of_question: strategy.value}
+
+    def test_a_lone_raw_survivor_records_single(self) -> None:
+        pipeline = _make_pipeline()
+        question = make_real_numeric_question()
+        qid = question.id_of_question
+        assert qid is not None
+        pipeline.register_expected_base_combine(question)
+        pipeline.skip_reasons[qid] = "single_forecaster"
+        (member,) = _percentile_members(question)[:1]
+
+        combined = pipeline.base_combine([member], question)
+
+        assert combined is member
+        assert pipeline.numeric_combine_methods == {qid: NUMERIC_COMBINE_METHOD_SINGLE}
+        assert NUMERIC_COMBINE_METHOD_SINGLE == "single"
+
+    def test_a_lone_per_bin_survivor_records_single_as_well(self) -> None:
+        pipeline = _make_pipeline()
+        question = _MANTIC_DATE_651
+        (member,) = _sharp_members(question, (8,))
+        combined = pipeline.base_combine([member], question)
+        assert combined is member
+        assert pipeline.numeric_combine_methods == {question.id_of_question: "single"}
+
+    @pytest.mark.asyncio
+    async def test_a_stacked_distribution_records_stacked_and_survives_the_re_entry(self) -> None:
+        """``stacking_route`` calls ``stack_predictions`` itself and then registers the expected
+        base combine; the framework re-enters ``_aggregate_predictions`` with the single pre-stacked
+        output, which must not overwrite the stacker's record with ``single``."""
+        pipeline = _make_pipeline()
+        question = make_real_numeric_question()
+        qid = question.id_of_question
+        assert qid is not None
+        members = _percentile_members(question)
+        stacked = members[1]
+
+        with patch.object(pipeline, "run_stacking", new=AsyncMock(return_value=stacked)):
+            adopted = await pipeline.stack_predictions(
+                cast("list[PredictionTypes]", members),
+                question,
+                research="research",
+                reasoned_predictions=self._stacked_reasoned(),
+            )
+        assert adopted is stacked
+        assert pipeline.outcomes[qid] == "primary"
+        assert pipeline.numeric_combine_methods == {qid: NUMERIC_COMBINE_METHOD_STACKED}
+        assert NUMERIC_COMBINE_METHOD_STACKED == "stacked"
+
+        pipeline.register_expected_base_combine(question)
+        re_entered = pipeline.base_combine([adopted], question)
+
+        assert re_entered is stacked
+        assert pipeline.numeric_combine_methods == {qid: "stacked"}
+
+    @pytest.mark.asyncio
+    async def test_the_fallback_stacker_records_stacked_too(self) -> None:
+        pipeline = _make_pipeline()
+        question = make_real_numeric_question()
+        members = _percentile_members(question)
+        attempts = 0
+
+        async def fail_primary(*args: Any, **kwargs: Any) -> PredictionTypes:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("primary failed")
+            return members[2]
+
+        with patch.object(pipeline, "run_stacking", side_effect=fail_primary):
+            adopted = await pipeline.stack_predictions(
+                cast("list[PredictionTypes]", members),
+                question,
+                research="research",
+                reasoned_predictions=self._stacked_reasoned(),
+            )
+
+        assert adopted is members[2]
+        assert pipeline.outcomes == {question.id_of_question: "fallback_llm"}
+        assert pipeline.numeric_combine_methods == {question.id_of_question: "stacked"}
+
+    @pytest.mark.asyncio
+    async def test_a_failed_stack_records_the_fallback_median(self) -> None:
+        pipeline = _make_pipeline()
+        question = make_real_numeric_question()
+        members = _percentile_members(question)
+
+        with patch.object(pipeline, "run_stacking", new=AsyncMock(side_effect=RuntimeError("down"))):
+            combined = await pipeline.stack_predictions(
+                cast("list[PredictionTypes]", members),
+                question,
+                research="research",
+                reasoned_predictions=self._stacked_reasoned(),
+            )
+
+        assert isinstance(combined, NumericDistribution)
+        assert pipeline.outcomes == {question.id_of_question: "fallback_median"}
+        assert pipeline.numeric_combine_methods == {question.id_of_question: "median"}
+
+    def test_binary_and_mc_questions_never_write_the_record(self) -> None:
+        pipeline = _make_pipeline()
+        binary = _make_binary_question(qid=901)
+        pipeline.base_combine([0.3, 0.5, 0.7], binary)
+        mc = _make_mc_question(qid=902)
+        pols = [
+            PredictedOptionList(
+                predicted_options=[
+                    PredictedOption(option_name="A", probability=a),
+                    PredictedOption(option_name="B", probability=b),
+                    PredictedOption(option_name="C", probability=1.0 - a - b),
+                ]
+            )
+            for a, b in ((0.5, 0.3), (0.6, 0.2))
+        ]
+        pipeline.base_combine(cast("list[PredictionTypes]", pols), mc)
+        pipeline.simple_combine([0.3, 0.5], binary)
+        assert pipeline.numeric_combine_methods == {}
+
+
+class TestTheAggregateMarkerMethod:
+    """``TemplateForecaster._aggregate_predictions`` pops the record and ends NUMERIC_AGGREGATE with it."""
+
+    @staticmethod
+    def _aggregate_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+        return [r.getMessage() for r in caplog.records if r.getMessage().startswith("NUMERIC_AGGREGATE:")]
+
+    @pytest.mark.asyncio
+    async def test_a_percentile_question_logs_method_median(self, caplog: pytest.LogCaptureFixture) -> None:
+        caplog.set_level(logging.INFO, logger="metaculus_bot")
+        bot = make_e2e_bot(AggregationStrategy.CONDITIONAL_STACKING)
+        question = make_real_numeric_question()
+
+        aggregated = await bot._aggregate_predictions(
+            cast("list[PredictionTypes]", _percentile_members(question)), question
+        )
+
+        assert isinstance(aggregated, NumericDistribution)
+        (line,) = self._aggregate_lines(caplog)
+        assert line.startswith(f"NUMERIC_AGGREGATE: question={question.id_of_question} qtype=numeric cdf_size=201 ")
+        assert line.endswith(" tail_floor=0.000000 method=median")
+        assert bot._pipeline.numeric_combine_methods == {}, (
+            "popped at the seam, so a record never outlives its question"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_per_bin_question_logs_method_mean_and_publishes_the_pool(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.INFO, logger="metaculus_bot")
+        bot = make_e2e_bot(AggregationStrategy.CONDITIONAL_STACKING)
+        question = _MANTIC_DATE_651
+
+        aggregated = await bot._aggregate_predictions(
+            cast("list[PredictionTypes]", _sharp_members(question, (3, 5, 7))), question
+        )
+
+        assert isinstance(aggregated, NumericDistribution)
+        assert pmf_of(aggregated)[[3, 5, 7]] == pytest.approx([0.3308] * 3, abs=1e-3)
+        (line,) = self._aggregate_lines(caplog)
+        assert line == (
+            f"NUMERIC_AGGREGATE: question={question.id_of_question} qtype=date cdf_size=13 oor_low=0.000000 "
+            "oor_high=0.000000 oor_low_raw=0.000000 oor_high_raw=0.000000 tail_floor=0.000000 method=mean"
+        )
+        assert bot._pipeline.numeric_combine_methods == {}
+
+    @pytest.mark.asyncio
+    async def test_a_path_that_never_recorded_logs_unrecorded_instead_of_forfeiting(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """``unrecorded`` is a bug signal, never an expected value: a combine path that forgot to
+        write the dict still publishes, and the archive says so."""
+        caplog.set_level(logging.INFO, logger="metaculus_bot")
+        bot = make_e2e_bot(AggregationStrategy.CONDITIONAL_STACKING)
+        question = make_real_numeric_question()
+        (member,) = _percentile_members(question)[:1]
+
+        with patch.object(bot._pipeline, "base_combine", return_value=member):
+            aggregated = await bot._aggregate_predictions([member], question)
+
+        assert aggregated is member
+        (line,) = self._aggregate_lines(caplog)
+        assert line.endswith(f" method={NUMERIC_COMBINE_METHOD_UNRECORDED}")
+        assert NUMERIC_COMBINE_METHOD_UNRECORDED == "unrecorded"

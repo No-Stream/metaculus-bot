@@ -67,6 +67,21 @@ class OptionProbabilityListWrapper(BaseModel):
     options: list[OptionProbability]
 
 
+class BinProbability(BaseModel):
+    """One bin of a per-bin declaration as the salvage rung reads it: the label the rationale used
+    beside its probability. ``value_extraction.extract_pmf`` folds the label onto the grid's keys,
+    so this carries the text as written rather than a matched bin."""
+
+    label: str
+    probability: float
+
+
+class BinProbabilityListWrapper(BaseModel):
+    """Wrapper for list[BinProbability] to satisfy json_schema response_format."""
+
+    bins: list[BinProbability]
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -85,6 +100,8 @@ def _get_wrapper_type(output_type: type) -> type[BaseModel] | None:
                 return DatePercentileListWrapper
             if item_type is OptionProbability:
                 return OptionProbabilityListWrapper
+            if item_type is BinProbability:
+                return BinProbabilityListWrapper
     return None
 
 
@@ -102,13 +119,9 @@ def _build_constrained_llm(response_format_model: type[BaseModel], parser_model:
     """
     return build_llm_with_openrouter_fallback(
         parser_model,
-        # Same CREDIT_ROLE_SPEND line as PARSER_LLM: the constrained primary and the
-        # structure_output fallback are one parsing job on the same tier.
+        # Why: one CREDIT_ROLE_SPEND tier for both parse paths, the same one PARSER_LLM bills to.
         role="parser",
-        # temperature=None: 0.2.92's GeneralLlm ctor already defaults temperature to
-        # None (it was a hard 0 pre-0.2.92), so this is now redundant-but-explicit —
-        # kept to pin provider-default sampling against a future default flip. reasoning
-        # models defer to provider defaults. No top_p.
+        # Why: redundant since ft 0.2.92 defaults it to None, kept as a pin; see docs/value_extraction.md "The LLM salvage rung: design notes".
         temperature=None,
         max_tokens=32_000,
         stream=False,
@@ -153,9 +166,7 @@ async def parse_structured[T](
     try:
         constrained_llm = _build_constrained_llm(schema_model, parser_llm.model)
 
-        # Build the extraction prompt (simpler than structure_output's — the schema
-        # is enforced by the model's constrained decoding, so we just need the text
-        # + instructions).
+        # Why: constrained decoding enforces the schema, so the prompt carries only the text and the notes.
         prompt_parts = [
             "Extract the structured data from the text below.",
         ]
@@ -166,7 +177,6 @@ async def parse_structured[T](
 
         raw_response = await constrained_llm.invoke(prompt)
 
-        # Parse the constrained JSON response
         if wrapper_type is not None:
             wrapper_instance = wrapper_type.model_validate_json(raw_response)
             # Unwrap to the list contents
@@ -174,11 +184,12 @@ async def parse_structured[T](
                 return wrapper_instance.percentiles  # type: ignore[return-value]
             if wrapper_type is OptionProbabilityListWrapper:
                 return wrapper_instance.options  # type: ignore[return-value]
+            if wrapper_type is BinProbabilityListWrapper:
+                return wrapper_instance.bins  # type: ignore[return-value]
         else:
             return schema_model.model_validate_json(raw_response)  # type: ignore[return-value]
 
-    # Boundary: constrained decoding is an optimization, so ANY failure here must degrade to
-    # the structure_output fallback below rather than fail the forecast.
+    # Why: constrained decoding is an optimization, so ANY failure degrades to the fallback below.
     except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except  # intentional: catch-all → graceful fallback
         logger.info(
             "Constrained parse failed (%s: %s); falling back to structure_output",

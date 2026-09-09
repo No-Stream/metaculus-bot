@@ -26,6 +26,7 @@ from tests.prompt_builders import (
     _extract_last_json_block,
     _mc_q,
     _numeric_q,
+    _pmf_prompt_text,
 )
 
 
@@ -273,6 +274,7 @@ _EXAMPLE_BLOCK_BUILDERS = [
         id="numeric",
     ),
     pytest.param(_date_prompt_text, id="date"),
+    pytest.param(_pmf_prompt_text, id="pmf"),
     pytest.param(
         lambda: stacking_binary_prompt(_binary_q(), research="r", base_predictions=["a1", "a2"]),
         id="stacking_binary",
@@ -296,7 +298,7 @@ _EXAMPLE_BLOCK_BUILDERS = [
 
 class TestStructuredForecastExampleBlocks:
     """Every builder's STRUCTURED FORECAST example must PARSE, and must not re-grow a
-    key the 2026-09-02 de-bloat retired.
+    key the 2026-09-02 de-bloat retired. The per-bin example is the one built from a grid.
 
     These examples are static literals, so the only thing that breaks them is a source
     edit — and until this test existed most of them were guarded by substring checks only,
@@ -321,7 +323,7 @@ class TestStructuredForecastExampleBlocks:
     @pytest.mark.parametrize("build_prompt", _EXAMPLE_BLOCK_BUILDERS)
     def test_example_block_parses(self, build_prompt: Callable[[], str]) -> None:
         parsed = json.loads(_extract_last_json_block(build_prompt()))
-        assert parsed["question_type"] in {"binary", "multiple_choice", "numeric", "date"}
+        assert parsed["question_type"] in {"binary", "multiple_choice", "numeric", "date", "pmf"}
 
     @pytest.mark.parametrize("build_prompt", _EXAMPLE_BLOCK_BUILDERS)
     def test_example_block_carries_no_retired_key(self, build_prompt: Callable[[], str]) -> None:

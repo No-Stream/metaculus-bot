@@ -45,7 +45,10 @@ pre-clamp decimal; MC output is a ``McForecast`` pairing the
 pre-``clamp_and_renormalize_mc`` option list with the probabilities as declared;
 numeric output feeds ``sanitize_percentiles`` unchanged; date output is the same
 percentile list with EPOCH-SECOND values, so it feeds the numeric pipeline through
-``numeric.date_axis.as_epoch_question``.
+``numeric.date_axis.as_epoch_question``; per-bin output (``extract_pmf``, the ``pmf``
+block a coarse-grid question is elicited with instead of percentiles) is a
+``PmfForecast`` carrying the platform's ``N + 2`` PMF vector in grid order, which
+``numeric.pmf_cdf`` turns into the CDF.
 """
 
 from __future__ import annotations
@@ -54,7 +57,7 @@ import logging
 import math
 import re
 from collections import Counter
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
 from typing import Literal
@@ -65,6 +68,7 @@ from forecasting_tools.data_models.numeric_report import Percentile
 from json_repair import repair_json
 from pydantic import ValidationError
 
+from metaculus_bot.constants import PMF_ABOVE_RANGE_KEY, PMF_BELOW_RANGE_KEY
 from metaculus_bot.exceptions import ValueExtractionError
 from metaculus_bot.mc_processing import (
     accumulate_declared_option_probs,
@@ -74,55 +78,44 @@ from metaculus_bot.mc_processing import (
 )
 from metaculus_bot.numeric.config import STANDARD_PERCENTILES
 from metaculus_bot.numeric.date_axis import to_epoch
-from metaculus_bot.question_types import QuestionType
+from metaculus_bot.numeric.pmf_grid import PmfGrid, fold_bin_label
 from metaculus_bot.simple_types import OptionProbability
 from metaculus_bot.structured_output_schema import (
     _MAX_STRUCTURED_BLOCK_BYTES,
     _MC_OPTION_PROB_SUM_TOLERANCE,
     BinaryStructured,
+    BlockType,
     DateStructured,
     MultipleChoiceStructured,
     NumericStructured,
+    PmfStructured,
     StructuredBlock,
     extract_json_block_candidates,
     iter_balanced_braces,
     parse_structured_payload,
+    pmf_prob_sum_tolerance,
 )
-from metaculus_bot.structured_parse import IsoDatePercentile, parse_structured
+from metaculus_bot.structured_parse import BinProbability, IsoDatePercentile, parse_structured
 
 logger = logging.getLogger(__name__)
 
 Rung = Literal["block", "repair", "llm"]
 
-# How far back from the rationale tail the unfenced-JSON rescue scans. The
-# block is prompted to be the LAST output, so a lost fence still leaves the
-# payload within the final few KB.
+# Why: the block is prompted LAST, so a lost fence still leaves the payload in the rationale tail.
 _TAIL_SCAN_CHARS = 4000
-# Float tolerance when matching parsed percentile keys against
-# ``STANDARD_PERCENTILES`` (guards against 0.1 vs 0.10000000001 drift from JSON
-# round-trips).
+# Why: JSON round-trips leave 0.1 as 0.10000000001, so percentile keys match STANDARD_PERCENTILES with slack.
 _PERCENTILE_KEY_TOLERANCE = 1e-6
 
 # --- Repair-rung fidelity ---------------------------------------------------
-# A numeric literal is COMPLETE when it is a full JSON number (optionally with a
-# leading-dot fraction, which json_repair fixes value-preservingly). Deliberately
-# rejects the truncated forms — "0.", ".", "1e", "1e-" — because those are the
-# shapes json_repair silently completes by INVENTING the missing digits: a
-# rationale cut mid-decimal at "posterior_prob":0.72 leaves "0." behind, which
-# repairs to 0.0 and would publish as the binary clamp floor.
+
+# Why: refuse truncated forms json_repair completes by inventing digits; see docs/value_extraction.md "The ladder".
 _COMPLETE_NUMBER_RE = re.compile(r"^[-+]?(?:\d+\.\d+|\d+|\.\d+)(?:[eE][-+]?\d+)?$")
-# String literals in EITHER quote style: raw candidates are exactly the malformed
-# blocks the repair rung exists for, and single-quoted output is the most common
-# malformation, so a double-quote-only reader walks that prose as value position.
-# The trailing ``(?:"|\Z)`` keeps an unterminated final string (the truncated-payload
-# case this check exists for) inside the literal rather than spilling it outside.
+# Why: single-quoted output is the commonest malformation; see docs/value_extraction.md "The ladder: design notes".
 _JSON_STRING_RE = re.compile(
     r'"(?:[^"\\]|\\.)*(?:"|\Z)' r"|'(?:[^'\\]|\\.)*(?:'|\Z)",
     re.DOTALL,
 )
-# A numeric-literal run in JSON value position. The body set is deliberately loose
-# (it swallows "1-2" into one token) so that malformed runs surface as incomplete
-# tokens rather than being split into two plausible-looking numbers.
+# Why: the loose body set swallows "1-2" into one token, so a malformed run surfaces as incomplete, not as two numbers.
 _NUMBER_RUN_RE = re.compile(r"[-+.0-9][0-9.eE+-]*")
 
 
@@ -187,7 +180,7 @@ class _DeterministicHit[T]:
 
 
 def _log_extraction(
-    qtype: QuestionType,
+    qtype: BlockType,
     rung: Rung,
     *,
     block_present: bool,
@@ -207,7 +200,7 @@ def _log_extraction(
 def _try_candidate[T](
     candidate: str,
     *,
-    qtype: QuestionType,
+    qtype: BlockType,
     convert_block: Callable[[StructuredBlock], T],
     validate: Callable[[T], T],
     try_strict: bool,
@@ -236,11 +229,7 @@ def _try_candidate[T](
             try:
                 return _DeterministicHit(value=validate(convert_block(strict)), rung="block")
             except (ValueError, TypeError) as exc:
-                # Schema-valid but unusable — e.g. a numeric block carrying only
-                # ``_REQUIRED_NUMERIC_PERCENTILES`` (the schema's floor), not the
-                # full ``STANDARD_PERCENTILES`` set the pipeline needs.
-                # json_repair cannot change already-valid JSON, so this
-                # candidate is spent and the caller falls back.
+                # Why: json_repair cannot alter valid JSON; see docs/value_extraction.md "The ladder: design notes".
                 failures.append(f"block: {label}: {exc}")
                 return None
 
@@ -278,7 +267,7 @@ def _try_candidate[T](
 async def _run_ladder[T](
     *,
     text: str,
-    qtype: QuestionType,
+    qtype: BlockType,
     convert_block: Callable[[StructuredBlock], T],
     validate: Callable[[T], T],
     llm_extract: Callable[[], Awaitable[T]],
@@ -291,25 +280,15 @@ async def _run_ladder[T](
     block_present = bool(fenced)
 
     # --- Rungs 1+2: deterministic walk over candidates, best-first ---------
-    # Selection order comes from extract_json_block_candidates: tagged ```json
-    # before untagged fences, and WITHIN a tier the last block by position first,
-    # because the prompt asks for the STRUCTURED FORECAST block last. Position is
-    # the primary signal; validity — strict OR repaired — only breaks ties.
-    #
-    # Each candidate is offered to BOTH deterministic mechanisms before the next
-    # one is tried (see _try_candidate). Running them as separate passes over the
-    # whole list published superseded drafts: a valid earlier draft block
-    # satisfied the strict pass, so a malformed final block never reached the
-    # repairer that exists to fix exactly that (a trailing comma).
+
+    # Why: candidate-major, or a superseded draft wins; see docs/value_extraction.md "The ladder: design notes".
     walk: list[tuple[str, bool]]
     if block_present:
         walk = [(candidate, True) for candidate in fenced]
     else:
         logger.info("No fenced JSON block in rationale for qtype=%s question=%s", qtype, question_id)
         failures.append("block: no fenced JSON block")
-        # No fence survived: rescue bare JSON objects from the rationale tail,
-        # LAST first for the same position primacy. Repair-only — calling these
-        # rung="block" would contradict block_present=False.
+        # Why: no fence survived, so rescue bare JSON from the tail, LAST first; repair-only (see _try_candidate).
         tail_blobs = list(iter_balanced_braces(text[-_TAIL_SCAN_CHARS:]))
         if not tail_blobs:
             failures.append("repair: no candidate JSON in rationale tail")
@@ -329,11 +308,7 @@ async def _run_ladder[T](
         if hit is None:
             continue
         if rank > 0:
-            # The value did NOT come from the position-last candidate, so it may
-            # not be the model's final answer (the observed case is a trailing
-            # schema-example block, which is benign — hence INFO, not WARNING).
-            # Watch this alongside EXTRACTION_RUNG: a rise means the prompt's
-            # block-last contract is eroding.
+            # Why: a non-last hit may not be the final block; see docs/value_extraction.md "The ladder: design notes".
             logger.info(
                 "BLOCK_FALLBACK: question=%s model=%s qtype=%s skipped=%d rung=%s reasons=%s",
                 question_id,
@@ -426,8 +401,7 @@ async def extract_binary(
 def _numeric_from_block(block: StructuredBlock) -> list[Percentile]:
     if not isinstance(block, NumericStructured) or not block.declared_percentiles:
         raise ValueError("block lacks declared_percentiles")
-    # Absorbs the old numeric_format_router F5 fallback: lift the block's
-    # declared_percentiles dict into Percentile objects.
+    # Why: absorbs the old numeric_format_router F5 fallback; see docs/value_extraction.md "The ladder".
     return [
         Percentile(percentile=float(pct), value=float(val)) for pct, val in sorted(block.declared_percentiles.items())
     ]
@@ -518,12 +492,7 @@ def _epoch_percentiles(dates: Sequence[IsoDatePercentile]) -> list[Percentile]:
     return [Percentile(percentile=float(item.percentile), value=to_epoch(item.value)) for item in dates]
 
 
-# On the epoch axis a date forecast IS a numeric forecast, so the fidelity contract is the
-# numeric one verbatim: every ``STANDARD_PERCENTILES`` entry present, values finite and
-# non-decreasing by label. What differs is upstream of it, in ``DateStructured``: the repair
-# rung's ``_repair_infidelity_reason`` cannot see a truncated date (it inspects numeric
-# literals outside string literals, and a date is a string), so the block schema's strict ISO
-# parse is what refuses the ``json_repair``-completed ``"2027-06-1"`` a cut-off rationale leaves.
+# Why: on the epoch axis a date forecast IS a numeric forecast; see docs/value_extraction.md "The ladder".
 _validate_date = _validate_numeric
 
 
@@ -597,17 +566,7 @@ def _make_mc_from_block(options: list[str]) -> Callable[[StructuredBlock], McFor
     def _mc_from_block(block: StructuredBlock) -> McForecast:
         if not isinstance(block, MultipleChoiceStructured):
             raise ValueError(f"expected multiple_choice block, got {type(block).__name__}")
-        # Match each block key to a canonical option through ``fold_option_label`` (case,
-        # whitespace, Unicode compatibility forms and curly-quote/dash glyphs all fold, on
-        # BOTH sides). We deliberately do NOT route through build_mc_prediction here:
-        # its _normalize_name strips a leading "Option " token, which would mangle
-        # options literally named "Option A"/"Option B". The block already declares
-        # exact per-option probabilities, so we map straight onto the canonical
-        # names in question order. Any unmatched key or missing option fails the
-        # rung (→ validation → next rung). Clamp + renormalize BEFORE constructing
-        # the PredictedOptionList so ft 0.2.92's clamp-and-renormalize validator
-        # (which raises on any >0.05 move) is a no-op; the caller still applies
-        # clamp_and_renormalize_mc idempotently.
+        # Why: build_mc_prediction is bypassed: its _normalize_name would strip "Option " (see fold_option_label).
         canonical_by_norm = {fold_option_label(opt): opt for opt in options}
         matched: dict[str, float] = {}
         for key, prob in block.option_probs.items():
@@ -620,6 +579,7 @@ def _make_mc_from_block(options: list[str]) -> Callable[[StructuredBlock], McFor
             raise ValueError(f"block option probabilities sum to {total}")
         ordered = [(name, matched[name]) for name in options if name in matched]
         declared = [prob for _, prob in ordered]
+        # Why: clamp before constructing, so ft's PredictedOptionList validator is a no-op; see McForecast.
         clamped = clamp_and_renormalize_probs(declared)
         option_list = PredictedOptionList(
             predicted_options=[
@@ -663,23 +623,15 @@ async def extract_mc(
     options = list(options)
 
     async def _llm() -> McForecast:
-        # Mirror the pre-ladder two-stage tolerant parse: strict
-        # PredictedOptionList first, then the loose list[OptionProbability]
-        # form. BOTH sub-paths route through build_mc_prediction so parser
-        # output with case/prefix-variant option names ("option a") is
-        # canonicalized onto the question's option set before _validate_mc's
-        # exact set comparison — the parser prompt_notes explicitly allow
-        # case-insensitive matches, so the strict result can't be trusted to
-        # carry canonical spellings.
+        """The pre-ladder two-stage tolerant parse: strict ``PredictedOptionList``, then the loose pair list."""
+        # Why: both sub-paths route through build_mc_prediction, since the parser may return "option a".
         try:
             strict = await parse_structured(text, PredictedOptionList, parser_llm, prompt_notes=prompt_notes)
             as_raw = [
                 OptionProbability(option_name=o.option_name, probability=o.probability)
                 for o in strict.predicted_options
             ]
-            # On this strict sub-path ``strict`` is an ft model, already clamped on construction,
-            # so the declared vector is the parser's output AFTER that clamp; only the tolerant
-            # list[OptionProbability] fallback below carries a genuinely pre-clamp vector.
+            # Why: ft clamps on construction, so this sub-path's declared vector is post-clamp, unlike the fallback's.
             return _parsed_mc_forecast(as_raw, options)
         except (ValidationError, ValueError) as exc:
             logger.warning("Primary MC parse failed in llm rung, using tolerant fallback: %s", exc)
@@ -699,12 +651,131 @@ async def extract_mc(
     )
 
 
+# ---------------------------------------------------------------------------
+# Per-bin PMF (the ``pmf`` block a coarse-grid question is elicited with)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PmfForecast:
+    """A per-bin extraction in the platform's own PMF shape.
+
+    ``declared`` is ``[below, p_0, ..., p_{N-1}, above]`` (length ``N + 2``), as the block or the
+    parser declared it and BEFORE the floor blend in ``numeric.pmf_cdf``; a closed bound's tail
+    is 0.0. This is the shape Mantic itself exposes for every resolved forecast
+    (``disagreement_forecasts.forecasts[].pmf``), so the ``MEMBER_FORECAST`` ``raw`` field and the
+    platform's record of the same forecast read alike.
+    """
+
+    declared: list[float]
+
+
+def _pmf_from_pairs(pairs: Iterable[tuple[str, float]], grid: PmfGrid) -> PmfForecast:
+    """Map label/probability pairs onto ``grid.keys`` the way ``_make_mc_from_block`` maps a ballot.
+
+    Both sides fold through ``fold_bin_label`` (``"7.0"``, ``" 7 "`` and ``"55,000"`` land on
+    ``"7"`` and ``"55000"``; a timestamp label's own fold differs from it, so the grid's keys are
+    folded too), a duplicate fold sums onto one bin, an unmatched key fails, a reserved key on a
+    closed bound fails, and EVERY grid key must be present: a block cut before its last bins
+    repairs into a valid partial declaration, and the every-key rule is what stops that publishing.
+    The block rung and the LLM rung share this one conversion.
+    """
+    reserved_closed = {
+        PMF_BELOW_RANGE_KEY: ("lower", grid.open_lower_bound),
+        PMF_ABOVE_RANGE_KEY: ("upper", grid.open_upper_bound),
+    }
+    canonical_by_fold = {fold_bin_label(key): key for key in grid.keys}
+    matched: dict[str, float] = {}
+    for key, prob in pairs:
+        folded = fold_bin_label(key)
+        canonical = canonical_by_fold.get(folded)
+        if canonical is None:
+            if folded in reserved_closed:
+                bound, _ = reserved_closed[folded]
+                raise ValueError(f"block declares {key!r} but the question's {bound} bound is closed")
+            raise ValueError(f"block key {key!r} matches no bin of this grid")
+        matched[canonical] = matched.get(canonical, 0.0) + float(prob)
+    missing = [key for key in grid.keys if key not in matched]
+    if missing:
+        raise ValueError(f"block is missing bin(s) {missing}; a partial declaration cannot be published")
+    total = sum(matched.values())
+    if total <= 0:
+        raise ValueError(f"block bin probabilities sum to {total}")
+    below = matched.get(PMF_BELOW_RANGE_KEY, 0.0)
+    above = matched.get(PMF_ABOVE_RANGE_KEY, 0.0)
+    return PmfForecast([below, *(matched[label] for label in grid.labels), above])
+
+
+def _make_pmf_from_block(grid: PmfGrid) -> Callable[[StructuredBlock], PmfForecast]:
+    def _pmf_from_block(block: StructuredBlock) -> PmfForecast:
+        if not isinstance(block, PmfStructured):
+            raise ValueError(f"expected pmf block, got {type(block).__name__}")
+        return _pmf_from_pairs(block.bin_probs.items(), grid)
+
+    return _pmf_from_block
+
+
+def _make_validate_pmf(grid: PmfGrid) -> Callable[[PmfForecast], PmfForecast]:
+    def _validate_pmf(forecast: PmfForecast) -> PmfForecast:
+        expected_length = len(grid.labels) + 2
+        if len(forecast.declared) != expected_length:
+            raise ValueError(f"pmf vector has {len(forecast.declared)} entries, expected {expected_length}")
+        for index, prob in enumerate(forecast.declared):
+            if not math.isfinite(prob) or not (0.0 <= prob <= 1.0):
+                raise ValueError(f"pmf entry {index} probability {prob} outside [0, 1]")
+        total = sum(forecast.declared)
+        tolerance = pmf_prob_sum_tolerance(len(grid.keys))
+        if abs(total - 1.0) > tolerance:
+            raise ValueError(f"pmf probabilities sum to {total}, outside 1.0 ± {tolerance} for {len(grid.keys)} keys")
+        return forecast
+
+    return _validate_pmf
+
+
+async def extract_pmf(
+    text: str,
+    grid: PmfGrid,
+    parser_llm: GeneralLlm,
+    *,
+    prompt_notes: str = "",
+    question_id: int | None = None,
+    model_name: str = "",
+) -> ExtractionOutcome[PmfForecast]:
+    """Extract a per-bin declaration on ``grid`` as the platform's ``N + 2`` PMF vector; see ``PmfForecast``.
+
+    Mirrors ``extract_mc``: the block rung reads ``PmfStructured.bin_probs``, the LLM salvage rung
+    reads ``list[BinProbability]`` (``structured_parse``), and both run ``_pmf_from_pairs``.
+    ``prompt_notes`` should be the per-bin sibling of ``build_parse_notes`` listing the grid's
+    exact keys, since the salvage parser has nothing else to spell them from. The ladder logs
+    ``EXTRACTION_RUNG ... qtype=pmf``: the marker's ``qtype`` is the BLOCK type the ladder parsed,
+    so the question's own type is joined from the ``MEMBER_FORECAST`` line beside it.
+    """
+
+    async def _llm() -> PmfForecast:
+        bins: list[BinProbability] = await parse_structured(
+            text, list[BinProbability], parser_llm, prompt_notes=prompt_notes
+        )
+        return _pmf_from_pairs(((item.label, item.probability) for item in bins), grid)
+
+    return await _run_ladder(
+        text=text,
+        qtype="pmf",
+        convert_block=_make_pmf_from_block(grid),
+        validate=_make_validate_pmf(grid),
+        llm_extract=_llm,
+        question_id=question_id,
+        model_name=model_name,
+    )
+
+
 __all__ = [
     "ExtractionOutcome",
     "McForecast",
+    "PmfForecast",
     "Rung",
     "extract_binary",
     "extract_date",
     "extract_mc",
     "extract_numeric",
+    "extract_pmf",
 ]

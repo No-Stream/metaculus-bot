@@ -2246,6 +2246,100 @@ class TestOutOfRangeMassFields:
         assert rec["marker"] == "numeric_aggregate_grid_mismatch"
 
 
+# Verbatim from metaculus_bot/member_forecast.py: the 2026-09-09 per-bin elicitation fields (Wave C).
+MEMBER_FORECAST_PMF_LINE = (
+    PFX + "MEMBER_FORECAST: question=651 model=openrouter/openai/gpt-5.6-sol role=member qtype=date "
+    "raw=[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.0] "
+    "published=[0.0,0.000833334,0.000833334,0.000833334,0.000833334,0.000833334,0.000833334,0.000833334,"
+    "0.000833334,0.990833326,0.000833334,0.000833334,0.000833334,0.0] oor_low=0.000000 oor_high=0.000000 "
+    "elicitation=pmf"
+)
+NUMERIC_AGGREGATE_POOLED_LINE = PFX + (
+    "NUMERIC_AGGREGATE: question=651 qtype=date cdf_size=13 oor_low=0.000000 oor_high=0.000000 "
+    "oor_low_raw=0.000000 oor_high_raw=0.000000 tail_floor=0.000000 method=mean"
+)
+NUMERIC_AGGREGATE_MEDIAN_LINE = PFX + (
+    "NUMERIC_AGGREGATE: question=650 qtype=numeric cdf_size=451 oor_low=0.050000 oor_high=0.050000 "
+    "oor_low_raw=0.010000 oor_high_raw=0.010000 tail_floor=0.050000 method=median"
+)
+# The ladder's line for a per-bin block: ``qtype=pmf`` is the block type, not the question type.
+EXTRACTION_RUNG_PMF_LINE = (
+    PFX + "EXTRACTION_RUNG: question=651 model=openrouter/openai/gpt-5.6-sol qtype=pmf rung=block block_present=True"
+)
+
+
+class TestPerBinElicitationFields:
+    """The two additive fields of Wave C: ``elicitation`` on MEMBER_FORECAST, ``method`` on NUMERIC_AGGREGATE.
+
+    On a Mantic enumerable grid (31 bins or fewer) each member declares one probability per bin,
+    and those members are pooled by the pointwise MEAN of their CDFs instead of the MEDIAN, because
+    the median of three sharp CDFs that disagree is the middle member outright. ``elicitation``
+    says how to read a member's ``raw`` / ``published``; ``method`` says which rule the published
+    aggregate came from, on every numeric and date question. Both are optional trailing groups, so
+    every archived line still harvests with the field ``None``. The member line is post 651's
+    12-bin closed date grid with a member certain of 2026-09-16 (bin 8), so ``raw`` and
+    ``published`` are the 14-entry ``[below, p_0, ..., p_11, above]`` vector.
+    """
+
+    def test_a_pmf_member_line_parses_with_its_vectors_tails_and_elicitation(self):
+        rec = _parse_one(MEMBER_FORECAST_PMF_LINE)
+        assert rec["marker"] == "member_forecast"
+        assert rec["qid"] == 651
+        assert rec["qtype"] == "date"
+        assert rec["elicitation"] == "pmf"
+        raw = json.loads(rec["raw"])
+        published = json.loads(rec["published"])
+        assert len(raw) == len(published) == 14
+        assert raw[9] == 1.0
+        assert published[9] == 0.990833326
+        assert (published[0], published[-1]) == (0.0, 0.0)
+        assert rec["oor_low"] == 0.0
+        assert rec["oor_high"] == 0.0
+
+    def test_member_lines_without_the_field_read_none(self):
+        for line in (
+            MEMBER_FORECAST_BINARY_LINE,
+            MEMBER_FORECAST_MC_LINE,
+            MEMBER_FORECAST_NUMERIC_STACKER_LINE,
+            MEMBER_FORECAST_DATE_LINE,
+            MEMBER_FORECAST_NUMERIC_TAILS_LINE,
+        ):
+            rec = _parse_one(line)
+            assert rec["marker"] == "member_forecast"
+            assert rec["elicitation"] is None
+
+    def test_a_pooled_aggregate_line_names_the_mean(self):
+        rec = _parse_one(NUMERIC_AGGREGATE_POOLED_LINE)
+        assert rec["marker"] == "numeric_aggregate"
+        assert rec["qid"] == 651
+        assert rec["method"] == "mean"
+        assert rec["tail_floor"] == 0.0
+
+    def test_a_percentile_aggregate_line_names_the_median(self):
+        rec = _parse_one(NUMERIC_AGGREGATE_MEDIAN_LINE)
+        assert rec["method"] == "median"
+        assert rec["tail_floor"] == 0.05
+        assert rec["oor_low_raw"] == 0.01
+
+    def test_aggregate_lines_that_predate_the_method_read_none(self):
+        for line in (
+            NUMERIC_AGGREGATE_DATE_LINE,
+            NUMERIC_AGGREGATE_NUMERIC_LINE,
+            NUMERIC_AGGREGATE_FLOORED_LINE,
+            NUMERIC_AGGREGATE_UNFLOORED_LINE,
+        ):
+            rec = _parse_one(line)
+            assert rec["marker"] == "numeric_aggregate"
+            assert rec["method"] is None
+
+    def test_the_pmf_block_type_is_admitted_on_the_extraction_rung_line(self):
+        rec = _parse_one(EXTRACTION_RUNG_PMF_LINE)
+        assert rec["marker"] == "extraction_rung"
+        assert rec["qtype"] == "pmf"
+        assert rec["rung"] == "block"
+        assert rec["block_present"] is True
+
+
 # Verbatim from metaculus_bot/aggregation_pipeline.py:_floor_single_survivor_binary —
 # the single-survivor binary publish floor, logged at WARNING from the base-combine
 # re-entry only when the lone value actually moved.

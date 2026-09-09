@@ -9,7 +9,14 @@ so the default was dropped to 0.0 (the floor enforcement at tail_widening.py:171
 stays correctly gated on `> 0` and re-enables if a forecaster sets it back).
 """
 
+import pytest
+from forecasting_tools.data_models.questions import DateQuestion, DiscreteQuestion
+
+from metaculus_bot.constants import MANTIC_SITE_URL, PLATFORM_MANTIC, PLATFORM_METACULUS
 from metaculus_bot.numeric import config as numeric_config
+from metaculus_bot.numeric.date_axis import as_epoch_question
+from tests.mantic_fakes import load_legacy_date_question, load_preseason_date_question
+from tests.pipeline_test_helpers import make_real_numeric_question
 
 
 def test_standard_percentiles_is_13_with_p1_and_p99():
@@ -58,3 +65,111 @@ def test_tail_widening_enable_flag_still_present():
     """The enable flag stays available so tests and env overrides can re-enable widening."""
     assert hasattr(numeric_config, "TAIL_WIDENING_ENABLE")
     assert isinstance(numeric_config.TAIL_WIDENING_ENABLE, bool)
+
+
+# --- Per-bin elicitation gate: ``elicit_per_bin`` (the numeric and date runners branch on it) ---
+
+
+def _mantic_url(qid: int) -> str:
+    return f"{MANTIC_SITE_URL}/questions/{qid}/"
+
+
+def _metaculus_url(qid: int) -> str:
+    return f"https://www.metaculus.com/questions/{qid}/"
+
+
+def _on_mantic(question: DateQuestion) -> DateQuestion:
+    """The framework parses every payload with a metaculus.com ``page_url``; ``ManticClient`` rewrites it to the host."""
+    return question.model_copy(update={"page_url": _mantic_url(question.id_of_post or 0)})
+
+
+def _count_question(bins: int, *, page_url: str) -> DiscreteQuestion:
+    """A count question with ``bins`` integer bins from 0 upward, in the platform's half-step convention."""
+    return DiscreteQuestion(
+        id_of_question=700,
+        id_of_post=700,
+        page_url=page_url,
+        question_text="How many?",
+        background_info="",
+        resolution_criteria="",
+        fine_print="",
+        published_time=None,
+        close_time=None,
+        lower_bound=-0.5,
+        upper_bound=bins - 0.5,
+        open_lower_bound=False,
+        open_upper_bound=True,
+        unit_of_measure="",
+        zero_point=None,
+        cdf_size=bins + 1,
+    )
+
+
+class TestElicitPerBinDefaults:
+    """The gate is three facts at once: outcome-space grid, bin count at most the threshold, platform in the set."""
+
+    def test_the_threshold_is_a_month_of_daily_bins(self) -> None:
+        assert numeric_config.PMF_ELICITATION_MAX_BINS == 31
+
+    def test_only_mantic_is_elicited_per_bin_on_this_landing(self) -> None:
+        assert set(numeric_config.PMF_ELICITATION_PLATFORMS) == {PLATFORM_MANTIC}
+
+
+class TestElicitPerBinOnRecordedManticQuestions:
+    def test_the_twelve_bin_date_question_651_is_elicited_per_bin(self) -> None:
+        assert numeric_config.elicit_per_bin(as_epoch_question(_on_mantic(load_preseason_date_question()))) is True
+
+    def test_the_legacy_200_bin_date_question_500_stays_on_percentiles(self) -> None:
+        assert numeric_config.elicit_per_bin(as_epoch_question(_on_mantic(load_legacy_date_question()))) is False
+
+    def test_the_same_payload_without_the_clients_url_rewrite_reads_as_metaculus(self) -> None:
+        assert numeric_config.elicit_per_bin(as_epoch_question(load_preseason_date_question())) is False
+
+
+class TestElicitPerBinOnGridShapes:
+    def test_a_201_point_mantic_numeric_question_stays_on_percentiles(self) -> None:
+        question = make_real_numeric_question().model_copy(update={"page_url": _mantic_url(2001)})
+        assert question.cdf_size == numeric_config.PCHIP_CDF_POINTS
+        assert numeric_config.elicit_per_bin(question) is False
+
+    def test_a_200_bin_mantic_discrete_question_stays_on_percentiles(self) -> None:
+        question = _count_question(200, page_url=_mantic_url(700))
+        assert numeric_config.grid_is_outcome_space(question)
+        assert numeric_config.elicit_per_bin(question) is False
+
+    @pytest.mark.parametrize(
+        ("bins", "expected"),
+        [
+            pytest.param(11, True, id="eleven-bins"),
+            pytest.param(31, True, id="at-the-threshold"),
+            pytest.param(32, False, id="one-past-the-threshold"),
+        ],
+    )
+    def test_the_threshold_is_inclusive_on_a_mantic_count_question(self, bins: int, expected: bool) -> None:
+        assert numeric_config.elicit_per_bin(_count_question(bins, page_url=_mantic_url(700))) is expected
+
+    def test_a_30_bin_mantic_numeric_question_with_nominal_bounds_on_the_range_is_elicited_per_bin(self) -> None:
+        """Post 560's shape: a plain NumericQuestion (not discrete) on a 30-bin grid is an outcome-space grid too."""
+        question = make_real_numeric_question(
+            lower_bound=100.0, upper_bound=6100.0, open_lower_bound=True, open_upper_bound=True
+        ).model_copy(
+            update={
+                "page_url": _mantic_url(560),
+                "cdf_size": 31,
+                "nominal_lower_bound": 100.0,
+                "nominal_upper_bound": 6100.0,
+            }
+        )
+        assert numeric_config.elicit_per_bin(question) is True
+
+
+class TestElicitPerBinIsManticOnlyByOneConstant:
+    def test_a_metaculus_discrete_question_stays_on_percentiles(self) -> None:
+        assert numeric_config.elicit_per_bin(_count_question(11, page_url=_metaculus_url(700))) is False
+
+    def test_adding_metaculus_to_the_platform_set_is_the_whole_switch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            numeric_config, "PMF_ELICITATION_PLATFORMS", frozenset({PLATFORM_MANTIC, PLATFORM_METACULUS})
+        )
+        assert numeric_config.elicit_per_bin(_count_question(11, page_url=_metaculus_url(700))) is True
+        assert numeric_config.elicit_per_bin(_count_question(32, page_url=_metaculus_url(700))) is False

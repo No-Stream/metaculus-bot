@@ -38,10 +38,13 @@ from metaculus_bot.exceptions import UnitMismatchError
 from metaculus_bot.llm_configs import STACKER_FALLBACK_LLM
 from metaculus_bot.member_forecast import (
     MEMBER_FORECAST_ROLE_STACKER,
+    NUMERIC_COMBINE_METHOD_SINGLE,
+    NUMERIC_COMBINE_METHOD_STACKED,
     format_member_forecast_marker,
     out_of_range_mass,
     percentile_pairs,
 )
+from metaculus_bot.numeric.config import elicit_per_bin
 from metaculus_bot.numeric.date_axis import numeric_qtype, numeric_view
 from metaculus_bot.numeric.diagnostics import log_final_prediction, log_open_bound_piling_diagnostics
 from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
@@ -86,6 +89,8 @@ class AggregationPipeline:
     # the single-forecaster short-circuit (which computes no spread at all) stops
     # reading identically to a spread-below-threshold skip in the published record.
     skip_reasons: dict[int, str] = field(default_factory=dict)
+    # The NUMERIC_AGGREGATE ``method`` per question (tokens in member_forecast.py); popped by the forecaster's seam.
+    numeric_combine_methods: dict[int, str] = field(default_factory=dict)
     expected_base_combines: set[int] = field(default_factory=set)
     counters: AggregationCounters = field(default_factory=AggregationCounters)
 
@@ -304,6 +309,9 @@ class AggregationPipeline:
                 and self.skip_reasons.get(qkey) == "single_forecaster"
             ):
                 return self._floor_single_survivor_binary(cast(float, lone), qkey)
+            # setdefault: a pre-stacked output re-enters here after stack_predictions already recorded it.
+            if isinstance(question, (NumericQuestion, DateQuestion)) and qkey is not None:
+                self.numeric_combine_methods.setdefault(qkey, NUMERIC_COMBINE_METHOD_SINGLE)
             # Snap-to-integers for a lone numeric prediction — the
             # min-forecasters=1 single-survivor path (forecaster.py short-circuits
             # spread + stacking and hands the raw prediction through). No-op for
@@ -312,11 +320,12 @@ class AggregationPipeline:
             # is empty and majority_votes_discrete([]) is False).
             return self._maybe_snap_to_integers(lone, question)
 
-        # CONDITIONAL_STACKING uses MEDIAN; regular STACKING uses MEAN
-        base_combine_strategy = (
+        # CONDITIONAL_STACKING uses MEDIAN; regular STACKING uses MEAN; per-bin members are pooled
+        base_combine_strategy = self._numeric_combine_strategy(
+            question,
             AggregationStrategy.MEDIAN
             if self.strategy == AggregationStrategy.CONDITIONAL_STACKING
-            else AggregationStrategy.MEAN
+            else AggregationStrategy.MEAN,
         )
         strategy_name = base_combine_strategy.value
         self._log_base_combine_strategy(len(predictions), strategy_name, expected=expected)
@@ -418,7 +427,7 @@ class AggregationPipeline:
                 timeout=STACKER_SOFT_DEADLINE,
             )
             self.outcomes[qid_for_outcome] = "primary"
-            return self._apply_platt_calibration(self._maybe_snap_to_integers(stacked, question), question)
+            return self._adopt_stacked(stacked, question)
         # Deliberate fallback ladder: ANY primary-stacker failure (timeout, API, parse)
         # degrades to the fallback LLM rather than dropping the question.
         except Exception as primary_exc:  # HARNESS-SCAN-EXEMPT-broad-except
@@ -451,7 +460,7 @@ class AggregationPipeline:
                     question.id_of_question,
                 )
                 self.outcomes[qid_for_outcome] = "fallback_llm"
-                return self._apply_platt_calibration(self._maybe_snap_to_integers(stacked, question), question)
+                return self._adopt_stacked(stacked, question)
             # Boundary, last rung of the ladder: fallback-stacker failure degrades to MEDIAN,
             # never drops the question. Narrowing here would turn an unexpected stacker
             # failure into a lost forecast.
@@ -474,9 +483,41 @@ class AggregationPipeline:
         question: MetaculusQuestion,
     ) -> PredictionTypes:
         combined = self._combine_by_type(
-            predictions, question, AggregationStrategy.MEDIAN, error_context="MEDIAN fallback"
+            predictions,
+            question,
+            self._numeric_combine_strategy(question, AggregationStrategy.MEDIAN),
+            error_context="MEDIAN fallback",
         )
         return self._apply_platt_calibration(self._maybe_snap_to_integers(combined, question), question)
+
+    def _adopt_stacked(self, stacked: PredictionTypes, question: MetaculusQuestion) -> PredictionTypes:
+        """The stacker's output becomes the report's prediction: record the method, then post-process."""
+        self._record_numeric_combine_method(question, NUMERIC_COMBINE_METHOD_STACKED)
+        return self._apply_platt_calibration(self._maybe_snap_to_integers(stacked, question), question)
+
+    @staticmethod
+    def _numeric_combine_strategy(question: MetaculusQuestion, strategy: AggregationStrategy) -> AggregationStrategy:
+        """The linear opinion pool for per-bin members; ``strategy`` unchanged for everything else.
+
+        A member elicited per bin (``elicit_per_bin``: a Mantic enumerable grid) can be sharp, 0.99
+        on one bin, and the pointwise MEDIAN of three sharp CDFs that disagree is the middle member's
+        CDF outright: 0.99 on its bin and the platform floor on the bins the other two believed,
+        the cliff a log score in the resolved bin punishes hardest (about -230 Series 1 points on
+        question 651's 12-bin grid). The pointwise MEAN of the CDFs is the CDF of the mixture PMF,
+        so every believed bin keeps a third of the mass a member gave it (+69), and
+        ``aggregate_numeric(..., "mean")`` already computes it. The elicitation is decided per
+        question, so an ensemble never mixes the two kinds of member; percentile members keep the
+        median on both platforms, and binary and MC questions are untouched.
+        """
+        if isinstance(question, (NumericQuestion, DateQuestion)) and elicit_per_bin(numeric_view(question)):
+            return AggregationStrategy.MEAN
+        return strategy
+
+    def _record_numeric_combine_method(self, question: MetaculusQuestion, method: str) -> None:
+        """Remember how a numeric or date question's members were combined; the aggregation seam pops it."""
+        qid = question.id_of_question
+        if isinstance(question, (NumericQuestion, DateQuestion)) and qid is not None:
+            self.numeric_combine_methods[qid] = method
 
     def simple_combine(
         self,
@@ -491,8 +532,9 @@ class AggregationPipeline:
             "Aggregating %s predictions with %s", self._prediction_type_label(first_prediction), self.strategy.value
         )
 
-        effective_strategy = (
-            AggregationStrategy.MEDIAN if self.strategy == AggregationStrategy.CONDITIONAL_STACKING else self.strategy
+        effective_strategy = self._numeric_combine_strategy(
+            question,
+            AggregationStrategy.MEDIAN if self.strategy == AggregationStrategy.CONDITIONAL_STACKING else self.strategy,
         )
 
         combined = self._combine_by_type(predictions, question, effective_strategy, error_context="aggregation")
@@ -550,6 +592,7 @@ class AggregationPipeline:
             return combine_binary_predictions(values, strategy)  # type: ignore[return-value]
         if isinstance(first, NumericDistribution) and isinstance(question, (NumericQuestion, DateQuestion)):
             numeric_preds = [p for p in predictions if isinstance(p, NumericDistribution)]
+            self._record_numeric_combine_method(question, strategy.value)
             # A date question's members live on the epoch-seconds axis; the combiner reads the
             # bounds and grid off the same view, so the ensemble CDF carries is_date too.
             return combine_numeric_predictions(numeric_preds, numeric_view(question), strategy)  # type: ignore[return-value]

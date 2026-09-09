@@ -5,8 +5,10 @@ distribution. It covers the full path: each forecaster declares the standard per
 set in plain text, the bot extracts and cleans them, builds a 201-point CDF that
 satisfies Metaculus' server-side constraints, aggregates across the ensemble in CDF
 space, and decides whether the ensemble disagrees enough to trigger conditional
-stacking. It also documents the time-series anchor research provider, which grounds
-numeric forecasts in the resolution series' own history.
+stacking. On a coarse Mantic grid whose bins are the outcome space, forecasters instead
+declare one probability per bin and the CDF is built from that PMF ("Per-bin elicitation
+on enumerable grids", between Steps 4 and 5). It also documents the time-series anchor
+research provider, which grounds numeric forecasts in the resolution series' own history.
 
 Every model name, flag, and default here is verified against the code. Where a value
 lives in a constants file this doc names the constant rather than restating its value,
@@ -236,6 +238,105 @@ and `k_tail=1.25` moved away from ideal in every segment (see
 still per-call configurable, and the function raises `ValueError` if asked to narrow
 rather than widen (narrowing is not implemented) or on a negative `span_floor_gamma`.
 
+## Per-bin elicitation on enumerable grids
+
+Steps 1 to 4 and the PCHIP build in Step 5 are the percentile path. On a coarse grid whose
+bins ARE the outcome space, the bot instead asks each forecaster for one probability per bin
+and builds the CDF from that PMF directly. Thirteen percentile anchors cannot say "zero on this
+bin", and PCHIP spreads mass onto bins the criteria exclude: Mantic question 651 (twelve
+one-day bins, 8 to 19 September 2026, a trading-day question) has three weekend bins that
+cannot resolve, and a percentile declaration put about a quarter of the mass on them, `50 *
+ln(0.75) = -14.4` baseline points for no information. On a count grid of 13 bins or fewer,
+13 strictly increasing percentile values cannot even exist, so the model repeats integers and
+the pipeline reads a degenerate declaration. Motivation, corpus counts and the rejected
+alternative (an `excluded_bins` list on the percentile block): `FUTURE.md`, "Mantic Crucible".
+
+**The gate** is `elicit_per_bin` (`numeric/config.py`): the question's platform is in
+`PMF_ELICITATION_PLATFORMS`, the grid is an outcome space (`grid_is_outcome_space`: a
+`DiscreteQuestion`, or any non-201 grid) and the bin count `cdf_size - 1` is at most
+`PMF_ELICITATION_MAX_BINS`. The platform set is Mantic-only for the first landing, because the
+ask is unproven live and on Metaculus it would move about half of all discrete questions (141
+of 300 sampled have 31 bins or fewer); adding `PLATFORM_METACULUS` to that one constant is the
+whole switch. By construction the gate is false on the 201-point continuous grid and on a
+200-bin Mantic discrete question, so both keep the percentile path byte-identical. A date
+question is gated on its epoch adapter (`numeric/date_axis.py`), which carries `page_url`.
+
+**The labels** (`numeric/pmf_grid.py`, `pmf_grid`) name each bin the way the platform displays
+it: the ISO date of the first UTC day a bin covers on a `day` or `week` date grid, the bin centre
+on a centre-aligned quantity grid (the discrete convention, `range_min = nominal_min - step /
+2`; a count question's bins are `0`, `1`, ...), and a right-closed `a to b` interval otherwise.
+The reserved keys `below_range` and `above_range` (`PMF_BELOW_RANGE_KEY` / `PMF_ABOVE_RANGE_KEY`
+in `constants.py`) appear only where the bound is open. The edges are `build_cdf_value_grid` on
+the question's own axis, which reproduces the platform's `continuous_range` exactly, so a label
+names the same bin the platform scores. The prompt's bound messages come from
+`pmf_bound_messages` (`numeric/utils.py`), the per-bin twin of `bound_messages`: same displayed
+bounds and order, but an open bound is described as its reserved key ("the probability that the
+outcome resolves above ...; scored as its own outcome") and a closed bound says there is no
+such key, instead of the percentile wording.
+
+**The build** is `build_pmf_distribution(declared, view, model_name=...)` in
+`numeric/pmf_cdf.py`. Its input is the platform's own PMF shape, `[below, p_0, ..., p_{N-1},
+above]` with `N + 2` entries and a closed tail's entry at 0.0 (the shape Mantic exposes for
+every stored forecast and the `MEMBER_FORECAST` marker records as `raw`). In order:
+
+1. **Refuse mass in a closed tail.** A positive `below` on a closed lower bound, or `above` on a
+   closed upper bound, raises `ValueError`. The extraction ladder rejects a reserved key on a
+   closed bound, so no runner input arrives this way, but the builder is a public boundary and a
+   guard fails shut: the first design pinned `cdf[0] = 0.0` after the cumulative sum, which
+   silently moved a closed tail's mass into the first in-range bin (the plan review reproduced
+   0.297 landing in bin 1). A malformed vector (wrong length, non-finite, negative, zero sum)
+   raises `ValueError` too.
+2. **Normalise** to sum 1 (the ladder bounds the declared sum to within 2% of 1.0).
+3. **Blend toward the cell floors.** The server needs every in-range step to be at least
+   `round(0.01 / N, 9)` and an open tail to be at least 0.001 (`grid_step_constraints`). Let `f`
+   be the vector of cell floors, each non-zero floor raised by `PMF_FLOOR_MARGIN` (1e-9, so the
+   server's 9-decimal PMF rounding can never land a cell one unit under its floor) and a closed
+   tail's floor 0, and `t = f / sum(f)` the floor distribution. The declaration `p` becomes
+   `(1 - alpha) p + alpha t` with the smallest `alpha` that lifts every deficient cell to its
+   floor: `max((f_i - p_i) / (t_i - p_i))` over the cells with `p_i < f_i`. That weight exists
+   and is at most `sum(f)` (about 0.012), because `t_i > f_i > p_i` on every deficient cell.
+   It is `_blend_with_uniform`'s idea (Step 5) applied to the cell floors exactly instead of to
+   a uniform mixture, so it moves the least mass possible: a bin the model set to 0 ends up at
+   exactly `min_step + 1e-9`, a certain member keeps 0.988 to 0.992 on its bin (0.9908 on
+   651's 12-bin closed grid), and a declaration that already meets every floor is returned
+   unchanged, which also makes the blend idempotent.
+4. **Assemble** `cdf[0] = p'[0]`, `cdf[k] = cdf[k-1] + p'[k]`, so `cdf[N] = 1 - p'[N+1]`; pin a
+   closed bound to exactly 0.0 / 1.0 (step 1 guarantees only float residue moves).
+5. **`safe_cdf_bounds`** with the grid's own limits: the one implementation of the open-bound
+   pins, the max-step packing and its `CDF_MAXSTEP_CLIP` marker (Step 5). At 31 bins or fewer
+   the cap is 1.0, so the packing never fires today; it is there so raising the threshold past
+   40 bins needs no new code. Closed bounds are re-pinned afterwards.
+6. **`validate_grid_cdf`**, a fail-SHUT replica of the server rules below: length `cdf_size`, no
+   NaN, every 9-decimal-rounded step within `grid_step_constraints`, closed bounds exactly
+   pinned, open bounds at least 0.001 inside. Raises `RuntimeError`; nothing is repaired here.
+7. **Wrap** exactly as the discrete percentile build does (`create_pchip_numeric_distribution`,
+   Step 6): `declared_percentiles` is the CDF labelled by the grid edges, `cdf_size` is copied,
+   `is_date` comes from the epoch adapter, `zero_point` from `resolve_zero_point`. Nothing
+   downstream (publish, comment, spread, telemetry, aggregation) sees a new shape.
+   `published_pmf(prediction)` reads the `N + 2` PMF back out (`[cdf[0], diff(cdf)..., 1 -
+   cdf[-1]]`) for the `MEMBER_FORECAST` line's `published` field.
+
+**What the per-bin path bypasses, and why each bypass is right.** `sanitize_percentiles` (Step
+3) requires exactly the thirteen standard percentiles and there are none; nothing it does has a
+per-bin analogue worth building, the floor blend is the whole repair. The PCHIP repair tiers
+and `validate_cdf_construction` go with it at no loss (the latter returns immediately for any
+distribution carrying `_pchip_cdf_values`). The unit-mismatch guard (Step 8) catches values
+declared in the wrong units; a per-bin declaration states no values, only mass on labelled
+bins, so the failure mode cannot occur, and routing the grid-shaped `declared_percentiles`
+into it would make the guard fail open (all three ratios pass trivially on grid input). The
+residual risk on this path is label MISREADING, which the prompt's grid sentence addresses and
+no numeric guard can. The discrete vote and snap (Step 7) are already skipped on every
+outcome-space grid, and the open-bound piling diagnostic takes declared percentiles; on the
+per-bin path piling on an open edge IS the `above_range` value, which `oor_high` records.
+
+`tests/test_numeric_pmf_cdf.py` runs the server oracle (`assert_server_accepts_cdf`) on the
+build for six declaration shapes (one-hot on the first, middle and last bin, uniform, a
+half-half split, everything in an open tail) across 3, 4, 12, 21 and 31 bins by the three
+bound shapes Mantic uses, then across every one of the 32 distinct coarse grids in the
+recorded 2026-09-08 corpus (`tests/data/mantic_cdf_grids_2026_09_08.json`); it pins the
+floor arithmetic, the closed-tail refusal, every `validate_grid_cdf` raise path, and that the
+pointwise MEAN of three sharp members (Step 9) is itself server-legal on every oracle grid.
+
 ## Step 5: PCHIP 201-point CDF
 
 `build_numeric_distribution` (`numeric/pipeline.py`) hands the sanitized percentiles
@@ -278,6 +379,12 @@ pre-scaling cap the residual analysis reads back (`performance_analysis/analysis
 - **Closed bounds** are pinned exactly: `cdf[0] == 0.0`, `cdf[-1] == 1.0`.
 - **Open bounds**: `cdf[0] >= 0.001`, `cdf[-1] <= 0.999`.
 - **Strictly increasing**, implied by min step > 0.
+- **There is no flat 0.59 cap.** Mantic's OpenAPI schema text says no two adjacent CDF values
+  may differ by more than 0.59, "the largest number obtainable via the sliders"; that
+  describes the slider interface, not the validator. Of 4,318 stored competitor forecasts in
+  the 2026-09-08 corpus, 34 carry a single in-range bin above 0.59 (the maximum 0.8952 on a
+  15-bin grid, 0.8468 by the `Mantic` account itself) and none exceed `0.2 * 200 / N`, and the
+  upstream serializer has no such constant. A certain per-bin forecast is legal on every grid.
 
 The upstream source for all of this is the open-source Metaculus backend,
 <https://github.com/Metaculus/metaculus>, where the validation lives in
@@ -503,6 +610,23 @@ preserves it. In production the base-combine path uses **MEDIAN** of the raw per
 CDFs (`base_combine` in `aggregation_pipeline.py`, because the default strategy is
 `CONDITIONAL_STACKING` and stacking is disabled in prod). Backtests and the mean arm use
 MEAN.
+
+**Per-bin members are pooled by the MEAN, on every path.** A member elicited per bin ("Per-bin
+elicitation on enumerable grids", above) can be sharp, 0.99 on one bin, and the pointwise
+median of three sharp CDFs that disagree is the middle member's CDF outright: the published
+forecast then carries 0.99 on that member's bin and the platform floor on the bins the other
+two believed, the cliff a log score in the resolved bin punishes hardest. The linear opinion
+pool is the pointwise MEAN of the members' CDFs (the mean of CDFs at each grid index is the CDF
+of the mixture PMF), which `aggregate_numeric(..., "mean")` already computes. On question 651's
+12-bin grid, three members certain of bins 3, 5 and 7 publish 0.0008 / 0.9908 / 0.0008 under
+the median and 0.3308 each under the pool: expected Series 1 score `50 * ln(p / (1/12))` of
+-112 against +69 if the three bins are equally likely, and +6 against +92 when two members
+agree. The pool never gives a bin less than a third of the mass any member put there.
+`aggregation_pipeline._numeric_combine_strategy` returns MEAN when `elicit_per_bin` holds for
+the question's numeric view and the configured strategy otherwise, so percentile members keep
+the MEDIAN everywhere, on both platforms (the benchmarked median-over-mean decision in
+`FUTURE.md` stands for them). The `NUMERIC_AGGREGATE` marker records which rule ran in its
+trailing `method` field (`mean`, `median`, `stacked` or `single`).
 
 ## Step 10: the numeric spread metric
 

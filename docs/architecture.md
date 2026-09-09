@@ -181,6 +181,21 @@ dataset (`performance_analysis/collector.py`) and the ghost scorer (`scripts/sco
 see `docs/performance_analysis.md` "Date questions are excluded from the dataset". Detail:
 [numeric_pipeline.md](numeric_pipeline.md) and `docs/operations.md` "Date questions".
 
+**The per-bin path.** A Mantic numeric or date question whose published bins are its outcome space
+and number 31 or fewer (`elicit_per_bin`, `numeric/config.py`: `PMF_ELICITATION_PLATFORMS` is
+Mantic-only and `PMF_ELICITATION_MAX_BINS` is 31) is elicited per bin rather than as percentiles.
+`run_numeric_forecast` and `run_date_forecast` (`forecaster_runners.py`) branch into
+`_run_pmf_forecast` on that gate: `pmf_prompt` (`prompts.py`) asks for one probability per bin
+label (`numeric/pmf_grid.py`, plus `below_range` / `above_range` where a bound is open), the
+`pmf` ladder in `value_extraction.py` reads the block, and `numeric/pmf_cdf.py` normalizes the
+declaration, blends it to the server's per-cell floors and assembles the CDF, bypassing
+`sanitize_percentiles`, the PCHIP repair tiers, the discrete vote and the unit-mismatch guard
+(each bypass reasoned in [numeric_pipeline.md](numeric_pipeline.md) "Per-bin elicitation"). The
+`MEMBER_FORECAST` line carries `elicitation=pmf` with the `N + 2` PMF as `raw` and `published`.
+Per-bin members are aggregated by the pointwise MEAN of their CDFs, the linear opinion pool,
+rather than the median (section 5 below); the 201-point Metaculus continuous path and every
+Metaculus question are untouched because the gate is false for them by construction.
+
 The ensemble is a handful of forecaster LLMs, one per vendor. The exact roster
 rotates often, so **read `metaculus_bot/llm_configs.py` for the current list** rather
 than trusting any names written here. Support models (summarizer, parser, stacker,
@@ -221,7 +236,13 @@ Past the guard, every question logs `FORECASTERS_SURVIVED: question=... survived
 The default strategy is `CONDITIONAL_STACKING` (set in `cli.py`'s `main`). Conceptually:
 
 - Compute the spread across the N forecasts (`spread_metrics.compute_spread`).
-- **Low spread**: return the MEDIAN of the raw per-model predictions.
+- **Low spread**: return the MEDIAN of the raw per-model predictions. The one exception is a
+  question elicited per bin (the Mantic coarse grids of section 3): its members are combined
+  by the pointwise MEAN of their CDFs (`_numeric_combine_strategy`, `aggregation_pipeline.py`),
+  because the pointwise median of three sharp per-bin members is the middle member's CDF
+  outright, the platform floor on the bins the other two believed, and the mean keeps every
+  believed bin at least a third of its mass; `NUMERIC_AGGREGATE ... method=mean|median|stacked|single`
+  records the rule that ran. Percentile members keep the MEDIAN on both platforms.
 - **High spread**: extract the disagreement crux with the analyzer LLM (under
   `CRUX_SOFT_DEADLINE`), run a targeted search on it — OpenAI native search on the same
   `NATIVE_SEARCH_*` model, effort, verbosity and timeout settings the native-search provider

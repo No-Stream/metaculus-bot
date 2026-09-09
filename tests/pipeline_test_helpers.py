@@ -12,11 +12,15 @@ from datetime import UTC, datetime
 from typing import Any
 
 import numpy as np
-from forecasting_tools import BinaryQuestion, GeneralLlm, MultipleChoiceQuestion, NumericQuestion
+from forecasting_tools import BinaryQuestion, GeneralLlm, MultipleChoiceQuestion, NumericDistribution, NumericQuestion
+from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import DateQuestion
 
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
+from metaculus_bot.numeric.config import grid_step_constraints
+from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
+from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
 
 # ---------------------------------------------------------------------------
 # Canned LLM responses
@@ -169,16 +173,15 @@ class LlmRouter:
         return any(signal.lower() in prompt.lower() for signal in stacker_signals)
 
     def _is_forecaster_prompt(self, prompt: str) -> bool:
-        # All forecaster + stacker prompts now emit a fenced STRUCTURED FORECAST
-        # JSON block. Stacker prompts also match — the __call__ order routes them
-        # via ``_is_stacker_prompt`` first, so this signal only sees non-stacker
-        # LLM calls. The old ``"Probability:"`` cue is gone: the base binary
-        # prompt no longer requests a trailing "Probability: NN%" line.
+        """Every forecaster and stacker prompt asks for a fenced STRUCTURED FORECAST block.
+
+        Stacker prompts match too; ``__call__`` routes them through ``_is_stacker_prompt`` first,
+        so this signal only sees non-stacker LLM calls.
+        """
         return "STRUCTURED FORECAST" in prompt
 
     def _detect_question_type(self, prompt: str) -> str:
-        # Numeric prompt talks about "percentiles" extensively; MC prompt has an
-        # "Options (in resolution order):" line the others lack. Otherwise binary.
+        """Numeric prompts talk about percentiles, MC prompts list the options in resolution order; else binary."""
         if "percentile" in prompt.lower():
             return "numeric"
         if "options (in resolution order)" in prompt.lower():
@@ -413,3 +416,28 @@ def assert_server_accepts_cdf(probs: np.ndarray, *, cdf_size: int, open_lower: b
         assert rounded[-1] <= 0.999, f"open upper bound cdf[-1]={rounded[-1]} > 0.999"
     else:
         assert rounded[-1] == 1.0, f"closed upper bound cdf[-1]={rounded[-1]} != 1.0"
+
+
+def certain_of_bin(view: NumericQuestion, bin_index: int) -> NumericDistribution:
+    """A per-bin member certain of one bin on ``view``'s grid: the platform floor on every other bin.
+
+    The shape the per-bin floor blend hands the aggregator: a zero declared on a bin lands at
+    ``min_step + 1e-9`` and the believed bin keeps the rest. Built straight from the heights, the way
+    the tail floor rebuilds a published aggregate, so it needs no elicitation and no percentiles.
+    """
+    min_step, _ = grid_step_constraints(view.cdf_size)
+    floor = min_step + 1e-9
+    pmf = np.full(view.cdf_size - 1, floor)
+    pmf[bin_index] = 1.0 - (pmf.size - 1) * floor
+    heights = np.concatenate(([0.0], np.cumsum(pmf)))
+    heights[-1] = 1.0
+    values = build_cdf_value_grid(view.lower_bound, view.upper_bound, None, heights.size)
+    declared = [Percentile(percentile=float(h), value=float(v)) for h, v in zip(heights, values, strict=True)]
+    return create_pchip_numeric_distribution(
+        pchip_cdf=[float(h) for h in heights], percentile_list=declared, question=view, zero_point=None
+    )
+
+
+def pmf_of(distribution: NumericDistribution) -> np.ndarray:
+    """The per-bin mass of a built distribution: the first difference of its CDF heights."""
+    return np.diff(np.asarray([p.percentile for p in distribution.get_cdf()], dtype=float))

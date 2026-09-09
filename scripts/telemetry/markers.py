@@ -4,7 +4,10 @@ Each :class:`MarkerSpec` pairs a marker name (which is also its archive-file ste
 with a regex whose named groups are the marker's fields. The regexes are written
 against the ACTUAL emitted format strings (the source of truth):
 
-* ``EXTRACTION_RUNG``   — ``metaculus_bot/value_extraction.py`` ``_log_extraction``
+* ``EXTRACTION_RUNG``   — ``metaculus_bot/value_extraction.py`` ``_log_extraction`` (``qtype``
+  is the BLOCK type: a question type, or ``pmf`` for the per-bin block a Mantic enumerable grid
+  is elicited with since 2026-09-09; the question's own type is on the MEMBER_FORECAST line with
+  the same ``question`` and ``model``)
 * ``GAP_FILL_V2``       — ``metaculus_bot/research/agentic/loop.py`` ``_log_completion``
 * ``GHOST_PRE`` / ``GHOST_PRE_JSON`` — ``metaculus_bot/research/agentic/loop.py``
   ``_set_research_plan_tool`` (the pre-research counterpart to the concluding
@@ -51,13 +54,19 @@ against the ACTUAL emitted format strings (the source of truth):
   JSON. The one marker that carries a member's forecast value on every question; before
   it the raw value lived only in the trim-lossy published comment. A numeric or date line
   ends with the built CDF's out-of-range mass, ``oor_low`` / ``oor_high`` (optional in the
-  regex, so lines that predate the fields still parse)
+  regex, so lines that predate the fields still parse), and a member elicited PER BIN (a
+  Mantic enumerable grid, since 2026-09-09) ends with ``elicitation=pmf``, on which ``raw``
+  and ``published`` are the platform's ``N + 2`` PMF vector instead of percentile pairs; read
+  ``elicitation`` before interpreting ``raw``, and an absent field means percentiles
 * ``NUMERIC_AGGREGATE``  — ``metaculus_bot/member_forecast.py`` ``format_numeric_aggregate_marker``,
   emitted from ``forecaster.py`` ``_aggregate_predictions`` (per-QUESTION, numeric and date:
   the PUBLISHED distribution's grid size and out-of-range mass, the aggregate twin of the
   member fields above, then the same mass before the platform tail floor and the level the
   floor raised them to, ``oor_low_raw`` / ``oor_high_raw`` / ``tail_floor``; how the Mantic floor gets
-  benchmarked on this bot's own forecasts)
+  benchmarked on this bot's own forecasts; then ``method``, the rule the members were combined
+  by: ``mean`` is the linear opinion pool per-bin members get, ``median`` what percentile members
+  keep, ``stacked`` a stacker-adopted distribution, ``single`` a lone raw survivor, and
+  ``unrecorded`` a combine path that forgot to record itself, a bug signal)
 * ``CLOSE_MARGIN``      — ``metaculus_bot/close_margin.py`` (emitted at submit time in ``forecaster.py``)
 * ``MARKET_RANKING``    — ``metaculus_bot/research/prediction_market.py``
   ``_log_ranking_telemetry`` (per-QUESTION ranked-retrieval outcome: pool size,
@@ -1148,10 +1157,14 @@ MARKER_SPECS: list[MarkerSpec] = [
         # ``published``, ``cdf[0]`` and ``1 - cdf[-1]``, on numeric and date lines only. Optional
         # in the regex so every line that predates the fields and every binary / MC line (no
         # CDF, no fields) still harvests, with both fields None on those records.
+        #
+        # ``elicitation``: ``pmf`` when the member declared one probability per bin, on which ``raw``
+        # and ``published`` are the platform's N + 2 PMF vector. Its own optional group; None means percentiles.
         re.compile(
             r"MEMBER_FORECAST:\s*question=(?P<question>\S+)\s+model=(?P<model>.+?)\s+role=(?P<role>\S+)"
             r"\s+qtype=(?P<qtype>\S+)\s+raw=(?P<raw>\S+)\s+published=(?P<published>\S+)"
             r"(?:\s+oor_low=(?P<oor_low>\S+)\s+oor_high=(?P<oor_high>\S+))?"
+            r"(?:\s+elicitation=(?P<elicitation>\S+))?"
         ),
         qid_kind=QID_KIND_QUESTION_ID,  # every emitter passes question.id_of_question
         raw_fields=frozenset({"raw", "published"}),
@@ -1179,11 +1192,16 @@ MARKER_SPECS: list[MarkerSpec] = [
         # MEMBER_FORECAST they also say whether the models place mass beyond the bounds on their
         # own. The three are one optional group at the tail, so lines that predate them harvest
         # with all three None.
+        #
+        # ``method`` (2026-09-09): the rule the members were combined by, on every numeric and date
+        # question: ``mean`` (the linear opinion pool per-bin members get), ``median``, ``stacked``,
+        # ``single``, or ``unrecorded`` (a bug signal). Its own optional group; earlier lines read None.
         re.compile(
             r"NUMERIC_AGGREGATE:\s*question=(?P<question>\S+)\s+qtype=(?P<qtype>\S+)"
             r"\s+cdf_size=(?P<cdf_size>\d+)\s+oor_low=(?P<oor_low>\S+)\s+oor_high=(?P<oor_high>\S+)"
             r"(?:\s+oor_low_raw=(?P<oor_low_raw>\S+)\s+oor_high_raw=(?P<oor_high_raw>\S+)"
             r"\s+tail_floor=(?P<tail_floor>\S+))?"
+            r"(?:\s+method=(?P<method>\S+))?"
         ),
         qid_kind=QID_KIND_QUESTION_ID,  # forecaster.py passes question.id_of_question
     ),
