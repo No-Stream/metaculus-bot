@@ -1334,8 +1334,9 @@ stderr), so per-run spend is durably grep-able:
   every `usage_delta_unsettled` figure, so a `0.00` is never mistaken for
   no-spend. `scripts/reconcile_credit_spend.py` recovers the settled number.
 - `CREDIT_ROLE_SPEND: role=... key=... usd=... calls=... costed_calls=...
-  byok_usd=...`: one line per (role, key) at end of run, saying WHERE the
-  OpenRouter dollars went. See "Per-role spend" below.
+  byok_usd=... prompt_tokens=... completion_tokens=... cached_tokens=...
+  reasoning_tokens=...`: one line per (role, key) at end of run, saying WHERE the
+  OpenRouter dollars and tokens went. See "Per-role spend" below.
 - `CREDIT_FLOOR_BREACH: key=donated remaining=... floor=...` when the donated
   key's remaining balance drops below `OPENROUTER_CREDIT_FLOOR_USD`
   (`constants.py`, $100). That level is an early warning, not an empty tank. Read
@@ -1369,6 +1370,14 @@ How the number is produced, because it decides how to read it:
   `byok_usd=0.0000`. This is the provider's figure, not litellm's price table.
 - `usd=n/a` means none of that row's calls carried cost data. It is never a
   fabricated zero; `costed_calls` says how many of `calls` the sum covers.
+- The four token fields (since 2026-09-09) sum over every call of the row:
+  `prompt_tokens` / `completion_tokens` are the base counts, `cached_tokens` is
+  the prompt tokens the provider served from its prompt cache
+  (`prompt_tokens_details.cached_tokens`), and `reasoning_tokens` the hidden
+  reasoning output (`completion_tokens_details.reasoning_tokens`). Cache hit rate
+  per role is `cached_tokens / prompt_tokens`; the gap-fill v2 driver should sit
+  near 0.8 once the ghost call reuses the cache (`docs/agentic_gap_fill.md` "The
+  ghost forecast"), and a forecaster slot near 0.
 - `role=untagged` means a completion nobody stamped: forecasting-tools' own
   helpers, or a builder call site that forgot its `role=`. `key=unknown` is the
   same for the key.

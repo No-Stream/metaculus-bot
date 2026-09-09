@@ -1193,12 +1193,25 @@ sync. Missing coerces to None, which reads correctly as "this run predates the f
 ### CREDIT_ROLE_SPEND
 
 Per-(role, key) decomposition of the run's OpenRouter spend, read off OpenRouter's own per-call
-usage accounting (`credit_telemetry.py`, "Per-role dollar attribution"). `usd` is `n/a` when no
-call of that row carried cost data, never a fabricated zero, and `costed_calls` says how many of
-`calls` the sum covers. `byok_usd` is the upstream-provider component, i.e. the part the donated
-key books as `byok_usage`; the personal key is not BYOK, so its rows carry `byok_usd=0.0000`.
-Roles are the names in `credit_telemetry.llm_call_metadata` (`forecaster:<vendor>`, `parser`,
-`native_search`, ...); `untagged` means a completion nobody stamped.
+usage accounting (`credit_telemetry.py`, "Per-role dollar attribution"; the field semantics and
+their receipts are in `docs/operations.md` "Per-role spend"). `usd` is `n/a` when no call of that
+row carried cost data, never a fabricated zero, and `costed_calls` says how many of `calls` the
+sum covers. `byok_usd` is the sum of `usage.cost_details.upstream_inference_cost`, the
+upstream-provider charge OpenRouter reports beside its own `usage.cost`. Roles are the names in
+`credit_telemetry.llm_call_metadata` (`forecaster:<vendor>`, `parser`, `native_search`, ...);
+`untagged` means a completion nobody stamped.
+
+Token fields, added 2026-09-09 and summed over every call of the row (costed or not):
+`prompt_tokens` and `completion_tokens` are the base counts; `cached_tokens` is
+`usage.prompt_tokens_details.cached_tokens`, the prompt tokens the provider served from its prompt
+cache, and `reasoning_tokens` is `usage.completion_tokens_details.reasoning_tokens`, the hidden
+reasoning output billed at the completion rate. Each detail count is 0 when the provider reports
+nothing, so `cached_tokens / prompt_tokens` is the row's cache hit rate and
+`reasoning_tokens / completion_tokens` its reasoning share. They exist because the 2026-09-09 cost
+pass had to FIT the gap-fill v2 driver's output tokens and could only infer that its prompt cache
+was active (`scratch/cost_pass_2026-09-09/v2_cost_anatomy.md`); with these fields both are read
+straight off the ledger. The tail is one optional regex group, so the 44 rows archived before it
+still harvest, with the four token fields coerced to None ("this run predates the field").
 
 ### CREDIT_FLOOR_BREACH
 

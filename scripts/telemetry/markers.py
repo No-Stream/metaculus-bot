@@ -675,10 +675,12 @@ MARKER_SPECS: list[MarkerSpec] = [
     ),
     MarkerSpec(
         "credit_role_spend",
-        # Why: usd reads n/a when uncosted, never a fake zero. Receipt: docs/telemetry_markers.md "CREDIT_ROLE_SPEND".
+        # Why: the token tail is optional so pre-2026-09-09 rows parse. Receipt: docs/telemetry_markers.md "CREDIT_ROLE_SPEND".
         re.compile(
             r"CREDIT_ROLE_SPEND:\s*role=(?P<role>\S+)\s+key=(?P<key>\S+)\s+usd=(?P<usd>\S+)\s+calls=(?P<calls>\d+)"
             r"\s+costed_calls=(?P<costed_calls>\d+)\s+byok_usd=(?P<byok_usd>\S+)"
+            r"(?:\s+prompt_tokens=(?P<prompt_tokens>\d+)\s+completion_tokens=(?P<completion_tokens>\d+)"
+            r"\s+cached_tokens=(?P<cached_tokens>\d+)\s+reasoning_tokens=(?P<reasoning_tokens>\d+))?"
         ),
     ),
     MarkerSpec(

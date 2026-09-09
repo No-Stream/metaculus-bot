@@ -1701,9 +1701,15 @@ class TestCredit:
 # Verbatim from credit_telemetry.py:log_role_spend, so a producer-side shape change breaks these loudly.
 CREDIT_ROLE_SPEND_LINE = (
     PFX + "CREDIT_ROLE_SPEND: role=forecaster:openai key=donated usd=0.2030 calls=2 costed_calls=2 byok_usd=0.2000"
+    " prompt_tokens=104000 completion_tokens=12500 cached_tokens=0 reasoning_tokens=11000"
 )
 CREDIT_ROLE_SPEND_NA_LINE = (
     PFX + "CREDIT_ROLE_SPEND: role=perplexity_research key=direct usd=n/a calls=2 costed_calls=0 byok_usd=n/a"
+    " prompt_tokens=0 completion_tokens=0 cached_tokens=0 reasoning_tokens=0"
+)
+# The pre-2026-09-09 shape, still in the archive: no token tail.
+CREDIT_ROLE_SPEND_PRE_TOKENS_LINE = (
+    PFX + "CREDIT_ROLE_SPEND: role=forecaster:google key=personal usd=1.1433 calls=4 costed_calls=4 byok_usd=0.5716"
 )
 CREDIT_ROLE_SPEND_EMPTY_LEDGER_LINE = (
     PFX + "CREDIT_ROLE_SPEND: no successful LLM completions reached the litellm success callback this run"
@@ -1721,6 +1727,24 @@ class TestCreditRoleSpend:
         assert rec["calls"] == 2
         assert rec["costed_calls"] == 2
         assert rec["byok_usd"] == 0.2000
+        assert (rec["prompt_tokens"], rec["completion_tokens"]) == (104000, 12500)
+        assert (rec["cached_tokens"], rec["reasoning_tokens"]) == (0, 11000)
+
+    def test_pre_token_rows_still_parse_with_the_token_fields_absent(self):
+        """The token tail was added 2026-09-09; the 44 archived rows before it must keep harvesting,
+        and their token fields read None ("this run predates the field"), never a fake zero."""
+        rec = _parse_one(CREDIT_ROLE_SPEND_PRE_TOKENS_LINE)
+        assert (rec["role"], rec["key"], rec["usd"], rec["byok_usd"]) == (
+            "forecaster:google",
+            "personal",
+            1.1433,
+            0.5716,
+        )
+        assert (rec["calls"], rec["costed_calls"]) == (4, 4)
+        assert rec["prompt_tokens"] is None
+        assert rec["completion_tokens"] is None
+        assert rec["cached_tokens"] is None
+        assert rec["reasoning_tokens"] is None
 
     def test_uncosted_row_reads_none_not_zero(self):
         """``n/a`` is the whole point of ``costed_calls``: the calls happened, the dollars are unknown, and a

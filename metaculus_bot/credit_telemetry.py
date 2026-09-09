@@ -86,7 +86,7 @@ import logging
 import math
 import os
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
@@ -581,12 +581,39 @@ def plain_llm_key_alias(model: str) -> str:
     return PERSONAL_KEY_ALIAS if model.startswith("openrouter/") else DIRECT_KEY_ALIAS
 
 
+@dataclass(frozen=True)
+class TokenCounts:
+    """Token counts off one completion's ``usage``, summed per row on the ledger.
+
+    ``cached`` is ``prompt_tokens_details.cached_tokens`` (prompt tokens read from the
+    provider's prompt cache) and ``reasoning`` is ``completion_tokens_details.reasoning_tokens``
+    (hidden reasoning output); each is 0 when the provider reports nothing.
+    """
+
+    prompt: int = 0
+    completion: int = 0
+    cached: int = 0
+    reasoning: int = 0
+
+    def __add__(self, other: TokenCounts) -> TokenCounts:
+        return TokenCounts(
+            prompt=self.prompt + other.prompt,
+            completion=self.completion + other.completion,
+            cached=self.cached + other.cached,
+            reasoning=self.reasoning + other.reasoning,
+        )
+
+
+NO_TOKENS: TokenCounts = TokenCounts()
+
+
 @dataclass
 class _RoleSpendAccumulator:
     calls: int = 0
     costed_calls: int = 0
     usd: float = 0.0
     byok_usd: float = 0.0
+    tokens: TokenCounts = field(default_factory=TokenCounts)
 
 
 @dataclass(frozen=True)
@@ -600,23 +627,30 @@ class RoleSpendRow:
     costed_calls: int
     usd: float | None
     byok_usd: float | None
+    tokens: TokenCounts
 
 
 _role_spend: dict[tuple[str, str], _RoleSpendAccumulator] = {}
 
 
 def record_llm_call_spend(
-    role: str, key_alias: str, *, cost_usd: float | None, byok_upstream_usd: float | None
+    role: str,
+    key_alias: str,
+    *,
+    cost_usd: float | None,
+    byok_upstream_usd: float | None,
+    tokens: TokenCounts = NO_TOKENS,
 ) -> None:
     """Add one successful completion to the ledger.
 
     ``cost_usd`` is OpenRouter's ``usage.cost`` (credits drawn from the key) and
     ``byok_upstream_usd`` its ``cost_details.upstream_inference_cost`` (the provider's
-    charge on a BYOK route). A call with neither is counted but not costed. Synchronous
-    and await-free by design — see the THREADING note above.
+    charge on a BYOK route). A call with neither is counted but not costed; its tokens are
+    summed either way. Synchronous and await-free by design — see the THREADING note above.
     """
     accumulator = _role_spend.setdefault((role, key_alias), _RoleSpendAccumulator())
     accumulator.calls += 1
+    accumulator.tokens = accumulator.tokens + tokens
     if cost_usd is None and byok_upstream_usd is None:
         return
     accumulator.costed_calls += 1
@@ -634,6 +668,7 @@ def role_spend_rows() -> list[RoleSpendRow]:
             costed_calls=acc.costed_calls,
             usd=acc.usd if acc.costed_calls else None,
             byok_usd=acc.byok_usd if acc.costed_calls else None,
+            tokens=acc.tokens,
         )
         for (role, key_alias), acc in _role_spend.items()
     ]
@@ -664,24 +699,54 @@ def log_role_spend() -> None:
         return
     for row in rows:
         logger.info(
-            "CREDIT_ROLE_SPEND: role=%s key=%s usd=%s calls=%d costed_calls=%d byok_usd=%s",
+            "CREDIT_ROLE_SPEND: role=%s key=%s usd=%s calls=%d costed_calls=%d byok_usd=%s"
+            " prompt_tokens=%d completion_tokens=%d cached_tokens=%d reasoning_tokens=%d",
             row.role,
             row.key_alias,
             _fmt_usd(row.usd),
             row.calls,
             row.costed_calls,
             _fmt_usd(row.byok_usd),
+            row.tokens.prompt,
+            row.tokens.completion,
+            row.tokens.cached,
+            row.tokens.reasoning,
         )
 
 
-def _openrouter_usage_cost(response_obj: Any) -> tuple[float | None, float | None]:
-    """``(usage.cost, usage.cost_details.upstream_inference_cost)`` off a litellm response,
-    each ``None`` when unreported (or non-finite, same rule as ``_as_float``)."""
+@dataclass(frozen=True)
+class _CallUsage:
+    """What one completion's ``usage`` object says about money and tokens."""
+
+    cost_usd: float | None
+    byok_upstream_usd: float | None
+    tokens: TokenCounts
+
+
+def _usage_token_counts(usage: Any) -> TokenCounts:
+    prompt_details = usage.prompt_tokens_details
+    completion_details = usage.completion_tokens_details
+    return TokenCounts(
+        prompt=usage.prompt_tokens or 0,
+        completion=usage.completion_tokens or 0,
+        cached=(prompt_details.cached_tokens if prompt_details is not None else None) or 0,
+        reasoning=(completion_details.reasoning_tokens if completion_details is not None else None) or 0,
+    )
+
+
+def _openrouter_call_usage(response_obj: Any) -> _CallUsage:
+    """Read ``usage.cost``, ``usage.cost_details.upstream_inference_cost`` and the token counts
+    off a litellm response; each dollar figure is ``None`` when unreported (or non-finite, same
+    rule as ``_as_float``), and a response without ``usage`` reads as uncosted with zero tokens."""
     usage = getattr(response_obj, "usage", None)
     if usage is None:
-        return None, None
+        return _CallUsage(cost_usd=None, byok_upstream_usd=None, tokens=NO_TOKENS)
     cost_details = usage.get("cost_details") or {}
-    return _as_float(usage.get("cost")), _as_float(cost_details.get("upstream_inference_cost"))
+    return _CallUsage(
+        cost_usd=_as_float(usage.get("cost")),
+        byok_upstream_usd=_as_float(cost_details.get("upstream_inference_cost")),
+        tokens=_usage_token_counts(usage),
+    )
 
 
 class RoleSpendTracker(CustomLogger):
@@ -693,12 +758,13 @@ class RoleSpendTracker(CustomLogger):
     ) -> None:
         del start_time, end_time  # CustomLogger hook signature; the ledger is not timed
         metadata = (kwargs.get("litellm_params") or {}).get("metadata") or {}
-        cost_usd, byok_upstream_usd = _openrouter_usage_cost(response_obj)
+        usage = _openrouter_call_usage(response_obj)
         record_llm_call_spend(
             metadata.get(ROLE_METADATA_KEY, UNTAGGED_ROLE),
             metadata.get(KEY_ALIAS_METADATA_KEY, UNKNOWN_KEY_ALIAS),
-            cost_usd=cost_usd,
-            byok_upstream_usd=byok_upstream_usd,
+            cost_usd=usage.cost_usd,
+            byok_upstream_usd=usage.byok_upstream_usd,
+            tokens=usage.tokens,
         )
 
 
