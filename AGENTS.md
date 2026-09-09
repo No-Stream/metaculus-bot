@@ -455,4 +455,6 @@ After pushing, check the run:
 | `README.md` | Human quick-start: install, configure, run. |
 | `FUTURE.md` | The design log: intent, history, and rejected ideas. Read it for the why, not for current state. |
 | `docs/supply_probe.md` | The question-supply probe: why it exists, what each report block means, the Mantic mode and its public-snapshot caveat, the API facts it is built around. |
+| `docs/constants.md` | Constants and their receipts: for every value in `constants.py`, the measurement, incident or decision behind it, one entry per constant in file order; the code keeps one line of why and a pointer here. |
+| `docs/telemetry_markers.md` | The telemetry marker registry: the index of run-log markers and their emitters, how the harvester matches them, the qid_kind convention, the HTML-comment markers and the harvesting gap, and one entry per `MarkerSpec` with its fields and receipts. |
 | `scratch_docs_and_planning/residual_analysis_playbook.md` | The per-round residual procedure. |

@@ -51,6 +51,90 @@ Publication happens inside the framework's forecast loop, not in `cli.py`. Every
 question that clears the min-forecasters guard is already on the platform (Metaculus,
 or Mantic in `--mode mantic`) by the time `cli.py` decides the exit code.
 
+### CLI startup wiring (`_configure_process`, `main`)
+
+`_configure_process` does the process-global setup, and it runs at the runtime entry
+point rather than at module import so that test imports and library consumers do not
+inherit these mutations. Four things happen in it, in order.
+
+Logging first. The root logger is configured at INFO, LiteLLM's own logger is pinned to
+WARNING with propagation off, `metaculus_bot.forecaster` runs at DEBUG so a run log
+carries the full per-question trace, and `openai.agents` is pinned to ERROR because it
+is noisy at INFO.
+
+Then the two client hardening patches. `apply_publish_hardening()` wraps the publish
+POSTs with a timeout and a retry, bounded tighter than the upstream default, because a
+single hung POST would block the whole batch (`metaculus_bot/publish_hardening.py` holds
+the rationale). `apply_fetch_hardening()` wraps the question-list GET with a bounded
+retry, because one transient 403, 429 or 5xx would otherwise kill the whole run
+(`metaculus_bot/fetch_hardening.py`).
+
+Then `reset_post_drop_count()`. The Mantic parse-drop counter is process-global, since
+the client has no link back to the bot, and it is read into the exit arithmetic at the
+end of the run. It is reset at startup rather than in `forecast_questions` because the
+fetch it counts happens before those resets run.
+
+Last the identity preflight (`metaculus_bot/api_preflight.py`), which exists because of
+the DNS-parking incident: one unauthenticated check before any mode sends its token, so the
+token never reaches a hijacked host. A Mantic run never contacts metaculus.com, so it does
+not depend on Metaculus DNS health, and `_assert_personal_keys_only()` runs before even that
+check, because the platform that donated the key is not the one being forecast (see
+`docs/operations.md` "Personal keys only, and the switch fails shut").
+
+`main` then wires the run, and four of its decisions are worth stating.
+
+Mode selection (`_question_source`) pins `skip_previously_forecasted_questions` on for
+every tournament-shaped mode, so a re-run cannot re-spend on questions already forecast.
+The Metaculus cup is a good way to read the bot's performance on regularly open
+questions; `mantic` is the same tournament shape over the Mantic slug, forecast through
+the `ManticClient` that `main` injects; and the evergreen `test_questions` set is a good
+way to read performance on a single question.
+
+The roster dict is annotated `dict[str, Any]` deliberately. Its `"forecasters"` slot
+holds a `list[GeneralLlm]` while the helper slots hold single `GeneralLlm` values, and
+the parent `ForecastBot.__init__` annotates `llms` as `dict[str, str | GeneralLlm]`,
+which, being invariant, cannot express the list value. `prepare_llm_config` consumes the
+`"forecasters"` list at runtime.
+
+The Mantic client is built after `_configure_process`, so the fail-shut key check and the
+identity preflight have both passed before the Mantic token is even read; `None` leaves
+the framework on its default Metaculus client. The two authenticated GETs that follow are
+described in `docs/operations.md` "Startup checks and robustness rules".
+
+Research persistence flushes inside the forecast `finally`. Records accumulate in memory
+for the whole run, so an exception escaping `asyncio.run` (an `OSError`, the
+invalid-run-mode `ValueError`, a `KeyboardInterrupt`, the SIGTERM from the 300-minute
+`timeout-minutes`) would otherwise discard every question's research, and a 40-question
+run that died on the last question would archive nothing. The workflows' upload step is
+`if: always()`, so a crashed run's partial batch still reaches the GitHub Actions
+artifact.
+
+What `main` does after forecasting, the end-of-run breakdown line and the ordered exit
+paths, is in `docs/operations.md` "The end-of-run breakdown and the exit ladder".
+
+#### The research-archive label (`persisted_tournament_id`, `persisted_platform`)
+
+Both functions are pure and keyed on the run mode. The tournament label is not pinned to
+`TOURNAMENT_ID` because `ResearchPersistenceWriter` stamps `tournament_id` on every
+record and residual analysis buckets and joins on it. A cup run labelled with the BOT
+tournament's slug files cup questions inside the tournament's config eras and inside the
+supply probe's per-slug rows, which is a silent data-corruption bug rather than a
+cosmetic one: the label is the only thing on the record that says which competition the
+question came from, since `run_mode` distinguishes the pipeline and not the object.
+
+`mantic` is labelled with the Mantic tournament slug, and `persisted_platform` stamps the
+platform (`mantic` or `metaculus`) beside it; what that platform field can and cannot
+protect against is in `docs/operations.md` "How the mode works".
+
+`test_questions` deliberately keeps `TOURNAMENT_ID`. The evergreen example set belongs to
+no tournament, so no label is right; `run_mode` is what separates those records, and
+re-labelling them now would make the archive's existing test-run records incomparable
+with future ones for no gain.
+
+`persisted_tournament_id` raises on an unknown mode, for the same reason
+`_question_source` does: a mode added to `RunMode` without a decision here should fail
+loudly at startup rather than mislabel a whole run's archive.
+
 ## The per-question pipeline
 
 Everything below runs once per question inside `_research_and_make_predictions`,

@@ -55,6 +55,54 @@ Ideas for improving the forecasting bot, roughly ordered by expected impact and 
 > entry added 2026-09-03 below is an operator ACTION rather than an improvement lever, so it is
 > outside that count.
 
+### Repo-wide comment-extraction sweep: a separate CR right after the Mantic merge (added 2026-09-09, **HIGH, operator action**)
+
+The operator ruled on 2026-09-09 that the AST smell hook's findings are to be fixed everywhere, not
+kept as convention. The four files the earlier ruling had exempted were cleaned on
+`mantic-competition` that day (`metaculus_bot/constants.py`, `metaculus_bot/cli.py`,
+`scripts/telemetry/markers.py`, `tests/test_telemetry_markers.py`; the moved prose lives in
+`docs/constants.md`, `docs/telemetry_markers.md`, `docs/architecture.md` and `docs/operations.md`,
+one line of why plus a pointer left in the code). The rest of the repository was deliberately left
+for its own CR so the Mantic review would not be buried: the scanner
+(`PYTHONPATH=$HOME/.local/lib/astscan python3 -m astscan.hook <file>`) reported 5,238 findings across
+436 files on 2026-09-09, mostly multi-line comment blocks and comments-as-docstrings in `tests/`; the
+largest production files were `metaculus_bot/research/resolution_source.py` (126),
+`metaculus_bot/research/rendered_fetch.py` (45), `metaculus_bot/forecaster.py` (42) and
+`metaculus_bot/prompts.py` (39). The proven recipe: one agent per file or file group, comments and
+docstrings only, an AST-equality check against HEAD with docstrings stripped so no code, string or
+regex can change (the checker used on 2026-09-09 lived at `/tmp/smell_pass/ast_equal.py`; recreate it
+in `scripts/` for the sweep), scanner at zero per file, a verifier that samples removed blocks against
+the destination doc, then `make all`. Prose goes to the topical doc that already covers the module,
+or to a registry-style doc when the comments are receipts on a table of values. **Operator: run this
+as the first CR after the Mantic merge lands; this entry is the reminder.**
+
+### Two prompt and comment candidates left open by the 2026-09-09 readiness review (added 2026-09-09, operator decision)
+
+Both were raised by two independent reviewers of the post-651 smoke and refuted by the adversarial
+verifiers as low-risk, so neither shipped without the operator's word.
+
+- **Date template wording on closed bounds (Metaculus render, one line each).** The shared date
+  template (`_date_axis` in `metaculus_bot/prompts.py`) renders for every date question on both
+  platforms. Two bullets are phrased for an open upper bound: step (6) "Coherent pathway for an
+  unusually late date, including not within the displayed window" and step (8) "put the 'not within
+  the window' mass beyond an open upper bound". On a closed-closed question such as post 651 the same
+  prompt states four times that there is no `above_range` key, and the live run showed all three
+  forecasters obeying that. The residual risk is a model that takes the bullet literally and emits an
+  `above_range` key, which the per-bin parser refuses at the free block rung, sending that member to
+  the paid salvage rung (usually recovered, otherwise the member drops). Candidate rewording: step (6)
+  "including, where the upper bound is open, a date beyond the displayed window"; step (8) "put any
+  'not within the window' mass beyond the upper bound where the question leaves it open". Three
+  presence pins move with it (`tests/prompts/test_date_prompt.py`, `tests/prompts/test_pmf_prompt.py`).
+  Because Metaculus date renders change, it needs the operator's go under the prompt-edit rule.
+- **Per-bin table in the Mantic comment (Mantic-only, presentation).** The comment's summary and
+  per-model bullets come from the framework's numeric report, which prints interpolated percentiles
+  ("10.00% chance of value below 2026-09-10 11:48:26 UTC"). On a day-binned per-bin question the
+  time of day is an interpolation artefact: the forecast carries one probability per day and nothing
+  finer. A per-bin renderer in `metaculus_bot/comment/` (one line per bin label with the pooled
+  probability, plus each member's vector) would show what was actually forecast. It fires only on
+  per-bin questions, so no Metaculus render or residual-analysis parser changes. The comment is
+  private on Mantic and scores nothing, so this is low priority unless Mantic comments go public.
+
 ### Fall 2026 season: both competitions are configured (updated 2026-09-06, **operator action**)
 
 Metaculus granted $1,500 of API credits on 2026-09-03 for the bot to compete in both the fall

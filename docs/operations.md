@@ -2113,5 +2113,118 @@ personal-key fallbacks, or the model-deprecation tripwire) even when every
 question that met the minimum-forecaster threshold was published. The non-zero
 exit is the CI red-check signal to investigate; it does not mean publishing
 failed. Credit-caused shortfalls alert again as of 2026-09-03, and are exempt only
-inside a suppression window (see that section above); every other cause always alerts. See the alert block near the end
-of `cli.py` for the exact conditions.
+inside a suppression window (see that section above); every other cause always alerts. The
+exact conditions are in the next subsection, "The end-of-run breakdown and the exit ladder".
+
+### The end-of-run breakdown and the exit ladder (`_report_degradation_and_exit`)
+
+`cli._report_degradation_and_exit` emits the one-line degradation breakdown, harvested as
+`run_alertable_summary`, and then decides the process exit status. It runs after
+`forecast_on_tournament` or `forecast_questions` has finished publishing, and every non-zero
+exit path in the run lives in this one function.
+
+**The arithmetic** is
+`alertable = bot_alertable + generic_fallback - suppressed_credit_fallback + mantic_post_drops`.
+
+- `bot_alertable` is `TemplateForecaster.alertable_count`, the sum of the degradation
+  counters enumerated under "Reading run logs" above.
+- `generic_fallback` counts donated-to-personal key fallbacks. They are counted in
+  `fallback_openrouter.py` at the wrapper level, process-global, because the wrapper has no
+  link back to the bot. Each fallback was successful, in that the run completed on the paid
+  personal key, and it is still alertable because a call that should have hit the free
+  donated key billed the operator instead. The count covers ALL fallback causes (401, 402,
+  429, the guardrail or data-policy block, and the 404 "no allowed providers" case).
+  `donated_404` and `credit` are two disjoint subsets of that same total, broken out for
+  diagnostics only: just the all-causes total is added to `alertable`, because adding a
+  subset as well would double-count events already inside it.
+- `suppressed_credit_fallback` is the credit subset, subtracted back out only while credit
+  alerting is suppressed (see "The credit-alert suppression window" above), because inside
+  such a window an empty donated key is an accepted state. Every other cause keeps its full
+  weight, since 401, 404, 429 and the guardrail block each mean real breakage, and every
+  event is still counted exactly once: the generic total adds it, and at most one subset
+  subtracts it. The subset counts only the SUPPRESSIBLE credit case, a donated key that
+  genuinely drained. A key that was revoked or re-capped to zero returns the same
+  `Key limit exceeded` text but is classified separately by
+  `fallback_openrouter.is_suppressible_credit_error`, which probes `/auth/key`, so it stays
+  inside the generic total and keeps the run red.
+- `mantic_post_drops` counts posts the Mantic client could not parse (see "Parse drops are
+  counted" above). The framework's per-post loop swallows the error as a warning, so this
+  process-global counter is the only thing that turns a forfeited post into a red run.
+
+**Two fields render conditionally**, so that a term appears on the line exactly when it
+applies. `donated_key` is rendered only when a spend-cap failure actually made the wrapper
+probe the donated key, because a rendered `unknown` would read as a failed probe rather than
+as "no run of this shape ever needed one". `mantic_post_drops` is rendered only when it is
+non-zero, which is when it explains a non-zero `alertable`. Both are optional groups in the
+registry's `run_alertable_summary` regex (`scripts/telemetry/markers.py`).
+
+**The line is emitted on every path**: degraded, suppressed-green, crashed, and fully clean.
+The green paths need it as much as the red one. When every donated-key call fell back and
+the credit subset cancels the whole generic total, `alertable` reads 0, which is the exact
+shape of the 2026-07-26 drained-key run, so gating the line on the exit status would leave
+that run's degradation and probe verdict entirely unrecorded.
+
+A fully clean run says so explicitly, under a distinguishable "clean" phrase that harvests
+as the same marker. It used to emit NOTHING, so that the line's presence would stay a signal
+rather than boilerplate, and the operator overturned that on 2026-08-25. The reason: silence
+is not distinguishable from a run that died before reaching this block, and once the donated
+key is refilled (past `CREDIT_ALERT_RESUME_DATE`) the clean shape becomes the COMMON one, so
+the archive's per-run census would lose exactly the runs that went well. During the
+drained-key window the question was moot, because every run fell back at least once and 0 of
+the 73 archived records are the clean shape. A raising `log_report_summary` is never clean no
+matter what the counters read, since that run lost a question, and its counters can
+legitimately be all-zero (q45085's shape), which is why the phrase rather than the fields is
+what marks a run clean. The `run_clean` predicate therefore has to stay the exact complement
+of every non-zero exit path in the function, including the two that run AFTER the line is
+emitted, the credit-floor breach and the deprecation tripwire. Without those two terms a run
+about to exit red could first stamp the archive's record with the clean token.
+
+**Emit then raise.** `TemplateForecaster.log_report_summary` raises by design when any
+report is an exception (`compact_log_report_summary` re-raises, so a failed question reddens
+CI under `return_exceptions=True`). It used to sit ABOVE the alertable block, so the one run
+that most needed a summary record left none: q45085's publish failure on 2026-08-03
+propagated out of it, `alertable` was never computed, and that run is the single forecasting
+run since 2026-07-26 with no `run_alertable_summary` line in the archive. Now the error is
+held, deliberately without narrowing it to a class, the breakdown is emitted on that path
+too, and the original exception is re-raised, so it keeps its traceback and CI stays exactly
+as red as before. Re-raising rather than calling `sys.exit` is what preserves that traceback
+in the log, and it takes precedence over the alertable exit because the exception is the
+richer red signal.
+
+**The ladder, in order.**
+
+1. A held report-summary error is re-raised, after the breakdown line.
+2. `alertable > 0` logs a WARNING and exits 1.
+3. `generic_fallback > 0` with `alertable` at zero logs an INFO and stays green. That state
+   is reachable only under suppression with every fallback credit-caused, since the
+   subtraction cannot otherwise reach zero from a positive total, so the line states that
+   rather than leaving a reader to derive it from the arithmetic.
+4. A clean run logs the all-clear census line described above.
+5. Anything else logs an INFO saying a post-summary check below decides the exit status. The
+   counters are quiet there while a red condition further down may still fire, so no green
+   claim may be made at that point.
+6. A donated-key balance below the early-warning floor exits 1, or, inside a suppression
+   window, logs an INFO saying the breach was observed and alerting is suppressed until the
+   resume date. The run completed and published normally either way, and this exit is purely
+   the ask-Metaculus-for-a-top-up signal; the INFO exists so that a reader who sees the
+   `CREDIT_FLOOR_BREACH` warning beside a green run does not have to guess why.
+7. The fall-cup configuration reminder exits 1. Its ERROR is logged at startup by
+   `check_fall_cup_reminder` (`constants.py`) so the operator sees it before the run's noise,
+   and it is checked in every run mode on purpose, so the cup and minibench crons and manual
+   runs all keep reddening until `FALL_CUP_CONFIGURED` is flipped. Same shape as the
+   credit-floor path: the run published normally, and the exit is purely the
+   reminder-to-configure signal.
+8. A stale Mantic slug exits 1 with the re-point-the-constants ERROR, because a zero-question
+   run is otherwise green while a Series 2 slug goes unforecast (see "Stale slug goes red"
+   above).
+9. The post-submission deprecation tripwire runs LAST, so that submission has fully completed
+   and every other alertable condition exits first with its own log line. When OpenRouter
+   retires a model the bot uses, the canonical case being the 2026-05-15 deprecation of
+   `x-ai/grok-4.1-fast`, which silently 404'd for about two days,
+   `check_deprecation_alerts_and_exit` (`fallback_openrouter.py`) prints a loud banner and
+   exits 1 so the Actions check turns red. It returns silently when no deprecation was
+   observed.
+
+The startup half of `cli.py`, the logging levels, the two hardening patches, the identity
+preflight and the research-archive labels, is in `docs/architecture.md` "CLI startup
+wiring".
