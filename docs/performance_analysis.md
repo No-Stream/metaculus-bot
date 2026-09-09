@@ -396,15 +396,22 @@ Entry point `metaculus_bot/performance_analysis/era_gap.py`, read-only and offli
 
 ```bash
 uv run python -m metaculus_bot.performance_analysis.era_gap --dataset <round>/perf_all_tagged.json \
-    --treated-era triple_era --comparison-era post_flip --strict [--output-json <path>]
+    --treated-era triple_era --comparison-era post_flip --strict \
+    [--era-field config_era] [--clusters <round>/cluster_structure.json] [--output-json <path>]
 ```
 
 Run it twice per round, once with `--strict` (the exclusion cohorts from `cohorts.py` dropped
 from BOTH arms, the count shown in the `excl` column) and once unfiltered, the same pairing the
 clip sweep uses. The dataset is the round's tagged pull: every record carries `config_era`,
-written by the round's tagging pass off `bot_comment_created_at` against the merge-date era map
-(the treated and comparison eras are whatever values that field holds). Every number is spot
-peer through `platform_scores.spot_peer_score`. The report prints four blocks:
+written by the round's tagging pass off `bot_comment_created_at` against the merge-date era map,
+and the treated and comparison eras are whatever values that field holds. The pass writes only
+the coarse eras there; sub-eras go to their own fields (`triple_subera` holds
+`triple_pre_market` / `triple_ranked_market`, `triple_subera_fine` holds `ranked_markets`,
+`post_dry_key_fix`, `ft_0292` and so on), so a sub-era arm needs `--era-field <field>`, which
+names the field both arms are selected on and is echoed in the report header. An arm value that
+the named field never carries fails shut with "no scoreable records" rather than running on an
+empty arm. Every number is spot peer through `platform_scores.spot_peer_score`. The report
+prints four blocks:
 
 - **Arms.** n, effective n (distinct UTC resolution days), exclusions, unscoreable records
   (no spot peer, submit time or resolve time), spot mean and median, fraction negative, lag
@@ -498,8 +505,9 @@ against all 184 is +11.04 on both.
 
 **Retarget the comparison each season.** The summer six-model arm is nearly exhausted; from
 the next round the interesting cut is the September `fall_config` merges against the
-`ranked_markets` sub-era (or the whole `triple_era`), which the tagging pass has to write into
-`config_era` (or a sub-era field passed as the era) before the module can read it.
+`ranked_markets` sub-era (or the whole `triple_era`). Once the tagging pass writes `fall_config`
+into `triple_subera_fine`, that read is
+`--era-field triple_subera_fine --treated-era fall_config --comparison-era ranked_markets`.
 
 ## The clip-threshold sweep
 

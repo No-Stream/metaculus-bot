@@ -75,7 +75,8 @@ The standing set, each reconciling explicitly with the prior round's same-named 
   slices; a floor fitted on older records must carry into the window (a fit that moves nothing is
   vacuous, not a pass); a candidate looser than the in-force clamp is CENSORED, read `cen` / `cen_m` bounds
 - era scoreboard and era gap (`performance_analysis.era_gap`; `--strict` plus one unfiltered, treated
-  era = the live roster, comparison era = the one it replaced): per-arm spot mean / median / frac neg with
+  era = the live roster, comparison era = the one it replaced; sub-era arms via `--era-field
+  triple_subera_fine`, the coarse `config_era` being the default): per-arm spot mean / median / frac neg with
   effective n by resolution day, the type-adjusted gap AND its horizon-matched form (comparison arm capped
   at the treated arm's longest submit-to-resolve lag, plus the lag-quintile-adjusted form; the per-arm lag
   quartile table is the receipt), each with a cluster-bootstrap interval and the by-record bracket; clusters

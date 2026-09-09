@@ -494,6 +494,7 @@ class EraGapReport:
     per_type_horizon_matched: list[PerTypeGap]
     strict: bool
     cluster_convention: str
+    era_field: str
     draws: int
     seed: int
 
@@ -512,6 +513,7 @@ class EraGapReport:
             "watch": self.watch.to_dict(),
             "strict": self.strict,
             "cluster_convention": self.cluster_convention,
+            "era_field": self.era_field,
             "draws": self.draws,
             "seed": self.seed,
         }
@@ -523,10 +525,11 @@ def compute_era_gap_report(
     *,
     strict: bool = False,
     cluster_convention: str = RESOLUTION_DAY_CONVENTION,
+    era_field: str = ERA_FIELD,
     draws: int = DEFAULT_BOOTSTRAP_DRAWS,
     seed: int = DEFAULT_BOOTSTRAP_SEED,
 ) -> EraGapReport:
-    """Every read of the era gap on two built arms; ``strict`` and ``cluster_convention`` label how they were built."""
+    """Every read of the era gap on two built arms; the keyword labels record how the arms were built."""
     _require_records(treated)
     _require_records(comparison)
     matched = horizon_match(comparison, treated.max_lag_days)
@@ -555,6 +558,7 @@ def compute_era_gap_report(
         per_type_horizon_matched=per_type_gaps(treated, matched),
         strict=strict,
         cluster_convention=cluster_convention,
+        era_field=era_field,
         draws=draws,
         seed=seed,
     )
@@ -694,6 +698,7 @@ def render_report(report: EraGapReport) -> str:
     lines = [
         f"# Era gap: {report.treated.label} vs {report.comparison.label} ({policy})",
         "",
+        f"Arms selected on `{report.era_field}`. "
         "Spot peer throughout (`platform_scores.spot_peer_score`), treated minus comparison. Lag is "
         "`actual_resolve_time` minus `bot_comment_created_at` in days, the forecast horizon. Clusters: "
         f"{report.cluster_convention}; `eff n` counts them. Bootstrap: {report.draws} draws, seed {report.seed}, "
@@ -730,8 +735,8 @@ def render_report(report: EraGapReport) -> str:
     return "\n".join(lines)
 
 
-def _era_records(data: list[dict], era: str) -> list[dict]:
-    return [r for r in data if r.get(ERA_FIELD) == era]
+def _era_records(data: list[dict], era: str, field: str) -> list[dict]:
+    return [r for r in data if r.get(field) == era]
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -743,6 +748,15 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--treated-era", required=True, help="The era under evaluation (the live roster).")
     parser.add_argument("--comparison-era", required=True, help="The era it is measured against.")
+    parser.add_argument(
+        "--era-field",
+        default=ERA_FIELD,
+        help=(
+            "The record field carrying both arms' era labels. The tagging pass writes coarse eras to "
+            "`config_era` and sub-eras to their own fields (`triple_subera`, `triple_subera_fine`), so a "
+            "sub-era arm needs its field named. Default: %(default)s."
+        ),
+    )
     parser.add_argument(
         "--strict",
         action="store_true",
@@ -765,12 +779,20 @@ def main(argv: list[str] | None = None) -> None:
     cluster_map = ClusterMap.load(args.clusters) if args.clusters else None
     convention = cluster_map.convention if cluster_map else RESOLUTION_DAY_CONVENTION
     treated = build_arm(
-        args.treated_era, _era_records(data, args.treated_era), strict=args.strict, clusters=cluster_map
+        args.treated_era,
+        _era_records(data, args.treated_era, args.era_field),
+        strict=args.strict,
+        clusters=cluster_map,
     )
     comparison = build_arm(
-        args.comparison_era, _era_records(data, args.comparison_era), strict=args.strict, clusters=cluster_map
+        args.comparison_era,
+        _era_records(data, args.comparison_era, args.era_field),
+        strict=args.strict,
+        clusters=cluster_map,
     )
-    report = compute_era_gap_report(treated, comparison, strict=args.strict, cluster_convention=convention)
+    report = compute_era_gap_report(
+        treated, comparison, strict=args.strict, cluster_convention=convention, era_field=args.era_field
+    )
 
     # Logging is pinned to stderr above so the rendered report can be piped on its own.
     print(render_report(report))  # noqa: T201

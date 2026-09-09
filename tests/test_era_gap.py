@@ -424,6 +424,37 @@ class TestCli:
         with pytest.raises(ValueError, match="no scoreable records"):
             main(["--dataset", path, "--treated-era", "fall_config", "--comparison-era", "post_flip"])
 
+    def test_era_field_selects_arms_on_a_sub_era_field(self, tmp_path, capsys):
+        """The tagging pass writes coarse eras to config_era and sub-eras to their own fields, so the
+        fall's primary read (a sub-era treated arm) needs the field named."""
+        records = [_record(i, spot=20.0 + i, lag_days=2 + i % 5, era="triple_era") for i in range(11)]
+        for i, record in enumerate(records):
+            record["triple_subera"] = "triple_ranked_market" if i < 6 else "triple_pre_market"
+        records.append(_record(50, spot=1.0, lag_days=3, era="post_flip"))  # no sub-era tag at all
+        path = self._write(tmp_path, records)
+        out_json = tmp_path / "sub_era.json"
+        main(
+            [
+                "--dataset",
+                path,
+                "--era-field",
+                "triple_subera",
+                "--treated-era",
+                "triple_ranked_market",
+                "--comparison-era",
+                "triple_pre_market",
+                "--output-json",
+                str(out_json),
+            ]
+        )
+        text = capsys.readouterr().out
+        assert "| triple_ranked_market | 6 |" in text
+        assert "| triple_pre_market | 5 |" in text
+        assert "selected on `triple_subera`" in text
+        assert json.loads(out_json.read_text())["era_field"] == "triple_subera"
+        with pytest.raises(ValueError, match="no scoreable records"):
+            main(["--dataset", path, "--treated-era", "triple_ranked_market", "--comparison-era", "triple_pre_market"])
+
     def test_clusters_argument_names_the_convention_and_the_labelled_counts(self, tmp_path, capsys):
         path = self._write(tmp_path, self._records())
         clusters = tmp_path / "cluster_structure.json"
