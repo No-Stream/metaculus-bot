@@ -342,6 +342,34 @@ the loop, optionally banking final findings and leaving pending leads. The two
 findings tools run their input through the same validation and detachment lint.
 Internal calls don't count against the tool-call budget.
 
+### The findings gates
+
+Three checks decide what the internal tools accept, and each one sits where the
+naive behaviour would quietly cost the run.
+
+`set_research_plan` rejects a plan with zero valid gaps (F3a) rather than storing
+it. Storing it would flip W1's `plan_gate_active` off, which opens the external
+tools, while `gates._evaluate_conclude_gate` returns `None` on `not plan.gaps`,
+which disables the W2 gate outright. Between them that lets a driver conclude
+with zero research. Leaving `state.research_plan` untouched (`None`, or a prior
+valid plan) keeps the W1 gate armed and stops a re-plan to empty from clobbering
+a plan that was already good, and the rejection nudges the driver to register
+real gaps.
+
+`run_agentic_loop` seeds the provenance sets from the frozen user brief, because
+the URLs embedded in it (the resolution-source snapshot, the market snapshot, the
+AskNews digests) are things the driver really saw, so a non-discrepancy finding
+may cite them. The system prompt is a fixed template that embeds no question
+URLs, so nothing is seeded from it. A discrepancy finding may not lean on a
+briefing URL at all: see `gates._check_url_provenance`.
+
+The quote spot-check in `_validate_findings_payload` is warn-only. A quote that
+is not found verbatim in the run's tool contents is logged and counted in
+`quote_mismatch_warnings`, but the finding is still banked, because
+`read_document` paraphrases and joins passages with ellipses. The warning is
+deduped per run on `(source_url, quote)`, so a finding re-listed in `conclude`'s
+`final_findings` counts once rather than once per submission.
+
 ## The ghost forecast (telemetry only)
 
 After the driver concludes, the loop asks it to privately complete the forecast
@@ -380,10 +408,20 @@ ghosts. A date ghost's percentiles are written in epoch seconds, the axis the da
 pipeline forecasts on; the scorer counts date ghosts by type and reports that none
 can be scored while the residual dataset excludes date questions
 (`docs/performance_analysis.md`). The JSON line is suppressed when no structured
-block parsed. The turn-one
+block parsed, and it carries its question id the same way `GHOST_FORECAST` does,
+through `log_prefix`, so the harvester derives it identically. The turn-one
 plan emits the same pair as `GHOST_PRE` / `GHOST_PRE_JSON`
 (`_set_research_plan_tool`) from the driver's pre-research dry run, so the
 pre-versus-post delta measures whether v2's own research moved its own view.
+
+When the driver supplies a `dry_run_forecast` that is not a dict, or one that
+fails schema validation (the observed case is flat declared percentiles, run
+30718626314), `GHOST_PRE_JSON` is suppressed and `_set_research_plan_tool` logs a
+WARN saying this question's ghost pair will have no pre-research half. That line
+exists because the loss is not random: it drops exactly the flattest
+pre-research views, the ones whose later sharpening would be the strongest
+evidence that research moved the driver, so the archived zero-move rate reads
+slightly high.
 
 ## The bounds
 
@@ -440,6 +478,26 @@ to an empty string instead of raising. There are four layers of this:
    independent guards inside the gather, so a v2 defect (an import error in the
    agentic package, an unhandled raise) can never zero out v1's addendum, and
    vice versa.
+
+Layer 2 has to tell two different timeouts apart. On Python 3.11 and newer
+`asyncio.TimeoutError` is the builtin `TimeoutError`, so a connection-level
+timeout raised inside the unguarded driver call arrives in the same `except` as a
+real outer `wait_for` deadline. The loop classifies by elapsed wall time: a
+genuine deadline hit has elapsed roughly `wall_deadline_s` (within
+`_DEADLINE_SLOP_S`, which absorbs scheduling jitter), while an inner timeout
+fires earlier and counts as a crash, stamping `error` and bumping the
+orchestrator's alertable counter like any other soft-fail. Both stamped strings
+are newline-sanitized, because the `GAP_FILL_V2` marker regex captures `error=`
+to end-of-line and an embedded newline would truncate the harvest.
+
+Layer 3 depends on where the handler coroutine is created. External tool handlers
+have concrete signatures and `async def` binds its kwargs eagerly, so a missing,
+misspelled or extra key in the LLM-emitted `arguments` raises `TypeError` at bind
+time, before any `await`. `_run_tool_handler` therefore instantiates the
+coroutine inside its own `try`, which turns that failure into a `status="error"`
+outcome instead of letting it escape the batch `gather` and abort the whole pass,
+matching what an unknown tool name does. The three internal tools bind
+positionally and cannot hit this.
 
 The benchmarking guard deserves its own mention. When `is_benchmarking=True`,
 v2 returns `""` before doing anything. Live search on a resolved question sees
@@ -582,3 +640,44 @@ silently disables the directed-reading rung without breaking anything else, and
 url_context retrieval fails the same quiet way on a host whose robots.txt
 disallows `Google-Extended`. If `read_document` never seems to work, check the
 reader model id first, then the target host's robots.txt.
+
+### The driver transport
+
+The driver's completions go through raw `litellm.acompletion` rather than a
+`GeneralLlm` wrapper, because the tool loop needs the raw request. Five details
+of that call are load-bearing (`agentic/llm.py`).
+
+The `messages` list is passed as a shallow copy, since litellm mutates the
+caller's list in place on some code paths and the loop's prefix has to stay
+append-only. Copying the container and not the dicts keeps dict identity intact,
+which is what providers cache on.
+
+`metadata` carries the `CREDIT_ROLE_SPEND` tag. The `GeneralLlm` builders stamp
+that once at construction; this path stamps it per call, so the alias names the
+key the attempt actually bills.
+
+`allowed_openai_params: ["reasoning_effort"]` is what gets the reasoning effort
+to OpenRouter. litellm's `OpenrouterConfig` does not map `reasoning_effort`, so
+without the whitelist the param survives only because `forecasting_tools` sets
+`litellm.drop_params=True` globally, which silently strips it. Whitelisting
+passes the raw param through, validated live by
+`scratch/driver_replay_2026-07-17`.
+
+`_skip_mcp_handler: True` is a private litellm kwarg, popped before the provider
+sees it. litellm 1.92 and newer eagerly import the proxy MCP-gateway handler,
+which requires fastapi (a proxy-only extra we do not install), whenever `tools`
+is passed, even for plain function tools that never touch the gateway. We run our
+own tool dispatch, so the import is skipped. Both the eager-import defect and
+this skip kwarg are 1.92-era, verified against the locked litellm 1.92; if a
+future litellm drops the kwarg, the call crashes loudly rather than regressing
+quietly.
+
+The donated-key fallback records itself. When the donated key fails with a
+key-scoped error, `record_donated_key_fallback` counts the event once in the
+generic total (plus at most one subset) and logs it as a paid personal-key
+fallback, the same accounting `FallbackOpenRouterLlm.invoke` does. Without it the
+bot's highest-volume donated-key path, a v2 run on every question in all four
+prod workflows, failed over to the paid key completely silently. The
+counted-and-logged decision is shared with `fallback_openrouter`; only the
+transport differs, and if this path ever grows a retry ladder the transport
+should be shared too.
