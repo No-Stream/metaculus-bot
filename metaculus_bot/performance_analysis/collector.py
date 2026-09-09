@@ -76,29 +76,13 @@ def _api_get(path: str, token: str, params: dict | None = None) -> dict:
 
 
 def fetch_resolved_questions(tournament: str, token: str) -> list[dict]:
-    """Fetch all resolved questions from a tournament.
+    """Every resolved post in a tournament, as the posts list serves them.
 
-    Fetches post IDs from the list API, then fetches each individually for full
-    details (resolution, my_forecasts, scaling, etc.). Returns list of raw API
-    response dicts.
+    ``with_cp=true`` puts the token's own ``my_forecasts`` (forecast values and score data) on
+    the list page next to the resolution, scaling and bounds the records read, for a single
+    question and for a group post's members alike, so no per-post GET is needed.
     """
-    post_ids = _fetch_resolved_post_ids(tournament, token)
-    logger.info(f"Found {len(post_ids)} resolved posts in tournament '{tournament}'")
-
     posts: list[dict] = []
-    for i, pid in enumerate(post_ids):
-        logger.info(f"  [{i + 1}/{len(post_ids)}] Fetching post {pid}...")
-        post_data = _api_get(f"/posts/{pid}/", token)
-        posts.append(post_data)
-        if i < len(post_ids) - 1:
-            time.sleep(FETCH_DELAY_SECS)
-
-    return posts
-
-
-def _fetch_resolved_post_ids(tournament: str, token: str) -> list[int]:
-    """Paginate the tournament posts list to get all resolved post IDs."""
-    post_ids: list[int] = []
     offset = 0
     while True:
         data = _api_get(
@@ -107,19 +91,20 @@ def _fetch_resolved_post_ids(tournament: str, token: str) -> list[int]:
             params={
                 "tournaments": tournament,
                 "statuses": "resolved",
+                "with_cp": "true",
                 "limit": PAGE_SIZE,
                 "offset": offset,
             },
         )
         results = data.get("results", [])
-        for post in results:
-            post_ids.append(post["id"])
+        posts.extend(results)
         logger.info(f"Fetched post listing page: {offset=}, got {len(results)} posts")
         if not results or data.get("next") is None:
             break
         offset += PAGE_SIZE
         time.sleep(FETCH_DELAY_SECS)
-    return post_ids
+    logger.info(f"Found {len(posts)} resolved posts in tournament '{tournament}'")
+    return posts
 
 
 def fetch_bot_comments(author_id: int, token: str) -> list[dict]:
@@ -189,30 +174,18 @@ def _comment_signals(comment: dict | None, post_id: int) -> _CommentSignals:
     """Parse every per-comment marker and per-model recovery off one bot comment."""
     comment_text = comment.get("text") or comment.get("comment_text") if comment else None
 
-    # MC questions need full per-option probability vectors (not just the top
-    # option line which the legacy single-string parser returned). Detect MC by
-    # checking whether the parser found any option lines; if so, use the dict
-    # values from parse_per_model_mc_option_probs as per_model_forecasts.
     per_model_numeric_percentiles = parse_per_model_numeric_percentiles(comment_text) if comment_text else {}
     per_model_mc_option_probs = parse_per_model_mc_option_probs(comment_text) if comment_text else {}
-    # An MC question yields full option-probability dicts; anything else falls back to the
-    # legacy single-value bullet parser.
+    # A non-empty option dict is the multiple-choice detector (docs/performance_analysis.md "Record fields").
     per_model = per_model_mc_option_probs or (parse_per_model_forecasts(comment_text) if comment_text else {})
     was_stacked = parse_stacked_marker(comment_text) if comment_text else None
-    # Tri-state outcome: prefers the new STACKER_OUTCOME= marker, falls back to
-    # the legacy STACKED= marker, then to historical body-shape detection for
-    # comments that predate either marker.
+    # Tri-state, read off a three-rung marker fallback (docs/performance_analysis.md "Record fields").
     if comment_text:
         stacker_outcome, stacker_outcome_source = parse_inferred_stacker_outcome(comment_text)
     else:
         stacker_outcome, stacker_outcome_source = None, "none"
 
-    # Cross-signal sanity: a stacked comment should expose at least one
-    # per-model entry via the rationale parsers. If the marker says stacked
-    # but we recovered nothing, the producer-side delimiter likely drifted —
-    # worth surfacing during triage, but only as DEBUG since legitimate cases
-    # (trimmed comments, binary/MC stacked Qs with no percentile restatement)
-    # look the same.
+    # DEBUG, not WARNING: a drifted delimiter and the legitimate shapes look identical here.
     if was_stacked is True and not per_model_numeric_percentiles and not per_model:
         logger.debug(
             f"Stacked comment yielded no per-model entries: post_id={post_id}, "
@@ -228,14 +201,9 @@ def _comment_signals(comment: dict | None, post_id: int) -> _CommentSignals:
         was_stacked=was_stacked,
         stacker_outcome=stacker_outcome,
         stacker_outcome_source=stacker_outcome_source,
-        # Additive skip-reason disclosure: a plain "skipped" outcome alone can't tell a
-        # below-threshold skip from the single-forecaster short-circuit (q44870). None
-        # on comments predating the marker.
+        # A bare "skipped" outcome cannot tell a below-threshold skip from the single-forecaster one.
         stacker_skip_reason=parse_stacker_skip_reason_marker(comment_text) if comment_text else None,
-        # Ensemble-size disclosure: (n_used, n_configured) when the FORECASTERS_USED
-        # marker is present, else None (older comments predate it). Lets era-bucketing
-        # tell a degraded publish (a model dropped) from a genuine roster change —
-        # CLAUDE.md's "fewer than N bullets" ambiguity.
+        # (n_used, n_configured): what tells a degraded publish from a genuine roster change.
         forecasters_used=parse_forecasters_used_marker(comment_text) if comment_text else None,
     )
 
@@ -274,10 +242,7 @@ def _process_post(post_data: dict, comment_lookup: dict[int, dict]) -> list[dict
 
     records: list[dict] = []
     for q in questions:
-        # Recover per-base-model forecasts from the stacker-combined R1 body.
-        # Empty for non-stacked comments; binary returns {model: "XX.X%"}, MC
-        # returns {model: {option: prob}}, numeric returns {} (use
-        # per_model_numeric_percentiles instead — it already handles stacking).
+        # A stacked comment discloses base values only in its R1 body (docs/performance_analysis.md "Record fields").
         q_type_for_base = q.get("type", "") if q else ""
         per_base_model_forecasts = parse_per_base_model_forecasts(signals.text, q_type_for_base) if signals.text else {}
         record = _process_single_question(
@@ -364,11 +329,7 @@ def _process_single_question(
     question_id = q.get("id")
     q_type = q.get("type", "")
     if q_type == "date":
-        # The live bot forecasts date questions (on the epoch-seconds axis of numeric/date_axis.py),
-        # so a resolved one arrives here; the residual dataset stays date-free by decision until a
-        # date question has resolved under that code, the same seam backtest/question_prep.py and
-        # ablation/run_pdf.py carry. Named here so the skip reads as the decision rather than as
-        # parse_resolution's unknown-type fallthrough.
+        # Excluded by decision, not a parse failure (docs/performance_analysis.md "Date questions").
         logger.warning(
             f"  Skipping Q{question_id} (post {post_id}): date question, excluded from residual analysis by decision"
         )
@@ -396,6 +357,7 @@ def _process_single_question(
     category = _post_category(post_data)
     q_title = q.get("title") or title
 
+    # Field meanings, provenance and the traps behind them: docs/performance_analysis.md "Record fields".
     record = {
         "post_id": post_id,
         "question_id": question_id,
@@ -406,44 +368,18 @@ def _process_single_question(
         "our_forecast_values": forecast_values,
         "our_prob_yes": prob_yes,
         "per_model_forecasts": per_model,
-        # Per-base-model forecasts recovered from stacker-combined R1 reasoning
-        # bodies. Empty for non-stacked comments. Binary: dict[str, str] like
-        # ``{"gpt-5.5": "72.0%"}``. MC: dict[str, dict[str, float]] (per-base-
-        # model option dicts). Numeric/discrete: empty dict — those question
-        # types use ``per_model_numeric_percentiles`` which already handles
-        # stacker-combined bodies. Downstream stacker_detection prefers this
-        # field for median/spread computations on stacked records, where
-        # ``per_model_forecasts`` collapses to the stacker's single aggregate.
+        # On a stacked record per_model_forecasts holds only the aggregate, so spread cuts read this.
         "per_base_model_forecasts": per_base_model_forecasts or {},
-        # Per-forecaster percentile lists for numeric/discrete questions.
-        # {model_name: [(percentile, value), ...]}. Empty for binary/MC.
+        # Numeric and discrete only; empty for binary and multiple choice.
         "per_model_numeric_percentiles": per_model_numeric_percentiles,
-        # Tri-state: True/False when the STACKED=<bool> marker is present in
-        # the comment, None for older comments where the marker didn't exist
-        # and stacking status can't be determined. Kept for back-compat;
-        # prefer stacker_outcome below for new analyses.
+        # Legacy tri-state, kept for back-compat; prefer stacker_outcome below for new analyses.
         "was_stacked": was_stacked,
-        # Stacker outcome ("primary"|"fallback_llm"|"fallback_median"|
-        # "fallback_mean"|"skipped"|"skipped_config_off") with provenance
-        # string ("marker_outcome"|"marker_legacy"|"historical_body"|"none").
-        # Distinguishes median-fallback from skipped at the record level — the
-        # legacy `was_stacked` collapses both to False/None and so is lossy for
-        # stacking-treatment-effect cuts. "skipped_config_off" (added
-        # 2026-07-19) separates config-suppressed skips from below-threshold
-        # skips; earlier comments collapse both into "skipped".
+        # Separates a median fallback from a skip, which was_stacked collapses into one False.
         "stacker_outcome": stacker_outcome,
         "stacker_outcome_source": stacker_outcome_source,
-        # Why the stacker was skipped ("spread_below_threshold" | "config_off" |
-        # "single_forecaster"), from the additive STACKER_SKIP_REASON comment
-        # marker. None whenever the stacker was not skipped or the comment
-        # predates the marker.
+        # None whenever the stacker did not skip, or the comment predates the marker.
         "stacker_skip_reason": stacker_skip_reason,
-        # Bot ensemble size from the FORECASTERS_USED comment marker (distinct
-        # from metadata.nr_forecasters, which is the Metaculus CROWD count):
-        # forecasters that contributed to the published aggregate (== per-model
-        # bullet count) and the roster size that run. Both None on comments that
-        # predate the marker. forecasters_used < forecasters_configured flags a
-        # degraded publish — a dropped model, not a roster change.
+        # The BOT ensemble size, not metadata.nr_forecasters, which is the Metaculus CROWD count.
         "forecasters_used": forecasters_used[0] if forecasters_used is not None else None,
         "forecasters_configured": forecasters_used[1] if forecasters_used is not None else None,
         "scaling": scaling,
@@ -452,43 +388,17 @@ def _process_single_question(
         "options": options,
         "comment_text": comment_text,
         "comment_id": comment_id,
-        # ISO-8601 timestamp on the bot's comment so cohort cuts can filter by
-        # *submit*-date (e.g., May-vintage stack) instead of the coarser
-        # actual_resolve_time stamp on the question.
+        # SUBMIT date, so a cohort cut need not key on the coarser actual_resolve_time.
         "bot_comment_created_at": comment_created_at,
-        # Metaculus-computed scores from my_forecasts.score_data. Contains
-        # spot_peer_score, peer_score (both ascending: negative = worse than crowd),
-        # spot_baseline_score, baseline_score, coverage, weighted_coverage,
-        # relative_legacy_score. None for records fetched before score data
-        # was captured; always populated on fresh pulls of resolved questions.
-        # READ SPOT_PEER, NOT PEER: the tournament leaderboard ranks on spot peer, and
-        # peer is the same quantity scaled by coverage. Accessors that encode that
-        # preference live in performance_analysis/platform_scores.py — use them rather
-        # than indexing this dict, so the convention can't drift per consumer.
+        # Read spot peer, not peer, and read it through platform_scores.py rather than this dict.
         "metaculus_scores": metaculus_scores,
         "metadata": {
-            # The Metaculus CROWD size, which lives on the POST, not on the question
-            # (verified against archived post payloads: every post carries
-            # ``nr_forecasters`` and ``forecasts_count``; no question dict carries
-            # either). Reading it off ``q`` with a 0 default made the field read 0 in
-            # all 2196 records ever pulled, which is not "no crowd" — it is "never
-            # read" — and it silently killed audit.py's own ``n/a`` fallback, since a
-            # real 0 is not a missing key. None when the post genuinely omits it, so a
-            # crowd-size cut can drop those records instead of averaging a fabricated
-            # zero into them. HISTORICAL RECORDS STAY 0: nothing rewrites the archive,
-            # so a reader must treat metadata.nr_forecasters == 0 on a pre-2026-08-25
-            # pull as unknown rather than as a measurement (fresh pulls carry real
-            # counts, typically 100-250 on tournament questions).
+            # Lives on the POST, not the question; 0 on a pre-2026-08-25 pull means unknown, not empty.
             "nr_forecasters": post_data.get("nr_forecasters"),
             "open_time": q.get("open_time"),
             "actual_resolve_time": q.get("actual_resolve_time"),
             "scheduled_resolve_time": q.get("scheduled_resolve_time"),
-            # Stored so a re-resolution has SOMETHING timestamp-shaped on the record, but
-            # never as the detector: Metaculus edited q44798 from 80 to 82 with this field
-            # left at 2026-08-31T21:38:45Z, a stamp that PRECEDES the pull which still read
-            # 80. Diff the resolution VALUE instead (performance_analysis/rescore_diff.py);
-            # this field is only useful once you already know an edit happened, for bounding
-            # when the original resolution was set.
+            # Never the re-resolution detector: it can PRECEDE the pull that still read the old value.
             "resolution_set_time": q.get("resolution_set_time"),
             "category": category,
         },

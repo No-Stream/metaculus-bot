@@ -142,11 +142,22 @@ C6 await live data, each with its read-only command):
   this covers. **Operator step, paid:** ONE per-bin smoke on post 651 (`make run_mantic_one
   POST=651`, about $3, publishes), verified with the authenticated `with_cp=true` read; the
   checklist is in `docs/operations.md` "Running it".
+- **Two validation siblings left as they are after the Wave C review (2026-09-09).** The
+  multiple-choice LLM salvage rung sums `float(item.probability)` unvalidated
+  (`mc_processing.accumulate_declared_option_probs`; `OptionProbability.probability` is an
+  unbounded float and `_validate_mc` range-checks the post-clamp list, which is vacuous), so an
+  out-of-range salvage value is clamped and renormalised instead of dropping the member; the
+  per-bin ladder now range-checks before folding. And `pchip_processing._apply_ramp_smoothing`
+  still compares the per-member min step unrounded where the ensemble post-processing now uses
+  the server's 9-decimal rounding. Both sit on the Metaculus path and neither has produced a
+  wrong published value in the archive; change either only with a measured reason.
 - **C2, supply probe Mantic mode: SHIPPED 2026-09-09** as `make supply_probe_mantic`
-  (`scripts/supply_probe.py --platform mantic`). The token path is primary (`with_cp=true` puts
-  `my_forecasts` on every list page, so closed-but-unresolved questions classify), the public
-  spot-time snapshot (`score_data.disagreement_forecasts.forecasts[]` against
-  `MANTIC_BOT_USER_ID`) classifies every resolved question without a secret, and the report adds
+  (`scripts/supply_probe.py --platform mantic`). The public spot-time snapshot
+  (`score_data.disagreement_forecasts.forecasts[]` against `MANTIC_BOT_USER_ID`, which the list
+  page carries only under `with_cp=true`, sent on every list GET whether or not a token is set)
+  classifies every resolved question without a secret (verified live 2026-09-09: 520 of 520
+  Series 1 questions); a token adds `my_forecasts`, so closed-but-unresolved questions classify
+  too. The report adds
   the miss rate per UTC release hour plus the realized window-length distribution. This is the
   instrument for the cadence decision below; the command that settles it after the first Series
   2 week is in `docs/operations.md` "Scheduling reliability".
@@ -2253,6 +2264,21 @@ them OUT of feature work, land as their own PRs.
   came out of it). Read the prompts.py and resolution_source.py figures as a snapshot taken while
   the 2026-09 bundle was still being edited. The re-measure keeps going stale because nothing
   updates it except a round that trips over it, so measure before acting rather than quoting these.
+
+  **`prompts.py` re-measured 2026-09-09: 2,436 lines** (2,154 before Wave C's per-bin elicitation
+  landed in `e1343db`; nothing else on this list was re-measured). The seam for its own PR is the
+  continuous template's third axis: the per-bin half (`_Elicitation`'s `_pmf_elicitation`,
+  `_pmf_axis_block`, `_pmf_grid_clause`, `_pmf_schema_block`, `pmf_prompt` and the `_PER_BIN_*` /
+  `_PMF_*` constants, about 270 lines) cannot leave alone, because `pmf_prompt` calls
+  `_continuous_prompt` and `_kind_axis` while `prompts.py` re-exports `pmf_prompt`, so a
+  `prompts_pmf.py` taking only that half is an import cycle. The clean split moves the shared
+  continuous template (`_ContinuousAxis`, `_Elicitation`, `_continuous_prompt`, `_kind_axis` and
+  its two axis builders, `_WIDTH_BULLET`, `_UNKNOWN_UNKNOWNS_BULLET`, `_bullet_lines`) into a
+  third module that both the percentile and the per-bin prompts import, with the numeric side's
+  precedent (`numeric/pmf_grid.py` and `numeric/pmf_cdf.py` came out of the same feature as their
+  own modules). Behaviour-neutral, and the Metaculus renders stay pinned byte for byte by
+  `tests/prompts/test_pmf_prompt.py::TestPercentileFillIsTodaysText`, so it is safe to do blind;
+  it is not done here per this section's standing rule.
 - **Dedupe the peg anchor when two tickers share one (added 2026-09-01, forge R15).** The bundle's
   peg-anchor block is decided per ticker inside `_fetch_yfinance_data`
   (`research/financial_data.py`), so a question naming two pegged crosses that share an anchor

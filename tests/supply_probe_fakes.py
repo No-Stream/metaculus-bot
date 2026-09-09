@@ -31,9 +31,9 @@ def _question(
     """One question dict.
 
     ``forecast`` models the three states the forfeit sweep distinguishes: None omits
-    ``my_forecasts`` entirely (a raw posts-LIST page, which is why the sweep needs detail
-    GETs), True carries a forecast, False carries the empty block a never-forecast question
-    shows under the bot's own token.
+    ``my_forecasts`` entirely (a posts-LIST page read without ``with_cp=true``, or without a
+    token, which is what the sweep's detail GETs exist for), True carries a forecast, False
+    carries the empty block a never-forecast question shows under the bot's own token.
     """
     question = {
         "id": qid,

@@ -38,8 +38,13 @@ from forecasting_tools.data_models.questions import DateQuestion
 from scipy.stats import norm
 
 from metaculus_bot.aggregation_strategies import AggregationStrategy
-from metaculus_bot.constants import MANTIC_OUT_OF_RANGE_TAIL_FLOOR, MANTIC_SITE_URL, PLATFORM_MANTIC, PLATFORM_METACULUS
-from metaculus_bot.numeric.config import STANDARD_PERCENTILES, grid_step_constraints
+from metaculus_bot.constants import MANTIC_OUT_OF_RANGE_TAIL_FLOOR, PLATFORM_MANTIC, PLATFORM_METACULUS
+from metaculus_bot.numeric.config import (
+    OPEN_TAIL_MIN_MASS,
+    PMF_FLOOR_MARGIN,
+    STANDARD_PERCENTILES,
+    grid_step_constraints,
+)
 from metaculus_bot.numeric.date_axis import as_epoch_question, to_epoch
 from metaculus_bot.numeric.out_of_range_floor import (
     FlooredCdf,
@@ -47,16 +52,21 @@ from metaculus_bot.numeric.out_of_range_floor import (
     floor_published_tails,
     tail_floor_for_platform,
 )
-from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid, safe_cdf_bounds
-from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
+from metaculus_bot.numeric.pchip_cdf import safe_cdf_bounds
 from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
+from metaculus_bot.numeric.pmf_cdf import build_pmf_distribution
 from metaculus_bot.numeric.utils import aggregate_numeric
 from metaculus_bot.question_platform import question_platform
 from tests.pipeline_test_helpers import (
+    ORACLE_BIN_COUNTS,
     assert_server_accepts_cdf,
+    cdf_heights,
+    distribution_from_heights,
+    make_count_question,
     make_e2e_bot,
     make_real_date_question,
     make_real_numeric_question,
+    on_mantic,
 )
 
 FLOOR = MANTIC_OUT_OF_RANGE_TAIL_FLOOR
@@ -412,7 +422,52 @@ class TestEveryManticGrid:
             assert 0.0 < result.floor < FLOOR, cdf_size
 
 
-_MANTIC_URL = f"{MANTIC_SITE_URL}/questions/2001/"
+_OPEN_BOUND_SHAPES = (
+    pytest.param(False, True, id="closed-open"),
+    pytest.param(True, True, id="open-open"),
+)
+
+
+class TestPooledPerBinMembersUnderTheFloor:
+    """The modal live path for a coarse open-bound Mantic grid: three per-bin builds, the mean pool, then the floor.
+
+    Every bin a member declared 0 on leaves the builder at ``min_step + PMF_FLOOR_MARGIN`` and each open
+    tail at ``OPEN_TAIL_MIN_MASS + PMF_FLOOR_MARGIN``. Raising a tail to 5% rescales the interior by about
+    0.90, which pushes every one of those bins UNDER the min step, so acceptance rests on the floor's
+    min-step sweep restoring them to exactly the min step with no margin left, and on the server's
+    9-decimal PMF rounding not landing them short of it.
+    """
+
+    @pytest.mark.parametrize(("open_lower", "open_upper"), _OPEN_BOUND_SHAPES)
+    @pytest.mark.parametrize("n_bins", ORACLE_BIN_COUNTS)
+    def test_the_floor_moves_and_the_server_accepts_the_result(
+        self, n_bins: int, open_lower: bool, open_upper: bool
+    ) -> None:
+        question = make_count_question(n_bins, open_lower=open_lower, open_upper=open_upper)
+        believed = sorted({0, n_bins // 2, n_bins - 1})
+        members: list[NumericDistribution] = []
+        for k in believed:
+            declared = [0.0] * (n_bins + 2)
+            declared[1 + k] = 1.0
+            members.append(build_pmf_distribution(declared, question))
+        pooled = aggregate_numeric(members, question, "mean")
+        builder_tail = OPEN_TAIL_MIN_MASS + PMF_FLOOR_MARGIN
+        raw_tails = (builder_tail if open_lower else 0.0, builder_tail)
+        assert (cdf_heights(pooled)[0], 1.0 - cdf_heights(pooled)[-1]) == pytest.approx(raw_tails, abs=1e-14)
+
+        outcome = floor_published_tails(pooled, question)
+
+        assert outcome.floor == FLOOR, "both tails sat at the builder's floor, so this is the moving case"
+        assert outcome.raw == pytest.approx(raw_tails, abs=1e-14)
+        assert outcome.published == pytest.approx((FLOOR if open_lower else 0.0, FLOOR))
+        published = cdf_heights(outcome.distribution)
+        assert_server_accepts_cdf(published, cdf_size=question.cdf_size, open_lower=open_lower, open_upper=open_upper)
+        min_step, _ = grid_step_constraints(question.cdf_size)
+        pmf = np.diff(published)
+        zero_bins = [k for k in range(n_bins) if k not in believed]
+        assert pmf[zero_bins] == pytest.approx(min_step, abs=1e-12), "the margin is consumed: exactly the min step"
+        assert np.round(pmf[zero_bins], 9).tolist() == [min_step] * len(zero_bins)
+        assert all(pmf[k] > 0.25 for k in believed), "each believed bin keeps the pool's third, scaled by the interior"
 
 
 def _normal_members(question: NumericQuestion, centres: tuple[float, ...], sd: float) -> list[NumericDistribution]:
@@ -428,19 +483,6 @@ def _normal_members(question: NumericQuestion, centres: tuple[float, ...], sd: f
     return members
 
 
-def _distribution_from_heights(heights: np.ndarray, question: NumericQuestion) -> NumericDistribution:
-    """A published-shape aggregate with exactly these CDF heights on the question's canonical grid."""
-    values = build_cdf_value_grid(question.lower_bound, question.upper_bound, None, len(heights))
-    declared = [Percentile(percentile=float(h), value=float(v)) for h, v in zip(heights, values, strict=True)]
-    return create_pchip_numeric_distribution(
-        pchip_cdf=[float(h) for h in heights], percentile_list=declared, question=question, zero_point=None
-    )
-
-
-def _heights(distribution: NumericDistribution) -> np.ndarray:
-    return np.asarray([p.percentile for p in distribution.get_cdf()], dtype=float)
-
-
 def _aggregate_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
     return [r.getMessage() for r in caplog.records if r.getMessage().startswith("NUMERIC_AGGREGATE:")]
 
@@ -451,8 +493,7 @@ def _fields(line: str) -> dict[str, str]:
 
 class TestPlatformGate:
     def test_mantic_gets_the_floor_and_metaculus_gets_none(self) -> None:
-        mantic = make_real_numeric_question(open_lower_bound=True)
-        mantic.page_url = _MANTIC_URL
+        mantic = on_mantic(make_real_numeric_question(open_lower_bound=True))
         assert question_platform(mantic) == PLATFORM_MANTIC
         assert tail_floor_for_platform(mantic) == FLOOR
 
@@ -474,16 +515,15 @@ class TestTheForecasterSeam:
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         caplog.set_level(logging.INFO, logger="metaculus_bot")
-        question = make_real_numeric_question(open_lower_bound=True, open_upper_bound=True)
-        question.page_url = _MANTIC_URL
+        question = on_mantic(make_real_numeric_question(open_lower_bound=True, open_upper_bound=True))
         members = _normal_members(question, centres=(10.0, 10.4, 9.7), sd=1.0)
-        member_heights_before = [_heights(m) for m in members]
+        member_heights_before = [cdf_heights(m) for m in members]
 
         bot = make_e2e_bot(AggregationStrategy.MEDIAN)
         aggregated = await bot._aggregate_predictions(cast(list[PredictionTypes], members), question)
 
         assert isinstance(aggregated, NumericDistribution)
-        published = _heights(aggregated)
+        published = cdf_heights(aggregated)
         assert published[0] >= FLOOR
         assert 1.0 - published[-1] >= FLOOR - 1e-12
         assert_server_accepts_cdf(published, cdf_size=len(published), open_lower=True, open_upper=True)
@@ -492,7 +532,7 @@ class TestTheForecasterSeam:
         assert [p.value for p in aggregated.declared_percentiles] == [p.value for p in aggregated.get_cdf()]
         assert [p.percentile for p in aggregated.declared_percentiles] == list(map(float, published))
         for before, member in zip(member_heights_before, members, strict=True):
-            assert np.array_equal(before, _heights(member))
+            assert np.array_equal(before, cdf_heights(member))
 
         (line,) = _aggregate_lines(caplog)
         fields = _fields(line)
@@ -510,13 +550,13 @@ class TestTheForecasterSeam:
         question = make_real_numeric_question(open_lower_bound=True, open_upper_bound=True)
         assert question_platform(question) == PLATFORM_METACULUS
         members = _normal_members(question, centres=(10.0, 10.4, 9.7), sd=1.0)
-        expected = _heights(aggregate_numeric(members, question, method="median"))
+        expected = cdf_heights(aggregate_numeric(members, question, method="median"))
 
         bot = make_e2e_bot(AggregationStrategy.MEDIAN)
         aggregated = await bot._aggregate_predictions(cast(list[PredictionTypes], members), question)
 
         assert isinstance(aggregated, NumericDistribution)
-        assert np.array_equal(_heights(aggregated), expected)
+        assert np.array_equal(cdf_heights(aggregated), expected)
         assert (expected[0], expected[-1]) == pytest.approx((0.01, 0.99)), "the structural 1% tails, unfloored"
         (line,) = _aggregate_lines(caplog)
         fields = _fields(line)
@@ -553,7 +593,7 @@ class TestTheForecasterSeam:
 
         assert isinstance(aggregated, NumericDistribution)
         assert aggregated.is_date is True, "the rebuilt aggregate must still render as dates in the comment"
-        published = _heights(aggregated)
+        published = cdf_heights(aggregated)
         assert len(published) == 13
         assert published[0] == 0.0, "a closed lower bound is never moved"
         assert 1.0 - published[-1] >= FLOOR - 1e-12
@@ -569,15 +609,14 @@ class TestTheForecasterSeam:
     def test_the_codex_shape_rebuilds_into_a_distribution_instead_of_raising(self) -> None:
         """98% below the lower bound, 0.1% above the upper, on the standard grid: the shape whose naive
         floor put ``cdf[-1]`` under ``cdf[0]`` and made this rebuild raise ``ValidationError``."""
-        question = make_real_numeric_question(open_lower_bound=True, open_upper_bound=True)
-        question.page_url = _MANTIC_URL
+        question = on_mantic(make_real_numeric_question(open_lower_bound=True, open_upper_bound=True))
         before = _legal_cdf(_fat_lower_tail(201, 0.98), open_lower=True, open_upper=True)
-        aggregated = _distribution_from_heights(before, question)
+        aggregated = distribution_from_heights(before, question)
 
         outcome = floor_published_tails(aggregated, question)
 
         assert outcome.distribution is not aggregated
-        published = _heights(outcome.distribution)
+        published = cdf_heights(outcome.distribution)
         assert_server_accepts_cdf(published, cdf_size=201, open_lower=True, open_upper=True)
         room = 1.0 - 0.98 - _least_interior_mass(201)
         assert published[0] == 0.98
@@ -596,10 +635,9 @@ class TestTheForecasterSeam:
         to what the interior's min-step mass leaves (about 2.6%), not to 5%, and the marker records
         that level as the floor applied."""
         caplog.set_level(logging.INFO, logger="metaculus_bot")
-        question = make_real_numeric_question(open_lower_bound=True, open_upper_bound=True)
-        question.page_url = _MANTIC_URL
+        question = on_mantic(make_real_numeric_question(open_lower_bound=True, open_upper_bound=True))
         members = _normal_members(question, centres=(-1.8, -1.6, -2.0), sd=1.0)
-        raw = _heights(aggregate_numeric(members, question, method="median"))
+        raw = cdf_heights(aggregate_numeric(members, question, method="median"))
         assert raw[0] > 0.95
         assert 1.0 - raw[-1] == pytest.approx(0.01)
         room = 1.0 - raw[0] - _least_interior_mass(201)
@@ -609,7 +647,7 @@ class TestTheForecasterSeam:
         aggregated = await bot._aggregate_predictions(cast(list[PredictionTypes], members), question)
 
         assert isinstance(aggregated, NumericDistribution)
-        published = _heights(aggregated)
+        published = cdf_heights(aggregated)
         assert_server_accepts_cdf(published, cdf_size=201, open_lower=True, open_upper=True)
         assert published[0] == raw[0], "the fat tail is never reduced"
         assert 1.0 - published[-1] == pytest.approx(room)
@@ -623,23 +661,28 @@ class TestTheForecasterSeam:
     async def test_a_date_aggregate_piled_past_its_open_upper_bound_still_rebuilds_as_a_date(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Both bounds open, every member certain of a day after the range: the upper tail is fat and
-        the lower rises as far as the 13-point grid's interior allows, through the epoch adapter."""
+        """Both bounds open, every member centred a few hours after the range ends: the upper tail is fat
+        and the lower rises exactly as far as the 13-point grid's interior allows, through the epoch
+        adapter. A 12-bin Mantic date question pools by the pointwise MEAN (``elicit_per_bin``), so the
+        raw reference is the members' mean. The centres sit close enough to the bound that the interior
+        holds more than its minimum, which is what leaves the floor room to move; members entirely beyond
+        the range legalise to an interior already at its minimum, the untouched case pinned above."""
         caplog.set_level(logging.INFO, logger="metaculus_bot")
         question: DateQuestion = make_real_date_question(open_lower_bound=True, open_upper_bound=True)
         epoch_question = as_epoch_question(question)
-        beyond = datetime(2026, 9, 22, tzinfo=UTC)
-        centres = tuple(to_epoch(beyond + timedelta(hours=h)) for h in (12, 13, 11))
+        range_end = datetime(2026, 9, 20, tzinfo=UTC)
+        centres = tuple(to_epoch(range_end + timedelta(hours=h)) for h in (8, 9, 7))
         members = _normal_members(epoch_question, centres=centres, sd=4 * 3600.0)
-        raw = _heights(aggregate_numeric(members, epoch_question, method="median"))
+        raw = cdf_heights(aggregate_numeric(members, epoch_question, method="mean"))
         assert 1.0 - raw[-1] > 0.95
+        assert raw[-1] - raw[0] > _least_interior_mass(13), "the interior holds more than its minimum"
 
         bot = make_e2e_bot(AggregationStrategy.MEDIAN)
         aggregated = await bot._aggregate_predictions(cast(list[PredictionTypes], members), question)
 
         assert isinstance(aggregated, NumericDistribution)
         assert aggregated.is_date is True
-        published = _heights(aggregated)
+        published = cdf_heights(aggregated)
         assert_server_accepts_cdf(published, cdf_size=13, open_lower=True, open_upper=True)
         assert published[-1] == raw[-1], "the fat tail is never reduced"
         assert raw[0] < published[0] < FLOOR

@@ -32,10 +32,12 @@ uv run python -m metaculus_bot.performance_analysis --tournament <slug> --output
 
 The `--tournament` default (`DEFAULT_TOURNAMENT`, `performance_analysis/cli.py`) lags
 the live season, so pass the current slug explicitly. The **pull is read-only and
-free** — it hits only the Metaculus API (resolved questions plus the bot's own
-comments, user id 275109, auth via `METACULUS_TOKEN`), makes no LLM or research calls
-and publishes nothing, so it is **not subject to the repo's cost gate** (unlike
-`make backtest_*` and live runs).
+free** — it hits only the Metaculus API (the tournament's resolved posts, paged off the
+list endpoint under `with_cp=true` so each page already carries the token's own
+`my_forecasts` and no per-post GET is issued, plus the bot's own comments, user id
+275109, auth via `METACULUS_TOKEN`), makes no LLM or research calls and publishes
+nothing, so it is **not subject to the repo's cost gate** (unlike `make backtest_*` and
+live runs).
 
 **Pass `--prior <previous round's dataset>` on every round pull.** Metaculus
 re-resolves questions IN PLACE without moving any timestamp we store. It edited q44798
@@ -440,6 +442,90 @@ row that moves no record renders `identity` rather than a CI.
 - The only pro-tightening row in either cohort is the single-survivor degraded publish
   q44874, whose shape the thin publish floor prices at **+51.08 over the 4 genuine k=1
   publishes with zero cost to the other three**.
+
+## Record fields: what each collector record carries, and the traps behind it
+
+`collector.py` `_process_single_question` builds one flat dictionary per question, and
+`_comment_signals` supplies the fields that come off the bot's own published comment. Those
+field names are a data contract with the research archive, so a field is added rather than
+renamed or repurposed in place. What each one means, and the trap behind it where there is
+one:
+
+- `per_model_forecasts` carries one entry per ensemble member on a non-stacked comment. On a
+  stacked comment it collapses to the stacker's single aggregate, so any median or spread
+  computation has to read `per_base_model_forecasts` instead, which is what
+  `stacker_detection.py` does on a stacked record.
+- `per_base_model_forecasts` is what the stacker-combined round-one reasoning body still
+  discloses, and it is empty on a non-stacked comment. Its shape follows the question type: a
+  binary question gives `dict[str, str]`, for instance `{"gpt-5.5": "72.0%"}`; a
+  multiple-choice question gives `dict[str, dict[str, float]]`, one option dictionary per base
+  model; and a numeric or discrete question gives an empty dictionary, because those types
+  carry their per-member detail in `per_model_numeric_percentiles`, whose parser already
+  handles stacker-combined bodies.
+- `per_model_numeric_percentiles` is `{model_name: [(percentile, value), ...]}` for numeric and
+  discrete questions, and empty for binary and multiple choice.
+- A non-empty per-option probability dictionary from `parse_per_model_mc_option_probs` IS the
+  multiple-choice detector inside `_comment_signals`; there is no separate type check. The
+  older single-string bullet parser returned only the top option line, which is why a
+  multiple-choice question needs the full per-option vector and the option dictionaries win
+  over the legacy parse.
+- `_comment_signals` logs at DEBUG, never WARNING, when a comment marked stacked yields no
+  per-model entries at all. A drifted producer-side delimiter is worth surfacing during triage,
+  but the legitimate shapes look identical: a middle-trimmed comment, or a stacked binary or
+  multiple-choice question with no percentile restatement.
+- `was_stacked` is the legacy tri-state: True or False when the `STACKED=<bool>` comment marker
+  is present, None on an older comment where stacking status cannot be determined at all. It is
+  kept for backward compatibility. Prefer `stacker_outcome`.
+- `stacker_outcome` is one of `primary`, `fallback_llm`, `fallback_median`, `fallback_mean`,
+  `skipped` or `skipped_config_off`, and `stacker_outcome_source` records which of three rungs
+  read it: `marker_outcome` (the `STACKER_OUTCOME=` marker), `marker_legacy` (the older
+  `STACKED=` marker), `historical_body` (body-shape detection for a comment predating either
+  marker) or `none`. The field exists because `was_stacked` collapses a median fallback and an
+  outright skip into the same False or None, which is lossy for any stacking-treatment-effect
+  cut. `skipped_config_off`, added 2026-07-19, separates a config-suppressed skip from a
+  below-threshold one; comments earlier than that collapse both into `skipped`.
+- `stacker_skip_reason` is `spread_below_threshold`, `config_off` or `single_forecaster`, from
+  the additive `STACKER_SKIP_REASON` marker, and None whenever the stacker did not skip or the
+  comment predates the marker. A bare `skipped` outcome cannot tell a below-threshold skip from
+  the single-forecaster short circuit (q44870), which is what the field was added for.
+- `forecasters_used` and `forecasters_configured` come from the `FORECASTERS_USED` marker: the
+  number of forecasters that contributed to the published aggregate, which equals the per-model
+  bullet count, and the roster size on that run. Both are None on a comment predating the
+  marker. This is the BOT ensemble size and is not `metadata.nr_forecasters`, which is the
+  Metaculus crowd count. `forecasters_used < forecasters_configured` marks a degraded publish, a
+  model that dropped, rather than a roster change, which is what resolves the "fewer than N
+  bullets" ambiguity named in `AGENTS.md`.
+- `bot_comment_created_at` is the ISO-8601 timestamp on the bot's own comment, so a cohort cut
+  can filter on SUBMIT date (the May-vintage stack, for instance) rather than the coarser
+  `actual_resolve_time` stamp on the question.
+- `metaculus_scores` is the platform's own `my_forecasts.score_data`: `spot_peer_score`,
+  `peer_score` (both ascending, so negative is worse than the crowd), `spot_baseline_score`,
+  `baseline_score`, `coverage`, `weighted_coverage` and `relative_legacy_score`. It is None on a
+  record fetched before score data was captured, and populated on any fresh pull of a resolved
+  question. Read spot peer rather than peer, and read it through
+  `performance_analysis/platform_scores.py` rather than by indexing this dictionary, so the
+  convention cannot drift per consumer. See "The tournament ranks on SPOT PEER" above.
+- `metadata.nr_forecasters` is the Metaculus CROWD size, and it lives on the POST rather than on
+  the question. Verified against archived post payloads: every post carries `nr_forecasters` and
+  `forecasts_count`, and no question dictionary carries either. Reading it off the question with
+  a 0 default is what made the field read 0 in every record pulled before 2026-08-25, and
+  because a real 0 is not a missing key it also killed `audit.py`'s own `n/a` fallback. It is
+  now None when the post genuinely omits the field, which lets a crowd-size cut drop those
+  records instead of averaging a fabricated zero into them. Fresh pulls carry real counts,
+  typically 100-250 on tournament questions. See "Two treatment tags read as TERNARY" above for
+  the archive-side consequence: nothing rewrites the archive, so a 0 on an older record is
+  unknown rather than a measurement.
+- `metadata.resolution_set_time` is stored so a re-resolution has something timestamp-shaped on
+  the record, and it is never the detector. Metaculus edited q44798 from 80 to 82 with this
+  field left at `2026-08-31T21:38:45Z`, a stamp that PRECEDES the pull which still read 80. Diff
+  the resolution VALUE instead (`performance_analysis/rescore_diff.py`); the field only helps
+  once you already know an edit happened, for bounding when the original resolution was set. See
+  "The round pull, and why `--prior` is mandatory" above.
+- A resolved DATE question never becomes a record at all. The live bot forecasts date questions
+  on the epoch-seconds axis of `numeric/date_axis.py`, so a resolved one does reach the
+  collector, and `_process_single_question` skips it with a WARNING ahead of `parse_resolution`,
+  which would otherwise file it under "Unknown question type" and make the exclusion look like a
+  parser bug. See "Date questions are excluded from the dataset, by decision" below.
 
 ## Recovering per-model forecasts
 

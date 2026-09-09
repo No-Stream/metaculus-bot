@@ -15,7 +15,7 @@ from forecasting_tools import (
 )
 from forecasting_tools.data_models.questions import DateQuestion
 
-from metaculus_bot.constants import MC_PROB_MIN, PLATFORM_MANTIC
+from metaculus_bot.constants import MC_PROB_MIN, PLATFORM_MANTIC, PMF_ABOVE_RANGE_KEY, PMF_BELOW_RANGE_KEY
 from metaculus_bot.numeric.config import (
     EXPECTED_PERCENTILE_COUNT,
     STANDARD_PERCENTILES,
@@ -1218,18 +1218,20 @@ _CONTINUOUS_SCORING_RULE = (
 # Per-bin scoring: mass on a bin the criteria exclude is lost (651's weekend days, -14.4 points), so say so.
 _PER_BIN_SCORING_RULE = (
     "This question is scored on the bin the outcome falls in: the score is the logarithm of the probability you "
-    "gave that bin (or the `below_range` / `above_range` key when the outcome falls beyond an open bound, scored as "
-    "its own outcome against a reference of a few percent, so starving it is heavily punished). This is a proper "
-    "scoring rule: to maximize expected score, report your true probability for every bin. Probability on a bin "
-    "the resolution criteria exclude (a weekend on a trading-day question, a count the rules rule out) is simply "
-    "lost, so give such a bin 0."
+    f"gave that bin (or the `{PMF_BELOW_RANGE_KEY}` / `{PMF_ABOVE_RANGE_KEY}` key when the outcome falls beyond an "
+    "open bound, scored as its own outcome against a reference of a few percent, so starving it is heavily "
+    "punished). This is a proper scoring rule: to maximize expected score, report your true probability for every "
+    "bin. Probability on a bin the resolution criteria exclude (a weekend on a trading-day question, a count the "
+    "rules rule out) is simply lost, so give such a bin 0."
 )
 
 # The block rung fails on a missing key; ``min_step`` is THIS grid's floor, not the aggregate's 5% tail floor.
+# The last sentence says what ``numeric.pmf_cdf._blend_to_cell_floors`` does, so the model does not pre-subtract it.
 _PER_BIN_OUTPUT_RULE = (
     "Give one probability for EVERY key listed in the schema below, spelled exactly as listed and in that order, "
-    "so that the probabilities sum to 1.0. Use 0 for a bin you are certain cannot occur; the platform's per-bin "
-    "minimum (about {min_step} on this grid) is added to every bin for you."
+    "so that the probabilities sum to 1.0. Use 0 for a bin you are certain cannot occur; a bin you leave at 0 is "
+    "lifted to the platform's per-bin minimum (about {min_step} on this grid) for you and the rest scaled down to "
+    "keep the total at 1.0."
 )
 
 # Only where the labels are intervals: the platform's bins are right-closed, so a key must say which edge it owns.
@@ -1293,14 +1295,14 @@ _MANTIC_OUT_OF_RANGE_RATE_QUANTITY = (
 _MANTIC_OUT_OF_RANGE_RATE_DATE_PMF = (
     "On this platform about half of past date questions with an open upper bound resolved AFTER it (101 of 188 "
     'in Series 1), so treat "the event has not happened by the upper bound" as a live central case and not a '
-    "tail: if that is your view, most of your probability belongs on `above_range`, and a token probability there "
-    "asserts a near-zero chance of an out-of-range outcome."
+    f"tail: if that is your view, most of your probability belongs on `{PMF_ABOVE_RANGE_KEY}`, and a token "
+    "probability there asserts a near-zero chance of an out-of-range outcome."
 )
 _MANTIC_OUT_OF_RANGE_RATE_QUANTITY_PMF = (
     "On this platform about one in five past quantitative questions resolved outside the displayed range (one "
     "in four of the discrete ones, one in eight of the continuous ones), so give the out-of-range key of each "
-    "open bound (`below_range`, `above_range`) your honest probability: a token probability there asserts a "
-    "near-zero chance of an out-of-range outcome."
+    f"open bound (`{PMF_BELOW_RANGE_KEY}`, `{PMF_ABOVE_RANGE_KEY}`) your honest probability: a token probability "
+    "there asserts a near-zero chance of an out-of-range outcome."
 )
 
 
@@ -1617,8 +1619,14 @@ def _percentile_elicitation(view: NumericQuestion) -> _Elicitation:
     )
 
 
-# How a per-bin prompt describes its keys, per label style; a centre-labelled key is the value itself and needs none.
+# How a per-bin prompt describes its keys, one sentence per label style, total over ``BinLabelStyle``. The centre
+# sentence is unconditional because ``_is_center_aligned`` admits any step (5 of the 46 coarse Mantic centre grids
+# step by 5, 500, 0.25 or 0.1), and a key ``5`` read as "5 up to 10" puts a belief of 3 one bin off.
 _PMF_KEY_RULES: dict[BinLabelStyle, str] = {
+    "center": (
+        "Every key is the value at the centre of its bin; the bin covers half the stated width either side of that "
+        "value."
+    ),
     "day": "Every key is a UTC calendar date and names the whole day it covers.",
     "week": "Every key is a UTC calendar date and names the seven days beginning on it.",
     "interval": _PMF_INTERVAL_KEY_RULE,
@@ -1646,8 +1654,8 @@ def _pmf_axis_block(view: NumericQuestion, grid: PmfGrid, min_step: float) -> st
             "        ── Bins & Bounds ──",
             _bullet_lines(
                 unit_line,
-                _PMF_KEY_RULES.get(grid.style, ""),
                 _pmf_grid_clause(view, grid),
+                _PMF_KEY_RULES[grid.style],
                 _PER_BIN_OUTPUT_RULE.format(min_step=f"{min_step:g}"),
             ),
         ]
@@ -1696,7 +1704,10 @@ def _pmf_elicitation(view: NumericQuestion, grid: PmfGrid) -> _Elicitation:
             wide_shape="a spread-out forecast",
         ),
         tails_bullet=_UNKNOWN_UNKNOWNS_BULLET.format(
-            tail_instruction="Keep enough probability on the outer bins (and on `below_range` / `above_range` where they exist)"
+            tail_instruction=(
+                "Keep enough probability on the outer bins (and on "
+                f"`{PMF_BELOW_RANGE_KEY}` / `{PMF_ABOVE_RANGE_KEY}` where they exist)"
+            )
         ),
         outcome_type_step="",
         final_check_lead=_PMF_DATE_FINAL_CHECK if is_date else _PMF_QUANTITY_FINAL_CHECK,
@@ -1864,7 +1875,7 @@ def numeric_prompt(
         research=research,
         lower_bound_message=lower_bound_message,
         upper_bound_message=upper_bound_message,
-        axis=_numeric_axis(question),
+        axis=_kind_axis(question),
         elicitation=_percentile_elicitation(question),
     )
 
@@ -1887,7 +1898,7 @@ def date_prompt(
         research=research,
         lower_bound_message=lower_bound_message,
         upper_bound_message=upper_bound_message,
-        axis=_date_axis(view),
+        axis=_kind_axis(view),
         elicitation=_percentile_elicitation(view),
     )
 

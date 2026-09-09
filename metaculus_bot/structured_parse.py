@@ -87,22 +87,21 @@ class BinProbabilityListWrapper(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _get_wrapper_type(output_type: type) -> type[BaseModel] | None:
-    """Return a wrapper BaseModel if output_type is a list[X], else None."""
-    origin = get_origin(output_type)
-    if origin is list:
-        args = get_args(output_type)
-        if args and len(args) == 1:
-            item_type = args[0]
-            if item_type is Percentile:
-                return PercentileListWrapper
-            if item_type is IsoDatePercentile:
-                return DatePercentileListWrapper
-            if item_type is OptionProbability:
-                return OptionProbabilityListWrapper
-            if item_type is BinProbability:
-                return BinProbabilityListWrapper
-    return None
+# Why: one table ties an item type to its wrapper AND list field; see docs/value_extraction.md "The LLM salvage rung".
+_LIST_WRAPPERS: dict[type, tuple[type[BaseModel], str]] = {
+    Percentile: (PercentileListWrapper, "percentiles"),
+    IsoDatePercentile: (DatePercentileListWrapper, "percentiles"),
+    OptionProbability: (OptionProbabilityListWrapper, "options"),
+    BinProbability: (BinProbabilityListWrapper, "bins"),
+}
+
+
+def _get_wrapper_type(output_type: type) -> tuple[type[BaseModel], str] | None:
+    """The ``(wrapper model, list field)`` pair for a ``list[X]`` output type, else None."""
+    if get_origin(output_type) is not list:
+        return None
+    (item_type,) = get_args(output_type)
+    return _LIST_WRAPPERS.get(item_type)
 
 
 def _build_constrained_llm(response_format_model: type[BaseModel], parser_model: str) -> GeneralLlm:
@@ -158,9 +157,9 @@ async def parse_structured[T](
     prompt_notes:
         Additional extraction instructions (e.g. build_parse_notes for numeric).
     """
-    # Determine if we need a wrapper (list types)
-    wrapper_type = _get_wrapper_type(output_type)
-    schema_model: type[BaseModel] = wrapper_type if wrapper_type is not None else output_type  # type: ignore[assignment]
+    # Why: response_format needs a single BaseModel, so a list[X] output type is parsed through its wrapper.
+    wrapper = _get_wrapper_type(output_type)
+    schema_model: type[BaseModel] = output_type if wrapper is None else wrapper[0]  # type: ignore[assignment]
 
     # --- Primary path: constrained json_schema ---
     try:
@@ -176,18 +175,11 @@ async def parse_structured[T](
         prompt = "\n".join(prompt_parts)
 
         raw_response = await constrained_llm.invoke(prompt)
-
-        if wrapper_type is not None:
-            wrapper_instance = wrapper_type.model_validate_json(raw_response)
-            # Unwrap to the list contents
-            if wrapper_type in (PercentileListWrapper, DatePercentileListWrapper):
-                return wrapper_instance.percentiles  # type: ignore[return-value]
-            if wrapper_type is OptionProbabilityListWrapper:
-                return wrapper_instance.options  # type: ignore[return-value]
-            if wrapper_type is BinProbabilityListWrapper:
-                return wrapper_instance.bins  # type: ignore[return-value]
-        else:
-            return schema_model.model_validate_json(raw_response)  # type: ignore[return-value]
+        parsed = schema_model.model_validate_json(raw_response)
+        if wrapper is None:
+            return parsed  # type: ignore[return-value]
+        _, list_field = wrapper
+        return getattr(parsed, list_field)
 
     # Why: constrained decoding is an optimization, so ANY failure degrades to the fallback below.
     except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except  # intentional: catch-all → graceful fallback

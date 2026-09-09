@@ -40,7 +40,6 @@ from forecasting_tools import (
 from forecasting_tools.ai_models.ai_utils.openai_utils import VisionMessageData
 from forecasting_tools.data_models.multiple_choice_report import PredictedOption
 from forecasting_tools.data_models.numeric_report import Percentile
-from forecasting_tools.data_models.questions import DiscreteQuestion
 from pydantic import ValidationError
 
 from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN, MANTIC_SITE_URL, PMF_ABOVE_RANGE_KEY
@@ -60,6 +59,8 @@ from metaculus_bot.numeric.pmf_grid import PmfGrid, pmf_grid
 from metaculus_bot.value_extraction import ExtractionOutcome, McForecast, PmfForecast
 from tests.pipeline_test_helpers import (
     assert_server_accepts_cdf,
+    cdf_heights,
+    make_count_question,
     make_real_date_question,
     make_real_numeric_question,
     server_min_step,
@@ -636,30 +637,6 @@ class TestRunNumericForecast:
         assert discrete_vote is None
 
 
-def _count_question(n_bins: int, *, page_url: str, open_upper: bool = True) -> DiscreteQuestion:
-    """A count question on ``n_bins`` integer bins 0..n_bins-1 in the platform's discrete convention."""
-    return DiscreteQuestion(
-        id_of_question=5001,
-        id_of_post=5001,
-        page_url=page_url,
-        question_text="How many releases will be published?",
-        background_info="",
-        resolution_criteria="",
-        fine_print="",
-        published_time=None,
-        close_time=None,
-        lower_bound=-0.5,
-        upper_bound=n_bins - 0.5,
-        open_lower_bound=False,
-        open_upper_bound=open_upper,
-        unit_of_measure="",
-        zero_point=None,
-        cdf_size=n_bins + 1,
-        nominal_lower_bound=0.0,
-        nominal_upper_bound=float(n_bins - 1),
-    )
-
-
 _MANTIC_URL = f"{MANTIC_SITE_URL}/questions/5001/"
 _METACULUS_URL = "https://www.metaculus.com/questions/5001/"
 
@@ -676,10 +653,6 @@ def _pmf_outcome(declared: list[float]) -> ExtractionOutcome[PmfForecast]:
 
 def _compact(values: list[float]) -> str:
     return json.dumps(values, separators=(",", ":"))
-
-
-def _cdf_heights(prediction: NumericDistribution) -> np.ndarray:
-    return np.asarray([p.percentile for p in prediction.get_cdf()], dtype=float)
 
 
 @contextmanager
@@ -765,7 +738,7 @@ class TestPerBinBranch:
         assert isinstance(prediction, NumericDistribution)
         assert prediction.is_date is True
         assert result.reasoning == "per-bin reasoning"
-        heights = _cdf_heights(prediction)
+        heights = cdf_heights(prediction)
         assert len(heights) == 13
         assert heights[0] == 0.0
         assert heights[-1] == 1.0
@@ -794,7 +767,7 @@ class TestPerBinBranch:
     ) -> None:
         """The numeric runner's return keeps its shape: ``(prediction, None)``, no discrete vote."""
         caplog.set_level(logging.INFO, logger="metaculus_bot.forecaster_runners")
-        question = _count_question(11, page_url=_MANTIC_URL)
+        question = make_count_question(11)
         extract = AsyncMock(return_value=_pmf_outcome(_COUNT_DECLARED))
         with (
             _percentile_path_never_runs(),
@@ -809,7 +782,7 @@ class TestPerBinBranch:
         grid = extract.await_args.args[1]  # type: ignore[union-attr]
         assert grid.keys == (*(str(count) for count in range(11)), PMF_ABOVE_RANGE_KEY)
 
-        heights = _cdf_heights(result.prediction_value)
+        heights = cdf_heights(result.prediction_value)
         assert len(heights) == 12
         assert heights[0] == 0.0
         assert_server_accepts_cdf(heights, cdf_size=12, open_lower=False, open_upper=True)
@@ -830,7 +803,7 @@ class TestPerBinBranch:
     ) -> None:
         """The call sequence, with the builder stubbed: the ladder's declared vector goes to
         ``build_pmf_distribution`` unchanged, and the model name rides along for the clip marker."""
-        question = _count_question(11, page_url=_MANTIC_URL)
+        question = make_count_question(11)
         built = MagicMock(spec=NumericDistribution)
         with (
             _percentile_path_never_runs(),
@@ -854,7 +827,7 @@ class TestPerBinBranch:
     @pytest.mark.asyncio
     async def test_a_declaration_the_builder_refuses_propagates(self, forecaster_llm, parser_llm) -> None:
         """A guard fails shut: mass declared in a closed tail raises out of the runner, never publishes."""
-        question = _count_question(11, page_url=_MANTIC_URL)
+        question = make_count_question(11)
         below_a_closed_floor = [0.3, *_COUNT_DECLARED[1:]]
         with (
             _percentile_path_never_runs(),
@@ -875,8 +848,8 @@ class TestPerBinBranch:
                 make_real_numeric_question().model_copy(update={"page_url": _MANTIC_URL}),
                 id="mantic-201-point-continuous-grid",
             ),
-            pytest.param(_count_question(200, page_url=_MANTIC_URL), id="mantic-200-bin-discrete"),
-            pytest.param(_count_question(11, page_url=_METACULUS_URL), id="metaculus-11-bin-discrete"),
+            pytest.param(make_count_question(200), id="mantic-200-bin-discrete"),
+            pytest.param(make_count_question(11, page_url=_METACULUS_URL), id="metaculus-11-bin-discrete"),
         ],
     )
     @pytest.mark.asyncio
@@ -926,15 +899,26 @@ class TestPerBinBranch:
 
 class TestBuildPmfParseNotes:
     def test_lists_every_key_verbatim_and_the_count(self) -> None:
-        grid = pmf_grid(_count_question(11, page_url=_MANTIC_URL))
+        grid = pmf_grid(make_count_question(11))
         notes = build_pmf_parse_notes(grid)
         for key in grid.keys:
             assert f"'{key}'" in notes
-        assert f"exactly {len(grid.keys)} objects" in notes
+        assert f"exactly {len(grid.keys)} keys" in notes
         assert "'label'" in notes
         assert "'probability'" in notes
         assert PMF_ABOVE_RANGE_KEY in notes
         assert "below_range" not in notes  # the lower bound is closed: no such key to spell
+
+    def test_an_unstated_key_is_left_out_never_written_as_zero(self) -> None:
+        """The notes used to say both "never fill it in" and "a key the forecaster gave no probability is 0",
+        and a parser obeying the second invented an ``above_range: 0`` that then satisfied the every-key rule.
+        A key the forecaster never priced is left out, so ``extract_pmf`` drops the member instead."""
+        notes = build_pmf_parse_notes(pmf_grid(make_count_question(11)))
+        assert "gave no probability" not in notes
+        assert "leave that key out" in notes
+        assert "never" in notes.lower()
+        assert "fill in" in notes
+        assert "ruled out is 0" in notes  # an explicit "cannot happen" IS a stated probability
 
     def test_a_date_grid_spells_dates_and_no_epoch_second(self) -> None:
         grid = pmf_grid(as_epoch_question(make_real_date_question()))

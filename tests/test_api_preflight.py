@@ -34,9 +34,9 @@ from metaculus_bot.api_preflight import (
 )
 from metaculus_bot.constants import MANTIC_API_BASE_URL
 from metaculus_bot.performance_analysis import cli as perf_cli
+from tests.http_fakes import text_response
 
-# The live Mantic fingerprint (probed 2026-09-08): the posts list is public and answers the
-# same JSON shape an authenticated Metaculus read does.
+# The live Mantic fingerprint: the posts list is public and answers the JSON shape of an authenticated Metaculus read.
 _MANTIC_POSTS_BODY = '{"next": null, "previous": null, "results": [{"id": 650}]}'
 _PARKED_LANDER_HTML = '<html><head><script>window.location.href="/lander"</script></head></html>'
 
@@ -63,13 +63,7 @@ def _mock_transport(
         if exc is not None:
             raise exc
         assert status is not None  # a non-exception transport stub must supply a status
-        response = requests.Response()
-        response.status_code = status
-        response._content = body.encode()
-        response.encoding = "utf-8"
-        response.url = request.url or api_preflight.preflight_url()
-        response.request = request
-        return response
+        return text_response(body, status=status, url=request.url or api_preflight.preflight_url(), request=request)
 
     with patch.object(HTTPAdapter, "send", fake_send):
         yield captured

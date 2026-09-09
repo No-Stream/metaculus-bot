@@ -38,7 +38,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from forecasting_tools.data_models.questions import DateQuestion, DiscreteQuestion
+from forecasting_tools.data_models.questions import DateQuestion
 
 PRESEASON_FIXTURE_PATH = Path(__file__).parent / "data" / "mantic_preseason2_posts_2026_09_08.json"
 LEGACY_DATE_FIXTURE_PATH = Path(__file__).parent / "data" / "mantic_series1_date_post_500_2026_09_08.json"
@@ -90,11 +90,6 @@ def load_coarse_discrete_post() -> dict[str, Any]:
     with COARSE_DISCRETE_FIXTURE_PATH.open() as f:
         payload = json.load(f)
     return copy.deepcopy(payload["results"][0])
-
-
-def load_coarse_discrete_question() -> DiscreteQuestion:
-    """Post 643 as the ``DiscreteQuestion`` the framework parses: counts 0 to 20, open upper bound."""
-    return DiscreteQuestion.from_metaculus_api_json(load_coarse_discrete_post())
 
 
 def load_preseason_date_question() -> DateQuestion:

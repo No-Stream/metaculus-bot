@@ -31,11 +31,16 @@ from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid, safe_cdf_bound
 from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
 from metaculus_bot.numeric.validation import resolve_zero_point
 
-__all__ = ["build_pmf_distribution", "published_pmf", "validate_grid_cdf"]
+__all__ = ["build_pmf_distribution", "published_pmf", "server_rounded_pmf", "validate_grid_cdf"]
 
 # The server compares the CDF rounded to 10 decimals and its PMF rounded to 9.
 _SERVER_CDF_DECIMALS: int = 10
 _SERVER_PMF_DECIMALS: int = 9
+
+
+def server_rounded_pmf(cdf: Sequence[float] | np.ndarray) -> np.ndarray:
+    """The in-range steps of ``cdf`` as the server compares them: the CDF rounded to 10 decimals, differenced, rounded to 9."""
+    return np.round(np.diff(np.round(np.asarray(cdf, dtype=float), _SERVER_CDF_DECIMALS)), _SERVER_PMF_DECIMALS)
 
 
 def build_pmf_distribution(
@@ -45,15 +50,16 @@ def build_pmf_distribution(
 
     ``declared`` is the platform's ``N + 2`` PMF shape (``N = view.cdf_size - 1`` bins):
     ``[below, p_0, ..., p_{N-1}, above]``, a closed tail's entry 0.0, every entry finite and
-    non-negative, the sum positive (the extraction ladder already bounds it to within 2% of 1.0;
-    it is normalised here). ``view`` is the numeric-pipeline view of the question, the epoch adapter
-    for a date question. ``model_name`` only labels the ``CDF_MAXSTEP_CLIP`` marker
-    ``safe_cdf_bounds`` emits if the grid's cap ever binds.
+    non-negative, the sum positive. The extraction ladder bounds the declared sum to
+    ``structured_output_schema.pmf_prob_sum_tolerance(len(grid.keys))`` of 1.0, a 0.02 floor plus
+    0.005 per key (0.06 on post 651's 12-key grid, 0.165 at the 33-key maximum); it is normalised
+    here, so only the shape is load-bearing. ``view`` is the numeric-pipeline view of the question
+    (the epoch adapter for a date question); ``model_name`` only labels the ``CDF_MAXSTEP_CLIP``
+    marker ``safe_cdf_bounds`` emits if the grid's cap ever binds.
 
     Raises:
         ValueError: the declaration is malformed, or carries mass in a closed tail.
-        RuntimeError: the built CDF fails a server rule (``validate_grid_cdf``), which no input
-            should reach; a guard fails shut.
+        RuntimeError: the built CDF fails a server rule (``validate_grid_cdf``); a guard fails shut.
     """
     open_lower, open_upper = view.open_lower_bound, view.open_upper_bound
     pmf = _validated_declaration(declared, cdf_size=view.cdf_size, open_lower=open_lower, open_upper=open_upper)
@@ -112,8 +118,8 @@ def validate_grid_cdf(cdf: Sequence[float] | np.ndarray, *, cdf_size: int, open_
         raise RuntimeError(f"CDF length {heights.size} != cdf_size {cdf_size} (inbound bins + 1)")
     if np.any(np.isnan(heights)):
         raise RuntimeError(f"CDF carries NaN at {np.flatnonzero(np.isnan(heights)).tolist()}")
+    _check_steps(server_rounded_pmf(heights), cdf_size=cdf_size)
     rounded = np.round(heights, _SERVER_CDF_DECIMALS)
-    _check_steps(np.round(np.diff(rounded), _SERVER_PMF_DECIMALS), cdf_size=cdf_size)
     _check_bounds(float(rounded[0]), float(rounded[-1]), open_lower=open_lower, open_upper=open_upper)
 
 

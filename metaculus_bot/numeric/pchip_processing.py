@@ -12,6 +12,7 @@ from forecasting_tools.data_models.questions import NumericQuestion
 
 from metaculus_bot.constants import NUM_MAX_STEP, NUM_MIN_PROB_STEP, NUM_RAMP_K_FACTOR
 from metaculus_bot.numeric.config import (
+    OPEN_TAIL_MIN_MASS,
     PCHIP_CDF_POINTS,
     grid_step_constraints,
 )
@@ -137,11 +138,11 @@ def _apply_ramp_smoothing(pchip_cdf: list[float], question: NumericQuestion, *, 
         if not question.open_lower_bound:
             smoothed[0] = 0.0
         else:
-            smoothed[0] = max(smoothed[0], 0.001)
+            smoothed[0] = max(smoothed[0], OPEN_TAIL_MIN_MASS)
         if not question.open_upper_bound:
             smoothed[-1] = 1.0
         else:
-            smoothed[-1] = min(smoothed[-1], 0.999)
+            smoothed[-1] = min(smoothed[-1], 1.0 - OPEN_TAIL_MIN_MASS)
 
         # Enforce max-step constraint post-smoothing
         smoothed = safe_cdf_bounds(
@@ -194,11 +195,11 @@ def _validate_pchip_cdf(pchip_cdf: list[float], question: NumericQuestion) -> No
     if not question.open_upper_bound and abs(pchip_cdf[-1] - 1.0) > 1e-6:
         raise ValueError(f"PCHIP CDF closed upper bound violation: {pchip_cdf[-1]} != 1.0")
 
-    if question.open_lower_bound and pchip_cdf[0] < 0.001:
-        raise ValueError(f"PCHIP CDF open lower bound violation: {pchip_cdf[0]} < 0.001")
+    if question.open_lower_bound and pchip_cdf[0] < OPEN_TAIL_MIN_MASS:
+        raise ValueError(f"PCHIP CDF open lower bound violation: {pchip_cdf[0]} < {OPEN_TAIL_MIN_MASS}")
 
-    if question.open_upper_bound and pchip_cdf[-1] > 0.999:
-        raise ValueError(f"PCHIP CDF open upper bound violation: {pchip_cdf[-1]} > 0.999")
+    if question.open_upper_bound and pchip_cdf[-1] > 1.0 - OPEN_TAIL_MIN_MASS:
+        raise ValueError(f"PCHIP CDF open upper bound violation: {pchip_cdf[-1]} > {1.0 - OPEN_TAIL_MIN_MASS}")
 
 
 def _log_pchip_success(pchip_cdf: list[float], question: NumericQuestion, smoothing_applied: bool) -> None:
@@ -294,7 +295,7 @@ def create_fallback_numeric_distribution(
 
     Wraps forecasting-tools' native CDF builder (``get_cdf()``) but runs its output
     through ``safe_cdf_bounds`` whatever the bound shape. Metaculus rejects open-bound
-    CDFs with ``cdf[0] < 0.001`` / ``cdf[-1] > 0.999`` and caps the per-bin step on
+    CDFs with ``cdf[0] < OPEN_TAIL_MIN_MASS`` / ``cdf[-1] > 1 - OPEN_TAIL_MIN_MASS`` and caps the per-bin step on
     every question, so the legal range and the grid's step limits are enforced here
     rather than trusting the raw builder output. The closed/closed case used to be
     handed back raw: a tight declaration (normal, sd 0.6 on a [0, 100] grid) produced

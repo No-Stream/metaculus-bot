@@ -287,6 +287,18 @@ class TestTheKeysAreMatchableByTheFold:
             folded = [fold_bin_label(key) for key in grid.keys]
             assert len(set(folded)) == len(grid.keys), grid.style
 
+    def test_centre_labels_that_collapse_at_nine_decimals_fail_shut(self) -> None:
+        """Three 1e-10-wide bins all render as ``0``; a grid that cannot name its bins raises rather than relabelling."""
+        shape = _CorpusShape(1, 4, 0.0, 3e-10, 0.0, 3e-10, False, False)
+        with pytest.raises(ValueError, match=r"fold onto the same key.*'0'"):
+            pmf_grid(_numeric(shape))
+
+    def test_interval_labels_that_collapse_at_nine_decimals_fail_shut(self) -> None:
+        """Sub-nanometre bins on a log axis all render as ``1000000 to 1000000``."""
+        shape = _CorpusShape(2, 4, 1e6, 1e6 + 3e-10, 1e6, 1e6 + 3e-10, False, False)
+        with pytest.raises(ValueError, match="1000000 to 1000000"):
+            pmf_grid(_numeric(shape, zero_point=0.0))
+
     def test_the_fold_is_idempotent(self) -> None:
         for grid in _every_style():
             for key in grid.keys:

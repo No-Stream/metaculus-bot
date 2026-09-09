@@ -167,14 +167,19 @@ class TestPerBinRulesArePresent:
     def test_the_output_rule_names_every_key_and_the_grids_own_floor(self) -> None:
         """The parser maps keys onto the grid and every key must be present; the interpolated floor is the
         server's per-bin minimum for THIS grid (0.01 / 21 on post 643's shape), so the sentence cannot be
-        read as the 5% tail floor the published Mantic aggregate carries."""
+        read as the 5% tail floor the published Mantic aggregate carries. The mechanism sentence says what
+        ``numeric.pmf_cdf._blend_to_cell_floors`` does (a 0 bin is lifted to the floor, the rest scaled
+        down); "added to every bin" would invite the model to pre-subtract the floor it is told not to."""
         prompt = _pmf_prompt_text()
         flat = _flat(prompt)
         assert flat.count(_flat(_per_bin_output_rule(22))) == 1
         assert "one probability for every key listed in the schema below" in flat
         assert "spelled exactly as listed and in that order" in flat
         assert "use 0 for a bin you are certain cannot occur" in flat
+        assert "a bin you leave at 0 is lifted to the platform's per-bin minimum" in flat
         assert "about 0.00047619 on this grid" in flat
+        assert "the rest scaled down to keep the total at 1.0" in flat
+        assert "added to every bin" not in flat
         assert "0.05" not in flat[flat.index("bins & bounds") : flat.index("── scoring rule")]
         assert (
             prompt.index("── Bins & Bounds")
@@ -270,16 +275,50 @@ class TestPerBinAbsences:
 class TestBinsAndBoundsBlock:
     """The axis block names the grid from the labelled bins themselves, never from the bound message
     (on a centre-style grid the last label need not equal the displayed maximum, post 650), and
-    describes the keys the way the model must read them: a base unit on a quantity, a UTC calendar day
-    on a date grid, a right-closed interval where the labels are intervals."""
+    describes the keys the way the model must read them, one key sentence per label style: the value
+    at the centre of a bin on a centre-labelled grid, a UTC calendar day or week on a date grid, a
+    right-closed interval where the labels are intervals (a numeric grid with edge-aligned nominal
+    bounds, a log-spaced grid, a date grid with edges at arbitrary times)."""
 
     def test_a_count_grid_names_its_unit_width_and_bin_count(self) -> None:
         flat = _flat(_pmf_prompt_text())
         block = flat[flat.index("── bins & bounds ──") : flat.index("── scoring rule ──")]
         assert "base unit of the bin labels: releases" in block
         assert "scoring grid: 21 bins of width 1 releases" in block
+        assert "every key is the value at the centre of its bin" in block
+        assert "the bin covers half the stated width either side of that value" in block
+        assert block.index("bins of width 1 releases") < block.index("every key is the value at the centre")
         assert "right-closed interval" not in block
         assert "utc calendar date" not in block
+
+    def test_a_centre_grid_with_a_wide_step_says_what_a_key_covers(self) -> None:
+        """Five of the 46 coarse Mantic centre grids step by something other than 1 (5, 500, 0.25, 0.1), where
+        a key ``5`` read as "5 up to 10" puts a belief of 3 one bin off: the centre sentence is unconditional."""
+        q = _pmf_q(cdf_size=11, lower_bound=-2.5, upper_bound=47.5, nominal_lower=0.0, nominal_upper=45.0)
+        prompt = _pmf_prompt_text(q)
+        flat = _flat(prompt)
+        block = flat[flat.index("── bins & bounds ──") : flat.index("── scoring rule ──")]
+        assert "scoring grid: 10 bins of width 5 releases" in block
+        assert "every key is the value at the centre of its bin" in block
+        assert list(json.loads(_extract_last_json_block(prompt))["bin_probs"])[:3] == ["0", "5", "10"]
+
+    def test_a_log_spaced_grid_names_the_geometry_and_the_interval_convention(self) -> None:
+        """A ``zero_point`` makes the bins geometric, so the additive width phrase would be false across the
+        axis and the labels are intervals (``_label_bins`` never centre-labels a log grid)."""
+        q = _pmf_q(
+            cdf_size=11,
+            lower_bound=1.0,
+            upper_bound=1024.0,
+            nominal_lower=1.0,
+            nominal_upper=1024.0,
+            zero_point=0.0,
+        )
+        flat = _flat(_pmf_prompt_text(q))
+        block = flat[flat.index("── bins & bounds ──") : flat.index("── scoring rule ──")]
+        assert "scoring grid: 10 bins, log-spaced" in block
+        assert "bins of width" not in block
+        assert "each key `a to b` is a right-closed interval" in block
+        assert "every key is the value at the centre" not in block
 
     def test_a_day_grid_describes_the_keys_as_utc_calendar_days(self) -> None:
         flat = _flat(_pmf_prompt_text(_mantic_date_q()))
@@ -294,6 +333,17 @@ class TestBinsAndBoundsBlock:
         flat = _flat(_pmf_prompt_text(q))
         assert "every key is a utc calendar date and names the seven days beginning on it" in flat
         assert "scoring grid: 4 bins of one calendar week each" in flat
+
+    def test_a_date_grid_with_arbitrary_edges_states_the_right_closed_convention(self) -> None:
+        """The platform sends an empty granularity on 50 of 51 live date questions; on a coarse one the
+        edges fall at arbitrary times, so each key is a timestamp interval and no day-or-week sentence fits."""
+        q = make_real_date_question(cdf_size=6, date_granularity="", open_upper_bound=True)
+        flat = _flat(_pmf_prompt_text(q))
+        block = flat[flat.index("── bins & bounds ──") : flat.index("── scoring rule ──")]
+        assert "each key `a to b` is a right-closed interval" in block
+        assert "scoring grid: 5 bins." in block
+        assert "calendar" not in block
+        assert "base unit" not in block
 
     def test_an_interval_grid_states_the_right_closed_convention(self) -> None:
         prompt = _pmf_prompt_text(_pmf_q(**_INTERVAL_GRID))

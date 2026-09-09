@@ -1,17 +1,20 @@
 """Tests for the supply probe's Mantic mode (``scripts/supply_probe.py --platform mantic``).
 
 Mantic's Crucible (competitions.mantic.com) is a Metaculus fork whose read endpoints are public,
-so the probe runs without a token there; what a token adds is ``my_forecasts`` on the list page
-(under ``with_cp=true``), which is the only way to classify a closed-but-unresolved question. A
-RESOLVED question exposes every competitor's spot-time forecast unauthenticated under
-``question.aggregations.recency_weighted.score_data.disagreement_forecasts.forecasts[]``, keyed by
-``author_id``, and that public snapshot is the token-free fallback. The instrument the mode adds is
-the miss rate per UTC release hour, which is what decides the cron-cadence question: GitHub delivers
-about a fifth of this repository's scheduled firings and a Series 2 window is sixty minutes long.
+so the probe runs without a token there. ``with_cp=true`` rides every list GET, token or not: it is
+what puts a RESOLVED question's public spot-time snapshot on the list page
+(``question.aggregations.recency_weighted.score_data.disagreement_forecasts.forecasts[]``, one entry
+per competitor keyed by ``author_id``), and under a token it also puts ``my_forecasts`` there, which
+is the only way to classify a closed-but-unresolved question. Without the flag the list page carries
+``score_data: {}`` on every post and nothing classifies, which is why the two recorded pages below are
+the same two posts read both ways. The instrument the mode adds is the miss rate per UTC release
+hour, which is what decides the cron-cadence question: GitHub delivers about a fifth of this
+repository's scheduled firings and a Series 2 window is sixty minutes long.
 
-Fixtures are the Metaculus builders from ``tests/supply_probe_fakes.py`` plus the snapshot, and one
-recorded payload (post 500, read unauthenticated). No live API: every test drives the pure functions
-or monkeypatches ``requests.get``, and the autouse egress guard would raise on any real connect.
+Fixtures are the Metaculus builders from ``tests/supply_probe_fakes.py`` plus the snapshot, and two
+recorded Series 1 list pages (unauthenticated, ``limit=2``, with and without ``with_cp=true``). No
+live API: every test drives the pure functions or monkeypatches ``requests.get``, and the autouse
+egress guard would raise on any real connect.
 """
 
 import json
@@ -22,7 +25,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-import requests
 
 from metaculus_bot.constants import (
     MANTIC_API_BASE_URL,
@@ -52,11 +54,14 @@ from scripts.supply_probe_platforms import (
     POSTS_URL,
     mantic_forecast_state,
 )
+from tests.http_fakes import json_response
 from tests.supply_probe_fakes import NOW, _post, _question
 
 MANTIC_NOW = datetime(2026, 9, 9, 18, 0, tzinfo=UTC)
-# Unauthenticated GET /api/posts/500/ on competitions.mantic.com: resolved, eight snapshot entries, none the bot.
-RESOLVED_POST_500_FIXTURE = Path(__file__).parent / "data" / "mantic_series1_resolved_post_500_public_2026_09_09.json"
+# Unauthenticated GET /api/posts/?tournaments=series-1&statuses=resolved&limit=2, read with and without with_cp=true.
+_DATA = Path(__file__).parent / "data"
+SERIES1_LIST_WITH_CP_FIXTURE = _DATA / "mantic_series1_resolved_list_with_cp_public_2026_09_09.json"
+SERIES1_LIST_WITHOUT_WITH_CP_FIXTURE = _DATA / "mantic_series1_resolved_list_without_with_cp_public_2026_09_09.json"
 
 
 def _snapshot(authors: Sequence[int] | None) -> dict:
@@ -117,15 +122,6 @@ def _mantic_question(
 
 def _mantic_summary(posts_by_status: dict) -> SlugSupply:
     return summarize_slug_supply("series-2", posts_by_status, now=MANTIC_NOW, platform=MANTIC_PROBE)
-
-
-def _json_response(url: str, body: dict) -> requests.Response:
-    response = requests.Response()
-    response.status_code = 200
-    response.url = url
-    response.encoding = "utf-8"
-    response._content = json.dumps(body).encode()
-    return response
 
 
 class TestManticForecastState:
@@ -311,12 +307,20 @@ class TestManticPaging:
         assert [call["params"]["offset"] for call in seen] == [0, 100]
         assert {call["url"] for call in seen} == {MANTIC_PROBE.posts_url}
 
-    def test_without_a_token_the_list_params_are_the_public_four(self, monkeypatch):
+    def test_without_a_token_the_list_params_still_include_with_cp(self, monkeypatch):
+        """``with_cp=true`` is what puts the public snapshot on the list page, so it rides every page
+        GET whether or not a token is present; the token adds only ``my_forecasts``."""
         seen = self._install_pages(monkeypatch, [[]])
 
         fetch_posts_by_status("series-1", ("closed",), None, platform=MANTIC_PROBE)
 
-        assert seen[0]["params"] == {"tournaments": "series-1", "statuses": "closed", "limit": 100, "offset": 0}
+        assert seen[0]["params"] == {
+            "tournaments": "series-1",
+            "statuses": "closed",
+            "limit": 100,
+            "offset": 0,
+            "with_cp": "true",
+        }
         assert seen[0]["token"] is None
 
     def test_with_a_token_the_list_pages_ask_for_my_forecasts(self, monkeypatch):
@@ -328,7 +332,9 @@ class TestManticPaging:
         assert "forecaster_id" not in seen[0]["params"]
         assert seen[0]["token"] == "personal-token"
 
-    def test_the_metaculus_platform_never_sends_with_cp(self, monkeypatch):
+    def test_the_metaculus_platform_sends_with_cp_too(self, monkeypatch):
+        """On Metaculus ``with_cp=true`` puts the token's ``my_forecasts`` on the list page, which is
+        what lets the forfeit sweep skip its per-post detail GETs."""
         seen = self._install_pages(monkeypatch, [[]])
 
         fetch_posts_by_status("summer-futureeval-2026", ("closed",), "token")
@@ -338,6 +344,7 @@ class TestManticPaging:
             "statuses": "closed",
             "limit": 100,
             "offset": 0,
+            "with_cp": "true",
         }
         assert seen[0]["url"] == POSTS_URL
 
@@ -348,7 +355,7 @@ class TestGetJsonWithoutAToken:
 
         def _fake_get(url, *, headers, params, timeout):
             calls.append({"url": url, "headers": headers})
-            return _json_response(url, {"results": []})
+            return json_response({"results": []}, url=url)
 
         monkeypatch.setattr(supply_probe.requests, "get", _fake_get)
 
@@ -359,7 +366,7 @@ class TestGetJsonWithoutAToken:
 
 class TestManticMain:
     """``--platform mantic`` end to end over a fake ``requests.get``: the Mantic host, the Mantic
-    preflight, an OPTIONAL token, ``with_cp`` only under a token, never ``forecaster_id``, no
+    preflight, an OPTIONAL token, ``with_cp`` on every list GET, never ``forecaster_id``, no
     detail GETs, and the platform in the JSON dump."""
 
     def _install(self, monkeypatch, *, token: str | None, results_by_status: dict[str, list[dict]]):
@@ -369,19 +376,13 @@ class TestManticMain:
         def _fake_get(url, *, headers, params, timeout):
             calls.append({"url": url, "headers": dict(headers), "params": dict(params)})
             results = results_by_status.get(str(params.get("statuses")), [])
-            return _json_response(
-                url, {"results": results, "next": f"{url}?offset=100", "previous": None, "count": None}
-            )
+            page = {"results": results, "next": f"{url}?offset=100", "previous": None, "count": None}
+            return json_response(page, url=url)
 
         monkeypatch.setattr(supply_probe.requests, "get", _fake_get)
         monkeypatch.setattr(supply_probe.time, "sleep", lambda _s: None)
         monkeypatch.setattr(supply_probe, "load_environment", lambda: None)
         monkeypatch.setattr(supply_probe, "verify_api_identity", preflights.append)
-        monkeypatch.setattr(
-            supply_probe,
-            "verify_metaculus_api_identity",
-            lambda: pytest.fail("the Metaculus preflight must not run in mantic mode"),
-        )
         monkeypatch.setattr(
             supply_probe,
             "resolve_bot_forecasts",
@@ -413,7 +414,7 @@ class TestManticMain:
         assert preflights == [MANTIC_API_BASE_URL]
         assert {call["url"] for call in calls} == {f"{MANTIC_API_BASE_URL}/posts/"}
         assert all(call["headers"] == {} for call in calls)
-        assert all("with_cp" not in call["params"] and "forecaster_id" not in call["params"] for call in calls)
+        assert all(call["params"]["with_cp"] == "true" and "forecaster_id" not in call["params"] for call in calls)
         assert {call["params"]["tournaments"] for call in calls} == {MANTIC_TOURNAMENT_ID}
         assert out.startswith("Mantic question-supply probe.")
         assert "never forecast by the bot: 1 (of 3; forecast 1, unknown 1)" in out
@@ -485,42 +486,40 @@ class TestManticMain:
         assert "METACULUS_TOKEN" not in out
 
 
-class TestMetaculusModeIsUnchanged:
-    """The default platform still does exactly what it did: the Metaculus posts URL, the
-    Metaculus preflight, a REQUIRED token in the header, the four list params and nothing else."""
+class TestMetaculusMode:
+    """The default platform: the Metaculus posts URL, the Metaculus base URL vetted by the
+    preflight, a REQUIRED token in the header, the five list params (``with_cp=true`` puts the
+    token's ``my_forecasts`` on the list page) and nothing else."""
 
     def _install(self, monkeypatch):
         calls: list[dict] = []
+        preflights: list[str] = []
 
         def _fake_get(url, *, headers, params, timeout):
             calls.append({"url": url, "headers": dict(headers), "params": dict(params)})
-            return _json_response(url, {"results": [_post(5001, _question(501, forecast=True))]})
+            return json_response({"results": [_post(5001, _question(501, forecast=True))]}, url=url)
 
         monkeypatch.setattr(supply_probe.requests, "get", _fake_get)
         monkeypatch.setattr(supply_probe.time, "sleep", lambda _s: None)
         monkeypatch.setattr(supply_probe, "load_environment", lambda: None)
-        monkeypatch.setattr(
-            supply_probe,
-            "verify_api_identity",
-            lambda _base_url: pytest.fail("the Metaculus mode preflights through verify_metaculus_api_identity"),
-        )
-        monkeypatch.setattr(supply_probe, "verify_metaculus_api_identity", lambda: None)
+        monkeypatch.setattr(supply_probe, "verify_api_identity", preflights.append)
         monkeypatch.setenv("METACULUS_TOKEN", "metaculus-token")
-        return calls
+        return calls, preflights
 
     @pytest.mark.parametrize("platform_argv", [(), ("--platform", PLATFORM_METACULUS)])
-    def test_the_metaculus_list_request_is_the_authenticated_four_param_get(self, monkeypatch, capsys, platform_argv):
-        calls = self._install(monkeypatch)
+    def test_the_metaculus_list_request_is_the_authenticated_five_param_get(self, monkeypatch, capsys, platform_argv):
+        calls, preflights = self._install(monkeypatch)
         monkeypatch.setattr("sys.argv", ["supply_probe", *platform_argv, "--slugs", "slug", "--statuses", "closed"])
 
         supply_probe.main()
         out = capsys.readouterr().out
 
+        assert preflights == [METACULUS_PROBE.base_url]
         assert calls == [
             {
                 "url": POSTS_URL,
                 "headers": {"Authorization": "Token metaculus-token"},
-                "params": {"tournaments": "slug", "statuses": "closed", "limit": 100, "offset": 0},
+                "params": {"tournaments": "slug", "statuses": "closed", "limit": 100, "offset": 0, "with_cp": "true"},
             }
         ]
         assert out.startswith("Metaculus question-supply probe.")
@@ -557,6 +556,7 @@ class TestManticDefaults:
 
     def test_the_mantic_probe_url_shares_the_host_its_preflight_vets(self):
         """Same promise as the Metaculus pin: the vetted base URL is the one the token goes to."""
+        assert MANTIC_PROBE.base_url == MANTIC_API_BASE_URL
         assert MANTIC_PROBE.posts_url == f"{MANTIC_API_BASE_URL}/posts/"
         assert MANTIC_PROBE.posts_url.startswith("https://competitions.mantic.com/api/")
 
@@ -569,38 +569,85 @@ class TestManticDefaults:
 
 
 @pytest.fixture(scope="module")
-def post_500() -> dict:
-    return json.loads(RESOLVED_POST_500_FIXTURE.read_text())
+def series1_with_cp_page() -> dict:
+    return json.loads(SERIES1_LIST_WITH_CP_FIXTURE.read_text())
 
 
-class TestRecordedManticFixture:
-    """The one recorded payload: post 500, a resolved Series 1 question read unauthenticated,
-    whose public snapshot names eight competitors and not the bot."""
+@pytest.fixture(scope="module")
+def series1_without_with_cp_page() -> dict:
+    return json.loads(SERIES1_LIST_WITHOUT_WITH_CP_FIXTURE.read_text())
 
-    def test_the_fixture_carries_the_eight_entry_spot_time_snapshot(self, post_500):
-        snapshot = post_500["question"]["aggregations"]["recency_weighted"]["score_data"]["disagreement_forecasts"]
 
-        assert post_500["status"] == "resolved"
-        assert len(snapshot["forecasts"]) == 8
-        assert MANTIC_BOT_USER_ID not in {entry["author_id"] for entry in snapshot["forecasts"]}
-        assert "my_forecasts" not in post_500["question"], "the recording was unauthenticated"
+def _score_data(post: dict) -> dict:
+    return post["question"]["aggregations"]["recency_weighted"]["score_data"]
 
-    def test_the_bot_reads_as_absent_and_a_named_competitor_as_present(self, post_500):
-        question = post_500["question"]
-        snapshot = question["aggregations"]["recency_weighted"]["score_data"]["disagreement_forecasts"]
-        a_competitor = snapshot["forecasts"][0]["author_id"]
 
-        assert mantic_forecast_state(question, bot_user_id=MANTIC_BOT_USER_ID) == FORECAST_ABSENT
-        assert mantic_forecast_state(question, bot_user_id=a_competitor) == FORECAST_PRESENT
+def _snapshot_authors(post: dict) -> set[int]:
+    return {entry["author_id"] for entry in _score_data(post)["disagreement_forecasts"]["forecasts"]}
 
-    def test_the_fixture_summarizes_as_one_forfeit_in_the_15_utc_hour(self, post_500):
-        supply = summarize_slug_supply("series-1", {"resolved": [post_500]}, now=MANTIC_NOW, platform=MANTIC_PROBE)
 
-        assert [row.question_id for row in supply.forfeits] == [post_500["question"]["id"]]
-        assert supply.forfeits[0].window_hours == pytest.approx(1.0)
-        assert supply.forecast_states == supply_probe.ForecastStateCounts(with_forecast=0, without_forecast=1)
-        assert supply.by_release_hour == (
-            ReleaseHourRow(hour_utc=15, questions=1, forecast=0, no_forecast=1, unknown=0, miss_rate=1.0),
+class TestRecordedManticListPages:
+    """The two recorded payloads: the same two resolved Series 1 posts, read unauthenticated with
+    and without ``with_cp=true``. The first is the request the probe issues and carries the public
+    snapshot; the second is what the list GET returns without the flag, and it classifies nothing,
+    which is the shape the tokenless mode read until the flag rode every page."""
+
+    def test_the_with_cp_page_carries_the_snapshot_and_no_token_block(self, series1_with_cp_page):
+        posts = series1_with_cp_page["results"]
+
+        assert [post["id"] for post in posts] == [645, 643]
+        assert all(post["status"] == "resolved" for post in posts)
+        assert all("my_forecasts" not in post["question"] for post in posts), "the recording was unauthenticated"
+        assert [len(_snapshot_authors(post)) for post in posts] == [10, 9]
+        assert all(MANTIC_BOT_USER_ID not in _snapshot_authors(post) for post in posts)
+
+    def test_the_snapshot_names_one_competitor_fewer_than_nr_forecasters(self, series1_with_cp_page):
+        """The gap the report header discloses: on 507 of the 524 snapshot-bearing posts in the
+        2026-09-08 public corpus the snapshot is short by exactly one, these two included."""
+        posts = series1_with_cp_page["results"]
+
+        assert [post["nr_forecasters"] - len(_snapshot_authors(post)) for post in posts] == [1, 1]
+
+    def test_the_bot_reads_as_absent_and_a_named_competitor_as_present(self, series1_with_cp_page):
+        post = series1_with_cp_page["results"][0]
+        a_competitor = next(iter(_snapshot_authors(post)))
+
+        assert mantic_forecast_state(post["question"], bot_user_id=MANTIC_BOT_USER_ID) == FORECAST_ABSENT
+        assert mantic_forecast_state(post["question"], bot_user_id=a_competitor) == FORECAST_PRESENT
+
+    def test_the_page_without_with_cp_is_the_same_posts_with_empty_score_data(
+        self, series1_with_cp_page, series1_without_with_cp_page
+    ):
+        posts = series1_without_with_cp_page["results"]
+
+        assert [post["id"] for post in posts] == [post["id"] for post in series1_with_cp_page["results"]]
+        assert all(post["status"] == "resolved" for post in posts)
+        assert all(_score_data(post) == {} for post in posts)
+        assert all("my_forecasts" not in post["question"] for post in posts)
+
+    def test_the_with_cp_page_summarizes_as_two_forfeits_in_the_23_utc_hour(self, series1_with_cp_page):
+        supply = summarize_slug_supply(
+            "series-1", {"resolved": series1_with_cp_page["results"]}, now=MANTIC_NOW, platform=MANTIC_PROBE
         )
-        assert supply.window_minutes == WindowMinutes(shortest=60.0, median=60.0, longest=60.0, questions=1)
+
+        assert [row.question_id for row in supply.forfeits] == [645, 643]
+        assert supply.forecast_states == supply_probe.ForecastStateCounts(with_forecast=0, without_forecast=2)
+        assert supply.by_release_hour == (
+            ReleaseHourRow(hour_utc=23, questions=2, forecast=0, no_forecast=2, unknown=0, miss_rate=1.0),
+        )
+        assert supply.window_minutes == WindowMinutes(shortest=60.0, median=60.0, longest=60.0, questions=2)
         assert supply.backlog == ()
+
+    def test_the_page_without_with_cp_reads_every_question_unknown(self, series1_without_with_cp_page):
+        """Why ``with_cp=true`` rides every list GET: without it the same resolved posts classify as
+        nothing, and the report says so instead of printing zero forfeits."""
+        supply = summarize_slug_supply(
+            "series-1", {"resolved": series1_without_with_cp_page["results"]}, now=MANTIC_NOW, platform=MANTIC_PROBE
+        )
+
+        assert supply.forfeits == ()
+        assert supply.forecast_states == supply_probe.ForecastStateCounts(unknown=2)
+        assert supply.by_release_hour == (
+            ReleaseHourRow(hour_utc=23, questions=2, forecast=0, no_forecast=0, unknown=2, miss_rate=None),
+        )
+        assert MANTIC_PROBE.all_unknown_hint in render_report([supply], now=MANTIC_NOW, platform=MANTIC_PROBE)

@@ -30,11 +30,10 @@ from forecasting_tools import (
 from forecasting_tools.data_models.data_organizer import PredictionTypes
 from forecasting_tools.data_models.multiple_choice_report import PredictedOption
 from forecasting_tools.data_models.numeric_report import Percentile
-from forecasting_tools.data_models.questions import DateQuestion, DiscreteQuestion
 
 from metaculus_bot.aggregation_pipeline import AggregationCounters, AggregationPipeline
 from metaculus_bot.aggregation_strategies import AggregationStrategy
-from metaculus_bot.constants import MANTIC_SITE_URL, THIN_PUBLISH_BINARY_CEIL, THIN_PUBLISH_BINARY_FLOOR
+from metaculus_bot.constants import THIN_PUBLISH_BINARY_CEIL, THIN_PUBLISH_BINARY_FLOOR
 from metaculus_bot.member_forecast import (
     NUMERIC_COMBINE_METHOD_SINGLE,
     NUMERIC_COMBINE_METHOD_STACKED,
@@ -48,9 +47,13 @@ from tests.conftest import make_mock_numeric_question
 from tests.mantic_fakes import load_preseason_date_question
 from tests.pipeline_test_helpers import (
     assert_server_accepts_cdf,
+    cdf_heights,
     certain_of_bin,
+    make_count_question,
     make_e2e_bot,
     make_real_numeric_question,
+    metaculus_url,
+    on_mantic,
     pmf_of,
 )
 
@@ -917,36 +920,6 @@ class TestThinPublishFloorInBaseCombine:
 # ---------------------------------------------------------------------------
 
 
-def _on_mantic(question: DateQuestion) -> DateQuestion:
-    """The framework parses every payload with a metaculus.com ``page_url``; ``ManticClient`` rewrites it to the host."""
-    return question.model_copy(update={"page_url": f"{MANTIC_SITE_URL}/questions/{question.id_of_post}/"})
-
-
-def _count_question(bins: int, *, mantic: bool, qid: int = 700) -> DiscreteQuestion:
-    """A count question with ``bins`` integer bins from 0 upward, in the platform's half-step convention."""
-    host = MANTIC_SITE_URL if mantic else "https://www.metaculus.com"
-    return DiscreteQuestion(
-        id_of_question=qid,
-        id_of_post=qid,
-        page_url=f"{host}/questions/{qid}/",
-        question_text="How many?",
-        background_info="",
-        resolution_criteria="",
-        fine_print="",
-        published_time=None,
-        close_time=None,
-        lower_bound=-0.5,
-        upper_bound=bins - 0.5,
-        open_lower_bound=False,
-        open_upper_bound=False,
-        unit_of_measure="",
-        zero_point=None,
-        cdf_size=bins + 1,
-        nominal_lower_bound=0.0,
-        nominal_upper_bound=float(bins - 1),
-    )
-
-
 def _sharp_members(question: MetaculusQuestion, bins: tuple[int, ...]) -> list[NumericDistribution]:
     """One member certain of each bin in ``bins``, on the question's own grid."""
     view = numeric_view(question)
@@ -967,7 +940,7 @@ def _percentile_members(question: NumericQuestion) -> list[NumericDistribution]:
     return members
 
 
-_MANTIC_DATE_651 = _on_mantic(load_preseason_date_question())
+_MANTIC_DATE_651 = on_mantic(load_preseason_date_question())
 
 
 class TestNumericCombineStrategy:
@@ -985,9 +958,15 @@ class TestNumericCombineStrategy:
         ("question", "expected"),
         [
             pytest.param(_MANTIC_DATE_651, AggregationStrategy.MEAN, id="mantic-12-bin-date"),
-            pytest.param(_count_question(11, mantic=True), AggregationStrategy.MEAN, id="mantic-11-bin-count"),
-            pytest.param(_count_question(450, mantic=True), AggregationStrategy.MEDIAN, id="mantic-450-bin-count"),
-            pytest.param(_count_question(11, mantic=False), AggregationStrategy.MEDIAN, id="metaculus-11-bin-count"),
+            pytest.param(make_count_question(11, open_upper=False), AggregationStrategy.MEAN, id="mantic-11-bin-count"),
+            pytest.param(
+                make_count_question(450, open_upper=False), AggregationStrategy.MEDIAN, id="mantic-450-bin-count"
+            ),
+            pytest.param(
+                make_count_question(11, page_url=metaculus_url(700), open_upper=False),
+                AggregationStrategy.MEDIAN,
+                id="metaculus-11-bin-count",
+            ),
             pytest.param(make_real_numeric_question(), AggregationStrategy.MEDIAN, id="metaculus-201-point"),
             pytest.param(load_preseason_date_question(), AggregationStrategy.MEDIAN, id="12-bin-date-off-mantic"),
             pytest.param(_make_binary_question(), AggregationStrategy.MEDIAN, id="binary"),
@@ -1018,7 +997,7 @@ class TestNumericCombineStrategy:
         pooled = pmf_of(combined)
         assert pooled[[3, 5, 7]] == pytest.approx([0.3308, 0.3308, 0.3308], abs=1e-3)
         assert pooled[[0, 1, 2, 4, 6, 8, 9, 10, 11]].max() < 0.001
-        heights = np.asarray([p.percentile for p in combined.get_cdf()])
+        heights = cdf_heights(combined)
         assert_server_accepts_cdf(heights, cdf_size=13, open_lower=False, open_upper=False)
         assert combined.is_date is True
         assert pipeline.numeric_combine_methods == {question.id_of_question: "mean"}
@@ -1028,26 +1007,26 @@ class TestNumericCombineStrategy:
         """450 bins is far above the per-bin threshold, so a Mantic question this wide stays on
         percentiles and its members are medianed byte for byte, exactly as before Wave C."""
         pipeline = _make_pipeline()
-        question = _count_question(450, mantic=True)
+        question = make_count_question(450, open_upper=False)
         members = _percentile_members(question)
-        expected = np.asarray([p.percentile for p in aggregate_numeric(members, question, "median").get_cdf()])
+        expected = cdf_heights(aggregate_numeric(members, question, "median"))
 
         combined = pipeline.base_combine(cast("list[PredictionTypes]", members), question)
 
         assert isinstance(combined, NumericDistribution)
-        assert np.array_equal(np.asarray([p.percentile for p in combined.get_cdf()]), expected)
+        assert np.array_equal(cdf_heights(combined), expected)
         assert pipeline.numeric_combine_methods[700] == "median"
 
     def test_base_combine_keeps_the_median_byte_for_byte_for_percentile_members(self) -> None:
         pipeline = _make_pipeline()
         question = make_real_numeric_question()
         members = _percentile_members(question)
-        expected = np.asarray([p.percentile for p in aggregate_numeric(members, question, "median").get_cdf()])
+        expected = cdf_heights(aggregate_numeric(members, question, "median"))
 
         combined = pipeline.base_combine(cast("list[PredictionTypes]", members), question)
 
         assert isinstance(combined, NumericDistribution)
-        assert np.array_equal(np.asarray([p.percentile for p in combined.get_cdf()]), expected)
+        assert np.array_equal(cdf_heights(combined), expected)
         assert pipeline.numeric_combine_methods == {question.id_of_question: "median"}
 
     def test_the_median_fallback_pools_per_bin_members_too(self) -> None:

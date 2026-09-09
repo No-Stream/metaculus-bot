@@ -17,12 +17,16 @@ by::
     NUMERIC_AGGREGATE: question=<id> qtype=numeric|date cdf_size=<n> oor_low=<f> oor_high=<f>
         oor_low_raw=<f> oor_high_raw=<f> tail_floor=<f> method=mean|median|stacked|single
 
-``method`` is written on EVERY numeric and date question: ``mean`` is the linear opinion pool
-(the pointwise mean of the members' CDFs) that per-bin members are combined by, ``median`` the
-pointwise median percentile members keep on both platforms, ``stacked`` a stacker-adopted
-distribution and ``single`` the lone raw member the min-forecasters=1 short-circuit hands
-through. ``unrecorded`` means a combine path forgot to record itself: a bug signal, never an
-expected value.
+``method`` is written on EVERY numeric and date question and is the authoritative record of
+the combine rule that ran, whatever the run's configured strategy or the comment's
+``STACKER_OUTCOME`` says. ``mean`` is the pointwise mean of the members' CDFs: per-bin members
+always get it (it is the linear opinion pool), and so does any run whose strategy is MEAN, the
+ablation and benchmark harnesses and plain STACKING's base combine among them. ``median`` is
+the pointwise median of the members' CDFs, ``stacked`` a stacker-adopted distribution and
+``single`` the lone raw member the min-forecasters=1 short-circuit hands through.
+``unrecorded`` means a combine path forgot to record itself: a bug signal, never an expected
+value. ``method`` does not say how the members were elicited; ``elicitation=pmf`` on the
+question's MEMBER_FORECAST lines is what identifies a per-bin question.
 
 Why the tails: the platform scores an out-of-range resolution against a fixed 0.05
 reference, and on Mantic half of all resolved date questions and a quarter of discrete ones

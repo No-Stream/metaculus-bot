@@ -1,6 +1,7 @@
 """Tests for spread_metrics module — measures forecaster disagreement."""
 
 import math
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import Mock
 
@@ -13,8 +14,11 @@ from metaculus_bot.constants import (
     CONDITIONAL_STACKING_BINARY_PROB_RANGE_THRESHOLD,
     CONDITIONAL_STACKING_MC_MAX_OPTION_THRESHOLD,
     CONDITIONAL_STACKING_NUMERIC_NORMALIZED_THRESHOLD,
+    MANTIC_SITE_URL,
 )
+from metaculus_bot.numeric.date_axis import as_epoch_question
 from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
+from metaculus_bot.numeric.pmf_cdf import build_pmf_distribution
 from metaculus_bot.spread_metrics import (
     _key_percentile_values,
     binary_log_odds_spread,
@@ -23,6 +27,7 @@ from metaculus_bot.spread_metrics import (
     mc_max_option_spread,
     numeric_percentile_spread,
 )
+from tests.pipeline_test_helpers import make_real_date_question
 
 
 class TestBinaryProbRangeSpread:
@@ -94,10 +99,7 @@ def _make_numeric_question(**overrides) -> NumericQuestion:
     return NumericQuestion(**defaults)
 
 
-# The 11 "core" percentile labels callers supply values for. P1/P99 are auto-generated
-# by the helper (extrapolated tails) so the produced list matches the production 13-set
-# without every caller having to hand-write two extra tail values. The spread metric only
-# reads P10/P50/P90 by label, so the exact P1/P99 values are immaterial to the assertions.
+# The 11 core labels callers supply; the helper extrapolates P1/P99, which the metric never reads.
 _CORE_PERCENTILE_LABELS = [2.5, 5, 10, 20, 40, 50, 60, 80, 90, 95, 97.5]
 
 
@@ -246,8 +248,7 @@ class TestNumericPercentileSpread:
         question = _make_numeric_question()
 
         spread = numeric_percentile_spread([model1, model2], question)
-        # Lookups are label-based: P10 |40-20|/100 = 0.20; P50 |60-40|/100 = 0.20;
-        # P90 |80-60|/100 = 0.20.
+        # Label-based lookups: |40-20|, |60-40| and |80-60| over the range of 100 are all 0.20.
         assert spread == pytest.approx(0.20, abs=0.01)
 
     def test_open_ended_bounds_uses_iqr_fallback(self):
@@ -257,10 +258,7 @@ class TestNumericPercentileSpread:
         question = _make_numeric_question(open_lower_bound=True, open_upper_bound=True)
 
         spread = numeric_percentile_spread([model1, model2], question)
-        # P90 values: model1=60, model2=80 -> median=70
-        # P10 values: model1=20, model2=40 -> median=30
-        # IQR denominator = 70 - 30 = 40
-        # raw spread at all key pcts = 20; normalized = 20/40 = 0.5
+        # IQR denominator median(P90) - median(P10) = 70 - 30 = 40; every key spread is 20, so 0.5.
         assert spread == pytest.approx(0.5, abs=0.02)
 
     def test_all_models_agree(self):
@@ -279,14 +277,11 @@ class TestNumericPercentileSpread:
             numeric_percentile_spread([model], question)
 
     def test_short_percentile_list_raises(self):
-        """Genuinely truncated lists (< _MIN_GRID_POINTS and not spanning P10-P90) raise.
+        """A list that is neither the 13 standard labels nor the question's own ``cdf_size``-point grid raises.
 
-        The open-tail CDF grid fix (spread_metrics.py `_key_percentile_values`) relaxed
-        the guard for plausible grids (>= 5 points) so open-bound discrete questions with
-        heavy out-of-bound mass no longer crash. A shorter list that also fails to span
-        P10-P90 must still raise.
+        Three points on a 201-point question cannot yield P10/P50/P90 without extrapolating
+        garbage, so the metric fails fast instead of interpolating.
         """
-        # Only 3 points — is_plausible_grid=False AND labels don't span P10-P90.
         short_model = _make_percentile_list([10, 15, 20, 25, 35, 40, 45, 55, 60, 65, 70])[:3]
         full_model = _make_percentile_list([10, 15, 20, 25, 35, 40, 45, 55, 60, 65, 70])
         question = _make_numeric_question()
@@ -305,7 +300,7 @@ class TestComputeSpread:
         assert spread == pytest.approx(binary_prob_range_spread([0.50, 0.68]))
 
     def test_binary_dispatch_uses_prob_range_not_log_odds(self):
-        # Regression: dispatcher must return prob-range, not log-odds.
+        """The dispatcher returns the probability range, not the log-odds spread."""
         question = _make_binary_question()
         spread = compute_spread(question, [0.01, 0.19])
         # prob-range = 0.18; log-odds ≈ 3.15 — these must differ noticeably
@@ -363,8 +358,7 @@ class TestConstants:
         assert CONDITIONAL_STACKING_NUMERIC_NORMALIZED_THRESHOLD == 0.15
 
 
-# The 13 standard percentile labels a continuous forecaster declares. Used to feed
-# sanitize_percentiles / build_numeric_distribution the same shape production does.
+# The 13 labels a continuous forecaster declares, so the builders see production's shape.
 _STANDARD_PERCENTILE_LABELS = [0.01, 0.025, 0.05, 0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 0.9, 0.95, 0.975, 0.99]
 
 
@@ -462,24 +456,25 @@ class TestContinuousSpreadByteIdentical:
 
 
 class TestOpenTailCdfGrid:
-    """Regression: CDF grids from open-bound discrete questions with heavy out-of-bound
-    mass previously raised in ``_key_percentile_values`` because the old guard required
-    ``labels[0] <= 0.10`` and ``labels[-1] >= 0.90``. On the "Toy Story" scenario a
-    resampled grid can legitimately start at labels[0] ≈ 0.40 (open lower bound with 40%
-    below-bound mass) or end at labels[-1] ≈ 0.60 (symmetric case above upper bound).
-    np.interp clamps at the ends, so the honest answer is the displayed bound.
+    """A CDF grid is recognised by its length, ``question.cdf_size``, never by where its labels start or end.
+
+    On an open-bound question the grid's cumulative-probability labels can legitimately start at
+    0.40 (40% of the mass below the displayed lower bound, the "Toy Story" scenario) or end at 0.60
+    (the symmetric case above the upper bound), and on a 3-bin Mantic grid with a heavy open tail
+    they do both at once with only four points. ``np.interp`` clamps at the ends, so the honest
+    answer at a clamped key percentile is the displayed bound.
     """
 
     def test_open_lower_bound_heavy_below_mass_returns_displayed_bound(self):
         """Open lower bound: labels start at 0.40. P10 clamps to values[0] (displayed lower bound)."""
         displayed_lower = 5.0
-        # A CDF grid with heavy below-bound mass — 40% of probability is below the displayed lower bound.
-        # Grid spans cumulative probability [0.40, 1.0] over the displayed range [5.0, 20.0].
+        # 40% of the mass is below the displayed lower bound, so the grid spans cumulative probability [0.40, 1.0].
         labels = [0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.0]
         values = [displayed_lower, 7.0, 9.0, 11.0, 13.0, 16.0, 20.0]
         model_pcts = [Percentile(percentile=p, value=v) for p, v in zip(labels, values, strict=True)]
+        question = _make_numeric_question(lower_bound=5.0, upper_bound=20.0, open_lower_bound=True, cdf_size=7)
 
-        p10, p50, p90 = _key_percentile_values(model_pcts)
+        p10, p50, p90 = _key_percentile_values(model_pcts, question)
         # np.interp clamps: query 0.10 is below labels[0]=0.40, so returns values[0] = displayed_lower
         assert p10 == pytest.approx(displayed_lower)
         # P50 and P90 interpolate normally inside the grid
@@ -489,56 +484,103 @@ class TestOpenTailCdfGrid:
     def test_open_upper_bound_heavy_above_mass_returns_displayed_bound(self):
         """Open upper bound: labels end at 0.60. P90 clamps to values[-1] (displayed upper bound)."""
         displayed_upper = 20.0
-        # A CDF grid with heavy above-bound mass — 40% of probability is above the displayed upper bound.
-        # Grid spans cumulative probability [0.0, 0.60] over the displayed range [5.0, 20.0].
+        # 40% of the mass is above the displayed upper bound, so the grid spans cumulative probability [0.0, 0.60].
         labels = [0.0, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60]
         values = [5.0, 7.0, 9.0, 11.0, 13.0, 16.0, displayed_upper]
         model_pcts = [Percentile(percentile=p, value=v) for p, v in zip(labels, values, strict=True)]
+        question = _make_numeric_question(lower_bound=5.0, upper_bound=20.0, open_upper_bound=True, cdf_size=7)
 
-        p10, p50, p90 = _key_percentile_values(model_pcts)
+        p10, p50, p90 = _key_percentile_values(model_pcts, question)
         # np.interp clamps: query 0.90 is above labels[-1]=0.60, so returns values[-1] = displayed_upper
         assert p90 == pytest.approx(displayed_upper)
         # P10 and P50 interpolate normally inside the grid (0.10 and 0.50 both <= 0.60)
         assert p10 == pytest.approx(7.0)  # exactly at labels index 1
         assert p50 == pytest.approx(16.0)  # exactly at labels index 5
 
-    def test_short_truncated_non_grid_list_still_raises(self):
-        """A genuinely truncated 3-point list not spanning P10-P90 should still raise."""
-        # Only 3 points, and range [0.40, 0.60] doesn't cover P10 or P90 —
-        # is_plausible_grid=False (len<5) AND spans_key_percentiles=False.
+    def test_a_three_point_list_on_a_201_point_question_is_not_a_grid(self):
+        """Three points on a 201-point question are a truncated list, not the question's grid, so they raise."""
         labels = [0.40, 0.50, 0.60]
         values = [10.0, 15.0, 20.0]
         model_pcts = [Percentile(percentile=p, value=v) for p, v in zip(labels, values, strict=True)]
 
         with pytest.raises(ValueError, match="neither the standard percentiles"):
-            _key_percentile_values(model_pcts)
+            _key_percentile_values(model_pcts, _make_numeric_question())
 
 
 class TestDuplicateStandardLabelsHardening:
-    """Finding-2 guard: a hypothetical 14-item list covering all 13 standard labels
-    plus one duplicate should route to the interp branch, not crash PercentileSet.
+    """A 14-item list covering all 13 standard labels plus one duplicate fails shut with the metric's
+    own message rather than crashing inside ``PercentileSet``.
 
-    Unreachable in practice (``filter_to_standard_percentiles`` deduplicates upstream),
-    but the length check makes ``_has_standard_labels`` defensively correct.
+    Unreachable in practice (``filter_to_standard_percentiles`` deduplicates upstream), but the
+    length check in ``_has_standard_labels`` is what routes it past ``PercentileSet``, and 14 points
+    are not the question's 201-point grid either.
     """
 
-    def test_duplicate_standard_label_routes_to_interp_branch(self):
-        """List with 14 entries (all 13 standard labels + one duplicate) does not crash."""
-        # All 13 standard labels, plus a duplicate of P50. frozenset() would match
-        # percentile_set.EXPECTED_KEYS on its own — the len check is what prevents the crash.
+    def test_duplicate_standard_label_fails_shut_with_the_metrics_message(self):
+        """All 13 standard labels plus a duplicate P50: frozenset alone would match, the len check keeps PercentileSet out."""
         standard_labels = [0.01, 0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99]
         standard_values = [1.0, 2.0, 3.0, 5.0, 8.0, 12.0, 15.0, 18.0, 22.0, 28.0, 32.0, 36.0, 40.0]
         model_pcts = [Percentile(percentile=p, value=v) for p, v in zip(standard_labels, standard_values, strict=True)]
-        # Add a duplicate of the P50 entry
         model_pcts.append(Percentile(percentile=0.50, value=15.0))
         assert len(model_pcts) == 14
 
-        # Should NOT crash — the len check routes past _has_standard_labels into the
-        # interp branch, where np.interp handles the sorted (labels, values) fine.
-        p10, p50, p90 = _key_percentile_values(model_pcts)
-        assert p10 == pytest.approx(5.0)
-        assert p50 == pytest.approx(15.0)
-        assert p90 == pytest.approx(28.0)
+        with pytest.raises(ValueError, match="neither the standard percentiles"):
+            _key_percentile_values(model_pcts, _make_numeric_question())
+
+
+class TestCoarseManticGridWithHeavyOpenTail:
+    """Two per-bin members on a 3-bin Mantic open-upper grid with 70% above the range compute a spread.
+
+    A built per-bin distribution's ``declared_percentiles`` is the question's own ``cdf_size``-point
+    grid (four points on three bins), and with 70% of the mass above the open upper bound its last
+    label is 0.30, so the old ``>= 5 points or spans P10-P90`` heuristic rejected it and the question
+    was forfeited after the full research and ensemble spend (``route_after_forecasts`` computes the
+    spread before the per-type gate is read). Wave C forecasts exactly these grids per bin and tells
+    the forecaster that most of a "when will X happen" date question's mass belongs above the range.
+    """
+
+    _MEMBER_MOST_LIKELY_FIRST_BIN = (0.0, 0.20, 0.07, 0.03, 0.70)
+    _MEMBER_MOST_LIKELY_LAST_BIN = (0.0, 0.03, 0.07, 0.20, 0.70)
+
+    def test_count_question_members_compute_a_finite_spread(self):
+        question = _make_numeric_question(
+            page_url=f"{MANTIC_SITE_URL}/questions/3/",
+            lower_bound=-0.5,
+            upper_bound=2.5,
+            open_upper_bound=True,
+            cdf_size=4,
+        )
+        members = [
+            build_pmf_distribution(self._MEMBER_MOST_LIKELY_FIRST_BIN, question),
+            build_pmf_distribution(self._MEMBER_MOST_LIKELY_LAST_BIN, question),
+        ]
+        assert all(len(m.declared_percentiles) == question.cdf_size for m in members)
+
+        spread = compute_spread(question, members)
+
+        assert math.isfinite(spread)
+        assert spread > 0.0
+
+    def test_date_question_members_compute_a_finite_spread_on_the_epoch_view(self):
+        """The date path reads the grid length off the epoch view, which carries the question's ``cdf_size``."""
+        start = datetime(2026, 9, 8, tzinfo=UTC)
+        question = make_real_date_question(
+            lower_bound=start, upper_bound=start + timedelta(days=3), cdf_size=4, open_upper_bound=True
+        )
+        view = as_epoch_question(question)
+        members = [
+            build_pmf_distribution(self._MEMBER_MOST_LIKELY_FIRST_BIN, view),
+            build_pmf_distribution(self._MEMBER_MOST_LIKELY_LAST_BIN, view),
+        ]
+
+        spread = compute_spread(question, members)
+
+        assert math.isfinite(spread)
+        assert spread > 0.0
+
+
+# The synthetic grid below is the question's own CDF grid, so the question declares its length.
+_PINNED_GRID_POINTS = 6
 
 
 class TestUndefinedDenominator:
@@ -560,11 +602,12 @@ class TestUndefinedDenominator:
         Labels start above 0.90, so np.interp clamps P10/P50/P90 to values[0].
         """
         labels = [0.94, 0.96, 0.97, 0.98, 0.99, 1.0]
+        assert len(labels) == _PINNED_GRID_POINTS
         values = [bound_value + offset * i for i in range(len(labels))]
         return [Percentile(percentile=p, value=v) for p, v in zip(labels, values, strict=True)]
 
     def test_zero_iqr_denominator_reports_inf(self, caplog):
-        question = _make_numeric_question(open_lower_bound=True, open_upper_bound=True)
+        question = _make_numeric_question(open_lower_bound=True, open_upper_bound=True, cdf_size=_PINNED_GRID_POINTS)
         model1 = self._pinned_grid(100.0, 0.0)
         model2 = self._pinned_grid(100.0, 1.0)
 
@@ -579,7 +622,7 @@ class TestUndefinedDenominator:
 
     def test_inf_exceeds_every_threshold(self):
         """The routing consequence: an undefined spread cannot skip stacking."""
-        question = _make_numeric_question(open_lower_bound=True, open_upper_bound=True)
+        question = _make_numeric_question(open_lower_bound=True, open_upper_bound=True, cdf_size=_PINNED_GRID_POINTS)
         spread = numeric_percentile_spread(
             [self._pinned_grid(100.0, 0.0), self._pinned_grid(100.0, 1.0)],
             question,

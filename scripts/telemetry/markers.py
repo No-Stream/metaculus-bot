@@ -63,10 +63,13 @@ against the ACTUAL emitted format strings (the source of truth):
   the PUBLISHED distribution's grid size and out-of-range mass, the aggregate twin of the
   member fields above, then the same mass before the platform tail floor and the level the
   floor raised them to, ``oor_low_raw`` / ``oor_high_raw`` / ``tail_floor``; how the Mantic floor gets
-  benchmarked on this bot's own forecasts; then ``method``, the rule the members were combined
-  by: ``mean`` is the linear opinion pool per-bin members get, ``median`` what percentile members
-  keep, ``stacked`` a stacker-adopted distribution, ``single`` a lone raw survivor, and
-  ``unrecorded`` a combine path that forgot to record itself, a bug signal)
+  benchmarked on this bot's own forecasts; then ``method``, the authoritative record of the rule
+  the members were combined by, whatever the configured strategy or STACKER_OUTCOME says:
+  ``mean`` the pointwise mean of the members' CDFs (every per-bin question, and any run whose
+  strategy is MEAN), ``median`` the pointwise median, ``stacked`` a stacker-adopted
+  distribution, ``single`` a lone raw survivor, and ``unrecorded`` a combine path that forgot
+  to record itself, a bug signal; ``elicitation=pmf`` on the MEMBER_FORECAST lines, not
+  ``method``, is what identifies a per-bin question)
 * ``CLOSE_MARGIN``      — ``metaculus_bot/close_margin.py`` (emitted at submit time in ``forecaster.py``)
 * ``MARKET_RANKING``    — ``metaculus_bot/research/prediction_market.py``
   ``_log_ranking_telemetry`` (per-QUESTION ranked-retrieval outcome: pool size,
@@ -1194,8 +1197,11 @@ MARKER_SPECS: list[MarkerSpec] = [
         # with all three None.
         #
         # ``method`` (2026-09-09): the rule the members were combined by, on every numeric and date
-        # question: ``mean`` (the linear opinion pool per-bin members get), ``median``, ``stacked``,
-        # ``single``, or ``unrecorded`` (a bug signal). Its own optional group; earlier lines read None.
+        # question, authoritative over the configured strategy and the comment's STACKER_OUTCOME:
+        # ``mean`` (the pointwise mean of the members' CDFs: every per-bin question, and any run
+        # whose strategy is MEAN), ``median``, ``stacked``, ``single``, or ``unrecorded`` (a bug
+        # signal). ``elicitation=pmf`` on MEMBER_FORECAST, not ``method``, says a question was
+        # elicited per bin. Its own optional group; earlier lines read None.
         re.compile(
             r"NUMERIC_AGGREGATE:\s*question=(?P<question>\S+)\s+qtype=(?P<qtype>\S+)"
             r"\s+cdf_size=(?P<cdf_size>\d+)\s+oor_low=(?P<oor_low>\S+)\s+oor_high=(?P<oor_high>\S+)"

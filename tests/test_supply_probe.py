@@ -46,6 +46,7 @@ from scripts.supply_probe_platforms import (
     POSTS_URL,
     bot_forecast_state,
 )
+from tests.http_fakes import json_response
 from tests.supply_probe_fakes import NOW, _group_post, _post, _question
 
 
@@ -544,12 +545,7 @@ class TestRateLimitRetry:
 
         def _fake_get(url, *, headers, params, timeout):
             calls.append({"url": url, "headers": headers, "params": dict(params), "timeout": timeout})
-            response = requests.Response()
-            response.status_code = next(served)
-            response.url = url
-            response.encoding = "utf-8"
-            response._content = json.dumps(payload if payload is not None else {"results": []}).encode()
-            return response
+            return json_response(payload if payload is not None else {"results": []}, status=next(served), url=url)
 
         monkeypatch.setattr(supply_probe.requests, "get", _fake_get)
         monkeypatch.setattr(supply_probe.time, "sleep", sleeps.append)
@@ -726,7 +722,7 @@ class TestMain:
             "resolved": [_post(703, _question(73, actual="2026-08-01T00:00:00Z", resolution="7", forecast=True))],
         }
         monkeypatch.setattr(supply_probe, "fetch_posts_by_status", lambda slug, statuses, token, **_: posts)
-        monkeypatch.setattr(supply_probe, "verify_metaculus_api_identity", lambda: None)
+        monkeypatch.setattr(supply_probe, "verify_api_identity", lambda _base_url: None)
         monkeypatch.setenv("METACULUS_TOKEN", "token")
         monkeypatch.setattr("sys.argv", ["supply_probe", "--slugs", "summer-futureeval-2026", *extra_argv])
 
@@ -779,7 +775,7 @@ class TestMain:
     def test_missing_token_exits_before_any_request(self, monkeypatch):
         monkeypatch.delenv("METACULUS_TOKEN", raising=False)
         monkeypatch.setattr(
-            supply_probe, "verify_metaculus_api_identity", lambda: pytest.fail("preflight ran without a token")
+            supply_probe, "verify_api_identity", lambda _base_url: pytest.fail("preflight ran without a token")
         )
         monkeypatch.setattr("sys.argv", ["supply_probe", "--slugs", "slug"])
 
@@ -795,7 +791,7 @@ class TestMain:
             calls.append("fetch")
             return posts
 
-        monkeypatch.setattr(supply_probe, "verify_metaculus_api_identity", lambda: calls.append("preflight"))
+        monkeypatch.setattr(supply_probe, "verify_api_identity", lambda base_url: calls.append(f"preflight {base_url}"))
         monkeypatch.setattr(supply_probe, "fetch_posts_by_status", _fetch)
         monkeypatch.setenv("METACULUS_TOKEN", "token")
         monkeypatch.setattr("sys.argv", ["supply_probe", "--slugs", "slug", "--statuses", "closed"])
@@ -803,7 +799,7 @@ class TestMain:
         supply_probe.main()
         capsys.readouterr()
 
-        assert calls == ["preflight", "fetch"]
+        assert calls == [f"preflight {METACULUS_PROBE.base_url}", "fetch"]
 
 
 class TestDefaults:
@@ -818,7 +814,10 @@ class TestDefaults:
 
     def test_probe_url_shares_the_host_the_preflight_vets(self):
         """The identity guard's promise is that the vetted host is the host the token goes
-        to, so a hardcoded probe URL would quietly break it under a base-URL override."""
+        to, so a hardcoded probe URL would quietly break it under a base-URL override. ``main``
+        vets ``platform.base_url``, the same string the posts URL is derived from."""
+        assert METACULUS_PROBE.base_url == MetaculusClient().base_url
+        assert METACULUS_PROBE.posts_url == POSTS_URL
         assert api_preflight.preflight_url().startswith(POSTS_URL)
 
     def test_an_override_loaded_from_a_dotenv_file_moves_both_urls_together(

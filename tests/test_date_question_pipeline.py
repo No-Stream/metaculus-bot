@@ -30,7 +30,6 @@ from metaculus_bot.aggregation_pipeline import AggregationPipeline
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.constants import (
     CONDITIONAL_STACKING_NUMERIC_NORMALIZED_THRESHOLD,
-    MANTIC_SITE_URL,
     NUMERIC_STACKING_ENABLED_ENV,
 )
 from metaculus_bot.exceptions import UnitMismatchError
@@ -51,8 +50,10 @@ from metaculus_bot.stacking_route import _conditional_stacking_verdict, _type_ga
 from tests.mantic_fakes import load_legacy_date_question, load_preseason_date_question
 from tests.pipeline_test_helpers import (
     assert_server_accepts_cdf,
+    cdf_heights,
     make_e2e_bot,
     make_real_date_question,
+    on_mantic,
     server_min_step,
 )
 
@@ -95,10 +96,6 @@ def _member(question: DateQuestion, declared: dict[str, str]) -> NumericDistribu
     ]
     sanitized, zero_point = sanitize_percentiles(percentiles, epoch, model_name="test-model")
     return build_numeric_distribution(sanitized, epoch, zero_point, model_name="test-model")
-
-
-def _cdf_heights(distribution: NumericDistribution) -> np.ndarray:
-    return np.asarray([p.percentile for p in distribution.get_cdf()], dtype=float)
 
 
 @pytest.fixture
@@ -154,7 +151,7 @@ class TestTheRunner:
         prediction = result.prediction_value
         assert isinstance(prediction, NumericDistribution)
         assert prediction.is_date is True
-        heights = _cdf_heights(prediction)
+        heights = cdf_heights(prediction)
         assert len(heights) == 13
         assert heights[0] == 0.0
         assert heights[-1] == 1.0
@@ -208,7 +205,7 @@ class TestTheRunner:
         prediction = _build_guarded_numeric_distribution(percentiles, epoch, test_llm)
 
         assert prediction.is_date is True
-        heights = _cdf_heights(prediction)
+        heights = cdf_heights(prediction)
         assert len(heights) == 201
         assert heights[0] == 0.0  # closed lower bound
         assert 0.3 < 1.0 - heights[-1] <= 0.999
@@ -232,7 +229,7 @@ class TestTheRunner:
 
         prediction = _build_guarded_numeric_distribution(percentiles, epoch, test_llm)
 
-        heights = _cdf_heights(prediction)
+        heights = cdf_heights(prediction)
         mass = np.diff(heights)
         assert len(heights) == 13
         assert int(np.argmax(mass)) == 8
@@ -265,7 +262,7 @@ class TestTheRunner:
 
         prediction = _build_guarded_numeric_distribution(percentiles, epoch, test_llm)
 
-        heights = _cdf_heights(prediction)
+        heights = cdf_heights(prediction)
         mass = np.diff(heights)
         assert len(heights) == 13
         out_of_range = heights[0] if open_edge == "lower" else 1.0 - heights[-1]
@@ -326,7 +323,7 @@ class TestTheRunner:
 
         prediction = _build_guarded_numeric_distribution(percentiles, epoch, test_llm)
 
-        heights = _cdf_heights(prediction)
+        heights = cdf_heights(prediction)
         assert heights[0] == pytest.approx(0.57, abs=0.01), heights[0]
         assert_server_accepts_cdf(heights, cdf_size=13, open_lower=True, open_upper=False)
 
@@ -349,7 +346,7 @@ class TestTheRunner:
 
         prediction = _build_guarded_numeric_distribution(percentiles, epoch, test_llm)
 
-        heights = _cdf_heights(prediction)
+        heights = cdf_heights(prediction)
         mass = np.diff(heights)
         assert heights[0] == 0.0
         assert mass[0] > 0.85, mass[0]
@@ -383,7 +380,7 @@ class TestTheRunner:
         assert "2026-07-" in readable
         assert " UTC" in readable
         assert _TEN_DIGIT_EPOCH.search(readable) is None
-        heights = _cdf_heights(prediction)
+        heights = cdf_heights(prediction)
         assert_server_accepts_cdf(heights, cdf_size=201, open_lower=False, open_upper=True)
 
 
@@ -416,7 +413,7 @@ class TestRoutingSites:
         )
         assert isinstance(combined, NumericDistribution)
         assert combined.is_date is True
-        heights = _cdf_heights(combined)
+        heights = cdf_heights(combined)
         assert len(heights) == 13
         assert heights[0] == 0.0
         assert heights[-1] == 1.0
@@ -521,9 +518,8 @@ def _per_bin_reasoning(bin_probs: dict[str, float]) -> str:
 
 @pytest.fixture
 def q651_on_mantic(q651: DateQuestion) -> DateQuestion:
-    """Post 651 on its own host: the framework parses every payload with a metaculus.com ``page_url``
-    and ``ManticClient`` rewrites it, so the recorded loader alone reads as a Metaculus question."""
-    return q651.model_copy(update={"page_url": f"{MANTIC_SITE_URL}/questions/{q651.id_of_post}/"})
+    """Post 651 on its own host; the recorded loader alone reads as a Metaculus question."""
+    return on_mantic(q651)
 
 
 class TestThePerBinRunner:
@@ -565,7 +561,7 @@ class TestThePerBinRunner:
         prediction = result.prediction_value
         assert isinstance(prediction, NumericDistribution)
         assert prediction.is_date is True
-        heights = _cdf_heights(prediction)
+        heights = cdf_heights(prediction)
         assert len(heights) == 13
         assert heights[0] == 0.0
         assert heights[-1] == 1.0

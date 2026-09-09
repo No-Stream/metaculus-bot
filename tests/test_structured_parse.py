@@ -295,8 +295,8 @@ class TestDatePercentileWrapper:
     def test_wrapper_shape_and_dispatch(self) -> None:
         w = DatePercentileListWrapper.model_validate({"percentiles": [{"percentile": 0.5, "value": "2026-09-16"}]})
         assert w.percentiles[0].value == datetime(2026, 9, 16, 12, tzinfo=UTC)
-        assert sp._get_wrapper_type(list[IsoDatePercentile]) is DatePercentileListWrapper
-        assert sp._get_wrapper_type(list[Percentile]) is PercentileListWrapper
+        assert sp._get_wrapper_type(list[IsoDatePercentile]) == (DatePercentileListWrapper, "percentiles")
+        assert sp._get_wrapper_type(list[Percentile]) == (PercentileListWrapper, "percentiles")
 
 
 class TestBinProbabilityWrapper:
@@ -342,4 +342,19 @@ class TestBinProbabilityWrapper:
         w = BinProbabilityListWrapper.model_validate({"bins": [{"label": "7", "probability": 1.0}]})
         assert w.bins[0].label == "7"
         assert w.bins[0].probability == 1.0
-        assert sp._get_wrapper_type(list[BinProbability]) is BinProbabilityListWrapper
+        assert sp._get_wrapper_type(list[BinProbability]) == (BinProbabilityListWrapper, "bins")
+
+
+class TestListWrapperTable:
+    """One table maps a list item type to its wrapper AND the wrapper's list field. Two parallel dispatch
+    chains let a wrapper land in one and miss the other, which fell off the end of the constrained path
+    into a second paid ``structure_output`` call with nothing logged."""
+
+    def test_every_wrapper_field_is_the_list_of_its_item_type(self) -> None:
+        assert set(sp._LIST_WRAPPERS) == {Percentile, IsoDatePercentile, OptionProbability, BinProbability}
+        for item_type, (wrapper, list_field) in sp._LIST_WRAPPERS.items():
+            assert wrapper.model_fields[list_field].annotation == list[item_type], (item_type, wrapper, list_field)
+
+    def test_a_non_list_or_unknown_item_type_has_no_wrapper(self) -> None:
+        assert sp._get_wrapper_type(BinaryPrediction) is None
+        assert sp._get_wrapper_type(list[BinaryPrediction]) is None

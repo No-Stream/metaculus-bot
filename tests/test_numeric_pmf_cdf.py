@@ -20,22 +20,34 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from forecasting_tools.data_models.questions import DiscreteQuestion, NumericQuestion
+from forecasting_tools.data_models.questions import NumericQuestion
 
-from metaculus_bot.constants import MANTIC_SITE_URL
-from metaculus_bot.numeric.config import OPEN_TAIL_MIN_MASS, PMF_FLOOR_MARGIN, elicit_per_bin, grid_step_constraints
+from metaculus_bot.numeric.config import (
+    OPEN_TAIL_MIN_MASS,
+    PMF_ELICITATION_MAX_BINS,
+    PMF_FLOOR_MARGIN,
+    elicit_per_bin,
+    grid_step_constraints,
+)
 from metaculus_bot.numeric.date_axis import EpochDateQuestion, as_epoch_question
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid, safe_cdf_bounds
 from metaculus_bot.numeric.pmf_cdf import build_pmf_distribution, published_pmf, validate_grid_cdf
 from metaculus_bot.numeric.pmf_grid import pmf_grid
 from metaculus_bot.numeric.utils import aggregate_numeric
 from tests.mantic_fakes import load_preseason_date_question
-from tests.pipeline_test_helpers import assert_server_accepts_cdf, server_min_step
+from tests.pipeline_test_helpers import (
+    ORACLE_BIN_COUNTS,
+    assert_server_accepts_cdf,
+    cdf_heights,
+    make_count_question,
+    make_real_numeric_question,
+    on_mantic,
+    server_min_step,
+)
 
 GRIDS_PATH = Path(__file__).parent / "data" / "mantic_cdf_grids_2026_09_08.json"
 
-# The plan's oracle set: five grid sizes across the elicitable range by the three bound shapes Mantic uses.
-ORACLE_BIN_COUNTS = (3, 4, 12, 21, 31)
+# The oracle set's bound shapes, the three Mantic uses; its five grid sizes are ``ORACLE_BIN_COUNTS``.
 ORACLE_BOUND_SHAPES = (
     pytest.param(False, False, id="closed-closed"),
     pytest.param(False, True, id="closed-open"),
@@ -50,37 +62,15 @@ def _corpus_coarse_grids() -> list[tuple[int, bool, bool]]:
     return [
         (grid["inbound_outcome_count"], grid["open_lower_bound"], grid["open_upper_bound"])
         for grid in grids
-        if grid["inbound_outcome_count"] <= 31
+        if grid["inbound_outcome_count"] <= PMF_ELICITATION_MAX_BINS
     ]
 
 
-def _count_question(
-    n_bins: int, *, open_lower: bool, open_upper: bool, zero_point: float | None = None
-) -> NumericQuestion:
-    """A Mantic count question on ``n_bins`` integer-centred bins, the modal coarse quantity shape."""
-    fields = {
-        "id_of_question": 900_000 + n_bins,
-        "id_of_post": 900_000 + n_bins,
-        "page_url": f"{MANTIC_SITE_URL}/questions/{900_000 + n_bins}/",
-        "question_text": "How many?",
-        "background_info": "",
-        "resolution_criteria": "",
-        "fine_print": "",
-        "published_time": None,
-        "close_time": None,
-        "lower_bound": -0.5,
-        "upper_bound": n_bins - 0.5,
-        "open_lower_bound": open_lower,
-        "open_upper_bound": open_upper,
-        "unit_of_measure": "",
-        "zero_point": zero_point,
-        "cdf_size": n_bins + 1,
-    }
-    if zero_point is not None:
-        fields["lower_bound"] = 1.0
-        fields["upper_bound"] = 1000.0
-        return NumericQuestion(**fields)
-    return DiscreteQuestion(**fields)
+def _log_scaled_question(n_bins: int) -> NumericQuestion:
+    """A Mantic quantity question on a geometric axis from 1.0 to 1000.0, both bounds closed: the one coarse
+    shape a count grid cannot carry."""
+    question = make_real_numeric_question(lower_bound=1.0, upper_bound=1000.0, open_upper_bound=False, zero_point=0.0)
+    return on_mantic(question).model_copy(update={"cdf_size": n_bins + 1})
 
 
 # --- The declared PMF shapes, as ``N + 2`` vectors with 0.0 in a closed tail's slot ---
@@ -130,13 +120,9 @@ def _declared(shape: str, n_bins: int, open_lower: bool, open_upper: bool) -> li
     return SHAPES[shape](n_bins, open_lower, open_upper)
 
 
-def _heights(prediction) -> np.ndarray:
-    return np.asarray([point.percentile for point in prediction.get_cdf()], dtype=float)
-
-
 def _assert_legal_on_the_grid(prediction, question: NumericQuestion) -> None:
     assert_server_accepts_cdf(
-        _heights(prediction),
+        cdf_heights(prediction),
         cdf_size=question.cdf_size,
         open_lower=question.open_lower_bound,
         open_upper=question.open_upper_bound,
@@ -153,7 +139,7 @@ class TestTheServerAcceptsEveryBuild:
         declared = _declared(shape, n_bins, open_lower, open_upper)
         if declared is None:
             pytest.skip("needs an open bound")
-        question = _count_question(n_bins, open_lower=open_lower, open_upper=open_upper)
+        question = make_count_question(n_bins, open_lower=open_lower, open_upper=open_upper)
         prediction = build_pmf_distribution(declared, question)
         _assert_legal_on_the_grid(prediction, question)
 
@@ -165,7 +151,7 @@ class TestTheServerAcceptsEveryBuild:
         declared = _declared(shape, n_bins, open_lower, open_upper)
         if declared is None:
             pytest.skip("needs an open bound")
-        question = _count_question(n_bins, open_lower=open_lower, open_upper=open_upper)
+        question = make_count_question(n_bins, open_lower=open_lower, open_upper=open_upper)
         assert elicit_per_bin(question), "the corpus filter and the gate must agree on what is coarse"
         prediction = build_pmf_distribution(declared, question)
         _assert_legal_on_the_grid(prediction, question)
@@ -183,7 +169,7 @@ class TestTheFloorBlend:
     @pytest.mark.parametrize(("open_lower", "open_upper"), ORACLE_BOUND_SHAPES)
     @pytest.mark.parametrize("n_bins", ORACLE_BIN_COUNTS)
     def test_a_certain_bin_keeps_at_least_0_988(self, n_bins: int, open_lower: bool, open_upper: bool) -> None:
-        question = _count_question(n_bins, open_lower=open_lower, open_upper=open_upper)
+        question = make_count_question(n_bins, open_lower=open_lower, open_upper=open_upper)
         prediction = build_pmf_distribution(SHAPES["one_hot_middle"](n_bins, open_lower, open_upper), question)
         assert published_pmf(prediction)[1 + n_bins // 2] >= 0.988
 
@@ -192,7 +178,7 @@ class TestTheFloorBlend:
     def test_a_zero_bin_lands_exactly_on_the_platform_minimum_plus_the_margin(
         self, n_bins: int, open_lower: bool, open_upper: bool
     ) -> None:
-        question = _count_question(n_bins, open_lower=open_lower, open_upper=open_upper)
+        question = make_count_question(n_bins, open_lower=open_lower, open_upper=open_upper)
         prediction = build_pmf_distribution(SHAPES["one_hot_middle"](n_bins, open_lower, open_upper), question)
         published = published_pmf(prediction)
         min_step, _ = grid_step_constraints(question.cdf_size)
@@ -211,37 +197,61 @@ class TestTheFloorBlend:
         assert pinned[-1] == 1.0 - OPEN_TAIL_MIN_MASS
 
     def test_a_closed_tail_receives_nothing(self) -> None:
-        question = _count_question(12, open_lower=False, open_upper=False)
+        question = make_count_question(12, open_lower=False, open_upper=False)
         published = published_pmf(build_pmf_distribution(SHAPES["one_hot_middle"](12, False, False), question))
         assert published[0] == 0.0
         assert published[-1] == 0.0
 
     def test_a_legal_declaration_is_returned_unchanged(self) -> None:
         """Nothing deficient, so the blend weight is zero and the declaration IS the published PMF."""
-        question = _count_question(4, open_lower=False, open_upper=True)
+        question = make_count_question(4, open_lower=False, open_upper=True)
         declared = [0.0, 0.4, 0.3, 0.2, 0.05, 0.05]
         assert published_pmf(build_pmf_distribution(declared, question)) == pytest.approx(declared, abs=1e-12)
 
     def test_the_blend_is_idempotent(self) -> None:
         """Feeding a published PMF back in changes nothing: every cell is already at or above its floor."""
-        question = _count_question(21, open_lower=False, open_upper=True)
+        question = make_count_question(21, open_lower=False, open_upper=True)
         first = build_pmf_distribution(SHAPES["one_hot_first"](21, False, True), question)
         second = build_pmf_distribution(published_pmf(first), question)
-        assert _heights(second) == pytest.approx(_heights(first), abs=1e-12)
+        assert cdf_heights(second) == pytest.approx(cdf_heights(first), abs=1e-12)
 
     def test_an_unnormalised_declaration_is_normalised_first(self) -> None:
-        """The ladder tolerates a sum within 2% of 1.0; the builder divides it out before anything else."""
-        question = _count_question(4, open_lower=False, open_upper=False)
+        """The ladder bounds the declared sum to ``pmf_prob_sum_tolerance(keys)`` of 1.0 (a 0.02 floor plus
+        0.005 per key); the builder divides it out before anything else, so only the shape is load-bearing."""
+        question = make_count_question(4, open_lower=False, open_upper=False)
         published = published_pmf(build_pmf_distribution([0.0, 0.5, 0.3, 0.2, 0.02, 0.0], question))
         assert sum(published) == pytest.approx(1.0, abs=1e-12)
         assert published[1:5] == pytest.approx([0.5, 0.3, 0.2, 0.02], rel=0.02)
 
     def test_the_mass_moved_is_bounded_by_the_floor_total(self) -> None:
         """The blend weight is at most the sum of the floors, about 0.012, so the declaration survives nearly intact."""
-        question = _count_question(31, open_lower=True, open_upper=True)
+        question = make_count_question(31, open_lower=True, open_upper=True)
         declared = [0.0, *([0.0] * 15), 0.6, 0.4, *([0.0] * 14), 0.0]
         published = np.asarray(published_pmf(build_pmf_distribution(declared, question)))
         assert 0.5 * np.abs(published - np.asarray(declared)).sum() <= 0.0125
+
+    def test_the_blend_weight_is_the_largest_of_the_per_cell_lifts(self) -> None:
+        """Two cells short of the floor by different amounts beside nine at zero: the weight is the MAX of
+        the per-cell ratios, the smallest one that lifts every deficient cell at once. A zero cell's ratio
+        is ``sum(floors)`` whatever the cell, so only distinct non-zero deficits tell the max from the min
+        or the mean, and the fail-shut guard cannot: ``safe_cdf_bounds`` quietly repairs the cells an
+        under-sized weight leaves short. Hand-derived: ``alpha = 12 * (min_step + margin) = 0.010000008``."""
+        question = make_count_question(12, open_lower=False, open_upper=False)
+        declared = [0.0] * 14
+        declared[1 + 0], declared[1 + 3] = 0.0005, 0.0001
+        declared[1 + 8] = 1.0 - 0.0005 - 0.0001
+        published = published_pmf(build_pmf_distribution(declared, question))
+
+        min_step, _ = grid_step_constraints(question.cdf_size)
+        alpha = 12 * (min_step + PMF_FLOOR_MARGIN)
+        assert alpha == pytest.approx(0.010000008, abs=1e-12)
+        assert round(published[1 + 0], 9) == 0.001328334
+        assert round(published[1 + 3], 9) == 0.000932334
+        assert round(published[1 + 8], 9) == 0.990239326
+        assert [round(published[1 + k], 9) for k in range(12) if k not in (0, 3, 8)] == [0.000833334] * 9
+        assert published[1 + 0] == pytest.approx((1.0 - alpha) * 0.0005 + alpha / 12, abs=1e-15)
+        assert published[1 + 3] == pytest.approx((1.0 - alpha) * 0.0001 + alpha / 12, abs=1e-15)
+        assert sum(published) == pytest.approx(1.0, abs=1e-12)
 
 
 class TestQuestion651:
@@ -281,7 +291,7 @@ class TestQuestion651:
         edges = build_cdf_value_grid(view.lower_bound, view.upper_bound, None, view.cdf_size)
         assert [point.value for point in prediction.declared_percentiles] == pytest.approx(list(edges))
         assert [point.percentile for point in prediction.declared_percentiles] == pytest.approx(
-            list(_heights(prediction))
+            list(cdf_heights(prediction))
         )
         assert prediction.declared_percentiles[0].percentile == 0.0
         assert prediction.declared_percentiles[-1].percentile == 1.0
@@ -289,7 +299,7 @@ class TestQuestion651:
 
 class TestTheWrap:
     def test_a_quantity_question_is_not_a_date(self) -> None:
-        question = _count_question(21, open_lower=False, open_upper=True)
+        question = make_count_question(21, open_lower=False, open_upper=True)
         prediction = build_pmf_distribution(SHAPES["uniform"](21, False, True), question)
         assert prediction.is_date is False
         assert prediction.cdf_size == 22
@@ -298,7 +308,7 @@ class TestTheWrap:
         assert prediction.open_lower_bound is False
 
     def test_a_zero_point_grid_keeps_its_geometric_axis(self) -> None:
-        question = _count_question(10, open_lower=False, open_upper=False, zero_point=0.0)
+        question = _log_scaled_question(10)
         prediction = build_pmf_distribution(SHAPES["uniform"](10, False, False), question)
         assert prediction.zero_point == 0.0
         values = [point.value for point in prediction.declared_percentiles]
@@ -306,10 +316,10 @@ class TestTheWrap:
         assert values[1] != pytest.approx(1.0 + 999.0 / 10)
 
     def test_published_pmf_is_the_platforms_n_plus_2_shape(self) -> None:
-        question = _count_question(12, open_lower=True, open_upper=True)
+        question = make_count_question(12, open_lower=True, open_upper=True)
         prediction = build_pmf_distribution(SHAPES["half_half"](12, True, True), question)
         published = published_pmf(prediction)
-        heights = _heights(prediction)
+        heights = cdf_heights(prediction)
         assert len(published) == 14
         assert published[0] == heights[0]
         assert published[-1] == pytest.approx(1.0 - heights[-1])
@@ -317,9 +327,9 @@ class TestTheWrap:
         assert sum(published) == pytest.approx(1.0, abs=1e-12)
 
     def test_get_cdf_and_declared_percentiles_agree(self) -> None:
-        question = _count_question(4, open_lower=False, open_upper=True)
+        question = make_count_question(4, open_lower=False, open_upper=True)
         prediction = build_pmf_distribution(SHAPES["one_hot_last"](4, False, True), question)
-        assert [p.percentile for p in prediction.declared_percentiles] == pytest.approx(list(_heights(prediction)))
+        assert [p.percentile for p in prediction.declared_percentiles] == pytest.approx(list(cdf_heights(prediction)))
 
 
 class TestTheBuilderRefuses:
@@ -327,36 +337,36 @@ class TestTheBuilderRefuses:
 
     def test_mass_in_a_closed_lower_tail(self) -> None:
         """The review reproduced 0.297 of a closed lower tail landing in bin 1 when the pin came after the sum."""
-        question = _count_question(12, open_lower=False, open_upper=False)
+        question = make_count_question(12, open_lower=False, open_upper=False)
         declared = [0.3, *([0.7 / 12] * 12), 0.0]
         with pytest.raises(ValueError, match="closed lower bound"):
             build_pmf_distribution(declared, question)
 
     def test_mass_in_a_closed_upper_tail(self) -> None:
-        question = _count_question(12, open_lower=True, open_upper=False)
+        question = make_count_question(12, open_lower=True, open_upper=False)
         declared = [0.1, *([0.6 / 12] * 12), 0.3]
         with pytest.raises(ValueError, match="closed upper bound"):
             build_pmf_distribution(declared, question)
 
     def test_mass_in_an_open_tail_is_the_forecast(self) -> None:
-        question = _count_question(12, open_lower=False, open_upper=True)
+        question = make_count_question(12, open_lower=False, open_upper=True)
         declared = [0.0, *([0.7 / 12] * 12), 0.3]
         published = published_pmf(build_pmf_distribution(declared, question))
         assert published[-1] == pytest.approx(0.3, abs=1e-3)
 
     def test_a_vector_of_the_wrong_length(self) -> None:
-        question = _count_question(12, open_lower=False, open_upper=False)
+        question = make_count_question(12, open_lower=False, open_upper=False)
         with pytest.raises(ValueError, match="14"):
             build_pmf_distribution([0.0, *([1.0 / 12] * 12)], question)
 
     @pytest.mark.parametrize("bad", [float("nan"), -0.1, float("inf")])
     def test_a_non_finite_or_negative_mass(self, bad: float) -> None:
-        question = _count_question(4, open_lower=False, open_upper=True)
+        question = make_count_question(4, open_lower=False, open_upper=True)
         with pytest.raises(ValueError, match=r"finite|negative"):
             build_pmf_distribution([0.0, 0.5, bad, 0.3, 0.1, 0.1], question)
 
     def test_an_all_zero_vector(self) -> None:
-        question = _count_question(4, open_lower=False, open_upper=True)
+        question = make_count_question(4, open_lower=False, open_upper=True)
         with pytest.raises(ValueError, match="sum"):
             build_pmf_distribution([0.0] * 6, question)
 
@@ -366,8 +376,8 @@ class TestValidateGridCdf:
 
     @staticmethod
     def _legal(n_bins: int, *, open_lower: bool, open_upper: bool) -> np.ndarray:
-        question = _count_question(n_bins, open_lower=open_lower, open_upper=open_upper)
-        return _heights(build_pmf_distribution(SHAPES["uniform"](n_bins, open_lower, open_upper), question))
+        question = make_count_question(n_bins, open_lower=open_lower, open_upper=open_upper)
+        return cdf_heights(build_pmf_distribution(SHAPES["uniform"](n_bins, open_lower, open_upper), question))
 
     def test_a_legal_cdf_passes(self) -> None:
         cdf = self._legal(12, open_lower=False, open_upper=True)
@@ -443,7 +453,7 @@ class TestTheLinearPoolOfPerBinMembers:
     def test_three_disagreeing_members_pool_to_a_third_each(
         self, n_bins: int, open_lower: bool, open_upper: bool
     ) -> None:
-        question = _count_question(n_bins, open_lower=open_lower, open_upper=open_upper)
+        question = make_count_question(n_bins, open_lower=open_lower, open_upper=open_upper)
         believed = sorted({0, n_bins // 2, n_bins - 1})
         members = [
             build_pmf_distribution(_one_hot(lambda n, k=k: k)(n_bins, open_lower, open_upper), question)

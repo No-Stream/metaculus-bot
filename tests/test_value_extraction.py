@@ -222,8 +222,7 @@ class TestRungRepair:
         llm_mock = AsyncMock(return_value=full_percentile_list())
         with patch("metaculus_bot.value_extraction.parse_structured", new=llm_mock):
             outcome = await extract_numeric(rationale_with(truncated), PARSER_LLM)
-        # Either deterministic repair produced a full 13-set (unlikely for a
-        # half-truncated block) or the llm rung salvaged. Never a partial set.
+        # Why: a half-truncated block yields a full 13-set from repair or from salvage, never a partial one.
         assert len(outcome.value) == 13
         assert outcome.rung in ("repair", "llm")
 
@@ -327,9 +326,7 @@ class TestFinalBlockPrecedence:
         assert len(fallback) == 1
         assert fallback[0].levelno == logging.INFO
         assert "skipped=1" in fallback[0].getMessage()
-        # A recovered forecast is never announced as a failure, at either layer.
-        # Scoped to our own loggers: caplog.records spans every logger that propagates
-        # to root, so an unrelated third-party WARNING would otherwise fail this.
+        # Why: a recovered forecast is never announced as a failure; scoped to our loggers since caplog spans root.
         our_warnings = [
             r for r in caplog.records if r.levelno >= logging.WARNING and r.name.startswith("metaculus_bot")
         ]
@@ -539,9 +536,8 @@ class TestSalvageFidelity:
 
     @pytest.mark.asyncio
     async def test_ties_are_still_accepted(self) -> None:
-        # A repeated value is a legitimate concentrated (often count-like) declaration, and
-        # the cluster spreader exists to separate exactly those — only a strict DECREASE
-        # with rising percentile is incoherent.
+        """A repeated value is a legitimate concentrated (often count-like) declaration that the cluster
+        spreader exists to separate; only a strict DECREASE with rising percentile is incoherent."""
         tied = full_percentile_list()
         tied[1] = Percentile(percentile=tied[1].percentile, value=tied[0].value)
         with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock(return_value=tied)):
@@ -642,9 +638,8 @@ class TestSalvageFidelity:
 
     @pytest.mark.asyncio
     async def test_a_truncated_literal_still_refuses_in_a_single_quoted_block(self) -> None:
-        # The single-quote handling above must not blind the check to a genuinely
-        # truncated value-position literal — the digits after "0." are gone in any
-        # quoting style, so the rung refuses and falls through to the LLM salvage.
+        """The single-quote handling must not blind the check to a genuinely truncated value-position
+        literal: the digits after ``0.`` are gone in any quoting style, so the rung refuses and salvages."""
         truncated = "{'question_type': 'binary', 'posterior_prob': 0.}"
         llm_mock = AsyncMock(return_value=BinaryPrediction(prediction_in_decimal=0.72))
         with patch("metaculus_bot.value_extraction.parse_structured", new=llm_mock):
@@ -654,10 +649,8 @@ class TestSalvageFidelity:
         assert outcome.value == 0.72
 
     @pytest.mark.asyncio
-    async def test_a_repair_may_drop_a_number_but_never_introduce_one(self) -> None:
-        # Syntax-only repairs stay allowed: a trailing comma changes no value, so the
-        # deterministic rung still handles the common malformed-block case (see
-        # TestRungRepair). This pins the direction of the asymmetry.
+    async def test_a_syntax_only_repair_is_accepted(self) -> None:
+        """A trailing comma changes no value, so the deterministic rung still handles the common malformed block."""
         with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock()) as llm:
             outcome = await extract_binary(
                 rationale_with('{"question_type": "binary", "posterior_prob": 0.28,}'), PARSER_LLM
@@ -666,6 +659,32 @@ class TestSalvageFidelity:
         assert outcome.rung == "repair"
         assert outcome.value == 0.28
         llm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("trailing_comma", [False, True], ids=["well-formed", "malformed"])
+    async def test_a_repair_that_drops_a_value_is_refused_like_one_that_invents_one(self, trailing_comma: bool) -> None:
+        """A block declaring ``posterior_prob`` twice is ambiguous. ``json.loads`` keeps the last value, so the
+        block rung refuses the repeated key; ``json_repair`` re-serialises through a dict and hands back a block
+        with ``0.28`` gone, and a repair that changes the numeric stream in EITHER direction is not a repair.
+        Only the parser LLM, reading the prose, may resolve it."""
+        tail = "," if trailing_comma else ""
+        block = f'{{"question_type": "binary", "posterior_prob": 0.28, "posterior_prob": 0.72{tail}}}'
+        llm_mock = AsyncMock(return_value=BinaryPrediction(prediction_in_decimal=0.5))
+        with patch("metaculus_bot.value_extraction.parse_structured", new=llm_mock):
+            outcome = await extract_binary(rationale_with(block), PARSER_LLM)
+
+        assert outcome.rung == "llm"
+        assert outcome.value == 0.5
+        llm_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_the_dropped_value_is_named_when_every_rung_fails(self) -> None:
+        block = '{"question_type": "binary", "posterior_prob": 0.28, "posterior_prob": 0.72,}'
+        with (
+            patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock(side_effect=ValueError("no"))),
+            pytest.raises(ValueExtractionError, match=r"repair dropped numeric value\(s\) \[0\.28\]"),
+        ):
+            await extract_binary(rationale_with(block), PARSER_LLM)
 
 
 class TestDateExtraction:

@@ -3,10 +3,11 @@
 Per slug it reports posts and questions at each status, the backlog of unresolved questions
 past their own ``scheduled_resolve_time``, the FORFEIT sweep (closed or resolved questions the
 bot never forecast, with their windows) and the miss rate per UTC release hour. Two platforms:
-Metaculus (default; ``METACULUS_TOKEN`` required, ``my_forecasts`` fetched per post) and
-Mantic's Crucible (``--platform mantic``; public reads, ``MANTIC_TOKEN`` optional, resolved
-questions classified from the public spot-time snapshot). The platform seams are the
-``PlatformProbe`` table in ``scripts/supply_probe_platforms.py``.
+Metaculus (default; ``METACULUS_TOKEN`` required, ``my_forecasts`` read off the list page and
+fetched per post only where it is missing) and Mantic's Crucible (``--platform mantic``; public
+reads, ``MANTIC_TOKEN`` optional, resolved questions classified from the public spot-time
+snapshot). Every list GET carries ``with_cp=true``, which is what puts both of those on the list
+page. The platform seams are the ``PlatformProbe`` table in ``scripts/supply_probe_platforms.py``.
 
 Read-only and free: only the platform's posts list and post detail, no LLM, research or publish
 call. Paging stops on the first short page and every request carries a bounded 429 retry. Why
@@ -38,15 +39,9 @@ from typing import Any
 
 import requests
 
-from metaculus_bot.api_preflight import verify_api_identity, verify_metaculus_api_identity
+from metaculus_bot.api_preflight import verify_api_identity
 from metaculus_bot.config import load_environment
-from metaculus_bot.constants import (
-    MANTIC_API_BASE_URL,
-    MANTIC_TOKEN_ENV,
-    MANTIC_TOURNAMENT_ID,
-    PLATFORM_MANTIC,
-    PLATFORM_METACULUS,
-)
+from metaculus_bot.constants import MANTIC_TOKEN_ENV, MANTIC_TOURNAMENT_ID, PLATFORM_METACULUS
 
 # Shared with the scoring pull so the two count questions one way (docs/supply_probe.md "API facts").
 from metaculus_bot.performance_analysis.collector import FETCH_DELAY_SECS, questions_on_post
@@ -404,10 +399,10 @@ def summarize_slug_supply(
     post that resolves mid-probe can be paged under both ``closed`` and ``resolved``.
 
     The forfeit sweep reads whatever the supplied payloads carry through the platform's
-    ``forecast_state``. On raw Metaculus list pages that is nothing, so every eligible question
-    comes back ``unknown`` and the forfeit list is empty — call :func:`resolve_bot_forecasts` on
-    the pages first (as :func:`probe_slugs` does) to get an answer. Mantic list pages answer as
-    they are.
+    ``forecast_state``. A list page fetched with the platform's ``list_params`` answers as it is;
+    a Metaculus page read without ``with_cp=true`` carries no ``my_forecasts``, so every eligible
+    question comes back ``unknown`` and the forfeit list is empty — call
+    :func:`resolve_bot_forecasts` on the pages first (as :func:`probe_slugs` does) to fill the gaps.
     """
     rows = question_rows(posts_by_status, platform=platform)
     resolved_ids = {row.question_id for row in rows if row.is_resolved}
@@ -479,8 +474,9 @@ def fetch_posts_by_status(
     Stops on the first short page: the scratch probes this replaces found the Metaculus
     tournament-filtered list serving no usable total, and Mantic advertises ``next`` past its
     last page with ``count`` null, so page length is the only end-of-results signal either
-    platform gives. ``MAX_PAGES`` bounds the walk. Under a token the platform's
-    ``authenticated_list_params`` ride every page GET.
+    platform gives. ``MAX_PAGES`` bounds the walk. The platform's ``list_params`` ride every page
+    GET, token or not: ``with_cp=true`` is what puts the public snapshot on a Mantic page, and the
+    tokenless mode classified nothing while it was sent only under a token.
     """
     posts_by_status: dict[str, list[dict]] = {}
     for status in statuses:
@@ -491,9 +487,8 @@ def fetch_posts_by_status(
                 "statuses": status,
                 "limit": PAGE_SIZE,
                 "offset": page * PAGE_SIZE,
+                **platform.list_params,
             }
-            if token:
-                params.update(platform.authenticated_list_params)
             data = _get_json(params, token, url=platform.posts_url)
             results = data.get("results") or []
             posts.extend(results)
@@ -532,16 +527,16 @@ def resolve_bot_forecasts(posts_by_status: dict[str, list[dict]], token: str | N
 
     One detail GET per post that needs one; the fetched payload replaces that post under EVERY
     status it was paged under, so two copies of a post that resolved mid-probe cannot disagree.
-    Metaculus-only (``POSTS_URL``): Mantic's list page already answers, so it is never called there.
+    With ``with_cp=true`` on the list GET the page already answers for nearly every post, so this
+    is the fallback for the ones left unknown. Metaculus-only (``POSTS_URL``): Mantic's list page
+    always answers, so it is never called there.
 
-    ``slug`` only labels the log lines. The sweep spends minutes issuing spaced GETs and used
-    to say nothing while it did, so a run that had wedged looked exactly like one that was
-    working; it now reports progress every ``DETAIL_PROGRESS_EVERY`` posts, with one DEBUG
-    line per GET for a per-URL trace.
+    ``slug`` only labels the log lines. The sweep can spend minutes issuing spaced GETs, so it
+    reports progress every ``DETAIL_PROGRESS_EVERY`` posts (a wedged run used to look exactly like
+    a working one), with one DEBUG line per GET for a per-URL trace.
 
-    A post whose detail GET fails is left as it was, which reads through as ``unknown`` rather
-    than as a forfeit: the sweep supplements the counts, and one unreachable post must not cost
-    the slug its census. Raises nothing; an exhausted retry on EVERY post is a large ``unknown``.
+    A post whose detail GET fails stays as it was and reads ``unknown`` rather than forfeited: one
+    unreachable post must not cost the slug its census. Raises nothing; every GET failing is a large ``unknown``.
     """
     needed = _posts_needing_detail(posts_by_status)
     if not needed:
@@ -586,10 +581,11 @@ def probe_slugs(
     live ones. Anything that is not a request failure is a contract break and crashes.
 
     ``resolve_forfeits`` costs one detail GET per closed/resolved post the list page did not
-    already answer for, a few hundred requests over a season. It defaults OFF so a caller that
-    only wants counts pays nothing; the CLI turns it ON (``--no-forfeits`` to opt out), because
-    a forfeit is what the weekly read exists to catch. Moot where the list page already answers
-    (Mantic): no detail GET is issued there whatever the flag says.
+    already answer for, which with ``with_cp=true`` on every list GET is close to none. It
+    defaults OFF so a caller that only wants counts pays nothing; the CLI turns it ON
+    (``--no-forfeits`` to opt out), because a forfeit is what the weekly read exists to catch.
+    Moot where the list page always answers (Mantic): no detail GET is issued there whatever the
+    flag says.
     """
     supplies: list[SlugSupply] = []
     for slug in slugs:
@@ -787,7 +783,7 @@ def main(argv: list[str] | None = None) -> None:
         action="store_false",
         help=(
             "Skip the Metaculus forfeit sweep's detail GETs (one read-only GET per closed/resolved post whose "
-            "list page did not already carry my_forecasts), leaving every question's state reported as unknown. "
+            "list page did not already carry my_forecasts), leaving those questions reported as unknown. "
             "Mantic classifies off the list page and never issues them."
         ),
     )
@@ -807,10 +803,7 @@ def main(argv: list[str] | None = None) -> None:
         )
 
     # The host is vetted before any token goes out (DNS-parking incident; see metaculus_bot/api_preflight.py).
-    if platform.name == PLATFORM_MANTIC:
-        verify_api_identity(MANTIC_API_BASE_URL)
-    else:
-        verify_metaculus_api_identity()
+    verify_api_identity(platform.base_url)
 
     now = datetime.now(UTC)
     slugs = args.slugs or list(platform.default_slugs)

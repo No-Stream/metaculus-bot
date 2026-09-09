@@ -190,7 +190,9 @@ def build_pmf_parse_notes(grid: PmfGrid) -> str:
     The per-bin sibling of ``build_parse_notes``, with the same one job: EXTRACT the probability the
     forecaster stated for each key, never interpret or rebalance it. The salvage rung has nothing
     else to spell the keys from, so they are listed verbatim: a label that matches no grid key fails
-    the conversion, and every key must be present (``value_extraction.extract_pmf``).
+    the conversion, and every key must be present (``value_extraction.extract_pmf``). A key the
+    forecaster never priced is therefore LEFT OUT rather than written as 0, so the every-key rule
+    drops the member instead of publishing a tail nobody declared.
     """
     keys = ", ".join(f"'{key}'" for key in grid.keys)
     reserved: list[str] = []
@@ -200,12 +202,13 @@ def build_pmf_parse_notes(grid: PmfGrid) -> str:
         reserved.append(f"'{PMF_ABOVE_RANGE_KEY}' is the probability that the outcome falls above the displayed range")
     reserved_note = f" {'; '.join(reserved)}." if reserved else ""
     return (
-        f"Return a JSON array of exactly {len(grid.keys)} objects, one per key, each with exactly two fields: "
-        f"'label' (string) and 'probability' (decimal in [0,1]). Use these labels verbatim, in this order, and no "
-        f"others: {keys}. Each label names one bin of the question's grid, spelled exactly as listed.{reserved_note} "
-        "Read each probability as the forecaster stated it (a percentage becomes a decimal: 35% -> 0.35); never "
-        "interpret, rebalance or fill it in. A key the forecaster gave no probability, or ruled out, is 0. The "
-        "probabilities should sum to about 1.0."
+        "Return a JSON array of objects, one per key the forecaster gave a probability, each with exactly two "
+        f"fields: 'label' (string) and 'probability' (decimal in [0,1]). The grid has exactly {len(grid.keys)} keys; "
+        f"use these labels verbatim, in this order, and no others: {keys}. Each label names one bin of the "
+        f"question's grid, spelled exactly as listed.{reserved_note} Read each probability as the forecaster stated "
+        "it (a percentage becomes a decimal: 35% -> 0.35); a bin the forecaster ruled out is 0. Never interpret, "
+        "rebalance or fill in a probability the forecaster did not state: leave that key out, even if the array is "
+        "then shorter than the key list. The probabilities should sum to about 1.0."
     )
 
 

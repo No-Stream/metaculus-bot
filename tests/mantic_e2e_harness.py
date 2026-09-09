@@ -58,6 +58,7 @@ from metaculus_bot.constants import (
 from metaculus_bot.mantic import ManticClient
 from metaculus_bot.numeric.config import STANDARD_PERCENTILES
 from metaculus_bot.time_budget import QuestionTimeBudget
+from tests.http_fakes import json_response
 from tests.mantic_fakes import (
     BINARY_POST_ID,
     COARSE_DISCRETE_POST_ID,
@@ -316,16 +317,6 @@ class RecordedRequest:
     send_kwargs: dict[str, Any]
 
 
-def _json_response(request: requests.PreparedRequest, status: int, payload: Any) -> requests.Response:
-    response = requests.Response()
-    response.status_code = status
-    response._content = json.dumps(payload).encode()
-    response.encoding = "utf-8"
-    response.url = request.url or ""
-    response.request = request
-    return response
-
-
 def _visible_posts(posts: list[dict[str, Any]], query: dict[str, list[str]]) -> list[dict[str, Any]]:
     """The page of ``posts`` a real list endpoint would answer: type-filtered, then ``offset``/``limit``-sliced.
 
@@ -363,11 +354,11 @@ def install_fake_transport(mp: pytest.MonkeyPatch, posts: list[dict[str, Any]]) 
         )
         if request.method == "GET" and parsed.path == _POSTS_PATH:
             results = _visible_posts(posts, query)
-            return _json_response(request, 200, {"next": None, "previous": None, "results": results})
+            return json_response({"next": None, "previous": None, "results": results}, request=request)
         if request.method == "POST" and parsed.path == _FORECAST_PATH:
-            return _json_response(request, 201, [])
+            return json_response([], status=201, request=request)
         if request.method == "POST" and parsed.path == _COMMENT_PATH:
-            return _json_response(request, 201, {})
+            return json_response({}, status=201, request=request)
         raise AssertionError(f"unexpected request {request.method} {request.url}")
 
     mp.setattr(HTTPAdapter, "send", fake_send)

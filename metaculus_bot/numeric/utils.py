@@ -18,10 +18,11 @@ from forecasting_tools.data_models.questions import NumericQuestion
 
 from metaculus_bot.constants import NUM_RAMP_K_FACTOR, PMF_ABOVE_RANGE_KEY, PMF_BELOW_RANGE_KEY
 from metaculus_bot.mc_processing import clamp_and_renormalize_probs
-from metaculus_bot.numeric.config import PCHIP_CDF_POINTS, grid_step_constraints
+from metaculus_bot.numeric.config import OPEN_TAIL_MIN_MASS, PCHIP_CDF_POINTS, grid_step_constraints
 from metaculus_bot.numeric.date_axis import EpochDateQuestion, format_epoch
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid, safe_cdf_bounds
 from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
+from metaculus_bot.numeric.pmf_cdf import server_rounded_pmf
 from metaculus_bot.numeric.validation import resolve_zero_point
 
 __all__ = [
@@ -53,11 +54,11 @@ def aggregate_binary_mean(predictions: Sequence[float]) -> float:
 def _pin_endpoints(p_vals: np.ndarray, question: NumericQuestion) -> None:
     """Pin CDF endpoints in-place according to open/closed bound semantics."""
     if question.open_lower_bound:
-        p_vals[0] = max(p_vals[0], 0.001)
+        p_vals[0] = max(p_vals[0], OPEN_TAIL_MIN_MASS)
     else:
         p_vals[0] = 0.0
     if question.open_upper_bound:
-        p_vals[-1] = min(p_vals[-1], 0.999)
+        p_vals[-1] = min(p_vals[-1], 1.0 - OPEN_TAIL_MIN_MASS)
     else:
         p_vals[-1] = 1.0
 
@@ -85,14 +86,15 @@ def _postprocess_ensemble_cdf(
 
     min_step_required, max_step_required = grid_step_constraints(len(p_vals))
 
-    diffs_before = np.diff(p_vals)
+    # Compared as the server compares it, so one-ULP noise in a pointwise mean of exact-min-step members cannot ramp the grid.
+    diffs_before = server_rounded_pmf(p_vals)
     min_delta_before = float(np.min(diffs_before)) if len(diffs_before) else 1.0
     if min_delta_before < min_step_required:
         ramp = np.linspace(0.0, min_step_required * NUM_RAMP_K_FACTOR, len(p_vals))
         p_vals = np.maximum.accumulate(p_vals + ramp)
         _pin_endpoints(p_vals, question)
 
-        diffs_after = np.diff(p_vals)
+        diffs_after = server_rounded_pmf(p_vals)
         min_delta_after = float(np.min(diffs_after)) if len(diffs_after) else 1.0
         logger.warning(
             "Ensemble CDF ramp smoothing (%s) | Q %s | URL %s | min_prob_delta_before=%.8f | min_prob_delta_after=%.8f",

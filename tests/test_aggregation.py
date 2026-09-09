@@ -11,13 +11,18 @@ from forecasting_tools.data_models.questions import NumericQuestion
 
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
-from metaculus_bot.numeric.config import PCHIP_CDF_POINTS, STANDARD_PERCENTILES, grid_step_constraints
+from metaculus_bot.numeric.config import (
+    PCHIP_CDF_POINTS,
+    PMF_FLOOR_MARGIN,
+    STANDARD_PERCENTILES,
+    grid_step_constraints,
+)
 from metaculus_bot.numeric.date_axis import as_epoch_question
 from metaculus_bot.numeric.pchip_processing import create_fallback_numeric_distribution
 from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
 from metaculus_bot.numeric.utils import aggregate_numeric
 from tests.mantic_fakes import load_preseason_date_question
-from tests.pipeline_test_helpers import assert_server_accepts_cdf, certain_of_bin, pmf_of
+from tests.pipeline_test_helpers import assert_server_accepts_cdf, cdf_heights, certain_of_bin, pmf_of
 
 
 @pytest.mark.asyncio
@@ -193,11 +198,11 @@ class TestEnsembleCdfGridAlignment:
     @pytest.mark.parametrize("method", ["mean", "median"])
     def test_aggregate_is_the_exact_pointwise_statistic(self, method: str) -> None:
         predictions = self._mixed_ensemble()
-        heights = np.array([[p.percentile for p in pred.get_cdf()] for pred in predictions], dtype=float)
+        heights = np.array([cdf_heights(pred) for pred in predictions])
         expected = heights.mean(axis=0) if method == "mean" else np.median(heights, axis=0)
 
         aggregated = aggregate_numeric(predictions, _MIXED_GRID_QUESTION, method)
-        actual = np.array([p.percentile for p in aggregated.get_cdf()], dtype=float)
+        actual = cdf_heights(aggregated)
 
         assert len(actual) == PCHIP_CDF_POINTS
         assert np.allclose(actual, expected, atol=1e-12), f"max deviation {np.max(np.abs(actual - expected))}"
@@ -225,7 +230,7 @@ class TestEnsembleCdfGridAlignment:
         assert "got_points=51" in markers[0]
         assert f"expected_points={PCHIP_CDF_POINTS}" in markers[0]
 
-        heights = np.array([p.percentile for p in aggregated.get_cdf()], dtype=float)
+        heights = cdf_heights(aggregated)
         assert len(heights) == PCHIP_CDF_POINTS
         assert np.all(np.diff(heights) > 0)
 
@@ -242,13 +247,10 @@ class TestLinearOpinionPoolOnAnEnumerableGrid:
     """
 
     _VIEW = as_epoch_question(load_preseason_date_question())
-    _FLOOR = grid_step_constraints(_VIEW.cdf_size)[0] + 1e-9
+    _FLOOR = grid_step_constraints(_VIEW.cdf_size)[0] + PMF_FLOOR_MARGIN
 
     def _members(self, bins: tuple[int, ...]) -> list[NumericDistribution]:
         return [certain_of_bin(self._VIEW, k) for k in bins]
-
-    def _heights(self, aggregate: NumericDistribution) -> np.ndarray:
-        return np.asarray([p.percentile for p in aggregate.get_cdf()], dtype=float)
 
     def test_three_sharp_members_pool_to_a_third_each(self) -> None:
         pooled = aggregate_numeric(self._members((3, 5, 7)), self._VIEW, "mean")
@@ -259,9 +261,7 @@ class TestLinearOpinionPoolOnAnEnumerableGrid:
         assert others == pytest.approx(np.full(others.size, self._FLOOR), abs=1e-9), (
             "the mean of three floors is the floor"
         )
-        assert_server_accepts_cdf(
-            self._heights(pooled), cdf_size=self._VIEW.cdf_size, open_lower=False, open_upper=False
-        )
+        assert_server_accepts_cdf(cdf_heights(pooled), cdf_size=self._VIEW.cdf_size, open_lower=False, open_upper=False)
 
     def test_the_median_of_the_same_members_is_the_middle_member_outright(self) -> None:
         medianed = aggregate_numeric(self._members((3, 5, 7)), self._VIEW, "median")
@@ -271,7 +271,7 @@ class TestLinearOpinionPoolOnAnEnumerableGrid:
         assert pmf[3] == pytest.approx(self._FLOOR, abs=1e-9)
         assert pmf[7] == pytest.approx(self._FLOOR, abs=1e-9)
         assert_server_accepts_cdf(
-            self._heights(medianed), cdf_size=self._VIEW.cdf_size, open_lower=False, open_upper=False
+            cdf_heights(medianed), cdf_size=self._VIEW.cdf_size, open_lower=False, open_upper=False
         )
 
     def test_two_against_one_keeps_a_third_on_the_dissenter(self) -> None:
@@ -284,7 +284,7 @@ class TestLinearOpinionPoolOnAnEnumerableGrid:
         assert medianed[3] == pytest.approx(self._FLOOR, abs=1e-9)
 
     def test_the_rules_coincide_when_the_members_agree(self) -> None:
-        pooled = self._heights(aggregate_numeric(self._members((8, 8, 8)), self._VIEW, "mean"))
-        medianed = self._heights(aggregate_numeric(self._members((8, 8, 8)), self._VIEW, "median"))
+        pooled = cdf_heights(aggregate_numeric(self._members((8, 8, 8)), self._VIEW, "mean"))
+        medianed = cdf_heights(aggregate_numeric(self._members((8, 8, 8)), self._VIEW, "median"))
         assert pooled == pytest.approx(medianed, abs=1e-12)
         assert pmf_of(aggregate_numeric(self._members((8, 8, 8)), self._VIEW, "mean"))[8] > 0.99

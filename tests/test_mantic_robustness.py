@@ -44,6 +44,7 @@ from metaculus_bot.mantic import (
     reset_post_drop_count,
 )
 from scripts.telemetry.markers import parse_log_text
+from tests.http_fakes import json_response, text_response
 from tests.mantic_fakes import BINARY_POST_ID, DISCRETE_POST_ID, load_preseason_posts
 
 _FAKE_TOKEN = "f" * 40
@@ -85,18 +86,6 @@ LIVE_TOURNAMENTS = [
 ]
 
 
-def _text_response(status: int, text: str) -> requests.Response:
-    response = requests.Response()
-    response.status_code = status
-    response._content = text.encode()
-    response.encoding = "utf-8"
-    return response
-
-
-def _json_response(status: int, payload: object) -> requests.Response:
-    return _text_response(status, json.dumps(payload))
-
-
 def _serve(monkeypatch: pytest.MonkeyPatch, *answers: requests.Response | Exception) -> MagicMock:
     """Answer successive ``requests.get`` calls with ``answers`` in order (an exception is raised);
     returns the spy so a test can read the requests."""
@@ -111,7 +100,7 @@ def _serve_preflight(
     """The preflight's two GETs in order: the tournament list, then the configured tournament's detail
     (``configured`` defaults to the live preseason project)."""
     detail = _tournament(MANTIC_TOURNAMENT_ID, is_ongoing=True) if configured is None else configured
-    return _serve(monkeypatch, _json_response(200, tournaments), _json_response(200, detail))
+    return _serve(monkeypatch, json_response(tournaments), json_response(detail))
 
 
 def _requested_urls(fake_get: MagicMock) -> list[str]:
@@ -328,7 +317,7 @@ class TestListTournaments:
     def test_the_get_is_authenticated_bounded_and_aimed_at_the_tournament_list(
         self, client: ManticClient, monkeypatch: pytest.MonkeyPatch
     ):
-        fake_get = _serve(monkeypatch, _json_response(200, LIVE_TOURNAMENTS))
+        fake_get = _serve(monkeypatch, json_response(LIVE_TOURNAMENTS))
 
         assert client.list_tournaments() == LIVE_TOURNAMENTS
 
@@ -341,13 +330,13 @@ class TestListTournaments:
     def test_a_non_200_fails_shut_naming_the_status(
         self, client: ManticClient, monkeypatch: pytest.MonkeyPatch, status: int
     ):
-        _serve(monkeypatch, _json_response(status, {"detail": "no"}))
+        _serve(monkeypatch, json_response({"detail": "no"}, status=status))
 
         with pytest.raises(ApiIdentityError, match=f"status={status}"):
             client.list_tournaments()
 
     def test_a_200_that_is_not_a_list_fails_shut(self, client: ManticClient, monkeypatch: pytest.MonkeyPatch):
-        _serve(monkeypatch, _json_response(200, {"detail": "a lander, not the API"}))
+        _serve(monkeypatch, json_response({"detail": "a lander, not the API"}))
 
         with pytest.raises(ApiIdentityError, match="not with a JSON list"):
             client.list_tournaments()
@@ -357,7 +346,7 @@ class TestListTournaments:
     ):
         """The captive-portal shape: a 200 HTML lander. The decode failure is folded into the one
         exception the docstring promises rather than escaping as a bare ``JSONDecodeError``."""
-        _serve(monkeypatch, _text_response(200, "<html><body>Sign in to the network</body></html>"))
+        _serve(monkeypatch, text_response("<html><body>Sign in to the network</body></html>"))
 
         with pytest.raises(ApiIdentityError, match="not with JSON") as excinfo:
             client.list_tournaments()
@@ -395,7 +384,7 @@ class TestGetTournament:
         self, client: ManticClient, monkeypatch: pytest.MonkeyPatch
     ):
         detail = _tournament(MANTIC_TOURNAMENT_ID, is_ongoing=True)
-        fake_get = _serve(monkeypatch, _json_response(200, detail))
+        fake_get = _serve(monkeypatch, json_response(detail))
 
         assert client.get_tournament(MANTIC_TOURNAMENT_ID) == detail
 
@@ -407,7 +396,7 @@ class TestGetTournament:
     def test_a_404_fails_shut_naming_the_slug_and_the_constant_to_re_point(
         self, client: ManticClient, monkeypatch: pytest.MonkeyPatch
     ):
-        _serve(monkeypatch, _json_response(404, _NOT_FOUND_BODY))
+        _serve(monkeypatch, json_response(_NOT_FOUND_BODY, status=404))
 
         with pytest.raises(ApiIdentityError, match="status=404") as excinfo:
             client.get_tournament("series-2")
@@ -419,7 +408,7 @@ class TestGetTournament:
     def test_a_rejected_token_fails_shut_naming_the_token_variable(
         self, client: ManticClient, monkeypatch: pytest.MonkeyPatch
     ):
-        _serve(monkeypatch, _json_response(_INVALID_TOKEN_STATUS, _INVALID_TOKEN_BODY))
+        _serve(monkeypatch, json_response(_INVALID_TOKEN_BODY, status=_INVALID_TOKEN_STATUS))
 
         with pytest.raises(ApiIdentityError, match=f"status={_INVALID_TOKEN_STATUS}") as excinfo:
             client.get_tournament(MANTIC_TOURNAMENT_ID)
@@ -427,7 +416,7 @@ class TestGetTournament:
         assert "MANTIC_TOKEN" in str(excinfo.value)
 
     def test_a_200_that_is_not_an_object_fails_shut(self, client: ManticClient, monkeypatch: pytest.MonkeyPatch):
-        _serve(monkeypatch, _json_response(200, LIVE_TOURNAMENTS))
+        _serve(monkeypatch, json_response(LIVE_TOURNAMENTS))
 
         with pytest.raises(ApiIdentityError, match="not with a JSON object"):
             client.get_tournament(MANTIC_TOURNAMENT_ID)
@@ -577,7 +566,7 @@ class TestPreflightManticTournaments:
     ):
         """The detail route 404s for a slug that does not exist; that, not absence from the list, is
         the bad-slug catch."""
-        _serve(monkeypatch, _json_response(200, LIVE_TOURNAMENTS), _json_response(404, _NOT_FOUND_BODY))
+        _serve(monkeypatch, json_response(LIVE_TOURNAMENTS), json_response(_NOT_FOUND_BODY, status=404))
 
         with (
             caplog.at_level(logging.INFO, logger=_MANTIC_LOGGER),
@@ -592,7 +581,7 @@ class TestPreflightManticTournaments:
     def test_a_rejected_token_fails_shut_before_any_discovery_line(
         self, client: ManticClient, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ):
-        fake_get = _serve(monkeypatch, _json_response(_INVALID_TOKEN_STATUS, _INVALID_TOKEN_BODY))
+        fake_get = _serve(monkeypatch, json_response(_INVALID_TOKEN_BODY, status=_INVALID_TOKEN_STATUS))
 
         with (
             caplog.at_level(logging.INFO, logger=_MANTIC_LOGGER),

@@ -77,6 +77,11 @@ TIMESTAMP_GRID = PmfGrid(
     open_upper_bound=False,
     style="timestamp",
 )
+# The smallest closed grids: one count bin, and two, for the cases where a second key would obscure the point.
+ONE_BIN_GRID = PmfGrid(labels=("0",), edges=(-0.5, 0.5), open_lower_bound=False, open_upper_bound=False, style="center")
+TWO_BIN_GRID = PmfGrid(
+    labels=("0", "1"), edges=(-0.5, 0.5, 1.5), open_lower_bound=False, open_upper_bound=False, style="center"
+)
 
 
 def rationale_with(block_json: str) -> str:
@@ -361,6 +366,30 @@ class TestBlockRungRefusals:
             outcome = await extract_pmf(rationale_with(pmf_block(probs)), DAY_GRID, PARSER_LLM)
         assert outcome.rung == "llm"
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("trailing_comma", [False, True], ids=["well-formed", "malformed"])
+    async def test_a_block_repeating_a_key_reaches_neither_deterministic_rung(self, trailing_comma: bool) -> None:
+        """``json.loads`` keeps the last of two equal keys and ``json_repair`` re-serialises through a dict, so
+        ``{"0": 0.9, "0": 0.4, "1": 0.6}`` would otherwise read as ``{"0": 0.4, "1": 0.6}`` on the block rung
+        (well-formed) or the repair rung (with a trailing comma). The decoder refuses the repeated key, and the
+        repair's dropped ``0.9`` fails the numeric-stream fidelity check, so only the parser LLM may read it."""
+        tail = "," if trailing_comma else ""
+        block = f'{{"question_type": "pmf", "bin_probs": {{"0": 0.9, "0": 0.4, "1": 0.6}}{tail}}}'
+        llm_mock = AsyncMock(return_value=salvage_bins({"0": 0.4, "1": 0.6}))
+        with patch("metaculus_bot.value_extraction.parse_structured", new=llm_mock):
+            outcome = await extract_pmf(rationale_with(block), TWO_BIN_GRID, PARSER_LLM)
+        assert outcome.rung == "llm"
+        llm_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_boolean_probability_in_the_block_falls_through(self) -> None:
+        """``true`` would read as 1.0 under pydantic's lax float; the schema refuses it and the ladder salvages."""
+        block = '{"question_type": "pmf", "bin_probs": {"0": true, "1": false}}'
+        llm_mock = AsyncMock(return_value=salvage_bins({"0": 1.0, "1": 0.0}))
+        with patch("metaculus_bot.value_extraction.parse_structured", new=llm_mock):
+            outcome = await extract_pmf(rationale_with(block), TWO_BIN_GRID, PARSER_LLM)
+        assert outcome.rung == "llm"
+
 
 class TestRepairRung:
     @pytest.mark.asyncio
@@ -484,6 +513,28 @@ class TestLlmRung:
             pytest.raises(ValueExtractionError, match=r"outside \[0, 1\]"),
         ):
             await extract_pmf("prose only", DAY_GRID, PARSER_LLM)
+
+    @pytest.mark.asyncio
+    async def test_out_of_range_aliases_of_one_key_cannot_cancel_into_a_valid_bin(self) -> None:
+        """Every value is range-checked BEFORE duplicate folds are summed: ``-1`` on ``"0"`` and ``2`` on
+        ``"0.0"`` would otherwise fold to a clean 1.0 on the one bin and pass every later check."""
+        bins = [BinProbability(label="0", probability=-1.0), BinProbability(label="0.0", probability=2.0)]
+        with (
+            patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock(return_value=bins)),
+            pytest.raises(ValueExtractionError, match=r"block key '0' probability -1.0 outside \[0, 1\]"),
+        ):
+            await extract_pmf("prose only", ONE_BIN_GRID, PARSER_LLM)
+
+    @pytest.mark.asyncio
+    async def test_a_salvage_that_never_states_the_open_tail_is_refused_not_zeroed(self) -> None:
+        """The parser's notes tell it to leave an unstated key out rather than write 0 for it, and the every-key
+        rule then drops the member: an ``above_range`` the forecaster never priced is not 0, it is unknown."""
+        bins = salvage_bins({**dict.fromkeys(COUNT_LABELS, 0.0), "2": 0.6, "3": 0.4})
+        with (
+            patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock(return_value=bins)),
+            pytest.raises(ValueExtractionError, match=r"missing bin\(s\) \['above_range'\]"),
+        ):
+            await extract_pmf("prose only", COUNT_GRID, PARSER_LLM)
 
     @pytest.mark.asyncio
     async def test_all_rungs_failing_raises_the_typed_error_with_qtype_pmf(self) -> None:

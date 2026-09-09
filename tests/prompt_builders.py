@@ -142,6 +142,7 @@ def _pmf_q(
     open_upper: bool = True,
     unit_of_measure: str = "releases",
     page_url: str = MANTIC_PAGE_URL,
+    zero_point: float | None = None,
 ) -> DiscreteQuestion:
     """A coarse Mantic discrete question in the shape of Series 1 post 643: counts 0 to 20, open ceiling.
 
@@ -150,7 +151,8 @@ def _pmf_q(
     real ``DiscreteQuestion`` rather than a MagicMock because ``pmf_prompt`` builds the labelled grid
     from the typed bounds and reads the nominal bounds through ``getattr``, which a MagicMock would
     answer with another MagicMock. The defaults are overridable so a test can render the other
-    corpus shapes (a closed 3-bin count, a 30-bin numeric grid whose nominal bounds are its edges).
+    corpus shapes (a closed 3-bin count, a 30-bin numeric grid whose nominal bounds are its edges, a
+    log-spaced grid with a ``zero_point``).
     """
     return DiscreteQuestion(
         id_of_question=643,
@@ -169,7 +171,7 @@ def _pmf_q(
         open_lower_bound=open_lower,
         open_upper_bound=open_upper,
         unit_of_measure=unit_of_measure,
-        zero_point=None,
+        zero_point=zero_point,
         cdf_size=cdf_size,
         nominal_lower_bound=nominal_lower,
         nominal_upper_bound=nominal_upper,

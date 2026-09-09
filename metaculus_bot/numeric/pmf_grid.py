@@ -31,6 +31,7 @@ a non-ISO date spelling falls through to the later rungs like an unmatched multi
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from itertools import pairwise
@@ -79,7 +80,12 @@ class PmfGrid:
 
 
 def format_bin_value(value: float) -> str:
-    """Render a quantity as the platform displays it: no trailing zeros, no float residue, never ``-0``."""
+    """Render a quantity as the platform displays it: no trailing zeros, no float residue, never ``-0``.
+
+    The same idiom as ``research/number_format.format_decimal_value``, at the server's 9-decimal PMF
+    rounding precision instead of FRED's published 6; not called directly because the import-linter
+    contract keeps ``numeric`` independent of ``research`` (the ``ts_render._fmt`` precedent).
+    """
     rendered = f"{round(value, _LABEL_DECIMALS):.{_LABEL_DECIMALS}f}".rstrip("0").rstrip(".")
     return "0" if rendered == "-0" else rendered
 
@@ -101,13 +107,26 @@ def pmf_grid(view: NumericQuestion) -> PmfGrid:
         float(edge) for edge in build_cdf_value_grid(view.lower_bound, view.upper_bound, zero_point, view.cdf_size)
     )
     style, labels = _label_bins(view, edges, zero_point)
-    return PmfGrid(
+    grid = PmfGrid(
         labels=labels,
         edges=edges,
         open_lower_bound=view.open_lower_bound,
         open_upper_bound=view.open_upper_bound,
         style=style,
     )
+    _require_distinct_keys(grid, view)
+    return grid
+
+
+def _require_distinct_keys(grid: PmfGrid, view: NumericQuestion) -> None:
+    """A guard, not a repair: bins narrower than the 9-decimal label precision fold onto one key, and no Mantic grid is that fine."""
+    folded = Counter(fold_bin_label(key) for key in grid.keys)
+    colliding = sorted(key for key, count in folded.items() if count > 1)
+    if colliding:
+        raise ValueError(
+            f"pmf_grid: question {view.id_of_question} has {len(grid.labels)} bins whose keys fold onto the same key "
+            f"{colliding}; bins this narrow cannot be named per bin"
+        )
 
 
 def _label_bins(

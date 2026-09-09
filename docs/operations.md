@@ -1065,13 +1065,15 @@ after the first Series 2 week). It pages the tournament's closed and resolved po
 each question as forecast, no_forecast or unknown, and prints the miss rate per UTC release hour
 (the hour of `open_time`, which on a 60-minute window is the hour a run had to land in) plus the
 realized open-to-close window distribution, so the 60-minute assumption is checked by the same
-run. `MANTIC_TOKEN` is the primary instrument: with it every list page carries `my_forecasts`
-(`with_cp=true`), so closed-but-unresolved questions classify too. Without it the probe still runs
-off the public API and classifies every RESOLVED question from the platform's spot-time snapshot
+run. `with_cp=true` rides every list GET: it is what puts the public spot-time snapshot on the list
+page, so without a token the probe still classifies every RESOLVED question from that snapshot
 (`score_data.disagreement_forecasts.forecasts[]`, author id against `MANTIC_BOT_USER_ID`), which is
-exactly what is scored; a closed-but-unresolved question then reads `unknown`. One caveat, stated
-in the report header rather than modelled: a forecast withdrawn before spot time reads as
-`no_forecast` in that snapshot.
+exactly what is scored, and a closed-but-unresolved question reads `unknown`. `MANTIC_TOKEN` adds
+`my_forecasts` to the same page, so closed-but-unresolved questions classify too. One caveat,
+stated in the report header rather than modelled: the snapshot names one competitor fewer than
+`nr_forecasters` on nearly every resolved question and the cause is not established, so a
+`no_forecast` read from it is provisional until the first question the bot forecast resolves and
+its snapshot names the bot (`docs/supply_probe.md` "The Mantic mode" has the numbers).
 
 ### Running it, and what is left for the operator
 

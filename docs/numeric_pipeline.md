@@ -286,7 +286,10 @@ every stored forecast and the `MEMBER_FORECAST` marker records as `raw`). In ord
    silently moved a closed tail's mass into the first in-range bin (the plan review reproduced
    0.297 landing in bin 1). A malformed vector (wrong length, non-finite, negative, zero sum)
    raises `ValueError` too.
-2. **Normalise** to sum 1 (the ladder bounds the declared sum to within 2% of 1.0).
+2. **Normalise** to sum 1. The ladder bounds the declared sum to
+   `pmf_prob_sum_tolerance(key_count)` of 1.0 (`structured_output_schema.py`: a 0.02 floor plus
+   0.005 per key, so 0.06 on post 651's 12-key grid and 0.165 at the 33-key maximum), and the
+   normalisation here is why only the shape is load-bearing.
 3. **Blend toward the cell floors.** The server needs every in-range step to be at least
    `round(0.01 / N, 9)` and an open tail to be at least 0.001 (`grid_step_constraints`). Let `f`
    be the vector of cell floors, each non-zero floor raised by `PMF_FLOOR_MARGIN` (1e-9, so the

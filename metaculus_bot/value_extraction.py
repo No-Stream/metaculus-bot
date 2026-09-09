@@ -1,54 +1,24 @@
 """Deterministic-first extraction ladder for forecast values.
 
-Forecaster (and stacker) LLMs emit their forecast exactly once: a fenced
-```json STRUCTURED FORECAST block as the LAST thing in the rationale. This
-module extracts the value with a four-rung ladder:
+Forecaster (and stacker) LLMs emit their forecast exactly once: a fenced ```json STRUCTURED
+FORECAST block as the LAST thing in the rationale. This module extracts the value with a
+four-rung ladder: **block** (``parse_structured_payload``), **repair** (``json_repair`` of a
+malformed fenced block, or a balanced-braces scan of the rationale tail when no fence survived),
+**llm** (``parse_structured`` over the full rationale, as salvage), then ``ValueExtractionError``,
+so the caller drops the forecaster exactly as parser failures propagated before the ladder.
 
-1. **block** — deterministic fenced-block parse (``parse_structured_payload``:
-   json.loads + Pydantic validation).
-2. **repair** — deterministic JSON repair (``json_repair``) of a malformed
-   fenced block, or a balanced-braces scan of the rationale tail when no
-   fence survived.
-3. **llm** — the existing LLM parser (``parse_structured``) over the full
-   rationale, as salvage. Logged loudly; the guardrail against fabrication is
-   the strict post-rung validation, not trust.
-4. raise ``ValueExtractionError`` — the caller drops/soft-fails the
-   forecaster, exactly as parser failures propagated before the ladder.
+Every rung's output must be a value the rationale could have STATED. The LLM rung decodes under
+a schema and cannot express "absent", so the post-rung validators are FIDELITY checks (finite,
+ordered, in bounds, on the question's option set), and the repair rung may neither invent nor
+drop a numeric value (``_repair_infidelity_reason``). The two deterministic rungs run
+CANDIDATE-major: for each candidate in selection order both the strict parse and the repair are
+tried before a lower-ranked candidate, so a malformed final block beats a superseded valid draft.
 
-**Every rung's output must be a value the rationale could have stated.** The
-LLM rung decodes under a schema, so handed a rationale with no forecast in it
-it *must* emit numbers — "absent" is not expressible. The post-rung validators
-are therefore FIDELITY checks, not just shape checks: a numeric set must be
-finite and ordered the way its labels say (a value-disordered salvage is
-fabrication, not a recoverable parse), an MC ballot must be non-empty and match
-the question's options, a binary probability must be finite and in bounds.
-Anything else fails the rung and falls through to the typed error, so the
-forecaster is DROPPED (alertable) rather than published on a manufactured
-number. The repair rung carries the same obligation in a different form: see
-``_repair_infidelity_reason`` for why a truncated numeric literal can never be
-repaired, only invented.
-
-The two deterministic rungs run CANDIDATE-major, not rung-major: for each
-candidate in selection order (position-last first, since the prompt asks for
-the block last) BOTH the strict parse and the repair are tried before a
-lower-ranked candidate is considered. Rung-major ordering would publish a
-superseded draft — a valid earlier block would satisfy rung 1, so a malformed
-final block would never reach the repairer. ``rung`` on the returned outcome
-names whichever mechanism produced the value, so the telemetry is unchanged.
-
-Every successful extraction emits one ``EXTRACTION_RUNG`` INFO line (this
-telemetry supersedes the deleted shadow-divergence comparison): watch for
-``rung=llm`` salvages and ``block_present=False`` as the drift signal.
-
-Callers keep their post-processing contracts: binary output is the RAW
-pre-clamp decimal; MC output is a ``McForecast`` pairing the
-pre-``clamp_and_renormalize_mc`` option list with the probabilities as declared;
-numeric output feeds ``sanitize_percentiles`` unchanged; date output is the same
-percentile list with EPOCH-SECOND values, so it feeds the numeric pipeline through
-``numeric.date_axis.as_epoch_question``; per-bin output (``extract_pmf``, the ``pmf``
-block a coarse-grid question is elicited with instead of percentiles) is a
-``PmfForecast`` carrying the platform's ``N + 2`` PMF vector in grid order, which
-``numeric.pmf_cdf`` turns into the CDF.
+Every successful extraction emits one ``EXTRACTION_RUNG`` INFO line; ``rung=llm`` and
+``block_present=False`` are the drift signals. The per-type output contracts (raw pre-clamp
+binary decimal, ``McForecast``, percentiles for ``sanitize_percentiles``, epoch-second percentiles
+for dates, the ``N + 2`` ``PmfForecast`` vector for per-bin grids) and the full rationale are in
+docs/value_extraction.md.
 """
 
 from __future__ import annotations
@@ -133,16 +103,12 @@ def _numeric_tokens_outside_strings(text: str) -> list[str]:
 def _repair_infidelity_reason(candidate: str, repaired: str) -> str | None:
     """Why this ``json_repair`` output cannot be trusted, or None when it can.
 
-    ``json_repair`` fixes SYNTAX, but on a truncated payload it also completes
-    VALUES, and a completed value is indistinguishable from a declared one once
-    it parses. Two rules keep the repair rung a repairer rather than an author:
-
-    1. If the raw candidate contains an incomplete numeric literal, refuse
-       outright — the true digits are gone, so any repair is invention.
-    2. Every numeric value in the repaired payload must already appear (with at
-       least the same multiplicity) in the raw candidate. Repairs that only
-       DROP numbers stay allowed — the schema catches a missing field — but a
-       repair may never introduce one.
+    ``json_repair`` fixes SYNTAX, but it also completes a truncated VALUE and collapses a
+    repeated key to its last value, and either result is indistinguishable from a declaration
+    once it parses. Two rules keep the repair rung a repairer rather than an author: a raw
+    candidate carrying an incomplete numeric literal is refused outright, and the repaired
+    payload's numeric values must be exactly the raw candidate's, as a multiset. Detail:
+    docs/value_extraction.md "The ladder".
     """
     candidate_tokens = _numeric_tokens_outside_strings(candidate)
     incomplete = [token for token in candidate_tokens if not _COMPLETE_NUMBER_RE.match(token)]
@@ -156,9 +122,12 @@ def _repair_infidelity_reason(candidate: str, repaired: str) -> str | None:
 
     candidate_values = Counter(float(token) for token in candidate_tokens)
     repaired_values = Counter(float(token) for token in repaired_tokens)
-    invented = sorted(value for value, count in repaired_values.items() if count > candidate_values.get(value, 0))
+    invented = sorted((repaired_values - candidate_values).elements())
     if invented:
         return f"repair introduced numeric value(s) {invented} absent from the raw candidate"
+    dropped = sorted((candidate_values - repaired_values).elements())
+    if dropped:
+        return f"repair dropped numeric value(s) {dropped} present in the raw candidate"
     return None
 
 
@@ -670,29 +639,32 @@ class PmfForecast:
     declared: list[float]
 
 
+# Why: a reserved key absent from ``grid.keys`` names a CLOSED bound, since ``PmfGrid.keys`` carries it only when open.
+_RESERVED_KEY_BOUNDS = {PMF_BELOW_RANGE_KEY: "lower", PMF_ABOVE_RANGE_KEY: "upper"}
+
+
 def _pmf_from_pairs(pairs: Iterable[tuple[str, float]], grid: PmfGrid) -> PmfForecast:
     """Map label/probability pairs onto ``grid.keys`` the way ``_make_mc_from_block`` maps a ballot.
 
-    Both sides fold through ``fold_bin_label`` (``"7.0"``, ``" 7 "`` and ``"55,000"`` land on
-    ``"7"`` and ``"55000"``; a timestamp label's own fold differs from it, so the grid's keys are
-    folded too), a duplicate fold sums onto one bin, an unmatched key fails, a reserved key on a
-    closed bound fails, and EVERY grid key must be present: a block cut before its last bins
-    repairs into a valid partial declaration, and the every-key rule is what stops that publishing.
-    The block rung and the LLM rung share this one conversion.
+    Every value is range-checked BEFORE folding, so two out-of-range aliases of one key cannot
+    cancel into a clean bin. Both sides fold through ``fold_bin_label`` (``"7.0"``, ``" 7 "`` and
+    ``"55,000"`` land on ``"7"`` and ``"55000"``; a timestamp label's own fold differs from it, so
+    the grid's keys are folded too), a duplicate fold sums onto one bin, an unmatched key fails, a
+    reserved key on a closed bound fails, and EVERY grid key must be present: a block cut before its
+    last bins repairs into a valid partial declaration, and the every-key rule is what stops that
+    publishing. The block rung and the LLM rung share this one conversion.
     """
-    reserved_closed = {
-        PMF_BELOW_RANGE_KEY: ("lower", grid.open_lower_bound),
-        PMF_ABOVE_RANGE_KEY: ("upper", grid.open_upper_bound),
-    }
     canonical_by_fold = {fold_bin_label(key): key for key in grid.keys}
     matched: dict[str, float] = {}
     for key, prob in pairs:
+        if not math.isfinite(prob) or not (0.0 <= prob <= 1.0):
+            raise ValueError(f"block key {key!r} probability {prob} outside [0, 1]")
         folded = fold_bin_label(key)
         canonical = canonical_by_fold.get(folded)
         if canonical is None:
-            if folded in reserved_closed:
-                bound, _ = reserved_closed[folded]
-                raise ValueError(f"block declares {key!r} but the question's {bound} bound is closed")
+            closed_bound = _RESERVED_KEY_BOUNDS.get(folded)
+            if closed_bound is not None:
+                raise ValueError(f"block declares {key!r} but the question's {closed_bound} bound is closed")
             raise ValueError(f"block key {key!r} matches no bin of this grid")
         matched[canonical] = matched.get(canonical, 0.0) + float(prob)
     missing = [key for key in grid.keys if key not in matched]

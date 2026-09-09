@@ -4,6 +4,7 @@ from abc import ABC
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
+import numpy as np
 import pytest
 from forecasting_tools.data_models.forecast_report import ForecastReport
 from forecasting_tools.data_models.numeric_report import NumericDistribution, Percentile
@@ -16,7 +17,7 @@ from forecasting_tools.data_models.questions import (
 from pydantic import Field
 
 from metaculus_bot.constants import PMF_ABOVE_RANGE_KEY, PMF_BELOW_RANGE_KEY
-from metaculus_bot.numeric.config import PCHIP_CDF_POINTS
+from metaculus_bot.numeric.config import PCHIP_CDF_POINTS, grid_step_constraints
 from metaculus_bot.numeric.date_axis import as_epoch_question
 from metaculus_bot.numeric.utils import (
     aggregate_binary_mean,
@@ -28,6 +29,7 @@ from metaculus_bot.numeric.utils import (
 from metaculus_bot.prompts import binary_prompt, multiple_choice_prompt, numeric_prompt
 from metaculus_bot.utils.logging_utils import compact_log_report_summary
 from tests.mantic_fakes import load_preseason_date_question
+from tests.pipeline_test_helpers import assert_server_accepts_cdf, cdf_heights, distribution_from_heights
 
 if TYPE_CHECKING:
     from forecasting_tools.helpers.metaculus_client import MetaculusClient
@@ -465,3 +467,74 @@ class DummyReport(ForecastReport):
 def test_compact_logger_no_exception(caplog: pytest.LogCaptureFixture) -> None:
     """Test that the compact logger runs without exceptions on a dummy report."""
     compact_log_report_summary([DummyReport()])  # should not raise
+
+
+# ---------- Ensemble ramp trigger ----------------------------------------------
+
+
+def _twelve_bin_closed_question() -> NumericQuestion:
+    return NumericQuestion(
+        id_of_question=912,
+        id_of_post=912,
+        page_url="https://competitions.mantic.com/questions/912/",
+        question_text="How many?",
+        background_info="",
+        resolution_criteria="",
+        fine_print="",
+        published_time=None,
+        close_time=None,
+        lower_bound=-0.5,
+        upper_bound=11.5,
+        open_lower_bound=False,
+        open_upper_bound=False,
+        unit_of_measure="",
+        zero_point=None,
+        cdf_size=13,
+    )
+
+
+def _heights_with_one_step_at(deficient_step: float, question: NumericQuestion) -> np.ndarray:
+    """Every in-range step exactly at the grid's min step except bin 5, which gets ``deficient_step``; the last bin takes the rest."""
+    min_step, _ = grid_step_constraints(question.cdf_size)
+    steps = np.full(question.cdf_size - 1, min_step)
+    steps[5] = deficient_step
+    steps[-1] = 1.0 - steps[:-1].sum()
+    return np.concatenate(([0.0], np.cumsum(steps)))
+
+
+def _ramp_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if "Ensemble CDF ramp smoothing" in r.getMessage()]
+
+
+class TestTheEnsembleRampFiresOnTheServersRoundedPmf:
+    """The ramp is for steps the SERVER would reject, so it reads the PMF the way the server does: rounded to 9 decimals.
+
+    A pointwise mean of members whose steps sit exactly at the min step carries one-ULP noise, and the
+    unrounded comparison read that noise as a violation, adding a ramp of up to ``3 * min_step``
+    across the whole grid (0.0023 of reshaped tail on a 12-bin grid; codex Wave C review, 2026-09-09).
+    """
+
+    def test_a_one_ulp_deficit_the_server_accepts_does_not_ramp(self, caplog: pytest.LogCaptureFixture) -> None:
+        question = _twelve_bin_closed_question()
+        min_step, _ = grid_step_constraints(question.cdf_size)
+        heights = _heights_with_one_step_at(np.nextafter(min_step, 0.0), question)
+        member = distribution_from_heights(heights, question)
+
+        with caplog.at_level("WARNING", logger="metaculus_bot.numeric.utils"):
+            pooled = cdf_heights(aggregate_numeric([member, member, member], question, "mean"))
+
+        assert _ramp_lines(caplog) == []
+        assert pooled == pytest.approx(heights, abs=1e-12)
+        assert_server_accepts_cdf(pooled, cdf_size=question.cdf_size, open_lower=False, open_upper=False)
+
+    def test_a_deficit_the_server_would_reject_still_ramps(self, caplog: pytest.LogCaptureFixture) -> None:
+        question = _twelve_bin_closed_question()
+        min_step, _ = grid_step_constraints(question.cdf_size)
+        heights = _heights_with_one_step_at(min_step - 1e-6, question)
+        member = distribution_from_heights(heights, question)
+
+        with caplog.at_level("WARNING", logger="metaculus_bot.numeric.utils"):
+            pooled = cdf_heights(aggregate_numeric([member, member, member], question, "mean"))
+
+        assert len(_ramp_lines(caplog)) == 1
+        assert_server_accepts_cdf(pooled, cdf_size=question.cdf_size, open_lower=False, open_upper=False)

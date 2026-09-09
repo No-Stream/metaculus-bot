@@ -14,6 +14,7 @@ import numpy as np
 from scipy.interpolate import PchipInterpolator
 
 from metaculus_bot.constants import NUM_MAX_STEP, NUM_MIN_PROB_STEP
+from metaculus_bot.numeric.config import OPEN_TAIL_MIN_MASS
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +148,7 @@ def safe_cdf_bounds(
 ) -> np.ndarray:
     """
     Ensure CDF respects Metaculus boundary constraints:
-    • For *open* bounds: cdf[0] ≥ 0.001, cdf[-1] ≤ 0.999
+    • For *open* bounds: cdf[0] ≥ ``OPEN_TAIL_MIN_MASS``, cdf[-1] ≤ ``1 - OPEN_TAIL_MIN_MASS``
     • No single step may exceed ``max_step``
     • Adjacent steps stay ≥ ``min_step`` (re-enforced after pin+cummax)
 
@@ -166,9 +167,9 @@ def safe_cdf_bounds(
 
     # Pin tails to legal open-bound limits
     if open_lower:
-        cdf[0] = max(cdf[0], 0.001)
+        cdf[0] = max(cdf[0], OPEN_TAIL_MIN_MASS)
     if open_upper:
-        cdf[-1] = min(cdf[-1], 0.999)
+        cdf[-1] = min(cdf[-1], 1.0 - OPEN_TAIL_MIN_MASS)
 
     # Enforce the maximum step rule
     pre_max_step = float(np.max(np.diff(cdf))) if cdf.size > 1 else 0.0
@@ -197,17 +198,15 @@ def safe_cdf_bounds(
 
     # Re-apply open bounds in case redistribution nudged them
     if open_lower:
-        cdf[0] = max(cdf[0], 0.001)
+        cdf[0] = max(cdf[0], OPEN_TAIL_MIN_MASS)
     if open_upper:
-        cdf[-1] = min(cdf[-1], 0.999)
+        cdf[-1] = min(cdf[-1], 1.0 - OPEN_TAIL_MIN_MASS)
 
     if cdf.size > 1:
         np.maximum.accumulate(cdf, out=cdf)
-        # Pinning cdf[0] up to 0.001 + cummax flattens any sub-0.001 prefix into
-        # 0-step bins, violating the server's min-step (the framework then
-        # drops the prediction on open-bound fallback questions). Re-enforce.
-        upper_cap = 0.999 if open_upper else 1.0
-        lower_cap = 0.001 if open_lower else 0.0
+        # Pinning cdf[0] up to the open-tail minimum + cummax flattens any prefix below it into 0-step bins.
+        upper_cap = 1.0 - OPEN_TAIL_MIN_MASS if open_upper else 1.0
+        lower_cap = OPEN_TAIL_MIN_MASS if open_lower else 0.0
         cdf = enforce_min_steps(cdf, min_step, upper_cap=upper_cap, lower_cap=lower_cap)
 
     return cdf

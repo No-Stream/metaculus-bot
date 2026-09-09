@@ -25,12 +25,14 @@ import json
 import logging
 import math
 import re
+from collections import Counter
 from collections.abc import Iterator, Mapping
 from datetime import datetime
 from typing import Annotated, Literal, get_args
 
 from pydantic import (
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
     ValidationError,
@@ -65,6 +67,17 @@ def pmf_prob_sum_tolerance(key_count: int) -> float:
 
 # Why: an unclosed fence can swallow a transcript; see docs/value_extraction.md "Block schemas: design notes".
 _MAX_STRUCTURED_BLOCK_BYTES: int = 200_000
+
+
+def _reject_boolean_probability(value: object) -> object:
+    """pydantic's lax float reads ``true`` as 1.0 and ``false`` as 0.0; neither is a declared probability."""
+    if isinstance(value, bool):
+        raise ValueError(f"a probability must be a number, got {value!r}")
+    return value
+
+
+# Why: the value-bearing probability fields; see docs/value_extraction.md "Block schemas: design notes".
+_Probability = Annotated[float, BeforeValidator(_reject_boolean_probability)]
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +272,25 @@ def _validate_scenario_sum(scenarios: list[ScenarioBranch]) -> list[ScenarioBran
     return scenarios
 
 
+def _validate_probability_dict(v: dict[str, float], *, label: str, tolerance: float) -> dict[str, float]:
+    """The probability-vector contract the ballot and the per-bin block share.
+
+    Non-empty, no blank key, every value in [0, 1] (which also refuses NaN), and a sum within
+    ``tolerance`` of 1.0. ``label`` names the field in the error text, which the archive sees.
+    """
+    if not v:
+        raise ValueError(f"{label} must be non-empty")
+    for key, prob in v.items():
+        if not key.strip():
+            raise ValueError(f"{label} keys must be non-empty strings, got {key!r}")
+        if not (0.0 <= prob <= 1.0):
+            raise ValueError(f"{label} values must be in [0, 1], got {prob}")
+    total = sum(v.values())
+    if abs(total - 1.0) > tolerance:
+        raise ValueError(f"{label} must sum to ~1.0 (tol {tolerance}), got {total}")
+    return v
+
+
 # ---------------------------------------------------------------------------
 # Per-question-type models
 # ---------------------------------------------------------------------------
@@ -275,7 +307,7 @@ class BinaryStructured(BaseModel):
     hazard: StatedHazard | None = None
     evidence: list[EvidenceItem] = Field(default_factory=list)
     scenarios: list[ScenarioBranch] = Field(default_factory=list)
-    posterior_prob: float = Field(ge=0.0, le=1.0)
+    posterior_prob: _Probability = Field(ge=0.0, le=1.0)
     # Why: archived blocks only; see docs/value_extraction.md "Block schemas: design notes".
     base_rate_anchor: BaseRateAnchor | None = None
     criteria_clauses: list[CriteriaClause] = Field(default_factory=list)
@@ -334,22 +366,11 @@ class NumericStructured(BaseModel):
     def _tolerate_unknown_outcome_type(cls, v: object, info: ValidationInfo) -> str | None:
         """An unrecognised spelling reads as absent instead of failing the whole block.
 
-        ``outcome_type`` gates discrete snapping, and the block value exists to save a
-        parser-LLM call (``forecaster_runners._resolve_discrete_vote``). Under a bare
-        ``Literal`` a near-miss spelling — "integer", "discrete", "count" — took the
-        PERCENTILES down with it: the numeric block has no strip-and-retry, so the whole
-        forecast dropped to LLM salvage AND the parser call fired anyway for the type.
-        Reading the strays as None costs exactly the one parser call the field was meant
-        to save, which is the right price for a misspelling.
-
-        Logged at WARNING with the raw value, because a spelling the roster starts using is a
-        prompt signal rather than noise, but only where the caller wants failure logging.
-        ``parse_structured_payload`` hands its ``log_failures`` down as validation context, so a
-        candidate probe that will be discarded silently (``value_extraction``'s ladder probes
-        every candidate that way) drops to DEBUG. Without that gate a misspelling warned on
-        superseded draft blocks and twice per numeric forecast on the publish path, about a block
-        that validates and publishes fine, which is exactly what ``log_failures`` exists to
-        prevent. Direct construction passes no context and keeps the WARNING.
+        ``outcome_type`` only gates discrete snapping, so a near-miss spelling costs the one parser
+        call the field was meant to save rather than the whole forecast. Logged at WARNING with the
+        raw value (a spelling the roster starts using is a prompt signal), or at DEBUG when the caller
+        passed ``log_failures=False`` as validation context. Detail: docs/value_extraction.md
+        "Block schemas: design notes".
         """
         if v is None:
             return None
@@ -388,20 +409,13 @@ class NumericStructured(BaseModel):
 class DateStructured(BaseModel):
     """Structured declaration for a date question: the 13 percentiles as ISO-8601 dates.
 
-    The values are parsed by ``numeric.date_axis.parse_forecast_date`` and nothing else: a calendar
-    date ``YYYY-MM-DD`` means noon UTC of that day (so it lands inside the platform's right-closed
-    day bin), a timestamp is taken as written with a naive time read as UTC, and every other
-    spelling fails. That single parser is what makes this block the TRUNCATION GUARD for dates.
-    The repair rung's fidelity check (``value_extraction._repair_infidelity_reason``) refuses a
-    numeric literal that ``json_repair`` would complete by inventing digits, but it reads only
-    numbers outside string literals, so a rationale cut mid-date (``"0.99": "2027-06-1``) is
-    invisible to it: ``json_repair`` closes the quote and hands back an invented ``"2027-06-1"``.
-    Here that value fails to parse and the whole block fails, which sends the ladder on to the
-    LLM rung rather than publishing a date nobody declared. Non-string values are rejected for
-    the same reason: pydantic would otherwise read a bare ``2027`` as a unix timestamp in 1970.
-
-    No ``outcome_type``: integer snapping on an epoch axis is meaningless, and the date runner
-    never records a discrete vote.
+    The values are parsed by ``numeric.date_axis.parse_forecast_date`` and nothing else (a calendar
+    date means noon UTC of that day, a timestamp is taken as written with a naive time read as UTC,
+    every other spelling fails, and a non-string is refused so pydantic never reads ``2027`` as a
+    1970 unix timestamp). That one parser is also the TRUNCATION GUARD for dates, since the repair
+    rung's numeric-literal check cannot see a date cut inside a string. No ``outcome_type``: integer
+    snapping on an epoch axis is meaningless. Detail: docs/value_extraction.md "Block schemas:
+    design notes".
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -438,7 +452,7 @@ class MultipleChoiceStructured(BaseModel):
 
     question_type: Literal["multiple_choice"]
     prior: StatedPrior | None = None
-    option_probs: dict[str, float]
+    option_probs: dict[str, _Probability]
     # Why: archived blocks only, read leniently so a bad value cannot cost the ballot; see _readable_optional_float.
     other_mass: float | None = None
     concentration: float | None = None
@@ -459,20 +473,9 @@ class MultipleChoiceStructured(BaseModel):
     @field_validator("option_probs")
     @classmethod
     def _check_option_probs(cls, v: dict[str, float]) -> dict[str, float]:
-        if not v:
-            raise ValueError("MultipleChoiceStructured.option_probs must be non-empty")
-        for key, prob in v.items():
-            if not isinstance(key, str) or not key.strip():
-                raise ValueError(f"MultipleChoiceStructured.option_probs keys must be non-empty strings, got {key!r}")
-            if not (0.0 <= prob <= 1.0):
-                raise ValueError(f"MultipleChoiceStructured.option_probs values must be in [0, 1], got {prob}")
-        total = sum(v.values())
-        if abs(total - 1.0) > _MC_OPTION_PROB_SUM_TOLERANCE:
-            raise ValueError(
-                f"MultipleChoiceStructured.option_probs must sum to ~1.0 "
-                f"(tol {_MC_OPTION_PROB_SUM_TOLERANCE}), got {total}"
-            )
-        return v
+        return _validate_probability_dict(
+            v, label="MultipleChoiceStructured.option_probs", tolerance=_MC_OPTION_PROB_SUM_TOLERANCE
+        )
 
 
 class PmfStructured(BaseModel):
@@ -490,25 +493,12 @@ class PmfStructured(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     question_type: Literal["pmf"]
-    bin_probs: dict[str, float]
+    bin_probs: dict[str, _Probability]
 
     @field_validator("bin_probs")
     @classmethod
     def _check_bin_probs(cls, v: dict[str, float]) -> dict[str, float]:
-        if not v:
-            raise ValueError("PmfStructured.bin_probs must be non-empty")
-        for key, prob in v.items():
-            if not key.strip():
-                raise ValueError(f"PmfStructured.bin_probs keys must be non-empty strings, got {key!r}")
-            if not (0.0 <= prob <= 1.0):
-                raise ValueError(f"PmfStructured.bin_probs values must be in [0, 1], got {prob}")
-        total = sum(v.values())
-        tolerance = pmf_prob_sum_tolerance(len(v))
-        if abs(total - 1.0) > tolerance:
-            raise ValueError(
-                f"PmfStructured.bin_probs must sum to ~1.0 (tol {tolerance} for {len(v)} keys), got {total}"
-            )
-        return v
+        return _validate_probability_dict(v, label="PmfStructured.bin_probs", tolerance=pmf_prob_sum_tolerance(len(v)))
 
 
 class DiscreteCountStructured(BaseModel):
@@ -578,22 +568,11 @@ _FENCE_PATTERN = re.compile(
 def extract_json_block_candidates(rationale_text: str) -> list[str]:
     """Fenced JSON-block bodies in SELECTION order (best candidate first).
 
-    Preference order (identical to ``extract_json_block``, now expressed as a
-    ranking rather than a single pick):
-      1. Explicitly tagged ```json / ```JSON (case-insensitive, any whitespace).
-      2. Untagged ``` fence whose body begins with `{`.
-    WITHIN each tier the LAST block by document position ranks first — the
-    prompt asks for the STRUCTURED FORECAST block last, so among equally-valid
-    blocks the last one is the intended forecast. Empty-bodied fences are
-    skipped.
-
-    Callers that know the ``question_type`` (``parse_structured_block``) walk
-    this list and keep the first body that VALIDATES, so a trailing schema-recap
-    or example block that doesn't parse no longer shadows the real forecast
-    earlier in the rationale. The publish path (``value_extraction._run_ladder``)
-    walks the same order but also runs ``json_repair`` on each body before
-    dropping to the next, so a malformed-but-repairable final block outranks a
-    lower-ranked valid one.
+    Tagged ```json fences outrank untagged fences whose body begins with ``{``, and within a tier
+    the LAST block by document position ranks first, because the prompt asks for the STRUCTURED
+    FORECAST block last. Empty bodies are skipped. Callers walk the list and keep the first body
+    that validates (or, on the publish path, repairs). Detail: docs/value_extraction.md "The
+    ladder: design notes".
     """
     if not rationale_text:
         return []
@@ -613,21 +592,11 @@ def extract_json_block_candidates(rationale_text: str) -> list[str]:
 
 
 def extract_json_block(rationale_text: str) -> str | None:
-    """
-    Extract the single best fenced JSON block from a rationale, by POSITION.
+    """The best-positioned fenced JSON block body, or None: ``extract_json_block_candidates``' first pick.
 
-    Preference order:
-      1. Explicitly tagged ```json / ```JSON (case-insensitive, any whitespace).
-      2. Untagged ``` fence whose body begins with `{`.
-    Within a tier the LAST block by document position wins. Returns the trimmed
-    body or None if nothing matches.
-
-    This helper is schema-blind: it returns the best-positioned candidate
-    without checking that it parses. Callers that know the ``question_type``
-    should prefer ``parse_structured_block``, which walks ALL candidates
-    (``extract_json_block_candidates``) and keeps the first that actually
-    validates. This stays for callers that only need a block's raw text — e.g.
-    peeking at a self-declared ``question_type`` before the schema is known.
+    Schema-blind, so it is for callers that need only a block's raw text (peeking at a self-declared
+    ``question_type`` before the schema is known); a caller that knows the type should use
+    ``parse_structured_block``, which keeps the first candidate that validates.
     """
     candidates = extract_json_block_candidates(rationale_text)
     return candidates[0] if candidates else None
@@ -704,30 +673,15 @@ def parse_structured_payload(
     *,
     log_failures: bool = True,
 ) -> StructuredBlock | None:
-    """
-    Validate a raw JSON payload string against the structured-block schemas.
+    """Validate a raw JSON payload string against the structured-block schemas, or None on any failure.
 
-    Callers that already have the block body in hand (e.g. after
-    ``extract_json_block`` or a ``json_repair`` pass) use this to run the
-    size cap, ``json.loads``, dict-shape check, ``question_type`` inject /
-    mismatch guard, and Pydantic ``model_validate`` (including the binary
-    telemetry strip-and-retry). Returns ``None`` on any failure; the calling
-    ladder decides how to log and whether to fall through to the next rung.
-
-    ``log_failures`` gates the WARNING lines on the failure paths (bad size /
-    JSON / shape / question_type / validation). A caller probing several
-    candidate blocks for the first valid one passes ``log_failures=False`` so a
-    rejected-then-recovered candidate doesn't emit a scary WARNING as if
-    extraction failed; the telemetry-strip RECOVERY log is not gated, since it
-    reports on a block that IS returned. Default ``True`` keeps every direct
-    caller's logging unchanged. It is also handed to ``model_validate`` as validation
-    CONTEXT, because a lenient validator that reads an unusable declaration as absent
-    logs from inside the model, where it cannot otherwise see the flag: without that, a
-    suppressed probe still emitted an operator-facing WARNING about a block it was about
-    to discard.
-
-    ``"discrete_count"`` is intentionally unsupported at runtime — see the
-    module docstring.
+    Runs the size cap, the duplicate-key-refusing decode, the dict-shape check, the
+    ``question_type`` inject-when-absent / mismatch guard, and ``model_validate`` (with the binary
+    telemetry strip-and-retry); the calling ladder decides how to log and whether to fall through.
+    ``log_failures`` gates the WARNING lines on the failure paths and is also handed down as
+    validation context so a lenient validator can respect it; a caller probing several candidates
+    passes False. ``"discrete_count"`` is intentionally unsupported at runtime (module docstring).
+    Detail: docs/value_extraction.md "Block schemas: design notes".
     """
     payload = _decode_structured_payload(raw_json, question_type, log_failures=log_failures)
     if payload is None:
@@ -750,6 +704,19 @@ def parse_structured_payload(
         return None
 
 
+def _object_without_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """``json.loads`` hook: an object repeating a key is refused instead of keeping the last value.
+
+    The default decoder is last-write-wins, so ``{"0": 0.9, "0": 0.4, "1": 0.6}`` would read as a
+    valid vector nobody declared. Raising here fails the decode, the block rung falls through, and
+    only the parser LLM, reading the prose, may resolve which value was meant.
+    """
+    duplicates = sorted(key for key, count in Counter(key for key, _ in pairs).items() if count > 1)
+    if duplicates:
+        raise ValueError(f"duplicate key {', '.join(repr(key) for key in duplicates)}")
+    return dict(pairs)
+
+
 def _decode_structured_payload(
     raw_json: str,
     question_type: BlockType,
@@ -758,9 +725,9 @@ def _decode_structured_payload(
 ) -> dict | None:
     """Size-cap, decode, and shape-check a raw structured block into a dict.
 
-    Returns None on any failure (over the byte cap, malformed JSON, a non-object payload, or
-    a ``question_type`` that contradicts the caller's). On success the expected
-    ``question_type`` is injected when absent, so the Pydantic discriminator resolves.
+    Returns None on any failure (over the byte cap, malformed JSON or a repeated key, a non-object
+    payload, or a ``question_type`` that contradicts the caller's, ``null`` included). On success
+    the expected ``question_type`` is injected when ABSENT, so the Pydantic discriminator resolves.
     """
     if len(raw_json) > _MAX_STRUCTURED_BLOCK_BYTES:
         if log_failures:
@@ -773,8 +740,9 @@ def _decode_structured_payload(
         return None
 
     try:
-        payload = json.loads(raw_json)
-    except json.JSONDecodeError as exc:
+        payload = json.loads(raw_json, object_pairs_hook=_object_without_duplicate_keys)
+    # Why: json.JSONDecodeError is a ValueError, and the duplicate-key hook raises a bare one.
+    except ValueError as exc:
         if log_failures:
             snippet = raw_json[:200].replace("\n", " ")  # HARNESS-SCAN-EXEMPT-subsampling: a log snippet, not a sample
             logger.warning(
@@ -791,19 +759,16 @@ def _decode_structured_payload(
             )
         return None
 
-    payload_qtype = payload.get("question_type")
-    if payload_qtype is not None and payload_qtype != question_type:
+    if "question_type" not in payload:
+        return {**payload, "question_type": question_type}
+    if payload["question_type"] != question_type:
         if log_failures:
             logger.warning(
                 "question_type mismatch: arg=%s, payload=%s. Refusing to parse.",
                 question_type,
-                payload_qtype,
+                payload["question_type"],
             )
         return None
-
-    # Inject the expected question_type if missing so the discriminator picks the right model.
-    if payload_qtype is None:
-        return {**payload, "question_type": question_type}
     return payload
 
 
@@ -815,23 +780,13 @@ def _retry_without_binary_telemetry(
     *,
     context: Mapping[str, object] | None = None,
 ) -> StructuredBlock | None:
-    """Re-validate a failed BINARY block with only the telemetry fields dropped.
+    """Re-validate a failed BINARY block with only the two telemetry fields dropped.
 
-    Strip-and-retry for malformed BINARY telemetry (2026-07-08). Since 2026-09-02 the
-    prompt no longer asks for either field, so on a fresh forecast this never fires; it
-    survives for archived blocks and for a model that emits one from habit. The
-    ``base_rate_anchor`` and ``criteria_clauses`` fields are TELEMETRY ONLY — nothing reads them
-    to clamp or mutate a forecast. But without this, a malformed anchor / clauses payload
-    (canonical failure modes: ``criteria_clauses: null`` even though the prompt says "omit";
-    a reversed ``{low > high}`` anchor) would make us drop the ENTIRE block — including a
-    perfectly good posterior_prob — silently disappearing the forecaster's base-rate blend
-    and prior/posterior contributions from the cross-model aggregation. That would let a pure
-    formatting bug in a telemetry field shift stacker input, violating the telemetry
-    rollout's zero-behavior-change invariant.
-
-    NOT a schema-wide before-validator: those silently coerce bad clause probs and miss the
-    reversed-anchor case. Only the telemetry fields are dropped, so any error in a core field
-    (posterior_prob, prior, base_rate, hazard, evidence, scenarios) still surfaces as None.
+    ``base_rate_anchor`` and ``criteria_clauses`` are telemetry nothing reads to mutate a forecast,
+    so a malformed one (``criteria_clauses: null``, a reversed anchor) must not take a good
+    ``posterior_prob`` down with it. Only those two fields are stripped, so an error in a core field
+    still surfaces as None; unprompted since 2026-09-02, it survives for archived blocks and habit.
+    Detail: docs/value_extraction.md "Block schemas: design notes".
     """
     telemetry_fields = {"base_rate_anchor", "criteria_clauses"}
     if question_type != "binary" or not telemetry_fields & payload.keys():
@@ -855,33 +810,15 @@ def parse_structured_block(
     rationale_text: str,
     question_type: BlockType,
 ) -> StructuredBlock | None:
-    """
-    Extract and validate a structured JSON block from a rationale.
+    """Extract and validate a structured JSON block from a rationale, or None.
 
-    Selection is validity-aware: rather than validating only the last block by
-    position (which let a trailing schema-recap / example block shadow a valid
-    forecast earlier in the rationale), this walks candidates best-first
-    (``extract_json_block_candidates``) and keeps the FIRST that validates for
-    ``question_type``. Among valid blocks the last-by-position still wins (the
-    prompt asks for the forecast block last); tagged ```json blocks still
-    outrank untagged fences.
-
-    Returns the parsed Pydantic model or None. None on:
-      - No fenced JSON block at all (logged at INFO)
-      - No candidate validates (the last-tried candidate's WARNING surfaces the
-        reason — malformed JSON / validation / question_type mismatch — exactly
-        as before)
-
-    A candidate that failed but was recovered by a later valid one is NOT logged
-    as a WARNING; instead a single INFO records that trailing blocks were skipped
-    (a signal the prompt's block-last contract is eroding). ``"discrete_count"``
-    is intentionally unsupported at runtime — see the module docstring.
-
-    Selection here is STRICT-only, which is why the publish path does not use it:
-    ``value_extraction._run_ladder`` also repairs each candidate in place, so a
-    malformed final block beats a lower-ranked valid one and no superseded draft
-    gets published. Callers of this function read a block for telemetry or
-    analysis, where an unrepaired None is the honest answer.
+    Validity-aware selection: candidates are walked best-first (``extract_json_block_candidates``)
+    and the FIRST that validates for ``question_type`` wins, so a trailing schema-recap block
+    cannot shadow a valid forecast earlier in the rationale. None when no fence exists (INFO) or no
+    candidate validates (the last candidate's WARNING names the reason); a candidate recovered by
+    a later valid one logs one INFO instead. Selection is STRICT-only, which is why the publish
+    path (``value_extraction._run_ladder``) does not use it. Detail: docs/value_extraction.md
+    "Block schemas: design notes".
     """
     candidates = extract_json_block_candidates(rationale_text)
     if not candidates:

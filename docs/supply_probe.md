@@ -50,9 +50,11 @@ retroactive close. That is why the sweep belongs in the weekly read rather than 
 scratch scripts.
 
 Resolving "did we forecast this" on Metaculus needs `my_forecasts`, which the posts LIST payload
-does not reliably carry (the scoring pull fetches every post individually for exactly that
-reason), so the sweep reads the list payload where the key is there and issues one per-post detail
-GET where it is not. A question's `forecast_state` is one of `forecast`, `no_forecast`, `unknown`;
+carries only under `with_cp=true` (the 2026-09-09 review measured it with the bot's token on the
+summer tournament: present on 100 of 100 resolved questions with the flag, on none without, and
+the four the list page called `no_forecast` matched their own detail payloads), so every list GET
+carries the flag and the sweep issues a per-post detail GET only where a question still reads
+`unknown`. A question's `forecast_state` is one of `forecast`, `no_forecast`, `unknown`;
 `unknown` means no payload answered (a list page the sweep did not enrich, a detail page that
 answered with a null block, or a detail GET that failed). Unknown questions are counted and
 disclosed rather than filed as forfeits: under-reporting a forfeit is recoverable, calling a
@@ -72,25 +74,36 @@ likelier than a total forfeit.
 Metaculus fork). Its read endpoints are public, so `MANTIC_TOKEN` is optional and only widens what
 the sweep can classify:
 
-- With a token, every list GET carries `with_cp=true`, which puts `my_forecasts` on the list page,
-  so closed-but-unresolved questions classify and no detail GET is ever issued.
-- Without a token, a RESOLVED question is classified from the platform's public spot-time snapshot,
+- `with_cp=true` rides every list GET, token or not. It is what puts a RESOLVED question's public
+  spot-time snapshot on the list page (without it every post's `score_data` is `{}` and nothing
+  classifies, which is what the tokenless mode read while the flag was sent only under a token),
+  and under a token it also puts `my_forecasts` there, so closed-but-unresolved questions classify
+  too. No detail GET is ever issued on Mantic. A 100-post page with the flag is
+  about 6 MB and 4 to 5 seconds, well inside the 45-second request timeout.
+- Without a token, a RESOLVED question is classified from that snapshot,
   `question.aggregations.recency_weighted.score_data.disagreement_forecasts.forecasts[]`, one entry
   per competitor keyed by `author_id`, read against `MANTIC_BOT_USER_ID` (81, `nostreambot-bot`).
-  That snapshot is exactly what the platform scores, which is why every eventually-resolved
+  The snapshot is exactly what the platform scores, which is why every eventually-resolved
   question is measurable without a secret. A closed-but-unresolved question (null
   `disagreement_forecasts`), an open one (`score_data: {}`) and a resolved-but-unscored one (empty
-  list) read `unknown`. Verified 2026-09-08 on the 556-post public corpus: the list on 520 of 520
-  resolved posts, on 4 of 32 closed ones.
-- The snapshot's one caveat, stated in the report header rather than modelled: a forecast
-  withdrawn before spot time reads as `no_forecast` (post 500 holds 8 entries against
-  `nr_forecasters` 9).
+  list) read `unknown`. Verified 2026-09-08 on the 556-post public corpus, read with the flag: the
+  list on 520 of 520 resolved posts, on 4 of 32 closed ones. The two recorded pages under
+  `tests/data/` are the same two Series 1 posts read with and without it.
+- The snapshot's caveat, stated in the report header rather than modelled: it names one competitor
+  fewer than the post's own `nr_forecasters` on nearly every resolved question (507 of the 524
+  snapshot-bearing posts in that corpus; exact on 12, short by two on 4, one more on 1), so it can
+  read `no_forecast` for an account that did forecast. Which account is missing varies across all
+  eleven that appear in the snapshots, and the cause is not established (a forecast withdrawn or
+  superseded before spot time is one candidate). No Mantic question the bot forecast has resolved
+  yet, so the PRESENT branch has never been exercised against a live payload: read a public-path
+  `no_forecast` as provisional until the first Series 2 question the bot forecast resolves and
+  `make supply_probe_mantic` shows `MANTIC_BOT_USER_ID` in its snapshot.
 - `forecaster_id` / `not_forecaster_id` are never sent: they answer 403 unauthenticated and are
   redundant with `my_forecasts` under a token.
 
-The platform seams (posts URL, token env and whether it is required, default slugs, the
-forecast-state read, the authenticated list params, whether the sweep needs detail GETs, the bot
-user id, and the three report prose strings) live in one `PlatformProbe` table in
+The platform seams (the API base URL and the posts URL derived from it, token env and whether it is
+required, default slugs, the forecast-state read, the list params, whether the sweep needs detail
+GETs, the bot user id, and the three report prose strings) live in one `PlatformProbe` table in
 `scripts/supply_probe_platforms.py`; paging, backlog, forfeit and rendering logic are shared. How
 to read the per-hour table for the cron-cadence decision: `docs/operations.md` "Scheduling
 reliability".
@@ -116,13 +129,13 @@ reliability".
   cup opening questions: the `metaculus-cup-fall-2026` row goes from zero posts to non-zero on the
   day it does. Only `requests.RequestException` is caught; anything else is a contract break and
   crashes.
-- **The vetted host is the host the token goes to.** The Metaculus posts URL is read off
+- **The vetted host is the host the token goes to.** Each platform's `base_url` is one field of its
+  `PlatformProbe`; `main` vets exactly that string with `verify_api_identity`, and the posts URL is
+  derived from it, so the two cannot diverge. The Metaculus base is read off
   `MetaculusClient().base_url` rather than hardcoded, so it honors a `METACULUS_API_BASE_URL`
-  override the same way `verify_metaculus_api_identity` does, including one set in a `.env` file:
-  the assignment runs after the imports, importing `metaculus_bot.constants` is what loads
-  `.env` / `.env.local`, and the preflight resolves its own URL per call for the same reason. The
-  Mantic URL is `MANTIC_API_BASE_URL`, the base the Mantic preflight vets. Both pairings are
-  pinned in the tests.
+  override the same way the bot's own fetches do, including one set in a `.env` file: importing
+  `metaculus_bot.constants` is what loads `.env` / `.env.local`, and the table is built after that
+  import. The Mantic base is `MANTIC_API_BASE_URL`. Both pairings are pinned in the tests.
 - **Question unwrapping is shared with the scoring pull** (`questions_on_post` in
   `performance_analysis.collector`): both read the same posts list, and a probe that counted
   questions differently from the pull it exists to project would be answering a subtly different
