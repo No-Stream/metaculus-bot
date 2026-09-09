@@ -785,8 +785,8 @@ async def test_fetch_plain_blocks_metaculus_without_network(url: str, monkeypatc
 def test_fetch_description_names_both_platform_hosts() -> None:
     """The driver reads FETCH_DESCRIPTION BEFORE it picks a URL and the block message only after
     the guard refused one, so the two must name the same hosts: a description that dropped one
-    would spend fetch steps on question pages the code then refuses (and, on Mantic, the driver
-    could still hand the page to the ungated read_document). Literal pins, so the test also
+    would spend fetch steps on question pages the code then refuses (``fetch`` and
+    ``read_document`` alike, through the same guard). Literal pins, so the test also
     fails if the constants behind the f-strings are re-pointed at something else."""
     for host in ("metaculus.com", "competitions.mantic.com"):
         assert host in FETCH_DESCRIPTION
@@ -2010,6 +2010,67 @@ async def test_read_document_missing_key(monkeypatch: pytest.MonkeyPatch) -> Non
 
     assert outcome.status == "error"
     assert "GOOGLE_API_KEY" in outcome.content_markdown
+
+
+class TestReadDocumentRefusesQuestionPlatformPages:
+    """``read_document`` refuses a question-platform URL before any rung runs, free or paid.
+
+    The plain and rendered rungs already refuse these through ``_fetch_plain_url_block``, but the
+    paid Gemini read dials from Google's address, so until this guard a driver that met a question
+    page in a search result could have it read there: on Mantic, the other bots' forecasts and
+    comments included. Same message and status the ``fetch`` refusal carries, so the driver reads
+    one contract.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://competitions.mantic.com/questions/650/",
+            "https://www.metaculus.com/questions/12345/some-question/",
+        ],
+    )
+    async def test_a_platform_page_is_blocked_before_any_fetch_or_paid_read(
+        self, url: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GOOGLE_API_KEY", "key")
+        acquire = AsyncMock(side_effect=AssertionError("the free ladder must not dial a platform page"))
+        monkeypatch.setattr(agentic_tools, "_acquire_local_document", acquire)
+        reader = _no_paid_reader(monkeypatch)
+
+        outcome = await agentic_tools.read_document(url, "what do the other forecasters say?")
+
+        assert outcome.status == "blocked"
+        assert outcome.content_markdown == fetch_outcomes._PLATFORM_FETCH_BLOCK_MSG
+        assert outcome.method == "plain"
+        acquire.assert_not_awaited()
+        reader.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_is_the_one_fetch_gives(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """One contract for the driver: the same URL refused by either tool reads identically."""
+        url = "https://competitions.mantic.com/questions/650/"
+        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+        _no_paid_reader(monkeypatch)
+
+        assert await agentic_tools.read_document(url, "anything") == await agentic_tools.fetch(url)
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("_no_local_document")
+    async def test_the_rest_of_the_platforms_domain_still_reaches_the_reader(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``blog.mantic.com`` is an outside source: only the competition host is the platform."""
+        monkeypatch.setenv("GOOGLE_API_KEY", "key")
+        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+        reader = MagicMock(return_value=("Quoted answer.", 1, ["URL_RETRIEVAL_STATUS_SUCCESS"]))
+        monkeypatch.setattr(agentic_tools, "_run_document_read_sync", reader)
+
+        outcome = await agentic_tools.read_document("https://blog.mantic.com/crucible-rules", "what are the rules?")
+
+        assert outcome.status == "ok"
+        assert outcome.method == "document"
+        reader.assert_called_once()
 
 
 def _document_response(text: str, *statuses: str) -> Any:

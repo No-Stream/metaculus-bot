@@ -41,7 +41,9 @@ Paid or externally visible — ask before each:
   (`competitions.mantic.com`, a fork of the Metaculus platform) and publishes there. It spends
   the operator's PERSONAL keys only: the Metaculus-donated OpenRouter key is refused, the run
   requires `DONATED_OPENROUTER_KEY_ENABLED=false` and fails shut without it, and with a single
-  key there is no key-swap fallback. About $2.60 per question. Detail: `docs/operations.md`
+  key there is no key-swap fallback. About $2.60 per question. `--only-posts <ids>` (or
+  `make run_mantic_one POST=<id>`) narrows any tournament-shaped mode to the listed post ids:
+  the one-question smoke run, still paid and still published. Detail: `docs/operations.md`
   "Mantic".
 - `make backtest_smoke_test` / `_small` / `_medium` / `_large`: every forecaster and research
   call, plus the `LEAKAGE_DETECTOR_MODEL` screen. No publish, real money. Question counts are

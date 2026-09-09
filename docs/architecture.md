@@ -18,7 +18,9 @@ Three files form the startup chain:
   imports it) and, when run directly, calls `cli.main()`.
 - `metaculus_bot/cli.py` — the command-line entry point. It parses `--mode`
   (`tournament`, `minibench`, `metaculus_cup`, `quarterly_cup`, `mantic`,
-  `test_questions`), builds the LLM roster dict from `llm_configs.py`, constructs a
+  `test_questions`) and the optional `--only-posts` post-id filter that narrows a
+  tournament-shaped mode to chosen questions (the one-question smoke run; see
+  `docs/operations.md` "Mantic"), builds the LLM roster dict from `llm_configs.py`, constructs a
   `TemplateForecaster` with `aggregation_strategy=CONDITIONAL_STACKING`, and runs the
   mode-specific forecast loop. Before any fetch it runs the API identity preflight
   (`api_preflight.verify_api_identity`, against the Metaculus API by default and the

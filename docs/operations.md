@@ -850,7 +850,26 @@ DONATED_OPENROUTER_KEY_ENABLED=false uv run python main.py --mode mantic
 # or: make run_mantic
 ```
 
-It needs `MANTIC_TOKEN` in `.env` (the operator also keeps it at
+The smoke run is the same command narrowed to one chosen question. `--only-posts`
+takes comma-separated post ids (the number in the question URL) and forecasts only
+those of the tournament's open questions:
+
+```bash
+DONATED_OPENROUTER_KEY_ENABLED=false uv run python main.py --mode mantic --only-posts 650
+# or: make run_mantic_one POST=650
+```
+
+The flag works in every tournament-shaped mode (`tournament`, `minibench`,
+`metaculus_cup`, `mantic`) and is refused with `test_questions`. It fetches the
+tournament's open questions exactly as an unfiltered run does, on the same client,
+keeps the listed posts, and logs one line such as
+`ONLY_POSTS: requested=650 matched=650 dropped=3`, a registered marker, so the
+archive records which question a smoke run spent on. `matched` is which of the
+requested ids were among the open questions; when none are, the run logs a warning
+and forecasts nothing rather than the whole tournament. The re-spend guard still
+applies, so a listed post the bot has already forecast is skipped like any other.
+
+Both commands need `MANTIC_TOKEN` in `.env` (the operator also keeps it at
 `~/.keys/MANTIC_TOKEN`). Without the switch the run stops at
 `_assert_personal_keys_only` before any spend.
 
@@ -907,7 +926,9 @@ The paid run is the operator's last step.
   in every mode.
 - `--mode mantic` / `make run_mantic`: spends the operator's personal keys
   (about $2.60 per question; the donated key is refused) and publishes to
-  competitions.mantic.com. See "Mantic" above.
+  competitions.mantic.com. `--only-posts <ids>` / `make run_mantic_one POST=<id>`
+  is the same run narrowed to the listed post ids, so one question's worth of
+  spend. See "Mantic" above.
 - `make backtest_smoke_test` / `_small` / `_medium` / `_large` — spends on every
   forecaster and research call, plus one `LEAKAGE_DETECTOR_MODEL` call per
   question for the leakage screen. No publish (the benchmark config sets

@@ -139,7 +139,12 @@ and turns a breach into an error `ToolOutcome` rather than a crash.
   left, itself bounded by Gemini's own read timeout
   (`_READ_DOCUMENT_TIMEOUT_S`), which sits above the HTTP timeout handed to the
   SDK — so the innermost one fires first and the driver gets a clean error
-  outcome instead of a tool-level kill.
+  outcome instead of a tool-level kill. A question-platform URL (metaculus.com or
+  `competitions.mantic.com`) is refused before any rung runs, with the same
+  `blocked` outcome `fetch` gives it: the paid reader dials from Google's address,
+  so it is the one rung the plain fetch's self-reference refusal could not
+  otherwise reach, and on Mantic the page it would read carries the other bots'
+  forecasts.
 
 ### The fetch ladder
 

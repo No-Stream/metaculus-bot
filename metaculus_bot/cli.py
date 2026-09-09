@@ -3,8 +3,8 @@ import asyncio
 import logging
 import os
 import sys
-from collections.abc import Awaitable, Callable
-from typing import Any, Literal, get_args
+from collections.abc import Awaitable, Callable, Iterable
+from typing import Any, Literal, NamedTuple, get_args
 
 from forecasting_tools import MetaculusApi
 
@@ -58,6 +58,13 @@ logger = logging.getLogger(__name__)
 
 
 RunMode = Literal["tournament", "minibench", "quarterly_cup", "metaculus_cup", "test_questions", "mantic"]
+
+
+class CliArgs(NamedTuple):
+    """What argv decides: the run mode, and the optional ``--only-posts`` narrowing of it."""
+
+    run_mode: RunMode
+    only_posts: frozenset[int] | None
 
 
 def _assert_personal_keys_only() -> None:
@@ -125,8 +132,22 @@ def _configure_process(run_mode: RunMode) -> None:
         verify_metaculus_api_identity()
 
 
-def _parse_run_mode() -> RunMode:
-    """Read ``--mode`` off argv."""
+def _parse_post_ids(text: str) -> frozenset[int]:
+    """The ``--only-posts`` value: comma-separated post ids, ``650`` or ``650,651``."""
+    try:
+        return frozenset(int(token) for token in text.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected comma-separated integer post ids, got {text!r}") from exc
+
+
+def _parse_cli_args() -> CliArgs:
+    """Read ``--mode`` and the optional ``--only-posts`` filter off argv.
+
+    ``--only-posts`` narrows a tournament-shaped mode to the listed post ids (the one-question
+    paid smoke run). It is refused with ``test_questions``, whose evergreen set is not a
+    tournament's open questions: a filter that silently did nothing on a paid run would be
+    worse than a usage error.
+    """
     parser = argparse.ArgumentParser(description="Run the Q1TemplateBot forecasting system")
     parser.add_argument(
         "--mode",
@@ -135,9 +156,22 @@ def _parse_run_mode() -> RunMode:
         default="tournament",
         help="Specify the run mode (default: tournament)",
     )
+    parser.add_argument(
+        "--only-posts",
+        type=_parse_post_ids,
+        default=None,
+        metavar="POST_IDS",
+        help=(
+            "Comma-separated post ids: forecast only these of the tournament's open questions "
+            "(the one-question smoke run). Tournament-shaped modes only."
+        ),
+    )
     args = parser.parse_args()
     run_mode: RunMode = args.mode
-    return run_mode
+    only_posts: frozenset[int] | None = args.only_posts
+    if only_posts is not None and run_mode == "test_questions":
+        parser.error("--only-posts narrows a tournament's open questions and does not apply to --mode test_questions")
+    return CliArgs(run_mode=run_mode, only_posts=only_posts)
 
 
 async def _forecast_with_callback_drain(start_forecast: Callable[[], Awaitable[list[Any]]]) -> list[Any]:
@@ -186,7 +220,55 @@ def _test_questions_source(template_bot: TemplateForecaster) -> Callable[[], Awa
     return lambda: template_bot.forecast_questions(questions, return_exceptions=True)
 
 
-def _question_source(template_bot: TemplateForecaster, run_mode: RunMode) -> Callable[[], Awaitable[list[Any]]]:
+async def _forecast_nothing() -> list[Any]:
+    """The factory for an ``--only-posts`` filter that matched none of the open questions."""
+    return []
+
+
+def _post_ids_csv(post_ids: Iterable[int | None]) -> str:
+    """Sorted comma-separated ids for the ``ONLY_POSTS`` marker; ``none`` for an empty list."""
+    known_ids = sorted(post_id for post_id in post_ids if post_id is not None)
+    return ",".join(str(post_id) for post_id in known_ids) or "none"
+
+
+def _tournament_source(
+    template_bot: TemplateForecaster,
+    tournament_id: int | str,
+    only_posts: frozenset[int] | None,
+) -> Callable[[], Awaitable[list[Any]]]:
+    """Forecast-factory over one tournament's open questions, narrowed to ``only_posts`` when set.
+
+    Unfiltered, this is the framework's own ``forecast_on_tournament``, untouched. Filtered, the
+    question-list fetch it makes internally runs here instead, on the same injected client (the
+    ``ManticClient`` in mantic mode), and only the posts asked for reach ``forecast_questions``;
+    a filter that matches nothing forecasts nothing rather than the whole tournament. Like the
+    URL resolves in ``_test_questions_source`` the fetch is synchronous and stays outside the
+    event loop, with only the forecast deferred into the factory. The ``ONLY_POSTS`` marker
+    records the request against what the tournament held open, so a smoke run's log says
+    which question it spent on.
+    """
+    if only_posts is None:
+        return lambda: template_bot.forecast_on_tournament(tournament_id, return_exceptions=True)
+    open_questions = template_bot.metaculus_client.get_all_open_questions_from_tournament(tournament_id)
+    matched = [question for question in open_questions if question.id_of_post in only_posts]
+    logger.info(
+        f"ONLY_POSTS: requested={_post_ids_csv(only_posts)} "
+        f"matched={_post_ids_csv(question.id_of_post for question in matched)} "
+        f"dropped={len(open_questions) - len(matched)}"
+    )
+    if not matched:
+        logger.warning(
+            "--only-posts matched none of the %d open question(s) in tournament %s; forecasting nothing",
+            len(open_questions),
+            tournament_id,
+        )
+        return _forecast_nothing
+    return lambda: template_bot.forecast_questions(matched, return_exceptions=True)
+
+
+def _question_source(
+    template_bot: TemplateForecaster, run_mode: RunMode, *, only_posts: frozenset[int] | None
+) -> Callable[[], Awaitable[list[Any]]]:
     """Resolve one run mode to the factory that forecasts its questions.
 
     Returns a factory rather than forecasting here so that every mode goes through the
@@ -195,22 +277,23 @@ def _question_source(template_bot: TemplateForecaster, run_mode: RunMode) -> Cal
     silently report no per-role spend by forgetting to wrap itself.
 
     Every tournament-shaped mode pins ``skip_previously_forecasted_questions`` on so a
-    re-run can't re-spend on questions already forecast.
+    re-run can't re-spend on questions already forecast, and honours ``only_posts``
+    (``_tournament_source``); the parser refuses that filter for ``test_questions``.
     """
     if run_mode == "tournament":
         check_tournament_dates(logging.getLogger(__name__))  # Warn/error if tournament dates are stale
         # to not risk explosive spend, we won't update preds
         template_bot.skip_previously_forecasted_questions = True
-        return lambda: template_bot.forecast_on_tournament(TOURNAMENT_ID, return_exceptions=True)
+        return _tournament_source(template_bot, TOURNAMENT_ID, only_posts)
     if run_mode == "minibench":
         # to not risk explosive spend, we won't update preds
         template_bot.skip_previously_forecasted_questions = True
-        return lambda: template_bot.forecast_on_tournament(MetaculusApi.CURRENT_MINIBENCH_ID, return_exceptions=True)
+        return _tournament_source(template_bot, MetaculusApi.CURRENT_MINIBENCH_ID, only_posts)
     if run_mode in ("quarterly_cup", "metaculus_cup"):
         # The metaculus cup is a good way to test the bot's performance on regularly open questions
         # to not risk explosive spend, we won't update preds
         template_bot.skip_previously_forecasted_questions = True
-        return lambda: template_bot.forecast_on_tournament(METACULUS_CUP_ID, return_exceptions=True)
+        return _tournament_source(template_bot, METACULUS_CUP_ID, only_posts)
     if run_mode == "mantic":
         # Mantic's competitions platform, through the ManticClient main injects; same
         # shape as the bot tournament, over the Mantic slug and its own end date.
@@ -221,7 +304,7 @@ def _question_source(template_bot: TemplateForecaster, run_mode: RunMode) -> Cal
         )
         # to not risk explosive spend, we won't update preds
         template_bot.skip_previously_forecasted_questions = True
-        return lambda: template_bot.forecast_on_tournament(MANTIC_TOURNAMENT_ID, return_exceptions=True)
+        return _tournament_source(template_bot, MANTIC_TOURNAMENT_ID, only_posts)
     if run_mode == "test_questions":
         # Example questions are a good way to test the bot's performance on a single question
         return _test_questions_source(template_bot)
@@ -277,14 +360,17 @@ def persisted_tournament_id(run_mode: RunMode) -> str:
     raise ValueError(f"Invalid run mode: {run_mode}")
 
 
-def _run_forecasts(template_bot: TemplateForecaster, run_mode: RunMode) -> list[Any]:
+def _run_forecasts(
+    template_bot: TemplateForecaster, run_mode: RunMode, *, only_posts: frozenset[int] | None = None
+) -> list[Any]:
     """Forecast one run mode's questions, on one event loop, with the callback drain.
 
     The only ``asyncio.run`` in the module: the loop is created here and torn down on
     return, and ``_forecast_with_callback_drain`` drains litellm's success callbacks
     inside it while the queue bound to it is still alive.
     """
-    return asyncio.run(_forecast_with_callback_drain(_question_source(template_bot, run_mode)))
+    source = _question_source(template_bot, run_mode, only_posts=only_posts)
+    return asyncio.run(_forecast_with_callback_drain(source))
 
 
 def main() -> None:
@@ -295,7 +381,7 @@ def main() -> None:
     first, then ``_configure_process`` installs the hardening patches and runs the
     fail-shut and identity checks, and only then is any platform token read.
     """
-    run_mode = _parse_run_mode()
+    run_mode, only_posts = _parse_cli_args()
     _configure_process(run_mode)
 
     # Fall-cup configuration reminder (constants.py): logs its ERROR here, at startup,
@@ -363,7 +449,7 @@ def main() -> None:
     credit_telemetry.log_start()
     donated_below_floor = False
     try:
-        forecast_reports = _run_forecasts(template_bot, run_mode)
+        forecast_reports = _run_forecasts(template_bot, run_mode, only_posts=only_posts)
     finally:
         donated_below_floor = credit_telemetry.log_end_and_check_floor()
         log_role_spend()

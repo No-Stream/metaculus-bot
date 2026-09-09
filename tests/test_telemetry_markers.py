@@ -26,6 +26,7 @@ tests loudly instead of silently dropping records from the archive:
 * CREDIT_BALANCE/SPEND/FLOOR_BREACH -> metaculus_bot/credit_telemetry.py
 * LITELLM_CALLBACK_DRAIN_TIMEOUT -> metaculus_bot/credit_telemetry.py:drain_litellm_callbacks
   (the completeness flag on that run's CREDIT_ROLE_SPEND rows)
+* ONLY_POSTS         -> metaculus_bot/cli.py:_tournament_source (the --only-posts smoke filter)
 * STACKER_OUTCOME/TOOLS_USED -> metaculus_bot/comment/markers.py (HTML-comment
   markers; see module docstring in markers.py for why they rarely appear in run logs).
 """
@@ -2832,6 +2833,32 @@ class TestRunAlertableSummary:
         assert rec["credit"] == 0
         assert rec["suppressed_credit"] == 0
         assert rec["donated_key"] is None
+
+
+# The --only-posts smoke filter (metaculus_bot/cli.py:_tournament_source): one line per run
+# that set it, saying which of the requested posts the tournament held open. Run-level, so no
+# question ref; ``requested`` / ``matched`` are comma-separated post ids.
+ONLY_POSTS_LINE = PFX + "ONLY_POSTS: requested=650 matched=650 dropped=3"
+ONLY_POSTS_NO_MATCH_LINE = PFX + "ONLY_POSTS: requested=650,999 matched=none dropped=4"
+
+
+class TestOnlyPosts:
+    def test_one_match(self):
+        rec = _parse_one(ONLY_POSTS_LINE)
+        assert rec["marker"] == "only_posts"
+        assert rec["requested"] == 650
+        assert rec["matched"] == 650
+        assert rec["dropped"] == 3
+        # A run-level marker: no question ref, so no qid or id space is stamped.
+        assert "qid" not in rec
+        assert "qid_kind" not in rec
+
+    def test_no_match(self):
+        """Several ids stay one comma-separated string; an empty match harvests as None."""
+        rec = _parse_one(ONLY_POSTS_NO_MATCH_LINE)
+        assert rec["requested"] == "650,999"
+        assert rec["matched"] is None
+        assert rec["dropped"] == 4
 
 
 # Gemini ungrounded-suppression WARN (metaculus_bot/research/gemini_search.py

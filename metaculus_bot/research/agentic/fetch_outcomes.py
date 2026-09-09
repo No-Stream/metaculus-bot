@@ -214,14 +214,14 @@ def _fetch_plain_url_block(url: str) -> PlainFetchResult | None:
     # host the critical API calls use. Blocking here (before _get_session) kills both
     # our-IP rungs; rendered only runs after a plain fetch. The brief already embeds the
     # resolution criteria these URLs would yield.
-    # What this does NOT cover: read_document's paid Gemini read dials from Google's IP,
-    # so it is deliberately ungated here and would read a platform page the driver hands
-    # it, other bots' forecasts included on a Mantic question page. Keeping those out of
-    # research rests on FETCH_DESCRIPTION telling the driver not to fetch these hosts
-    # (pinned in tests/test_agentic_tools.py) and on the resolution-source pre-filter never
-    # citing one, so the driver only meets a platform URL it picked out of a search result.
-    # The resolution-source ladder's own paid rung IS closed to a self-reference
-    # (`resolution_source._url_context_rung_applies`); this v2 path is not.
+    # read_document runs this same check first, before its free ladder and before the paid
+    # Gemini read, which dials from Google's IP and is the one rung the our-IP refusal here
+    # could not otherwise reach: it would read a platform page the driver hands it, other
+    # bots' forecasts included on a Mantic question page. FETCH_DESCRIPTION also tells the
+    # driver not to fetch these hosts (pinned in tests/test_agentic_tools.py) and the
+    # resolution-source pre-filter never cites one, so the driver only meets a platform URL
+    # it picked out of a search result. The resolution-source ladder's own paid rung is
+    # closed to a self-reference the same way (`resolution_source._url_context_rung_applies`).
     if resolution_source.is_metaculus_self_ref(url):
         return PlainFetchResult(
             status="blocked",

@@ -160,6 +160,10 @@ the unit-mismatch withhold rides ``FORECASTER_DROPS`` rather than its own marker
   end-of-run breakdown, emitted on EVERY path — degraded, fully-suppressed green,
   crashed, and fully clean — so the archive holds one record per run; the ``clean``
   variant is the 2026-08-25 addition that keeps a healthy run in the census)
+* ``ONLY_POSTS`` — ``metaculus_bot/cli.py`` ``_tournament_source`` (per-RUN, only when the
+  ``--only-posts`` smoke filter was set: the post ids requested, the open ones matched, and
+  how many open questions the filter left out — which question a one-question paid run
+  spent on)
 * ``CREDIT_BALANCE`` / ``CREDIT_SPEND`` / ``CREDIT_ROLE_SPEND`` / ``CREDIT_FLOOR_BREACH`` — ``metaculus_bot/credit_telemetry.py``
   (``CREDIT_ROLE_SPEND`` is per-RUN, per-(role, key): where the run's OpenRouter dollars went)
 * ``LITELLM_CALLBACK_DRAIN_TIMEOUT`` — ``metaculus_bot/credit_telemetry.py``
@@ -1330,6 +1334,15 @@ MARKER_SPECS: list[MarkerSpec] = [
             r"(?: with (?P<suppressed_credit>\S+?) credit event\(s\) suppressed until (?P<resume_date>\S+?))?"
             r"(?:, donated_key=(?P<donated_key>\S+?))?\);"
         ),
+    ),
+    MarkerSpec(
+        "only_posts",
+        # The ``--only-posts`` smoke filter (cli.py ``_tournament_source``), one line per run
+        # that set it: the post ids asked for, the open ones the tournament actually held among
+        # them, and how many open questions the filter left out. It is what says which question
+        # a one-question paid run spent on. ``requested`` / ``matched`` are comma-separated post
+        # ids (a lone id coerces to int, several stay one string) and an empty match is ``none``.
+        re.compile(r"ONLY_POSTS:\s*requested=(?P<requested>\S+)\s+matched=(?P<matched>\S+)\s+dropped=(?P<dropped>\d+)"),
     ),
     MarkerSpec(
         "gemini_ungrounded_suppressed",

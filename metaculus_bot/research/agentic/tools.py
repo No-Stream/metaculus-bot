@@ -840,6 +840,11 @@ async def read_document(url: str, ask: str, *, ladder_exhausted: bool = False) -
     page with no text at all, or a PDF with no text layer. Measured 2026-09-03, that is two of 47
     archived fetch failures, against 191 reader calls over the 2026 summer season.
 
+    A question-platform URL (metaculus.com, competitions.mantic.com) is refused before any rung
+    runs, with the same ``blocked`` outcome ``fetch`` gives it (``_fetch_plain_url_block``). The
+    paid reader dials from Google's address, so it is the one rung that our-IP refusal could not
+    otherwise reach, and on Mantic the page it would read carries the other bots' forecasts.
+
     The retrieval-count guard on the paid rung stays exactly as it was, because it is what
     keeps that rung honest: ``method="document"`` maps to the ``fetched`` tier
     (``provenance._METHOD_TO_TIER``), the highest authority the artifact renderer has — only a
@@ -856,6 +861,9 @@ async def read_document(url: str, ask: str, *, ladder_exhausted: bool = False) -
     rungs just ran for that URL, and running them again would re-request an image the plain rung
     classified from its Content-Type without ever downloading it.
     """
+    blocked = _fetch_plain_url_block(url)
+    if blocked is not None:
+        return ToolOutcome(content_markdown=blocked.text, method=blocked.method, status="blocked")
     started = monotonic()
     held = local_document.HeldDocument() if ladder_exhausted else await _acquire_local_document(url)
     if held.oversize:

@@ -58,6 +58,8 @@ What's inside:
    ```
 
    Pick a run mode with `--mode`: `tournament` (default), `minibench`, `metaculus_cup`, `mantic`, or `test_questions`.
+   Add `--only-posts <post id>` to forecast just one (or a comma-separated few) of a tournament's open
+   questions, the smoke run; `make run_mantic_one POST=650` is the Mantic shorthand.
 
    ```bash
    uv run python main.py --mode test_questions
