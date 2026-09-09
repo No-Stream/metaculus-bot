@@ -55,8 +55,8 @@ against the ACTUAL emitted format strings (the source of truth):
 * ``NUMERIC_AGGREGATE``  — ``metaculus_bot/member_forecast.py`` ``format_numeric_aggregate_marker``,
   emitted from ``forecaster.py`` ``_aggregate_predictions`` (per-QUESTION, numeric and date:
   the PUBLISHED distribution's grid size and out-of-range mass, the aggregate twin of the
-  member fields above, then the same mass before the platform tail floor and the floor that
-  moved it, ``oor_low_raw`` / ``oor_high_raw`` / ``tail_floor``; how the Mantic floor gets
+  member fields above, then the same mass before the platform tail floor and the level the
+  floor raised them to, ``oor_low_raw`` / ``oor_high_raw`` / ``tail_floor``; how the Mantic floor gets
   benchmarked on this bot's own forecasts)
 * ``CLOSE_MARGIN``      — ``metaculus_bot/close_margin.py`` (emitted at submit time in ``forecaster.py``)
 * ``MARKET_RANKING``    — ``metaculus_bot/research/prediction_market.py``
@@ -1172,8 +1172,9 @@ MARKER_SPECS: list[MarkerSpec] = [
         #
         # ``oor_low`` / ``oor_high`` are the PUBLISHED tails, after that floor. The trailing
         # ``oor_low_raw`` / ``oor_high_raw`` are the aggregate's own tails before it and
-        # ``tail_floor`` the floor that moved an endpoint (0 on Metaculus, on a closed-bound
-        # question, or when the tails already met it), so the floor's cost and gain can be
+        # ``tail_floor`` the level the moved tails were actually raised to (the floor, or less
+        # where the other tail's mass left the interior only its min-step minimum; 0 on
+        # Metaculus, on a closed-bound question, or when nothing moved), so the floor's cost and gain can be
         # replayed on this bot's own forecasts; joined with the per-member ``oor_*`` fields on
         # MEMBER_FORECAST they also say whether the models place mass beyond the bounds on their
         # own. The three are one optional group at the tail, so lines that predate them harvest

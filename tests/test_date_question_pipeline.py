@@ -45,7 +45,7 @@ from metaculus_bot.research.agentic.driver_prompt import _question_header, _temp
 from metaculus_bot.research.agentic.loop import _summarize_ghost
 from metaculus_bot.spread_metrics import compute_spread
 from metaculus_bot.stacking_route import _conditional_stacking_verdict, _type_gate_enabled
-from tests.mantic_fakes import DATE_POST_ID, load_legacy_date_post, load_preseason_post
+from tests.mantic_fakes import load_legacy_date_question, load_preseason_date_question
 from tests.pipeline_test_helpers import assert_server_accepts_cdf, make_e2e_bot, make_real_date_question
 
 _DAY = timedelta(days=1)
@@ -95,12 +95,12 @@ def _cdf_heights(distribution: NumericDistribution) -> np.ndarray:
 
 @pytest.fixture
 def q651() -> DateQuestion:
-    return DateQuestion.from_metaculus_api_json(load_preseason_post(DATE_POST_ID))
+    return load_preseason_date_question()
 
 
 @pytest.fixture
 def q500() -> DateQuestion:
-    return DateQuestion.from_metaculus_api_json(load_legacy_date_post())
+    return load_legacy_date_question()
 
 
 @pytest.fixture
@@ -233,6 +233,38 @@ class TestTheRunner:
         ]
         assert " n_unique=1 " in line
         assert line.endswith(" spread_applied=true")
+
+    @pytest.mark.parametrize(
+        ("open_edge", "terminal_bin"),
+        [("lower", 0), ("upper", 11)],
+        ids=["open_lower", "open_upper"],
+    )
+    def test_every_percentile_on_an_open_bound_publishes_with_the_mass_in_the_terminal_bin(
+        self, open_edge: str, terminal_bin: int, test_llm: GeneralLlm
+    ) -> None:
+        """A forecaster who writes the bound's own timestamp at all 13 percentiles (the parse
+        notes invite "at or after the lower bound 2026-09-08") has put everything in the terminal
+        bin, which is where the bound value buckets. The symmetric spread used to put half the
+        values past an OPEN bound and the build published ``cdf[0] == 0.5``: a coin flip on
+        "before the window" invented from a declaration that named nothing before it (codex
+        second-opinion review, 2026-09)."""
+        question = make_real_date_question(open_lower_bound=open_edge == "lower", open_upper_bound=open_edge == "upper")
+        epoch = as_epoch_question(question)
+        bound = epoch.lower_bound if open_edge == "lower" else epoch.upper_bound
+        percentiles = [Percentile(percentile=p, value=bound) for p in STANDARD_PERCENTILES]
+
+        prediction = _build_guarded_numeric_distribution(percentiles, epoch, test_llm)
+
+        heights = _cdf_heights(prediction)
+        mass = np.diff(heights)
+        assert len(heights) == 13
+        out_of_range = heights[0] if open_edge == "lower" else 1.0 - heights[-1]
+        assert out_of_range < 0.05, out_of_range  # the structural 0.01 of a P1 on the edge, never the invented 0.5
+        assert int(np.argmax(mass)) == terminal_bin
+        assert mass[terminal_bin] > 0.9
+        assert_server_accepts_cdf(
+            heights, cdf_size=13, open_lower=open_edge == "lower", open_upper=open_edge == "upper"
+        )
 
     def test_the_fallback_distribution_of_a_201_grid_date_question_still_renders_dates(
         self, q500: DateQuestion, monkeypatch: pytest.MonkeyPatch

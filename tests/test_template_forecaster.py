@@ -755,7 +755,7 @@ class TestMetaculusClientSeam:
 class TestUnsupportedQuestionTypes:
     """The type guard at the top of ``forecast_questions`` DROPS conditional questions with one
     WARNING rather than raising; every entry path (tournament fetch, URL list) funnels through
-    it. Date questions pass it since 2026-09-08 (Mantic's pool is 41% date questions)."""
+    it. Date questions pass it (Mantic's pool is 41% date questions)."""
 
     async def test_conditional_questions_are_skipped_with_a_warning(self, mock_general_llm, caplog):
         bot = _bot_with_one_forecaster(mock_general_llm)

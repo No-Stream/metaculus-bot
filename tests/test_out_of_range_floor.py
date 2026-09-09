@@ -7,6 +7,13 @@ displayed range in Series 1, so the PUBLISHED aggregate of a Mantic numeric, dis
 gets each open tail raised to ``MANTIC_OUT_OF_RANGE_TAIL_FLOOR``; Metaculus aggregates stay
 byte-identical and per-member forecasts are never touched.
 
+A tail rises only as far as the other tail leaves room for: the server needs every one of the grid's
+N steps to be at least ``round(0.01 / N, 9)``, so when one open tail already holds most of the mass
+the other is raised to ``min(floor, 1 - fat tail - N * min step)`` rather than to the floor. Without
+that cap a both-open aggregate with 98% below the lower bound had its upper tail set to 5%, which put
+``cdf[-1]`` under ``cdf[0]`` and made the rebuild raise at the aggregation seam, forfeiting the
+question (codex second-opinion review, 2026-09-08).
+
 Three layers are pinned here: the pure array function (its semantics and the server's CDF rules on
 its output), the same rules on every distinct grid Mantic has ever published (the recorded corpus,
 distilled into ``tests/data/mantic_cdf_grids_2026_09_08.json``), and the forecaster seam that applies
@@ -40,7 +47,8 @@ from metaculus_bot.numeric.out_of_range_floor import (
     floor_published_tails,
     tail_floor_for_platform,
 )
-from metaculus_bot.numeric.pchip_cdf import safe_cdf_bounds
+from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid, safe_cdf_bounds
+from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
 from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
 from metaculus_bot.numeric.utils import aggregate_numeric
 from metaculus_bot.question_platform import question_platform
@@ -53,6 +61,12 @@ from tests.pipeline_test_helpers import (
 
 FLOOR = MANTIC_OUT_OF_RANGE_TAIL_FLOOR
 GRIDS_PATH = Path(__file__).parent / "data" / "mantic_cdf_grids_2026_09_08.json"
+
+
+def _least_interior_mass(cdf_size: int) -> float:
+    """The mass a legal CDF on this grid must keep between its endpoints: every step at least the min step."""
+    min_step, _ = grid_step_constraints(cdf_size)
+    return (cdf_size - 1) * min_step
 
 
 def _legal_cdf(raw_heights: np.ndarray, *, open_lower: bool, open_upper: bool) -> np.ndarray:
@@ -72,6 +86,16 @@ def _normal_cdf(n_points: int, *, centre: float, sd: float) -> np.ndarray:
     return norm.cdf(np.linspace(0.0, 1.0, n_points), loc=centre, scale=sd)
 
 
+def _fat_lower_tail(n_points: int, mass_below: float) -> np.ndarray:
+    """``mass_below`` of the mass under the lower bound, the structural 0.1% above the upper, linear between."""
+    return np.linspace(mass_below, 0.999, n_points)
+
+
+def _fat_upper_tail(n_points: int, mass_above: float) -> np.ndarray:
+    """The mirror image: ``mass_above`` beyond the upper bound, the structural 0.1% below the lower."""
+    return np.linspace(0.001, 1.0 - mass_above, n_points)
+
+
 SHAPES: dict[str, Callable[[int], np.ndarray]] = {
     "concentrated_middle": lambda n: _normal_cdf(n, centre=0.5, sd=0.03),
     "piled_on_lower_edge": lambda n: _normal_cdf(n, centre=0.05, sd=0.02),
@@ -79,6 +103,15 @@ SHAPES: dict[str, Callable[[int], np.ndarray]] = {
     "flat": lambda n: np.linspace(0.0, 1.0, n),
     "fat_both_tails": lambda n: _normal_cdf(n, centre=0.5, sd=0.6),
     "fat_upper_tail_only": lambda n: _normal_cdf(n, centre=0.9, sd=0.3),
+    # One tail already fat, the other structural: 94% leaves exactly the floor of room, 99.9% none at all.
+    "mass_below_lower_94pct": lambda n: _fat_lower_tail(n, 0.94),
+    "mass_below_lower_95pct": lambda n: _fat_lower_tail(n, 0.95),
+    "mass_below_lower_98pct": lambda n: _fat_lower_tail(n, 0.98),
+    "mass_below_lower_99.9pct": lambda n: np.full(n, 0.999),
+    "mass_above_upper_94pct": lambda n: _fat_upper_tail(n, 0.94),
+    "mass_above_upper_95pct": lambda n: _fat_upper_tail(n, 0.95),
+    "mass_above_upper_98pct": lambda n: _fat_upper_tail(n, 0.98),
+    "mass_above_upper_99.9pct": lambda n: np.full(n, 0.001),
 }
 """Every aggregate shape a Mantic question can publish, up to the grid, as raw heights on the unit grid."""
 
@@ -87,26 +120,56 @@ def _shape(name: str, n_points: int) -> np.ndarray:
     return SHAPES[name](n_points)
 
 
+def _assert_open_tail_follows_the_rule(raw: float, published: float, *, interior_after: float, least_interior: float):
+    """Never lowered; at or above the floor it is left alone; under it, raised to the floor unless the
+    other tail leaves the interior only its minimum, in which case it rises exactly that far."""
+    assert published >= raw, "a tail is never lowered"
+    if raw >= FLOOR:
+        assert published == raw, "a tail already at or above the floor keeps its exact mass"
+        return
+    assert published <= FLOOR + 1e-12, "a tail is never raised above the floor"
+    if published < FLOOR - 1e-12:
+        assert interior_after == pytest.approx(least_interior), (
+            "short of the floor only when the interior is at its minimum"
+        )
+
+
 def _assert_floored_result_is_legal(result: FlooredCdf, before: np.ndarray, *, open_lower: bool, open_upper: bool):
+    """The server's rules, the per-side tail rule, and ``floor`` as the level the moved tails were
+    raised to (the floor, or less where the other tail capped it), ``0.0`` when none moved."""
     after = result.cdf
     assert len(after) == len(before)
-    assert np.all(np.diff(after) >= 0.0), "the floored CDF must stay non-decreasing"
+    assert np.all(np.diff(after) > 0.0), "the floored CDF must be strictly increasing"
     assert_server_accepts_cdf(after, cdf_size=len(after), open_lower=open_lower, open_upper=open_upper)
 
     raw_low, raw_high = float(before[0]), 1.0 - float(before[-1])
     assert result.raw == (raw_low, raw_high)
     assert result.published == (float(after[0]), 1.0 - float(after[-1]))
 
-    # Per side: an open tail under the floor is raised to exactly the floor, otherwise left alone.
+    interior_after = float(after[-1] - after[0])
+    least_interior = _least_interior_mass(len(before))
     if open_lower:
-        assert after[0] == (FLOOR if raw_low < FLOOR else before[0])
+        _assert_open_tail_follows_the_rule(
+            raw_low, result.published[0], interior_after=interior_after, least_interior=least_interior
+        )
     else:
         assert after[0] == 0.0 == before[0]
     if open_upper:
-        assert after[-1] == ((1.0 - FLOOR) if raw_high < FLOOR else before[-1])
+        _assert_open_tail_follows_the_rule(
+            raw_high, result.published[1], interior_after=interior_after, least_interior=least_interior
+        )
     else:
         assert after[-1] == 1.0 == before[-1]
-    assert result.floored == (after[0] != before[0] or after[-1] != before[-1])
+
+    lower_moved, upper_moved = bool(after[0] != before[0]), bool(after[-1] != before[-1])
+    if not (lower_moved or upper_moved):
+        assert result.floor == 0.0
+        return
+    assert 0.0 < result.floor <= FLOOR
+    if lower_moved:
+        assert result.published[0] == pytest.approx(result.floor)
+    if upper_moved:
+        assert result.published[1] == pytest.approx(result.floor)
 
 
 class TestFloorSemantics:
@@ -119,15 +182,15 @@ class TestFloorSemantics:
         result = floor_out_of_range_tails(before, open_lower=True, open_upper=True, floor=FLOOR)
 
         _assert_floored_result_is_legal(result, before, open_lower=True, open_upper=True)
-        assert result.floored is True
+        assert result.floor == FLOOR
         assert result.published == (FLOOR, 1.0 - (1.0 - FLOOR))
         assert result.published[1] == pytest.approx(FLOOR)
 
     def test_the_interior_is_rescaled_not_shifted_so_the_median_stays_put(self) -> None:
+        """An affine map of [0.001, 0.999] onto [0.05, 0.95] fixes 0.5; the min-step re-lift of the tail
+        bins then moves the crossing by a few thousandths of a bin, nothing a reader could see."""
         before = _legal_cdf(_shape("concentrated_middle", 201), open_lower=True, open_upper=True)
         after = floor_out_of_range_tails(before, open_lower=True, open_upper=True, floor=FLOOR).cdf
-        # An affine map of [0.001, 0.999] onto [0.05, 0.95] fixes 0.5; the min-step re-lift of the tail
-        # bins then moves the crossing by a few thousandths of a bin, nothing a reader could see.
         grid = np.arange(len(before), dtype=float)
         crossing_before = float(np.interp(0.5, before, grid))
         crossing_after = float(np.interp(0.5, after, grid))
@@ -151,7 +214,7 @@ class TestFloorSemantics:
     def test_two_closed_bounds_return_the_input_unchanged(self) -> None:
         before = _legal_cdf(_shape("concentrated_middle", 201), open_lower=False, open_upper=False)
         result = floor_out_of_range_tails(before, open_lower=False, open_upper=False, floor=FLOOR)
-        assert result.floored is False
+        assert result.floor == 0.0
         assert np.array_equal(result.cdf, before)
         assert result.raw == result.published == (0.0, 0.0)
 
@@ -160,7 +223,7 @@ class TestFloorSemantics:
         assert before[0] > FLOOR
         assert 1.0 - before[-1] > FLOOR
         result = floor_out_of_range_tails(before, open_lower=True, open_upper=True, floor=FLOOR)
-        assert result.floored is False
+        assert result.floor == 0.0
         assert np.array_equal(result.cdf, before)
 
     def test_one_thin_and_one_fat_tail_floors_only_the_thin_side(self) -> None:
@@ -182,7 +245,7 @@ class TestFloorSemantics:
         for name in SHAPES:
             before = _legal_cdf(_shape(name, 201), open_lower=True, open_upper=True)
             result = floor_out_of_range_tails(before, open_lower=True, open_upper=True, floor=0.0)
-            assert result.floored is False, name
+            assert result.floor == 0.0, name
             assert np.array_equal(result.cdf, before), name
 
     def test_the_input_array_is_not_mutated(self) -> None:
@@ -208,6 +271,89 @@ class TestFloorSemantics:
 
         result = floor_out_of_range_tails(before, open_lower=True, open_upper=True, floor=FLOOR)
         _assert_floored_result_is_legal(result, before, open_lower=True, open_upper=True)
+
+
+_FAT_TAIL_MASSES = (0.98, 0.945)
+"""The codex review's two shapes: 98% beyond one bound made the naive floor non-monotone, 94.5% left zero-width steps."""
+_GRIDS_UNDER_TEST = (13, 201, 451, 2001)
+"""Mantic's date grid, the standard grid, the discrete corpus's largest and the platform's largest."""
+
+
+class TestAFatTailLeavesLittleRoomForTheFloor:
+    """One open tail already holds most of the mass; the other rises only as far as the interior allows.
+
+    The server needs every one of the grid's N steps to be at least ``round(0.01 / N, 9)``, so the
+    interior keeps at least N times that, and the thin tail is raised to
+    ``min(floor, 1 - fat tail - that interior)``: about 1% behind a 98% tail, 4.5% behind a 94.5%
+    one, and nothing when the interior is already at its minimum. The fat tail is never reduced.
+    Before this cap the 98% shape came back with ``cdf[-1] = 0.95 < cdf[0] = 0.98`` and the seam's
+    rebuild raised ``ValidationError``, forfeiting the question.
+    """
+
+    @pytest.mark.parametrize("cdf_size", _GRIDS_UNDER_TEST)
+    @pytest.mark.parametrize("mass_below", _FAT_TAIL_MASSES)
+    def test_a_fat_lower_tail_caps_how_far_the_upper_tail_rises(self, cdf_size: int, mass_below: float) -> None:
+        before = _legal_cdf(_fat_lower_tail(cdf_size, mass_below), open_lower=True, open_upper=True)
+        assert (before[0], before[-1]) == (mass_below, 0.999), "the legaliser leaves this shape as built"
+
+        result = floor_out_of_range_tails(before, open_lower=True, open_upper=True, floor=FLOOR)
+
+        _assert_floored_result_is_legal(result, before, open_lower=True, open_upper=True)
+        room = 1.0 - mass_below - _least_interior_mass(cdf_size)
+        assert 0.001 < room < FLOOR
+        assert result.cdf[0] == mass_below, "the fat tail is never reduced"
+        assert result.published[1] == pytest.approx(room), "the thin tail rises exactly as far as the interior allows"
+        assert result.floor == pytest.approx(room)
+        assert float(result.cdf[-1] - result.cdf[0]) == pytest.approx(_least_interior_mass(cdf_size))
+
+    @pytest.mark.parametrize("cdf_size", _GRIDS_UNDER_TEST)
+    @pytest.mark.parametrize("mass_above", _FAT_TAIL_MASSES)
+    def test_a_fat_upper_tail_caps_how_far_the_lower_tail_rises(self, cdf_size: int, mass_above: float) -> None:
+        before = _legal_cdf(_fat_upper_tail(cdf_size, mass_above), open_lower=True, open_upper=True)
+        assert before[0] == 0.001
+        assert 1.0 - before[-1] == pytest.approx(mass_above)
+
+        result = floor_out_of_range_tails(before, open_lower=True, open_upper=True, floor=FLOOR)
+
+        _assert_floored_result_is_legal(result, before, open_lower=True, open_upper=True)
+        room = 1.0 - mass_above - _least_interior_mass(cdf_size)
+        assert 0.001 < room < FLOOR
+        assert result.cdf[-1] == before[-1], "the fat tail is never reduced"
+        assert result.published[0] == pytest.approx(room)
+        assert result.floor == pytest.approx(room)
+        assert float(result.cdf[-1] - result.cdf[0]) == pytest.approx(_least_interior_mass(cdf_size))
+
+    @pytest.mark.parametrize("cdf_size", _GRIDS_UNDER_TEST)
+    def test_an_interior_already_at_its_minimum_leaves_the_cdf_untouched(self, cdf_size: int) -> None:
+        """99.9% below the lower bound legalises to the tightest interior the server accepts, and a fat
+        tail is never reduced, so there is no room at all: the input comes back as is."""
+        before = _legal_cdf(np.full(cdf_size, 0.999), open_lower=True, open_upper=True)
+        assert float(before[-1] - before[0]) == pytest.approx(_least_interior_mass(cdf_size))
+
+        result = floor_out_of_range_tails(before, open_lower=True, open_upper=True, floor=FLOOR)
+
+        assert result.floor == 0.0
+        assert result.cdf is before
+        assert result.raw == result.published
+
+    def test_a_94_percent_tail_leaves_exactly_the_floor_of_room_on_the_standard_grid(self) -> None:
+        before = _legal_cdf(_fat_lower_tail(201, 0.94), open_lower=True, open_upper=True)
+        result = floor_out_of_range_tails(before, open_lower=True, open_upper=True, floor=FLOOR)
+        _assert_floored_result_is_legal(result, before, open_lower=True, open_upper=True)
+        assert result.floor == FLOOR
+        assert result.published[1] == pytest.approx(FLOOR)
+        assert float(result.cdf[-1] - result.cdf[0]) == pytest.approx(_least_interior_mass(201))
+
+    @pytest.mark.parametrize("cdf_size", _GRIDS_UNDER_TEST)
+    @pytest.mark.parametrize("mass_beyond", _FAT_TAIL_MASSES)
+    def test_a_fat_open_tail_beside_a_closed_bound_is_left_alone(self, cdf_size: int, mass_beyond: float) -> None:
+        fat_lower = _legal_cdf(_fat_lower_tail(cdf_size, mass_beyond), open_lower=True, open_upper=False)
+        fat_upper = _legal_cdf(_fat_upper_tail(cdf_size, mass_beyond), open_lower=False, open_upper=True)
+        for before, open_lower, open_upper in ((fat_lower, True, False), (fat_upper, False, True)):
+            result = floor_out_of_range_tails(before, open_lower=open_lower, open_upper=open_upper, floor=FLOOR)
+            _assert_floored_result_is_legal(result, before, open_lower=open_lower, open_upper=open_upper)
+            assert result.floor == 0.0
+            assert np.array_equal(result.cdf, before)
 
 
 def _corpus_grids() -> list[tuple[int, bool, bool, int]]:
@@ -253,14 +399,25 @@ class TestEveryManticGrid:
             if open_upper:
                 assert 1.0 - after[-1] >= FLOOR - 1e-12, (cdf_size, open_lower, open_upper)
 
+    def test_a_fat_tailed_shape_still_rises_on_every_both_open_grid(self) -> None:
+        """98% beyond one bound: the other tail leaves its structural 0.1% on every grid, and the fat
+        tail never moves. Both-open grids only; beside a closed bound there is nothing to raise."""
+        for cdf_size, open_lower, open_upper, _ in _corpus_grids():
+            if not (open_lower and open_upper):
+                continue
+            before = _legal_cdf(_shape("mass_below_lower_98pct", cdf_size), open_lower=True, open_upper=True)
+            result = floor_out_of_range_tails(before, open_lower=True, open_upper=True, floor=FLOOR)
+            assert result.cdf[0] == before[0], cdf_size
+            assert result.cdf[-1] < before[-1], cdf_size
+            assert 0.0 < result.floor < FLOOR, cdf_size
+
 
 _MANTIC_URL = f"{MANTIC_SITE_URL}/questions/2001/"
 
 
-def _inside_range_members(
-    question: NumericQuestion, centres: tuple[float, ...], sd: float
-) -> list[NumericDistribution]:
-    """Three members whose thirteen percentiles all sit inside the range: the structural 1% tails."""
+def _normal_members(question: NumericQuestion, centres: tuple[float, ...], sd: float) -> list[NumericDistribution]:
+    """Three members with normal percentiles at ``centres``: inside the range they carry the structural
+    1% tails, beyond a bound they pile the aggregate's mass past it (the shape the feasibility cap is for)."""
     members: list[NumericDistribution] = []
     for centre in centres:
         declared = [
@@ -269,6 +426,15 @@ def _inside_range_members(
         sanitized, zero_point = sanitize_percentiles(declared, question, model_name="test-model")
         members.append(build_numeric_distribution(sanitized, question, zero_point, model_name="test-model"))
     return members
+
+
+def _distribution_from_heights(heights: np.ndarray, question: NumericQuestion) -> NumericDistribution:
+    """A published-shape aggregate with exactly these CDF heights on the question's canonical grid."""
+    values = build_cdf_value_grid(question.lower_bound, question.upper_bound, None, len(heights))
+    declared = [Percentile(percentile=float(h), value=float(v)) for h, v in zip(heights, values, strict=True)]
+    return create_pchip_numeric_distribution(
+        pchip_cdf=[float(h) for h in heights], percentile_list=declared, question=question, zero_point=None
+    )
 
 
 def _heights(distribution: NumericDistribution) -> np.ndarray:
@@ -310,7 +476,7 @@ class TestTheForecasterSeam:
         caplog.set_level(logging.INFO, logger="metaculus_bot")
         question = make_real_numeric_question(open_lower_bound=True, open_upper_bound=True)
         question.page_url = _MANTIC_URL
-        members = _inside_range_members(question, centres=(10.0, 10.4, 9.7), sd=1.0)
+        members = _normal_members(question, centres=(10.0, 10.4, 9.7), sd=1.0)
         member_heights_before = [_heights(m) for m in members]
 
         bot = make_e2e_bot(AggregationStrategy.MEDIAN)
@@ -343,7 +509,7 @@ class TestTheForecasterSeam:
         caplog.set_level(logging.INFO, logger="metaculus_bot")
         question = make_real_numeric_question(open_lower_bound=True, open_upper_bound=True)
         assert question_platform(question) == PLATFORM_METACULUS
-        members = _inside_range_members(question, centres=(10.0, 10.4, 9.7), sd=1.0)
+        members = _normal_members(question, centres=(10.0, 10.4, 9.7), sd=1.0)
         expected = _heights(aggregate_numeric(members, question, method="median"))
 
         bot = make_e2e_bot(AggregationStrategy.MEDIAN)
@@ -360,7 +526,7 @@ class TestTheForecasterSeam:
 
     def test_the_same_object_comes_back_when_nothing_is_floored(self) -> None:
         question = make_real_numeric_question(open_lower_bound=True, open_upper_bound=True)
-        members = _inside_range_members(question, centres=(10.0, 10.4, 9.7), sd=1.0)
+        members = _normal_members(question, centres=(10.0, 10.4, 9.7), sd=1.0)
         aggregated = aggregate_numeric(members, question, method="median")
 
         outcome = floor_published_tails(aggregated, question)
@@ -380,7 +546,7 @@ class TestTheForecasterSeam:
         epoch_question = as_epoch_question(question)
         day = datetime(2026, 9, 16, tzinfo=UTC)
         centres = tuple(to_epoch(day + timedelta(hours=h)) for h in (12, 13, 11))
-        members = _inside_range_members(epoch_question, centres=centres, sd=4 * 3600.0)
+        members = _normal_members(epoch_question, centres=centres, sd=4 * 3600.0)
 
         bot = make_e2e_bot(AggregationStrategy.MEDIAN)
         aggregated = await bot._aggregate_predictions(cast(list[PredictionTypes], members), question)
@@ -399,3 +565,87 @@ class TestTheForecasterSeam:
         assert fields["oor_low"] == fields["oor_low_raw"] == "0.000000"
         assert (fields["oor_high_raw"], fields["oor_high"]) == ("0.010000", "0.050000")
         assert fields["tail_floor"] == "0.050000"
+
+    def test_the_codex_shape_rebuilds_into_a_distribution_instead_of_raising(self) -> None:
+        """98% below the lower bound, 0.1% above the upper, on the standard grid: the shape whose naive
+        floor put ``cdf[-1]`` under ``cdf[0]`` and made this rebuild raise ``ValidationError``."""
+        question = make_real_numeric_question(open_lower_bound=True, open_upper_bound=True)
+        question.page_url = _MANTIC_URL
+        before = _legal_cdf(_fat_lower_tail(201, 0.98), open_lower=True, open_upper=True)
+        aggregated = _distribution_from_heights(before, question)
+
+        outcome = floor_published_tails(aggregated, question)
+
+        assert outcome.distribution is not aggregated
+        published = _heights(outcome.distribution)
+        assert_server_accepts_cdf(published, cdf_size=201, open_lower=True, open_upper=True)
+        room = 1.0 - 0.98 - _least_interior_mass(201)
+        assert published[0] == 0.98
+        assert 1.0 - published[-1] == pytest.approx(room)
+        assert outcome.raw == (0.98, pytest.approx(0.001))
+        assert outcome.published == (0.98, pytest.approx(room))
+        assert outcome.floor == pytest.approx(room)
+        assert outcome.cdf_size == 201
+
+    @pytest.mark.asyncio
+    async def test_members_piled_below_the_range_publish_a_capped_upper_tail_and_an_honest_marker(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Every member's thirteen percentiles sit below the range, so the aggregate carries about 96%
+        beyond the open lower bound and the builder's 1% above the upper. The upper tail can rise only
+        to what the interior's min-step mass leaves (about 2.6%), not to 5%, and the marker records
+        that level as the floor applied."""
+        caplog.set_level(logging.INFO, logger="metaculus_bot")
+        question = make_real_numeric_question(open_lower_bound=True, open_upper_bound=True)
+        question.page_url = _MANTIC_URL
+        members = _normal_members(question, centres=(-1.8, -1.6, -2.0), sd=1.0)
+        raw = _heights(aggregate_numeric(members, question, method="median"))
+        assert raw[0] > 0.95
+        assert 1.0 - raw[-1] == pytest.approx(0.01)
+        room = 1.0 - raw[0] - _least_interior_mass(201)
+        assert 0.01 < room < FLOOR
+
+        bot = make_e2e_bot(AggregationStrategy.MEDIAN)
+        aggregated = await bot._aggregate_predictions(cast(list[PredictionTypes], members), question)
+
+        assert isinstance(aggregated, NumericDistribution)
+        published = _heights(aggregated)
+        assert_server_accepts_cdf(published, cdf_size=201, open_lower=True, open_upper=True)
+        assert published[0] == raw[0], "the fat tail is never reduced"
+        assert 1.0 - published[-1] == pytest.approx(room)
+        (line,) = _aggregate_lines(caplog)
+        fields = _fields(line)
+        assert fields["oor_low"] == fields["oor_low_raw"] == f"{raw[0]:.6f}"
+        assert fields["oor_high_raw"] == "0.010000"
+        assert fields["oor_high"] == fields["tail_floor"] == f"{room:.6f}"
+
+    @pytest.mark.asyncio
+    async def test_a_date_aggregate_piled_past_its_open_upper_bound_still_rebuilds_as_a_date(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Both bounds open, every member certain of a day after the range: the upper tail is fat and
+        the lower rises as far as the 13-point grid's interior allows, through the epoch adapter."""
+        caplog.set_level(logging.INFO, logger="metaculus_bot")
+        question: DateQuestion = make_real_date_question(open_lower_bound=True, open_upper_bound=True)
+        epoch_question = as_epoch_question(question)
+        beyond = datetime(2026, 9, 22, tzinfo=UTC)
+        centres = tuple(to_epoch(beyond + timedelta(hours=h)) for h in (12, 13, 11))
+        members = _normal_members(epoch_question, centres=centres, sd=4 * 3600.0)
+        raw = _heights(aggregate_numeric(members, epoch_question, method="median"))
+        assert 1.0 - raw[-1] > 0.95
+
+        bot = make_e2e_bot(AggregationStrategy.MEDIAN)
+        aggregated = await bot._aggregate_predictions(cast(list[PredictionTypes], members), question)
+
+        assert isinstance(aggregated, NumericDistribution)
+        assert aggregated.is_date is True
+        published = _heights(aggregated)
+        assert_server_accepts_cdf(published, cdf_size=13, open_lower=True, open_upper=True)
+        assert published[-1] == raw[-1], "the fat tail is never reduced"
+        assert raw[0] < published[0] < FLOOR
+        assert float(published[-1] - published[0]) == pytest.approx(_least_interior_mass(13))
+        (line,) = _aggregate_lines(caplog)
+        fields = _fields(line)
+        assert (fields["qtype"], fields["cdf_size"]) == ("date", "13")
+        assert fields["oor_high"] == fields["oor_high_raw"]
+        assert fields["oor_low"] == fields["tail_floor"] == f"{published[0]:.6f}"

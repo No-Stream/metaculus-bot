@@ -364,11 +364,11 @@ def _process_single_question(
     question_id = q.get("id")
     q_type = q.get("type", "")
     if q_type == "date":
-        # The live bot forecasts date questions (since 2026-09-08, on the epoch-seconds axis of
-        # numeric/date_axis.py), so a resolved one arrives here; the residual dataset stays
-        # date-free by decision until a date question has resolved under that code, the same
-        # seam backtest/question_prep.py and ablation/run_pdf.py carry. Named here so the skip
-        # reads as the decision rather than as parse_resolution's unknown-type fallthrough.
+        # The live bot forecasts date questions (on the epoch-seconds axis of numeric/date_axis.py),
+        # so a resolved one arrives here; the residual dataset stays date-free by decision until a
+        # date question has resolved under that code, the same seam backtest/question_prep.py and
+        # ablation/run_pdf.py carry. Named here so the skip reads as the decision rather than as
+        # parse_resolution's unknown-type fallthrough.
         logger.warning(
             f"  Skipping Q{question_id} (post {post_id}): date question, excluded from residual analysis by decision"
         )

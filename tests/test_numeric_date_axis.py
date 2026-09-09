@@ -41,6 +41,8 @@ from tests.mantic_fakes import (
     DATE_POST_ID,
     DISCRETE_POST_ID,
     load_legacy_date_post,
+    load_legacy_date_question,
+    load_preseason_date_question,
     load_preseason_post,
 )
 from tests.pipeline_test_helpers import make_real_date_question, make_real_numeric_question
@@ -60,12 +62,12 @@ _Q500_RANGE_MAX = datetime(2026, 8, 12, 12, tzinfo=UTC)
 
 @pytest.fixture
 def q651() -> DateQuestion:
-    return DateQuestion.from_metaculus_api_json(load_preseason_post(DATE_POST_ID))
+    return load_preseason_date_question()
 
 
 @pytest.fixture
 def q500() -> DateQuestion:
-    return DateQuestion.from_metaculus_api_json(load_legacy_date_post())
+    return load_legacy_date_question()
 
 
 def _continuous_range_epochs(post: dict) -> np.ndarray:

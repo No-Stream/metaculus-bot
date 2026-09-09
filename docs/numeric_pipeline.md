@@ -165,7 +165,18 @@ three-bin Mantic post 253 a declared 90% on the first bin published 0.558 (Manti
 review 2026-09, rank 7; the corpus reproductions are
 `tests/test_numeric_discrete_grid_plateaus.py`). What a plateau pins is an interval
 (`P90 = 0` and `P95 = 1` say `F(0.5)` lies in [0.90, 0.95)), and the published mass is
-that interval's lower edge less the uniform mixture. The predicate is
+that interval's lower edge less the uniform mixture. A plateau that would cross a bound is
+translated back inside the range, spacing intact, whichever kind of bound it is: the bound
+value buckets into the terminal bin, so a plateau ON the bound (a forecaster writing the
+bound's own timestamp at every percentile, which the date parse notes invite) keeps its full
+span in that bin. Spread symmetrically about the bound, half of it crossed an OPEN edge and
+published `cdf[0] == 0.5` on post 651's grid, a coin flip on "before the window" invented
+from a declaration that named nothing before it, while the CLOSED-edge clamp folded it to
+half its width, a span ratio of 6e-6 that Step 8 withheld at its 1e-5 threshold, the very
+drop the outcome-space carve-out exists to remove (codex second-opinion review, 2026-09).
+The shifted plateau may start exactly on the bound: a declared P1 equal to the lower bound
+already does, and it builds the same CDF as one at the `minimum_separation` standoff
+(closed: cdf[0] = 0; open: the structural 0.01). The predicate is
 `grid_is_outcome_space` (`numeric/config.py`): a natively discrete question
 (`DiscreteQuestion`, which every Metaculus discrete and every Mantic quantitative question
 parses as) or any non-201 grid, the same predicate on which Step 7's discrete snap skips. On
@@ -504,10 +515,17 @@ gate, the comment and the `NUMERIC_AGGREGATE` marker all read the floored distri
 
 **The rule.** On a question whose platform is Mantic (`question_platform` reads it off
 `page_url`; `PLATFORM_MANTIC` in `constants.py`), the published CDF carries at least
-`MANTIC_OUT_OF_RANGE_TAIL_FLOOR` (`constants.py`, 0.05) beyond each OPEN bound: an open tail
-under the floor is raised to exactly the floor (`cdf[0] = 0.05`, or `cdf[-1] = 0.95`), an open
-tail already at or above it is left alone, and a closed bound stays at its exact `0.0` / `1.0`.
-Both sides may move at once. The interior is rescaled affinely between the new endpoints, which
+`MANTIC_OUT_OF_RANGE_TAIL_FLOOR` (`constants.py`, 0.05) beyond each OPEN bound, as far as the
+other tail leaves room for: an open tail under the floor is raised to
+`min(0.05, 1 − the other tail − N × min step)`, where `N × min step` (`round(0.01 / N, 9)` per
+bin) is the least mass the server lets the interior keep, so beside a thin tail it goes to exactly
+the floor (`cdf[0] = 0.05`, or `cdf[-1] = 0.95`), beside a fat one it rises less (behind a 98%
+lower tail on the 201-point grid the upper tail goes from 0.1% to 1%), and an interior already at
+its minimum moves nothing; an open tail already at or above the floor is left alone (a tail is
+never reduced), and a closed bound stays at its exact `0.0` / `1.0`. Both sides may move at once.
+Without the cap a both-open aggregate with 98% below the lower bound came back with
+`cdf[-1] = 0.95 < cdf[0]` and the rebuild raised at the seam, forfeiting the question (codex
+review, 2026-09-08). The interior is rescaled affinely between the new endpoints, which
 keeps it monotone and can only shrink steps, so the platform's max step cannot be newly
 violated; the bins that sat exactly on the min step (the uniform-mixture tails of a
 concentrated PCHIP build) do land below it, so `enforce_min_steps` (`numeric/pchip_cdf.py`)
@@ -518,7 +536,8 @@ heights as both its CDF and its `declared_percentiles`, on the value axis the ag
 carried. `tests/test_out_of_range_floor.py` checks the server's `continuous_cdf` rules on the
 result for every distinct grid in the recorded 2026-09-08 Mantic corpus
 (`tests/data/mantic_cdf_grids_2026_09_08.json`: 88 grids, 3 to 450 bins, every bound
-combination), on six aggregate shapes each.
+combination), on fourteen aggregate shapes each: six ordinary ones and eight with 94%, 95%, 98%
+or 99.9% of the mass already beyond one bound.
 
 **Why.** Mantic scores an out-of-range resolution against a fixed 0.05 reference,
 `50 * ln(mass / 0.05)`: 5% there scores 0 and the structural 1% the pipeline builds whenever every
@@ -537,9 +556,11 @@ the gate covers them without a flag.
 
 **Telemetry.** `NUMERIC_AGGREGATE` keeps `oor_low` / `oor_high` as the PUBLISHED tails and adds
 three trailing fields: `oor_low_raw` / `oor_high_raw`, the aggregate's own tails before the
-floor, and `tail_floor`, the floor that moved an endpoint (`0.000000` on Metaculus, on a
-closed-bound question, or when the tails already met it). Raw against published is how the floor
-gets benchmarked on this bot's own forecasts once live Mantic telemetry accumulates.
+floor, and `tail_floor`, the level the moved tails were actually raised to: `0.050000` normally,
+less where the other tail capped the raise, and `0.000000` when nothing moved (Metaculus, a
+closed-bound question, tails already at or above the floor, an interior already at its minimum).
+Raw against published is how the floor gets benchmarked on this bot's own forecasts once live
+Mantic telemetry accumulates.
 
 ## The time-series anchor provider
 

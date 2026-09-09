@@ -26,10 +26,11 @@ Three files form the startup chain:
   (`api_preflight.verify_api_identity`, against the Metaculus API by default and the
   Mantic API in `--mode mantic`; it raises `ApiIdentityError` when the host does not
   answer like the platform), and in mantic mode the personal-keys-only assertion, the
-  swap to the Mantic platform client (`metaculus_bot/mantic.py`) and one authenticated
-  GET of the tournament list that fails shut unless the token may forecast the configured
-  tournament and logs the `MANTIC_TOURNAMENTS` discovery line; see
-  `docs/operations.md` "Mantic". It also wires credit telemetry and decides the process exit code:
+  swap to the Mantic platform client (`metaculus_bot/mantic.py`) and two authenticated
+  GETs, neither retried: the tournament list, which logs the `MANTIC_TOURNAMENTS` discovery
+  line, then the configured tournament's own route (`GET /api/projects/tournaments/<slug>/`)
+  for the forecast-permission check, which fails shut unless that route answers with a
+  `user_permission` that allows forecasting; see `docs/operations.md` "Mantic". It also wires credit telemetry and decides the process exit code:
   the run exits non-zero when any degradation counter fired (`alertable_count` on
   `TemplateForecaster` sums them: dropped forecasters, questions that failed to
   publish, stacker fallbacks, research-provider and summarizer failures, gap-fill
@@ -360,7 +361,7 @@ Whichever applies, keep the `# noqa: PLC0415`, state the reason inline, and neve
 | Startup / CLI | `main.py`, `metaculus_bot/cli.py` |
 | API identity preflight | `metaculus_bot/api_preflight.py` (`verify_api_identity`, its Metaculus wrapper, `ApiIdentityError`) |
 | Mantic platform client (Crucible, a Metaculus fork) | `metaculus_bot/mantic.py` |
-| Which platform a question is on | `metaculus_bot/question_platform.py` (`question_platform(question)` reads the `page_url` host; the `PLATFORM_METACULUS` / `PLATFORM_MANTIC` tokens live in `constants.py` and `research/persistence.py` re-exports them). The prompts read it for the platform-aware scoring sentence and the Mantic out-of-range base rate |
+| Which platform a question is on | `metaculus_bot/question_platform.py` (`question_platform(question)` reads the `page_url` host; the `PLATFORM_METACULUS` / `PLATFORM_MANTIC` tokens live in `constants.py`). The prompts read it for the platform-aware scoring sentence and the Mantic out-of-range base rate |
 | Publish hardening and close gate | `metaculus_bot/publish_hardening.py` (the forced POST timeout is scoped to `QUESTION_PLATFORM_HOSTS` from `constants.py`, so it covers both platforms), `publish_gate.py` |
 | Per-question orchestration | `metaculus_bot/forecaster.py` |
 | Post-fan-out aggregation routing | `metaculus_bot/stacking_route.py` |

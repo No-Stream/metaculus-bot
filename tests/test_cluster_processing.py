@@ -12,6 +12,7 @@ import pytest
 from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
 
+from metaculus_bot.constants import NUM_SPREAD_DELTA_MULT
 from metaculus_bot.numeric.cluster_processing import (
     apply_cluster_spreading,
     apply_jitter_for_duplicates,
@@ -20,6 +21,12 @@ from metaculus_bot.numeric.cluster_processing import (
     ensure_strictly_increasing_bounded,
     is_degenerate_cluster,
 )
+from metaculus_bot.numeric.config import (
+    EXPECTED_PERCENTILE_COUNT,
+    STANDARD_PERCENTILES,
+    grid_bin_width,
+)
+from metaculus_bot.numeric.validation import detect_unit_mismatch
 
 
 def _make_question(open_upper=False, open_lower=False, lower=0.0, upper=100.0) -> NumericQuestion:
@@ -112,10 +119,9 @@ class TestClusterProcessing:
         )
 
         assert clusters_applied == 1
-        # Check that clustered values are now different
-        cluster_values = result[1:4]  # The cluster positions
-        assert len(set(cluster_values)) == 3  # All different now
-        assert all(a < b for a, b in pairwise(cluster_values))  # Strictly increasing
+        cluster_values = result[1:4]
+        assert len(set(cluster_values)) == 3
+        assert all(a < b for a, b in pairwise(cluster_values))
 
     def test_apply_cluster_spreading_boundary_constraints(self):
         """Test cluster spreading respects boundary constraints.
@@ -183,7 +189,7 @@ class TestIsDegenerateCluster:
         assert is_degenerate_cluster([7.0, 7.0, 7.0, 9.0], 1e-7) is False
 
     def test_single_value_is_not_degenerate(self):
-        # Nothing to compare, and a 1-element set never reaches the spreader.
+        """Nothing to compare, and a 1-element set never reaches the spreader."""
         assert is_degenerate_cluster([7.0], 1e-7) is False
         assert is_degenerate_cluster([], 1e-7) is False
 
@@ -346,7 +352,7 @@ class TestDiscreteGridPlateauCap:
         )
 
     def test_three_bin_plateau_spans_at_most_one_bin(self):
-        # Mantic post 253: bins centred on 0, 1, 2; P1..P90 = 0, P95 = P97.5 = 1, P99 = 2.
+        """Mantic post 253: bins centred on 0, 1, 2; P1..P90 = 0, P95 = P97.5 = 1, P99 = 2."""
         values = [0.0] * 10 + [1.0, 1.0, 2.0]
         question = self._discrete_question(4, -0.5, 2.5)
 
@@ -360,13 +366,14 @@ class TestDiscreteGridPlateauCap:
         assert all(a < b for a, b in pairwise(result[:10]))
 
     def test_per_position_spread_is_the_bin_width_over_the_plateau_length(self):
+        """The cap only tightens a plateau whose full spread would exceed its bin: uncapped the
+        three-value plateau is [19, 20, 21] (the "mid_cluster" golden), a 2.0 spread, which fits a
+        2.5-wide bin unchanged and is halved by a 1.0-wide one."""
         values = [10.0, 20.0, 20.0, 20.0, 30.0]
         question = self._discrete_question(41, 0.0, 100.0)  # bin width 2.5
 
         result, _ = apply_cluster_spreading(values, question, value_eps=1e-6, spread_delta=1.0, range_size=100.0)
 
-        # Uncapped this is [19, 20, 21] (the "mid_cluster" golden); the 2.5-wide bin only tightens
-        # a plateau whose full spread would exceed it, and 2 * 1.0 = 2.0 fits, so it is unchanged.
         assert result == pytest.approx([10.0, 19.0, 20.0, 21.0, 30.0])
 
         question = self._discrete_question(201, 0.0, 100.0)  # bin width 0.5 but the 201 grid is exempt
@@ -406,3 +413,94 @@ class TestDiscreteGridPlateauCap:
         assert result[-1] < 9 * day
         assert result[-1] - result[0] == pytest.approx(12 * spread_delta)
         assert result[-1] - result[0] <= day
+
+
+class TestCollapseOnABoundOfAnOutcomeSpaceGrid:
+    """A whole-set collapse ON a bound is translated into the range, whichever kind of bound.
+
+    The symmetric spread was bounded only at CLOSED edges. On an OPEN edge half the values
+    crossed outside the range: post 651's grid with 13 declarations at the open lower bound
+    spread to [-6.2 s, +6.2 s] around it, and the build published ``cdf[0] == 0.5``, a coin
+    flip on "before the window" invented from a declaration that named nothing before it. On
+    a CLOSED edge the clamp folded the spread to half its width, a span ratio of 6e-6 that
+    ``detect_unit_mismatch`` withheld at its 1e-5 threshold: the very drop the outcome-space
+    carve-out exists to remove (codex second-opinion review, 2026-09). The bound value
+    itself buckets into the terminal bin, so the faithful reading is "all mass in that bin":
+    the plateau is shifted, not clipped, until it lies within the range, keeping its full
+    12-step span under the one-bin cap. Interior collapses and collapses at a bin CENTRE
+    were fine at every grid size and are byte-identical.
+    """
+
+    GRID_SIZES: ClassVar[tuple[int, ...]] = (3, 13, 22, 451, 2001)
+    RANGE_SIZE: ClassVar[float] = 12 * 86_400.0  # post 651's twelve days, in epoch seconds
+
+    def _question(self, cdf_size: int, *, open_lower: bool, open_upper: bool) -> NumericQuestion:
+        return cast(
+            NumericQuestion,
+            SimpleNamespace(
+                open_upper_bound=open_upper,
+                open_lower_bound=open_lower,
+                upper_bound=self.RANGE_SIZE,
+                lower_bound=0.0,
+                cdf_size=cdf_size,
+                id_of_question=651,
+            ),
+        )
+
+    @pytest.mark.parametrize("cdf_size", GRID_SIZES)
+    @pytest.mark.parametrize("bound_kind", ["closed", "open"])
+    @pytest.mark.parametrize("edge", ["lower", "upper"])
+    def test_the_plateau_keeps_its_full_span_inside_the_terminal_bin(
+        self, edge: str, bound_kind: str, cdf_size: int
+    ) -> None:
+        is_open = bound_kind == "open"
+        question = self._question(
+            cdf_size, open_lower=is_open and edge == "lower", open_upper=is_open and edge == "upper"
+        )
+        bound = question.lower_bound if edge == "lower" else question.upper_bound
+        values = [bound] * EXPECTED_PERCENTILE_COUNT
+        value_eps, _base_delta, spread_delta = compute_cluster_parameters(
+            self.RANGE_SIZE, detect_count_like_pattern(values), span=0.0
+        )
+        bin_width = grid_bin_width(question.lower_bound, question.upper_bound, cdf_size)
+
+        result, clusters_applied = apply_cluster_spreading(
+            values, question, value_eps=value_eps, spread_delta=spread_delta, range_size=self.RANGE_SIZE
+        )
+
+        assert clusters_applied == 1
+        assert all(a < b for a, b in pairwise(result))
+        assert question.lower_bound <= result[0]
+        assert result[-1] <= question.upper_bound
+        if edge == "lower":
+            assert result[-1] <= question.lower_bound + bin_width
+        else:
+            assert question.upper_bound - bin_width <= result[0]
+        # Shifted, not clipped: the span is the one an interior collapse gets under the one-bin cap.
+        per_position = min(spread_delta, bin_width / (EXPECTED_PERCENTILE_COUNT - 1))
+        assert result[-1] - result[0] == pytest.approx((EXPECTED_PERCENTILE_COUNT - 1) * per_position)
+        # 12 * NUM_SPREAD_DELTA_MULT = 1.2e-5 of the range, a 20% margin over the guard's 1e-5.
+        span_ratio = (result[-1] - result[0]) / self.RANGE_SIZE
+        assert span_ratio == pytest.approx((EXPECTED_PERCENTILE_COUNT - 1) * NUM_SPREAD_DELTA_MULT)
+        percentiles = [Percentile(percentile=p, value=v) for p, v in zip(STANDARD_PERCENTILES, result, strict=True)]
+        mismatch, reason = detect_unit_mismatch(percentiles, question)
+        assert not mismatch, reason
+
+    @pytest.mark.parametrize("bound_kind", ["closed", "open"])
+    def test_the_plateau_starts_exactly_on_the_bound_it_was_declared_on(self, bound_kind: str) -> None:
+        """Shifted to the bound, not to a standoff inside it: a declared P1 = lower already lands
+        there and builds the same CDF (closed: cdf[0] = 0; open: the structural 0.01), and
+        keeping the plateau where it is unless it crosses a bound is what leaves a bin-centre
+        plateau whose cap binds (post 253) byte-identical."""
+        question = self._question(13, open_lower=bound_kind == "open", open_upper=False)
+        values = [question.lower_bound] * EXPECTED_PERCENTILE_COUNT
+        value_eps, _base_delta, spread_delta = compute_cluster_parameters(
+            self.RANGE_SIZE, detect_count_like_pattern(values), span=0.0
+        )
+
+        result, _ = apply_cluster_spreading(
+            values, question, value_eps=value_eps, spread_delta=spread_delta, range_size=self.RANGE_SIZE
+        )
+
+        assert result[0] == question.lower_bound
+        assert result[1] == pytest.approx(question.lower_bound + spread_delta)

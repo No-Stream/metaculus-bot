@@ -667,11 +667,11 @@ class TestGhostGridScaledMaxStep:
 
 
 class TestGhostsWithoutAScorer:
-    """Gap-fill v2 emits date ghosts (since 2026-09-08) and nothing here can score one: the
-    residual dataset excludes date questions by decision, so no date record exists to join, and
-    the tally has no date arm should one ever appear. Both facts are counted and named in the
-    report; before this a date ghost fell off the end of the type dispatch with no trace, so the
-    operator read the missing pairs as questions still waiting on resolutions."""
+    """Gap-fill v2 emits date ghosts and nothing here can score one: the residual dataset
+    excludes date questions by decision, so no date record exists to join, and the tally has no
+    date arm should one ever appear. Both facts are counted and named in the report; before this
+    a date ghost fell off the end of the type dispatch with no trace, so the operator read the
+    missing pairs as questions still waiting on resolutions."""
 
     _DATE_PAYLOAD: ClassVar[dict] = {
         "qtype": "date",

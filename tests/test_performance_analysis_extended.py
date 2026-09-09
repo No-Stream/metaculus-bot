@@ -558,11 +558,11 @@ class TestCollectorCommentCreatedAt:
 
 
 class TestCollectorExcludesDateQuestions:
-    """The live bot forecasts date questions (since 2026-09-08, on the epoch-seconds axis), so a
-    resolved one reaches the collector; the residual dataset stays date-free by decision, the
-    same exclusion ``backtest/question_prep.py`` and ``ablation/run_pdf.py`` carry at their
-    seams. The skip has to be explicit and named in the log: ``parse_resolution``'s unknown-type
-    fallthrough would file the same question as a parser bug."""
+    """The live bot forecasts date questions (on the epoch-seconds axis), so a resolved one
+    reaches the collector; the residual dataset stays date-free by decision, the same exclusion
+    ``backtest/question_prep.py`` and ``ablation/run_pdf.py`` carry at their seams. The skip has
+    to be explicit and named in the log: ``parse_resolution``'s unknown-type fallthrough would
+    file the same question as a parser bug."""
 
     @pytest.mark.parametrize("resolution", ["above_upper_bound", "2026-07-20T12:00:00Z"])
     def test_a_resolved_date_question_is_skipped_by_type_with_one_named_warning(self, resolution, caplog):

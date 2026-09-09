@@ -54,7 +54,7 @@ import logging
 import socket
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any, Literal
+from typing import Any
 
 from metaculus_bot.ablation.replay_configs import (
     ADAPTIVE_MAX_WEIGHT,  # noqa: F401  # re-export: candidate-arm knob read off this module
@@ -104,8 +104,6 @@ from metaculus_bot.ablation.weighted_quantiles import (
 )
 
 logger: logging.Logger = logging.getLogger(__name__)
-
-QuestionType = Literal["binary", "multiple_choice", "numeric"]
 
 
 # Zero-API guard

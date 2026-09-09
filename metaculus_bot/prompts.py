@@ -794,11 +794,12 @@ def _resolution_metric_echo_bullets(question_type: Literal["binary", "numeric"])
         # The range is WEAK evidence about WHICH variant resolves and NO evidence about the
         # magnitude of the outcome. It used to say the bounds "were set by someone who could see
         # the real series, so a candidate far outside the range is probably the wrong variant":
-        # true on Metaculus, false on Mantic, where writers are paid for bot disagreement and 22%
-        # of resolved discrete and 51% of date questions escaped their range, so a forecaster that
-        # extrapolated correctly was told by this prompt to pull its percentiles back inside
-        # (roughly 195 baseline points between the two outcomes). The 44211 correction survives:
-        # inside the range confirms nothing.
+        # true on Metaculus, false on Mantic, where writers are paid for bot disagreement and
+        # 24.8% of resolved discrete and 53.7% of date questions escaped their range (the receipt
+        # sits above the _MANTIC_OUT_OF_RANGE_RATE_* constants), so a forecaster that extrapolated
+        # correctly was told by this prompt to pull its percentiles back inside (roughly 195
+        # baseline points between the two outcomes). The 44211 correction survives: inside the
+        # range confirms nothing.
         reconcile = (
             "Reconcile each candidate against the displayed range above, reading the range as WEAK evidence "
             "about which series variant resolves and as NO evidence about the magnitude of the outcome: a "

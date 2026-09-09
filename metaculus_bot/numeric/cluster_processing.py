@@ -80,6 +80,21 @@ def _cluster_end_index(values: list[float], start: int, value_eps: float) -> int
     return end
 
 
+def _symmetric_plateau(center: float, size: int, spread_delta: float) -> list[float]:
+    """``size`` values ``spread_delta`` apart, symmetric about ``center`` (size 3: -d, 0, +d; size 4: -1.5d..+1.5d)."""
+    return [center + (idx - (size - 1) / 2.0) * spread_delta for idx in range(size)]
+
+
+def _shifted_inside(new_vals: list[float], low: float, high: float) -> list[float]:
+    """``new_vals`` translated, spacing intact, until it lies within ``[low, high]``; unchanged when it already does."""
+    shift = 0.0
+    if new_vals[0] < low:
+        shift = low - new_vals[0]
+    elif new_vals[-1] > high:
+        shift = high - new_vals[-1]
+    return [v + shift for v in new_vals]
+
+
 def _spread_cluster_values(
     values: list[float],
     start: int,
@@ -92,36 +107,46 @@ def _spread_cluster_values(
 ) -> list[float]:
     """Replacement values for the cluster ``values[start:end + 1]``, symmetric about its mean.
 
-    Bound-clamped, then shifted up if it would collide with the preceding value, then
-    compressed if it would overrun the following one. The compression is what keeps the
-    spread from reordering the set when the next declared value sits close by.
+    Kept in range (how depends on the grid, below), then shifted up if it would collide with
+    the preceding value, then compressed if it would overrun the following one. The
+    compression is what keeps the spread from reordering the set when the next declared value
+    sits close by.
 
     Where the published bins are the outcome space (``grid_is_outcome_space``: a natively
     discrete question or a non-201 grid, the shapes the vote-gated discrete snap never
-    reshapes afterwards) the WHOLE plateau stays inside one bin: its total spread is capped at
-    the grid's bin width. The grid points are the bin edges, so a plateau at integer k that
-    spilled past k +- 0.5 handed the mass the forecaster put on k to the neighbouring bins. On
+    reshapes afterwards) the WHOLE plateau stays inside one bin. Its total spread is capped at
+    the grid's bin width: the grid points are the bin edges, so a plateau at integer k that
+    spilled past k +- 0.5 handed the mass the forecaster put on k to the neighbouring bins (on
     the 3-bin Mantic post 253 a declared 90% on the first bin published 0.558 under the
-    uncapped count-like unit spread (Mantic edge-case review, 2026-09). The 201-point
-    continuous grid is untouched: there the unit spread is pre-processing the snap can undo.
+    uncapped count-like unit spread; Mantic edge-case review, 2026-09). And a plateau that
+    would cross a bound is TRANSLATED back inside the range, spacing intact, whichever kind of
+    bound it is: the bound value buckets into the terminal bin, so a plateau ON the bound keeps
+    its full span there. Symmetric about the bound, half of it crossed an OPEN edge (13
+    declarations at the open lower bound of a grid shaped like post 651's published
+    ``cdf[0] == 0.5``, 50% "before the window" invented from a declaration that named
+    nothing before it), and the CLOSED-edge
+    clamp folded it to half its width, a span ``detect_unit_mismatch`` withheld (codex
+    second-opinion review, 2026-09). The plateau may start exactly on the bound: a declared
+    P1 = lower already does, and it builds the same CDF as one at the standoff inside.
+
+    The 201-point continuous grid is untouched: there the unit spread is pre-processing the
+    snap can undo, so it is uncapped and clamped to the ``minimum_separation`` standoff at a
+    CLOSED edge only.
     """
     size = end - start + 1
-    if grid_is_outcome_space(question):
-        bin_width = grid_bin_width(question.lower_bound, question.upper_bound, question.cdf_size)
-        spread_delta = min(spread_delta, bin_width / (size - 1))
-
     center = float(np.mean(values[start : end + 1]))
 
-    # Offsets symmetric around center. For size=3: -d, 0, +d; size=4: -1.5d..+1.5d.
-    offsets = [((idx - (size - 1) / 2.0) * spread_delta) for idx in range(size)]
-    new_vals = [center + off for off in offsets]
-
-    # Enforce bounds softly during spread to avoid later large clamps
-    tiny = minimum_separation(range_size)
-    if not question.open_lower_bound:
-        new_vals = [max(v, question.lower_bound + tiny) for v in new_vals]
-    if not question.open_upper_bound:
-        new_vals = [min(v, question.upper_bound - tiny) for v in new_vals]
+    if grid_is_outcome_space(question):
+        bin_width = grid_bin_width(question.lower_bound, question.upper_bound, question.cdf_size)
+        new_vals = _symmetric_plateau(center, size, min(spread_delta, bin_width / (size - 1)))
+        new_vals = _shifted_inside(new_vals, question.lower_bound, question.upper_bound)
+    else:
+        new_vals = _symmetric_plateau(center, size, spread_delta)
+        tiny = minimum_separation(range_size)
+        if not question.open_lower_bound:
+            new_vals = [max(v, question.lower_bound + tiny) for v in new_vals]
+        if not question.open_upper_bound:
+            new_vals = [min(v, question.upper_bound - tiny) for v in new_vals]
 
     # If a previous value exists and is >= first new, shift all up minimally
     if start - 1 >= 0 and new_vals[0] <= values[start - 1]:
@@ -163,8 +188,10 @@ def apply_cluster_spreading(
     on post 651's twelve one-day bins, and the date prompt invites that shape, so
     the member publishes with its mass in that day instead of being withheld as a
     unit mismatch; the width the spread adds stays inside the bin the forecaster
-    named. A genuine scale error on such a grid sits several bins outside the
-    bounds and still raises in ``clamp_values_to_bounds``.
+    named, and a collapse ON a bound is shifted into the terminal bin rather than
+    spilling past an open edge or being folded at a closed one. A genuine scale
+    error on such a grid sits several bins outside the bounds and still raises in
+    ``clamp_values_to_bounds``.
 
     Mutates and returns ``modified_values``.
     """
@@ -242,8 +269,7 @@ def ensure_strictly_increasing_bounded(
                 target = max(target, question.lower_bound + epsilon)
             modified_values[i] = max(modified_values[i], target)
 
-    # Additional pass (right-to-left) to make room near closed upper bound
-    # If upper bound is closed and strict increase is capped, slide earlier values down by epsilon
+    # Right-to-left: where a closed upper bound capped the increase, slide earlier values down by epsilon
     for i in range(len(modified_values) - 2, -1, -1):
         if modified_values[i] >= modified_values[i + 1]:
             target = modified_values[i + 1] - epsilon

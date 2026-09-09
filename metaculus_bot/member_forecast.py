@@ -9,7 +9,7 @@ A numeric or date line carries two additive trailing fields, ``oor_low=<f> oor_h
 the OUT-OF-RANGE mass of the CDF the runner built from ``published``, i.e. ``cdf[0]`` (below
 the lower bound) and ``1 - cdf[-1]`` (above the upper). The per-question aggregate marker
 carries the same pair for the PUBLISHED distribution, then the pair as it stood before the
-platform tail floor and the floor that moved it::
+platform tail floor and the level the floor raised them to::
 
     NUMERIC_AGGREGATE: question=<id> qtype=numeric|date cdf_size=<n> oor_low=<f> oor_high=<f>
         oor_low_raw=<f> oor_high_raw=<f> tail_floor=<f>
@@ -20,8 +20,9 @@ resolved outside the displayed range, while this pipeline publishes exactly 1% t
 whenever every percentile sits inside. On a Mantic question the published aggregate's open
 tails are raised to ``MANTIC_OUT_OF_RANGE_TAIL_FLOOR`` (``numeric/out_of_range_floor.py``);
 ``oor_low_raw`` / ``oor_high_raw`` keep the aggregate's own tails and ``tail_floor`` is the
-floor that moved an endpoint (``0`` on Metaculus, on a closed-bound question, or when the
-tails were already at or above it), so the floor can be benchmarked on this bot's own
+level the moved tails were actually raised to (the floor, or less where the other tail's mass
+capped the raise; ``0`` on Metaculus, on a closed-bound question, or when nothing moved), so
+the floor can be benchmarked on this bot's own
 forecasts from the archive, and the member lines keep measuring what the models declared.
 
 ``raw`` is the value the extraction ladder read off the model's rationale, before any
@@ -154,7 +155,7 @@ def format_numeric_aggregate_marker(
     """Build the per-question NUMERIC_AGGREGATE line for the published distribution.
 
     ``out_of_range`` is the PUBLISHED distribution's tail mass, ``out_of_range_raw`` the same pair
-    before the platform tail floor, ``tail_floor`` the floor that moved an endpoint (module docstring).
+    before the platform tail floor, ``tail_floor`` the level the moved tails were raised to (module docstring).
     """
     raw_low, raw_high = out_of_range_raw
     return (

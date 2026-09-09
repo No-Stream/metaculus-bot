@@ -27,7 +27,6 @@ from forecasting_tools import (
 from forecasting_tools.data_models.data_organizer import PredictionTypes
 from forecasting_tools.data_models.multiple_choice_report import PredictedOption
 from forecasting_tools.data_models.numeric_report import Percentile
-from forecasting_tools.data_models.questions import DateQuestion
 
 from metaculus_bot.aggregation_pipeline import AggregationCounters, AggregationPipeline
 from metaculus_bot.aggregation_strategies import AggregationStrategy
@@ -36,7 +35,7 @@ from metaculus_bot.numeric.config import STANDARD_PERCENTILES
 from metaculus_bot.numeric.date_axis import EpochDateQuestion
 from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
 from tests.conftest import make_mock_numeric_question
-from tests.mantic_fakes import DATE_POST_ID, load_preseason_post
+from tests.mantic_fakes import load_preseason_date_question
 
 
 def _make_binary_question(qid: int = 100) -> BinaryQuestion:
@@ -547,7 +546,7 @@ class TestRunStacking:
         line must say ``qtype=date``."""
         caplog.set_level(logging.INFO, logger="metaculus_bot")
         pipeline = _make_pipeline()
-        question = DateQuestion.from_metaculus_api_json(load_preseason_post(DATE_POST_ID))
+        question = load_preseason_date_question()
         qid = question.id_of_question
         assert qid is not None
         window_start = datetime(2026, 9, 16, 2, tzinfo=UTC).timestamp()

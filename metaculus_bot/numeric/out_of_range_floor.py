@@ -18,17 +18,37 @@ a Metaculus aggregate comes back as the very same object, per-member forecasts a
 (their ``MEMBER_FORECAST`` tails keep measuring what the models declared), and the backtest and
 ablation harnesses replay Metaculus questions, so the platform gate covers them.
 
-What it does, per side: an open tail under the floor is raised to exactly the floor, an open tail
-already at or above it is left alone, and a closed bound stays at its exact 0.0 or 1.0 (the server
-requires that). The interior is rescaled affinely between the new endpoints, which keeps it monotone,
-fixes the median of a symmetric shape in place and can only shrink steps, so the platform's max step
-cannot be newly violated; it CAN push the bins that sat exactly on the min step (the uniform-mixture
-tails of a concentrated PCHIP build) below it, so the pipeline's min-step sweep runs again with the
-new endpoints as its caps. ``tests/test_out_of_range_floor.py`` proves the server's rules on the
-result for every distinct grid Mantic has published.
+What it does, per side: an open tail under the floor is raised toward it, an open tail already at or
+above it is left alone (a tail is never reduced), and a closed bound stays at its exact 0.0 or 1.0
+(the server requires that). A tail rises only as far as the other tail leaves room for. The server
+needs every one of the grid's ``N`` steps to be at least ``round(0.01 / N, 9)``, so the interior
+keeps at least ``N`` times that, and each open tail is raised to
+``min(floor, 1 - the other tail - that interior mass)``: the floor itself whenever the other tail is
+thin too (the interior keeps 0.90), less when the other tail is fat (98% below the lower bound on
+the 201-point grid leaves the upper tail room to rise from 0.1% to 1%), and nothing at all when the
+interior already sits at its minimum. Both sides settle from the same two raw endpoints, which is
+enough because a fat tail's target is its own raw value. Without the cap a both-open aggregate with
+98% below the lower bound had its upper tail set to 5%, so ``cdf[-1] = 0.95 < cdf[0] = 0.98`` and
+the rebuild raised at the aggregation seam, which has no fallback: the question was forfeited (codex
+second-opinion review, 2026-09-08). A confident aggregate beyond one open bound is a realistic Mantic
+shape, since half its date questions resolved above the range.
+
+The interior is rescaled affinely between the new endpoints, which keeps it monotone, fixes the
+median of a symmetric shape in place and can only shrink steps, so the platform's max step cannot be
+newly violated; it CAN push the bins that sat exactly on the min step (the uniform-mixture tails of
+a concentrated PCHIP build) below it, so the pipeline's min-step sweep runs again with the new
+endpoints as its caps. With the endpoints feasible that sweep needs nothing more: its forward pass
+lifts each bin to the min step and its backward pass pulls the run down from the upper cap, and the
+lower cap is only ever reached exactly. A lift under ``_LIFT_TOLERANCE`` (the server's 10-decimal CDF
+rounding, so invisible to it) is not a move: an aggregate whose interior already sits at the minimum
+arrives with its endpoints a few 1e-15 off it, accumulated over the grid's steps, and without the
+tolerance the seam rebuilt the distribution for that noise and logged the tail's own raw mass as the
+floor applied. ``tests/test_out_of_range_floor.py`` proves the server's rules on the result for
+every distinct grid Mantic has published.
 
 The raw (pre-floor) tails are kept beside the published ones so the floor can be benchmarked on
-this bot's own forecasts once live telemetry accumulates: the marker records both.
+this bot's own forecasts once live telemetry accumulates: the marker records both, and its
+``tail_floor`` is the level the moved tails were actually raised to (the floor, or the capped level).
 """
 
 from __future__ import annotations
@@ -53,28 +73,34 @@ __all__ = [
     "tail_floor_for_platform",
 ]
 
+# The smallest lift of a tail that counts as a move: the server's 10-decimal CDF rounding (module docstring).
+_LIFT_TOLERANCE: float = 1e-10
+
 
 @dataclass(frozen=True)
 class FlooredCdf:
     """A CDF's heights after the floor, with the mass beyond each bound before and after.
 
     ``raw`` and ``published`` are ``(below the lower bound, above the upper bound)``, i.e.
-    ``cdf[0]`` and ``1 - cdf[-1]``; ``floored`` says whether either endpoint moved.
+    ``cdf[0]`` and ``1 - cdf[-1]``. ``floor`` is the level the moved tails were raised to: the
+    nominal floor, or less where the other tail left the interior no more than its min-step mass;
+    ``0.0`` when neither endpoint moved, in which case ``cdf`` is the input array itself.
     """
 
     cdf: np.ndarray
     raw: tuple[float, float]
     published: tuple[float, float]
-    floored: bool
+    floor: float
 
 
 @dataclass(frozen=True)
 class TailFloorOutcome:
     """What the seam publishes and logs: the distribution to publish and the marker's tail fields.
 
-    ``distribution`` is the input object itself when nothing was floored. ``floor`` is the floor that
-    moved an endpoint, ``0.0`` when none did (a Metaculus question, a closed-bound question, or
-    tails already at or above the floor).
+    ``distribution`` is the input object itself when nothing was floored. ``floor`` is the level the
+    moved tails were raised to (``FlooredCdf.floor``), ``0.0`` when none moved (a Metaculus
+    question, a closed-bound question, tails already at or above the floor, or an interior already
+    at its minimum).
     """
 
     distribution: NumericDistribution
@@ -90,24 +116,30 @@ def tail_floor_for_platform(question: MetaculusQuestion) -> float:
 
 
 def floor_out_of_range_tails(cdf: np.ndarray, *, open_lower: bool, open_upper: bool, floor: float) -> FlooredCdf:
-    """Raise each OPEN tail of a server-legal CDF to at least ``floor``; pure, input untouched.
+    """Raise each OPEN tail of a server-legal CDF toward ``floor``, as far as the other tail allows; pure.
 
     ``cdf`` is the heights the server would receive (length ``inbound bins + 1``, monotone, endpoints
     already pinned for the bound flags). A floor of ``0.0`` is a no-op that hands the input back.
     """
     low, high = float(cdf[0]), float(cdf[-1])
-    target_low = max(low, floor) if open_lower else low
-    target_high = min(high, 1.0 - floor) if open_upper else high
     raw = (low, 1.0 - high)
-    if target_low == low and target_high == high:
-        return FlooredCdf(cdf=cdf, raw=raw, published=raw, floored=False)
+    min_step, _ = grid_step_constraints(cdf.size)
+    least_interior = (cdf.size - 1) * min_step
+    lifted_low = min(floor, high - least_interior)
+    lifted_high = min(floor, 1.0 - low - least_interior)
+    lower_moved = open_lower and lifted_low > low + _LIFT_TOLERANCE
+    upper_moved = open_upper and lifted_high > raw[1] + _LIFT_TOLERANCE
+    if not (lower_moved or upper_moved):
+        return FlooredCdf(cdf=cdf, raw=raw, published=raw, floor=0.0)
 
+    target_low = lifted_low if lower_moved else low
+    target_high = 1.0 - lifted_high if upper_moved else high
     rescaled = target_low + (cdf - low) * ((target_high - target_low) / (high - low))
     rescaled[0] = target_low
     rescaled[-1] = target_high
-    min_step, _ = grid_step_constraints(cdf.size)
     legal = enforce_min_steps(rescaled, min_step, upper_cap=target_high, lower_cap=target_low)
-    return FlooredCdf(cdf=legal, raw=raw, published=(float(legal[0]), 1.0 - float(legal[-1])), floored=True)
+    applied = max(lifted_low if lower_moved else 0.0, lifted_high if upper_moved else 0.0)
+    return FlooredCdf(cdf=legal, raw=raw, published=(float(legal[0]), 1.0 - float(legal[-1])), floor=applied)
 
 
 def floor_published_tails(aggregated: NumericDistribution, question: MetaculusQuestion) -> TailFloorOutcome:
@@ -127,7 +159,7 @@ def floor_published_tails(aggregated: NumericDistribution, question: MetaculusQu
         open_upper=aggregated.open_upper_bound,
         floor=tail_floor_for_platform(question),
     )
-    if not result.floored:
+    if result.floor == 0.0:
         return TailFloorOutcome(
             distribution=aggregated, cdf_size=cdf.size, raw=result.raw, published=result.raw, floor=0.0
         )
@@ -147,5 +179,5 @@ def floor_published_tails(aggregated: NumericDistribution, question: MetaculusQu
         cdf_size=cdf.size,
         raw=result.raw,
         published=result.published,
-        floor=tail_floor_for_platform(question),
+        floor=result.floor,
     )

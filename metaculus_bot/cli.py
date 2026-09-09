@@ -382,15 +382,16 @@ def _run_forecasts(
 def _check_tournament_dates(run_mode: RunMode) -> bool:
     """Run the mode's stale-slug check at startup; True only when the MANTIC slug is past its end date.
 
-    ``check_tournament_dates`` (constants.py) warns from a slug's end date and raises at the hard
-    stop two weeks later, for the Metaculus bot tournament and for Mantic alike. In between, the
-    Metaculus tournament stays advisory: its questions are open for weeks and a fortnight of
-    warnings costs nothing. On Mantic that fortnight is a silent forfeit. A zero-question run is
-    green, Series 2 opens under a slug that does not exist yet, and every hourly run would keep
-    fetching the ended preseason and exit 0, about seventy questions at Series 1's rate (edge
-    review item 5). So in mantic mode the verdict is held and reddens the run after publishing,
-    the same shape as the fall-cup reminder; the shared hard stop is untouched. The cup and
-    minibench slugs carry no end date and are not checked.
+    ``check_tournament_dates`` (constants.py) warns from the UTC day after a slug's end date (the
+    constant names the last open day) and raises at the hard stop two weeks later, for the
+    Metaculus bot tournament and for Mantic alike. In between, the Metaculus tournament stays
+    advisory: its questions are open for weeks and a fortnight of warnings costs nothing. On
+    Mantic that fortnight is a silent forfeit. A zero-question run is green, Series 2 opens under
+    a slug that does not exist yet, and every hourly run would keep fetching the ended preseason
+    and exit 0, about seventy questions at Series 1's rate (edge review item 5). So in mantic mode
+    the verdict is held and reddens the run after publishing, the same shape as the fall-cup
+    reminder; the shared hard stop is untouched. The cup and minibench slugs carry no end date and
+    are not checked.
     """
     if run_mode == "tournament":
         check_tournament_dates(logger)

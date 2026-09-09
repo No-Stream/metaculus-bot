@@ -66,7 +66,7 @@ class ResearchPersistenceWriter:
         ``research_text`` (forecasters must not see it), so it is archived as its
         own field to keep records self-contained for grep-based triage.
 
-        ``platform`` (``PLATFORM_METACULUS`` / ``PLATFORM_MANTIC``, since 2026-09-08) says
+        ``platform`` (``PLATFORM_METACULUS`` / ``PLATFORM_MANTIC``) says
         which question platform ``qid``, ``post_id`` and ``page_url`` belong to. Filenames
         stay un-namespaced and the archive builder groups on the bare qid, so this field
         separates the two platforms' records within a group and is what a cross-platform

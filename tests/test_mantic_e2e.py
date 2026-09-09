@@ -78,7 +78,7 @@ from metaculus_bot.constants import (
     MC_PROB_MIN,
 )
 from metaculus_bot.mantic import ManticClient
-from metaculus_bot.numeric.config import STANDARD_PERCENTILES
+from metaculus_bot.numeric.config import STANDARD_PERCENTILES, grid_step_constraints
 from metaculus_bot.time_budget import QuestionTimeBudget
 from tests.mantic_fakes import (
     BINARY_POST_ID,
@@ -132,6 +132,12 @@ _BITCOIN_MEMBER_NORMALS: tuple[tuple[float, float], ...] = (
     (78_000.0, 6_000.0),
     (78_800.0, 6_200.0),
     (77_300.0, 5_800.0),
+)
+# The third run: every percentile below post 650's range (from 54,950), so 97.6% of the aggregate lies past its open lower bound.
+_BITCOIN_MEMBER_NORMALS_BELOW_THE_RANGE: tuple[tuple[float, float], ...] = (
+    (51_000.0, 2_000.0),
+    (50_500.0, 2_200.0),
+    (51_500.0, 1_800.0),
 )
 _BITCOIN_MEDIAN_RANGE = (77_000.0, 79_000.0)
 # Every forecaster is certain the largest move lands on 2026-09-16 and spreads its percentiles
@@ -238,14 +244,18 @@ def _date_reasoning(start_hour: int, end_hour: int) -> str:
     )
 
 
-def _canned_responses(posts: list[dict[str, Any]]) -> dict[str, list[str]]:
+def _canned_responses(
+    posts: list[dict[str, Any]],
+    *,
+    discrete_normals: tuple[tuple[float, float], ...] = _BITCOIN_MEMBER_NORMALS,
+) -> dict[str, list[str]]:
     """One rationale per forecaster per question, keyed by the question title the prompt carries."""
     questions = {post["id"]: post["question"] for post in posts}
     mc_options: list[str] = questions[MULTIPLE_CHOICE_POST_ID]["options"]
     return {
         questions[BINARY_POST_ID]["title"]: [_binary_reasoning(prob) for prob in _BINARY_MEMBER_PROBS],
         questions[MULTIPLE_CHOICE_POST_ID]["title"]: [_mc_reasoning(mc_options, probs) for probs in _MC_MEMBER_PROBS],
-        questions[DISCRETE_POST_ID]["title"]: [_numeric_reasoning(mean, sd) for mean, sd in _BITCOIN_MEMBER_NORMALS],
+        questions[DISCRETE_POST_ID]["title"]: [_numeric_reasoning(mean, sd) for mean, sd in discrete_normals],
         questions[DATE_POST_ID]["title"]: [_date_reasoning(start, end) for start, end in _DATE_MEMBER_HOUR_WINDOWS],
     }
 
@@ -481,7 +491,11 @@ async def _stub_research(question: MetaculusQuestion, time_budget: QuestionTimeB
     return _RESEARCH_TEXT
 
 
-def _run_mantic_mode(posts: list[dict[str, Any]]) -> Iterator[_ManticRun]:
+def _run_mantic_mode(
+    posts: list[dict[str, Any]],
+    *,
+    discrete_normals: tuple[tuple[float, float], ...] = _BITCOIN_MEMBER_NORMALS,
+) -> Iterator[_ManticRun]:
     """One full mantic-mode run over ``posts``; the module-scoped fixtures below each wrap one.
 
     Synchronous so each fixture runs the pipeline a single time (and installs and removes the
@@ -502,7 +516,7 @@ def _run_mantic_mode(posts: list[dict[str, Any]]) -> Iterator[_ManticRun]:
 
         _apply_hardening_with_restore(mp)
         recorded = _install_fake_transport(mp, posts)
-        llm_calls = _install_llm_stub(mp, _canned_responses(posts))
+        llm_calls = _install_llm_stub(mp, _canned_responses(posts, discrete_normals=discrete_normals))
 
         bot = make_e2e_bot(
             AggregationStrategy.CONDITIONAL_STACKING,
@@ -548,6 +562,13 @@ def mantic_run_after_prior_forecast() -> Iterator[_ManticRun]:
         for post in _future_dated_posts()
     ]
     yield from _run_mantic_mode(posts)
+
+
+@pytest.fixture(scope="module")
+def mantic_run_with_members_below_the_range() -> Iterator[_ManticRun]:
+    """The same fresh run with the discrete question's members piled below its range: the aggregate's
+    lower tail is fat, so the Mantic floor can raise the upper tail only as far as the interior allows."""
+    yield from _run_mantic_mode(_future_dated_posts(), discrete_normals=_BITCOIN_MEMBER_NORMALS_BELOW_THE_RANGE)
 
 
 @pytest.fixture
@@ -854,6 +875,53 @@ class TestTheOutOfRangeTailFloor:
         assert len(lines) == _FORECASTS_PER_QUESTION
         for line in lines:
             assert line.endswith(" oor_low=0.010000 oor_high=0.010000")
+
+
+class TestTheTailFloorWhenOneTailIsFat:
+    """The floor on the wire when the aggregate already piles most of its mass beyond one open bound.
+
+    Every member's thirteen percentiles sit below post 650's range, so the aggregate carries about
+    97.6% below the open lower bound and the builder's 1% above the upper. The server needs each of
+    the 450 bins to keep its min step, so the upper tail can rise only to what that interior leaves
+    (about 1.4%), never to 5%, and the fat tail is never reduced. Before the feasibility cap this
+    shape made the seam's rebuild raise and the question was forfeited; here the payload the server
+    receives passes its rules and the marker records the level actually applied.
+    """
+
+    def test_the_published_cdf_keeps_the_fat_tail_and_raises_the_thin_one_as_far_as_the_interior_allows(
+        self, mantic_run_with_members_below_the_range: _ManticRun
+    ) -> None:
+        probs = np.asarray(
+            mantic_run_with_members_below_the_range.forecast_payload(DISCRETE_POST_ID)["continuous_cdf"], dtype=float
+        )
+        assert_server_accepts_cdf(probs, cdf_size=451, open_lower=True, open_upper=True)
+        min_step, _ = grid_step_constraints(451)
+        least_interior = 450 * min_step
+        assert probs[0] > 0.95, "the members' mass sits below the range"
+        room = 1.0 - probs[0] - least_interior
+        assert 0.01 < room < MANTIC_OUT_OF_RANGE_TAIL_FLOOR
+        assert 1.0 - probs[-1] == pytest.approx(room)
+        assert float(probs[-1] - probs[0]) == pytest.approx(least_interior)
+
+    def test_the_aggregate_marker_records_the_level_actually_applied(
+        self, mantic_run_with_members_below_the_range: _ManticRun
+    ) -> None:
+        run = mantic_run_with_members_below_the_range
+        probs = np.asarray(run.forecast_payload(DISCRETE_POST_ID)["continuous_cdf"], dtype=float)
+        (line,) = [line for line in run.marker_lines("NUMERIC_AGGREGATE:") if f"question={DISCRETE_POST_ID} " in line]
+        fields = dict(token.split("=", 1) for token in line.split(": ", 1)[1].split(" "))
+        min_step, _ = grid_step_constraints(451)
+        room = 1.0 - probs[0] - 450 * min_step
+        assert fields["oor_low"] == fields["oor_low_raw"] == f"{probs[0]:.6f}", "the fat tail is published as built"
+        assert fields["oor_high_raw"] == "0.010000"
+        assert float(fields["oor_high"]) == pytest.approx(room, abs=1e-6)
+        assert fields["tail_floor"] == f"{room:.6f}", "the floor recorded is the level applied, not the nominal 5%"
+
+    def test_every_question_still_publishes(self, mantic_run_with_members_below_the_range: _ManticRun) -> None:
+        run = mantic_run_with_members_below_the_range
+        assert len(run.forecast_posts()) == _FORECAST_QUESTION_COUNT
+        assert len(run.comment_posts()) == _FORECAST_QUESTION_COUNT
+        assert not run.llm_calls.unexpected_prompts
 
 
 class TestNothingReachesMetaculus:
