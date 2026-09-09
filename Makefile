@@ -1,4 +1,4 @@
-.PHONY: install lock test test_verbose all lint lint_imports deps format typecheck typecheck_ty cov audit run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research sync_telemetry sync_raw_research sync_all resync_from_store backfill_research download_research download_run_logs download_raw_research backfill_comments score_ghosts close_margin_watch supply_probe supply_probe_mantic dispatch_watch backtest_with_cache run_mantic run_mantic_one
+.PHONY: install lock test test_verbose all lint lint_imports deps format typecheck typecheck_ty cov audit run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research sync_telemetry sync_raw_research sync_all resync_from_store backfill_research download_research download_run_logs download_raw_research backfill_comments score_ghosts close_margin_watch supply_probe supply_probe_mantic dispatch_watch cronjob_dispatch_setup backtest_with_cache run_mantic run_mantic_one
 
 # Stream logs live from recipes; avoid per-target buffering
 MAKEFLAGS += --output-sync=none
@@ -334,6 +334,18 @@ supply_probe_mantic:
 # `gh run list`; no dispatch, no LLM, no publish). ARGS="--days 14", ARGS="--expected-dispatch-per-hour 0".
 dispatch_watch:
 	uv run python scripts/dispatch_watch.py $(ARGS)
+
+# Idempotent setup of the cron-job.org jobs that dispatch the bot workflows twice an hour each
+# (GitHub delivers about 22% of scheduled cron firings, see docs/operations.md "Scheduling
+# reliability"; workflow_dispatch events are not dropped, and a run that finds no new question
+# spends nothing). The default is a DRY RUN: it prints the three job payloads with the GitHub
+# token redacted and, when CRONJOB_API_KEY and GH_DISPATCH_TOKEN are both set, the
+# create/update/unchanged plan from a read-only list of the account; it never writes.
+# ARGS="--apply" is PAID (ask-first gate, see AGENTS.md): it creates or changes a live schedule,
+# and every firing it adds is a paid, publishing bot run. ARGS="--apply --enable-mantic" once
+# run_bot_on_mantic.yaml is on main.
+cronjob_dispatch_setup:
+	uv run python scripts/cronjob_dispatch_setup.py $(ARGS)
 
 # Download run-log artifacts + harvest telemetry only (no research sync). Same script
 # as sync_telemetry; kept as a named target for parity with download_research.
