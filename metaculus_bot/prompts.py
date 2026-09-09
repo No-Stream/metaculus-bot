@@ -1,4 +1,11 @@
 # HARNESS-SCAN-EXEMPT-monolithic-file-loc  # prompt-template registry; text length, not control flow — splitting fragments prompt review
+"""Every prompt the bot sends: research, forecasting, stacking and gap-fill.
+
+Each constant here carries at most one comment line. The receipt behind it, meaning the
+measurement, incident or operator decision that fixed its wording, lives in docs/prompts.md
+under a heading named for the constant.
+"""
+
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -29,8 +36,7 @@ from metaculus_bot.numeric.validation import resolve_zero_point
 from metaculus_bot.question_platform import question_platform
 from metaculus_bot.time_utils import _as_utc
 
-# Width of a rendered percentile label at minimum: "0." plus two decimals, so P10
-# reads "0.10" rather than "0.1".
+# "0." plus two decimals, so P10 reads "0.10" rather than "0.1".
 _PERCENTILE_LABEL_MIN_WIDTH = 4
 
 
@@ -46,17 +52,14 @@ def _percentile_label(percentile: float) -> str:
     return f"{percentile:.10f}".rstrip("0").ljust(_PERCENTILE_LABEL_MIN_WIDTH, "0")
 
 
-# The canonical percentile set as the prompts enumerate it. Derived from
-# STANDARD_PERCENTILES so a change to the set can never leave a prompt asking
-# forecasters for percentiles the pipeline rejects.
+# Derived from STANDARD_PERCENTILES so no prompt can ask for a percentile the pipeline rejects.
 _STANDARD_PERCENTILES_DECIMAL_CSV = ", ".join(_percentile_label(p) for p in STANDARD_PERCENTILES)
 _LOWEST_PERCENTILE_LABEL = _percentile_label(STANDARD_PERCENTILES[0])
 _HIGHEST_PERCENTILE_LABEL = _percentile_label(STANDARD_PERCENTILES[-1])
 
 # Decimal places for illustrative example probabilities in ``_option_probs_example``.
 _EXAMPLE_PROB_DECIMALS = 4
-# Lower/upper safety epsilons for illustrative example probs so no bucket lands
-# at exactly 0.0 or 1.0 (the prompt tells the model to use values in (0, 1)).
+# Epsilons so no illustrative bucket lands at exactly 0.0 or 1.0; the prompt asks for (0, 1).
 _EXAMPLE_PROB_FLOOR = 0.01
 _EXAMPLE_PROB_CEIL = 0.99
 
@@ -75,8 +78,7 @@ def _build_example_probs(n_opts: int) -> list[float]:
     remainder = round(1.0 - base * n_opts, _EXAMPLE_PROB_DECIMALS)
     probs = [base] * n_opts
     probs[0] = round(probs[0] + remainder, _EXAMPLE_PROB_DECIMALS)
-    # For very large n_opts, ``base`` can round to 0.0 or (n_opts == 1) to 1.0;
-    # keep every bucket in the (floor, ceil) band the prompt promises.
+    # ``base`` rounds to 0.0 at very large n_opts and to 1.0 at n_opts == 1.
     return [min(_EXAMPLE_PROB_CEIL, max(_EXAMPLE_PROB_FLOOR, p)) for p in probs]
 
 
@@ -128,19 +130,13 @@ def _forecasting_window_str(question: MetaculusQuestion) -> str:
     nuclear detonation occur in a Japanese city by 2030?" as already-resolved
     YES because a detonation happened in 1945 — the question's forecasting
     window is open_time → scheduled_resolution_time, not "all of history".
+    Receipt: docs/prompts.md "_forecasting_window_str".
     """
-    # MetaculusQuestion types these as `datetime | None`, but real API-fetched
-    # questions always populate both. Assert to fail fast — a missing timestamp
-    # means upstream data is broken and we want a loud error, not a silent
-    # fallback that corrupts forecasts.
+    # Typed as optional but always populated on a real API question, so a missing one is broken data.
     assert question.open_time is not None, "question.open_time is required"
     assert question.scheduled_resolution_time is not None, "question.scheduled_resolution_time is required"
 
-    # Normalize both sides to tz-aware UTC before subtracting: ft 0.2.92 makes
-    # question datetimes tz-aware, and ``datetime.now()`` (naive) minus an aware
-    # value raises TypeError. ``datetime.now(timezone.utc)`` also fixes 0.2.54's
-    # latent naive-local-vs-naive-UTC skew (harmless only when the host runs UTC,
-    # e.g. CI). The rendered dates are unchanged for current naive UTC inputs.
+    # tz-aware on both sides: ft 0.2.92 question datetimes are aware, and naive minus aware raises.
     today = datetime.now(UTC)
     open_time = _as_utc(question.open_time)
     scheduled_resolution_time = _as_utc(question.scheduled_resolution_time)
@@ -183,47 +179,23 @@ def _aggregated_tool_output_section(aggregated_tool_output: str | None) -> str:
 def _option_probs_example(options: list[str]) -> str:
     """Render the ``option_probs`` JSON-body fragment for MC schema examples.
 
-    Both ``multiple_choice_prompt`` and ``stacking_multiple_choice_prompt`` need
-    the same shape: real option names as JSON keys with illustrative decimal
-    probs that sum to ~1.0. A parser can only bind LLM output to the allowed
-    options when the schema example carries the exact option strings — literal
-    ``Option_A`` placeholders yield ``<<NOT_FOUND>>`` on strict parsers.
-
-    Uses ``json.dumps`` for both keys and values so option names carrying
-    ``"``, ``\\``, or newlines produce a syntactically valid JSON example (a
-    naive f-string would emit invalid JSON that misleads the LLM about the
-    schema). The caller wraps the returned fragment in an outer ``{{...}}`` so
-    we strip ``json.dumps``'s outer braces before returning.
-
-    Returns the empty string for an empty options list so the caller can render
-    ``{{}}`` degenerately without a special case.
+    Real option names as JSON keys with illustrative decimal probs summing to ~1.0: a parser can only
+    bind LLM output to the allowed options when the schema example carries the exact option strings,
+    and literal ``Option_A`` placeholders yield ``<<NOT_FOUND>>`` on strict parsers. Returns ``""``
+    for an empty options list. Receipt: docs/prompts.md "_option_probs_example".
     """
     if not options:
         return ""
     example_probs = _build_example_probs(len(options))
     body = json.dumps(dict(zip(options, example_probs, strict=True)))
-    # ``body`` is ``{"opt1": p1, "opt2": p2, ...}`` — strip the outer braces
-    # because the template supplies them (``"option_probs": {{{example}}}``).
+    # The template supplies the outer braces (``"option_probs": {{{example}}}``).
     return body[1:-1]
 
 
 CitationStyle = Literal["markdown", "auto_annotated"]
 
 
-# Source-tier vocabulary for the RESEARCH-side prompts (web research + AskNews
-# summarizer). The FULL A-D definitions live here and only here; the forecaster prompts'
-# provenance ladder (``_SOURCE_PROVENANCE_LADDER`` below) names the tag shape, carries a
-# one-clause GLOSS per tier, and relies on the briefing arriving tagged. Re-cutting a tier
-# boundary means editing both, or the forecaster reads the old boundary while the research
-# side tags by the new one.
-# Without research-side tags a C-tier aggregator claim arrives in the briefing
-# looking identical to a B-tier wire fact and the ladder has nothing to weight. Deliberately
-# short — research output is itself an input to further summarization — and
-# zero-indent so the text survives ``clean_indents`` verbatim in every consumer
-# (contrast the ladder's >=15-space pre-indent note).
-# NOTE(prod-behavior): merging this to main changes live research-output format;
-# it is timed to ride the gap-fill v2 config-era boundary (the july15 merge) —
-# do not merge/cherry-pick separately.
+# Zero-indent so ``clean_indents`` leaves it verbatim; the A-D tier definitions live here only. Receipt: docs/prompts.md "_SOURCE_TIER_TAG_INSTRUCTION".
 _SOURCE_TIER_TAG_INSTRUCTION = """\
 SOURCE TIER TAGS: annotate each factual claim inline with its source tier, e.g. "[A: official]", "[B: Reuters]", "[C: aggregator]", "[D: social]":
 (A) official / primary — government statistics, regulatory filings (e.g. SEC/EDGAR), court records, central-bank releases, and the question's own named resolution source;
@@ -250,25 +222,7 @@ def _mc_options_line(options: Sequence[str] | None) -> str:
     return "Options (in resolution order): " + " | ".join(names)
 
 
-# The FOCUS AREAS market-odds bullet, narrowed away from the four venues the
-# structured prediction-market snapshot already covers live. In 42 ranked-era
-# bundles the old blanket bullet ("Prediction market odds and forecasts (if
-# available)") produced exactly one content-redundant retrieval plus three stale
-# covered-venue prices that contradicted correct live snapshot rows — the only
-# measured harm mode — while every realized instance of decisive market evidence
-# came from OUTSIDE those four venues (Good Judgment Open on q44869, CME FedWatch
-# on q45401, the Metaculus crowd on q20683). Hence narrowed rather than removed.
-# Wording confirmed verbatim by the operator 2026-09-01; receipts in
-# scratch/residual_2026-08-31/market_odds_coverage.md.
-#
-# Split in two so the policy has exactly ONE definition across prompts that format it
-# differently: `web_research_prompt` wants a FOCUS AREAS bullet, and the two Perplexity
-# prompts are unbulleted prose whose whole body is one `clean_indents` block, where an
-# interpolated line starting at column 0 would defeat the dedent for the entire prompt.
-# The bullet is the policy plus its dash, so the operator-confirmed text is byte-identical
-# on the surface it was confirmed against. Restating it per prompt is what let the two
-# Perplexity sites keep the retired blanket "consider all relevant prediction markets" ask
-# after this one was narrowed, until a review caught them.
+# One policy, two renderings: a column-0 line defeats the Perplexity dedent. Receipt: docs/prompts.md "OUTSIDE_VENUE_MARKET_ODDS_POLICY".
 OUTSIDE_VENUE_MARKET_ODDS_POLICY = (
     "Market-implied or crowd odds from sources OTHER than Polymarket, Kalshi, Manifold, or PredictIt "
     "(e.g. Metaculus, Good Judgment Open, CME FedWatch, bookmakers) — always name the market and the date "
@@ -279,25 +233,7 @@ OUTSIDE_VENUE_MARKET_ODDS_POLICY = (
 _OUTSIDE_VENUE_MARKET_ODDS_BULLET = f"- {OUTSIDE_VENUE_MARKET_ODDS_POLICY}"
 
 
-# Citation instruction for the Gemini grounding provider. The SDK returns grounding
-# metadata that `research/gemini_search.py` splices in as plain `[N]` markers; the
-# model ALSO writes its own hierarchical `[1.2.3]` indices, which index a chunk list
-# we do not hold — 173 of 323 archived gemini sections carried them, 163 of those
-# alongside our real markers, so a forecaster reading the section cannot tell which
-# brackets are checkable. The formatter strips them after splicing; this stops the
-# model producing them in the first place. Gemini-only: the markdown branch is the
-# native-search provider, whose citations are the model's own by design.
-#
-# The closing carve-out is spelled out because ``_SOURCE_TIER_TAG_INSTRUCTION`` renders
-# 26 lines further down the SAME prompt and orders the model to write bracketed
-# ``[A: official]`` tier tags, so an unqualified ban on "self-invented bracketed"
-# annotation reads as a contradiction. Over-compliance is the direction nothing guards:
-# a model that stops tagging costs the forecaster prompts the source-tier signal they
-# weight on and leaves ``research/gemini_attribution.py`` no tags to check, whereas
-# UNDER-compliance is already handled downstream by ``_strip_model_citation_indices``,
-# which removes the dotted indices and keeps the tier tags in a mixed group. Phrased as
-# "still applies" rather than as a requirement, because the tier block's own closing
-# line licenses leaving a claim untagged when its tier is unclear.
+# Gemini only; the closing carve-out answers the tier-tag block below. Receipt: docs/prompts.md "_AUTO_ANNOTATED_CITATION_CLAUSE".
 _AUTO_ANNOTATED_CITATION_CLAUSE = (
     "Include inline citations for all factual claims (the tool will auto-annotate) — do NOT write your own "
     "citation markers or index numbers: no hierarchical tokens like [1.2.3], no self-invented bracketed "
@@ -479,17 +415,7 @@ def asknews_summarizer_prompt(
     )
 
 
-# Prepended to the AskNews section when the summarizer soft-fails, so the raw
-# articles are never mistaken for a screened analyst briefing. The AskNews audit
-# made five properties of ``asknews_summarizer_prompt`` above load-bearing: a hard
-# per-article relevance gate, recency-first ordering, supersession arithmetic, an
-# evidence-age opener, and proportional length. The raw path has NONE of them, leads
-# with the Historical section, and loses the [PRE-WINDOW] labeling that FUTURE.md
-# credits with saving multiple questions — hence the instruction to date facts and
-# screen articles by hand, which is the same vocabulary the prompt defines, kept
-# beside it so the two cannot drift. Deliberately NOT a markdown heading:
-# ``_demote_inner_headings`` (orchestrator) would shift an h1/h2 and the framework's
-# section renormalization would then mangle the provider header.
+# Not a markdown heading: ``_demote_inner_headings`` would mangle the provider header. Receipt: docs/prompts.md "SUMMARIZER_SOFT_FAIL_BANNER".
 SUMMARIZER_SOFT_FAIL_BANNER = (
     "> **⚠ RAW UNSCREENED ARTICLES — the analyst-briefing pass failed for this question.**\n"
     "> No per-article relevance gate ran, ordering is the raw feed's (oldest-first, "
@@ -499,22 +425,7 @@ SUMMARIZER_SOFT_FAIL_BANNER = (
 )
 
 
-# Source-provenance / motivation trust ladder, shared verbatim across the three
-# forecaster prompts (binary / MC / numeric). Reverse-engineering high-scoring
-# competitor bots showed they rank factual claims by proximity to the primary
-# record and adjust by source motivation. Interpolated in place of the old
-# "Separate facts from opinions" bullet (which leads this block, so the swap is
-# clean and just appends the ladder). The A-D tier DEFINITIONS are stated once,
-# in the research-side ``_SOURCE_TIER_TAG_INSTRUCTION`` above, and the briefing
-# arrives carrying the tags (every artifact record since the tagging landed in
-# prod); the ladder names the tag shape, keeps the two usage clauses the tag instruction
-# does not carry, and glosses each tier in one clause. It used to restate all four
-# definitions in full, which re-taught the model a vocabulary the text in front of it was
-# already written in. The gloss is not the definition: those live once in
-# ``_SOURCE_TIER_TAG_INSTRUCTION``, and a tier re-cut has to move both.
-# Every line is pre-indented to >= 15 spaces so clean_indents preserves the
-# nesting in all three prompts despite their differing baselines (binary
-# baseline 12, MC/numeric baseline 8).
+# Pre-indented to >= 15 spaces so ``clean_indents`` nests it in all three prompts. Receipt: docs/prompts.md "_SOURCE_PROVENANCE_LADDER".
 _SOURCE_PROVENANCE_LADDER = """
                • Separate facts from opinions. Exercise healthy skepticism: only weight opinions strongly when they come from identifiable experts or credentialed entities. Internet sources mix fact and opinion freely.
                • Weight factual claims by proximity to the primary record. The briefing's claims arrive tagged by
@@ -535,16 +446,7 @@ _SOURCE_PROVENANCE_LADDER = """
                  corroborating sources is likely a transcription or translation error — flag it, don't anchor on it."""
 
 
-# How to read a searched-and-found-nothing result, shared verbatim across the three
-# forecaster prompts. On qid 44799 the gap-fill resolver reported "I found no
-# authoritative public record" and four of six forecasters converted that into
-# "the authorization is absent"; the two that discounted it scored best in the
-# ensemble. A third bullet ("absence is weaker still where the actor has already
-# demonstrated the behavior") was dropped: it carried no receipt of its own and pushed
-# the wrong way on qid 43837 (eleven prior tournaments announced, none found, answer NO).
-# Same pre-indent contract as _SOURCE_PROVENANCE_LADDER above: every line is at >= 15
-# spaces so clean_indents preserves the nesting in all three prompts despite their
-# differing baselines (binary 12, MC/numeric 8).
+# Same >= 15-space pre-indent contract as the ladder above. Receipt: docs/prompts.md "_NULL_RESULT_READING".
 _NULL_RESULT_READING = """
                • Read a null search result as a null search result. "No record found", "no authoritative
                  source located", or "could not confirm" licenses only "we could not find evidence of X" —
@@ -557,11 +459,7 @@ _NULL_RESULT_READING = """
                  fast-moving topic is nearly no evidence at all."""
 
 
-# Which reference class is admissible for a "how many X in period P" question,
-# shared verbatim by the binary, MC and numeric prompts (count questions arrive as
-# all three types). On qid 44561 all six members built a "no failure announced yet,
-# so Poisson(1.0)" schedule model instead of the pooled FDIC bank-failure rate, and
-# published far too low. Same >= 15-space pre-indent contract as _NULL_RESULT_READING.
+# Same pre-indent contract; binary, MC and continuous. Receipt: docs/prompts.md "_COUNT_IN_PERIOD_REFERENCE_CLASS".
 _COUNT_IN_PERIOD_REFERENCE_CLASS = """
                • For questions asking how many events of a kind occur in a period, the admissible outside
                  view is the pooled realized rate of that event over the longest comparable history. A
@@ -569,29 +467,7 @@ _COUNT_IN_PERIOD_REFERENCE_CLASS = """
                  about the pipeline and updates that rate; it does not replace it."""
 
 
-# The soft-clock rule: a target date the responsible actor is not BOUND to is evidence that
-# a target exists, not that it will hold. The 2026-09-02 failure-mode audit
-# (scratch/failure_mode_audit_2026-09-02/AUDIT_SYNTHESIS.md, lens A) found the shape on 52 of
-# 815 STRICT records (6.4%; 8.3% of binaries; coder kappa 0.74): on "will X happen before D"
-# questions whose only route to X was an ANNOUNCED target date, members decomposed
-# P(target lands in window) x P(X | target) and set the first term near 1 because the target
-# had been announced. On the 37 flagged binaries the bot published a mean 0.44 for events that
-# happened 3 times (8%); 13 records above 0.5 resolved NO and none went the other way; flagged
-# records score 18.7 spot-peer points worse (95% CI 5.9 to 33.4) and are wrong-sided 40% of
-# the time against 18%. Soft targets WITHOUT the decomposition move score fine (+13.6) and
-# deadline questions in general are calibrated (0.25 published, 0.25 realized), so the rule
-# names the MOVE, not the question shape, and it is roster-wide (every vendor biased up 0.27
-# to 0.47 on the shape, within 0.06 of zero off it). Receipts: qids 43837 (a Fall tournament
-# start read off the Summer close), 44424 (an announced summit that slipped twice), 44557 (a
-# "planned August" launch off a partner page and a Wikipedia infobox); the contrast is 45217,
-# where a statutory clock existed, members computed the date and scored +45. The "measured
-# record of meeting" carve-out is load-bearing: on qid 42305 a weekly bulletin with a measured
-# 1-to-3-week publication lag WAS a binding clock in practice and a near-1 timing term was
-# right. Binary + MC only (the numeric prompt anchors on a range, not a probability); no
-# structured-block field, since the number belongs in the rationale and the block is written
-# after the forecast is fixed. Supersedes `_REMAINING_EXPOSURE_RULE` and
-# `_ANCHOR_CONSISTENCY_RULE`, the two 2026-09-02 rules the fix plan's Item B removed. Same
-# >= 15-space pre-indent contract as _COUNT_IN_PERIOD_REFERENCE_CLASS.
+# Binary + MC and the date axis; same pre-indent contract. Receipt: docs/prompts.md "_SOFT_CLOCK_RULE".
 _SOFT_CLOCK_RULE = """
                • A target date the responsible actor has not bound itself to — no statute, no contract, no
                  published schedule it has a measured record of meeting — is evidence that a target EXISTS,
@@ -603,24 +479,7 @@ _SOFT_CLOCK_RULE = """
                  the time.)"""
 
 
-# History repeats past an acknowledged regime change (the same audit's lens C): a member
-# writes down a historical cadence, names in the SAME rationale a reason it has been
-# discharged (its driver was met, the deadline passed, the rule changed), and keeps the old
-# cadence as its central estimate anyway. 12.1% of coded rationales; about 7 spot-peer points
-# per flagged record (95% CI 2.7 to 12.2); the pattern failed in 83% of fires and in 13 of 13
-# on the live triple. Coder agreement was 0.59 and the label is partly hindsight-contaminated,
-# so read those numbers as upper bounds. That caveat is why the model-facing parenthetical
-# names the count as a small audit of this bot's own past forecasts rather than stating a flat
-# rate: against the 17-18% held rate the three older era bands show, 0 of 13 is an ordinary
-# draw (p = 0.09), and a bare figure reads to a forecaster as near-certainty. Conditional on
-# the member's OWN written acknowledgment, so it cannot fire on a question where nothing has
-# changed, and shipped only once `_ANCHOR_CONSISTENCY_RULE`'s "do not move off your number when
-# history counsels caution" was gone, since the two pulled opposite ways. Shipped on the fix
-# plan's recommendation (section 6) with the operator's final say pending; to revert, delete
-# this constant, its two interpolation sites in `binary_prompt` and `multiple_choice_prompt`,
-# and only the history-discharged cases in `TestSoftClockAndHistoryDischargedRules`, which also
-# covers the approved `_SOFT_CLOCK_RULE`. Binary + MC only. Same pre-indent contract as the
-# rule above.
+# Binary + MC, operator's final say pending; same pre-indent contract. Receipt: docs/prompts.md "_HISTORY_DISCHARGED_RULE".
 _HISTORY_DISCHARGED_RULE = """
                • If your own analysis names a reason the historical cadence has been discharged (its driver was
                  met, the deadline passed, the rule changed), that cadence is a bound on your estimate, not its
@@ -628,27 +487,14 @@ _HISTORY_DISCHARGED_RULE = """
                  past forecasts, a cadence kept as the center held in none of 13 recent cases)."""
 
 
-# Apply the rate to the exposure that is LEFT. On qid 43837 six members applied a monthly
-# announcement rate across the FULL question window when 16 days had already elapsed
-# event-free (then OR-ed it with a scheduled path the rate already covered, which the
-# binary union line now forbids: "union only over paths that cannot be the same event").
-# One sentence, interpolated INLINE (no pre-indent) into the binary conditional-hazard
-# bullet, which is the same rule specialised to recurring events, and standing alone as
-# one bullet in the MC outside-view step, which has no hazard bullet. Binary + MC only:
-# the numeric prompt anchors on a range, not a rate. It replaced a two-bullet constant
-# that restated the hazard bullet twenty lines below it and the union clause five lines
-# above it, so the rule read three times and the model was told nothing new twice.
+# ONE sentence, interpolated inline with no pre-indent. Receipt: docs/prompts.md "_REMAINING_EXPOSURE_SENTENCE".
 _REMAINING_EXPOSURE_SENTENCE = (
     "Rates apply to the exposure that REMAINS: estimate the rate over the longest window the evidence supports, "
     "then apply it from now until the deadline, treating the elapsed event-free part of the window as observed "
     "(a rate spread over the whole window prices time that has already passed)."
 )
 
-# The binary outside-view step's conditional-hazard bullet, which OPENS with the sentence
-# above because the hazard check is that same rule specialised to recurring events. A named
-# constant rather than an inline interpolation: ruff-format split the mid-bullet replacement
-# field across three lines at an indent the surrounding prompt does not use, in the region of
-# this file that gets edited most. The rendered text is unchanged.
+# Named because ruff-format split the mid-bullet field at a foreign indent. Receipt: docs/prompts.md "_BINARY_CONDITIONAL_HAZARD_BULLET".
 _BINARY_CONDITIONAL_HAZARD_BULLET = (
     f"{_REMAINING_EXPOSURE_SENTENCE} Conditional-hazard check: for a recurring event with a history of "
     "inter-arrival gaps, fit a simple model to the gaps (exponential with mean = average gap, or the observed "
@@ -657,21 +503,7 @@ _BINARY_CONDITIONAL_HAZARD_BULLET = (
 )
 
 
-# The three READING rules for the rendered market table that its own legend does not carry.
-# The legend (`market_retrieval.rendering.MARKET_SIGNAL_LEGEND`, printed beside the table)
-# owns NOTATION: the liquidity labels and `no-liquidity-data`, the evidential row order, the
-# four `relation` tiers, RESOLVED, `↳` sub-rows, `[remaining N]`, `(Nd ago)`, `demoted from
-# same-date:`. Re-teaching any of that here gave the model two partially-overlapping glossaries
-# (the legend had grown labels the prompt never mentioned), so the prompt keeps only POLICY —
-# what to DO with a row the legend has already explained. Receipts: rule 2 and rule 3 are both
-# q45189, where all three forecasters imported a thin single-strike price at full weight, then
-# read one bracket of a ten-bracket Kalshi ladder as an equality constraint on a tail and cut
-# the resolving bucket below their own prior (published 0.130, spot -26.77). Rule 1 is the
-# ranked-retrieval design intent: an other-cut market is the same quantity, so it is something
-# to extrapolate from, not to haircut. `same_quantity_other_cut` is verbatim from
-# `market_retrieval.ranking.TIERS`; renaming it there without renaming it here silently teaches
-# forecasters a vocabulary the table no longer uses. Ships in all three forecaster prompts,
-# gated with the rest of the clause on the snapshot section being present.
+# ``same_quantity_other_cut`` is verbatim from ``market_retrieval.ranking.TIERS``. Receipt: docs/prompts.md "_MARKET_READING_RULES".
 _MARKET_READING_RULES = (
     "Three reading rules for the snapshot (its legend defines the columns and markers). A "
     "`same_quantity_other_cut` market measures the same thing at another date, threshold or source: "
@@ -684,14 +516,7 @@ _MARKET_READING_RULES = (
 )
 
 
-# Header the prediction-market research provider emits (`research/section_format.py`
-# PROVIDER_SECTION_HEADERS imports it from here, the same way it imports
-# TS_ANCHOR_SECTION_HEADER). The three forecaster prompts gate the whole market clause on this
-# substring, so the policy appears only when a snapshot was actually rendered. Prod-neutral:
-# the provider emits the header whenever it rendered anything, including the deliberate-empty
-# "no sufficiently relevant market" sentence, and omits it only when it returned "" —
-# benchmarking, flag off, or a soft-fail — which are exactly the prompts where ~1.5k chars of
-# market policy had nothing to bear on.
+# ``research/section_format.py`` imports it; the market clause gates on it. Receipt: docs/prompts.md "MARKET_SNAPSHOT_SECTION_HEADER".
 MARKET_SNAPSHOT_SECTION_HEADER = "## Prediction Market Snapshot"
 
 
@@ -706,27 +531,11 @@ def _strong_evidence_market_clause(
 ) -> str:
     """Shared "prediction markets are strong evidence" clause for the three forecaster prompts.
 
-    Returns ``""`` unless ``research`` carries ``MARKET_SNAPSHOT_SECTION_HEADER`` — the clause
-    is about reading a table, so it renders only when the table does (the same substring gate
-    the numeric prompt's TS-anchor clause uses). Note the one path where the two come apart: on
-    the provider's DELIBERATE-empty answer the header is present with a single sentence and no
-    table, so the reading rules render while the legend that defines their notation (`↳`
-    sub-rows, `[remaining N]`, the liquidity and relation labels) does not. Left as is on
-    purpose: a second gating condition would silently drop the whole market policy from every
-    prompt that DOES have a table the moment its false negative fired, which is a far worse
-    failure than three rules naming notation an empty section never uses. The framing is identical across binary / MC / numeric; only a few
-    type-specific words differ (the signal noun, the anchor verb phrase, the extrapolation
-    target, and the projection tail). Centralizing it keeps the strong-evidence framing AND the
-    reading rules in sync across all three prompts. Spliced into each prompt's ``clean_indents``
-    f-string; the embedded newlines are cosmetic (``clean_indents`` and the whitespace-collapsing
-    tests both ignore them).
-
-    Why the strong push is earned (don't re-litigate this in future prompt audits): past misses
-    traced to forecasters ignoring prediction markets, and the evidence is that a liquid, closely
-    matched real-money market is hard to beat — treat one like a stock-market price, and this bot
-    is not assumed good enough to beat the stock market. Forecaster judgment operates in the
-    match/mismatch discounting (resolution criteria, resolution date, liquidity), not in waving the
-    market off. The all-caps shouting was dropped 2026-07-18 as decoration; the strong push stays.
+    Returns ``""`` unless ``research`` carries ``MARKET_SNAPSHOT_SECTION_HEADER``, so the policy
+    renders only where the table does. The framing is identical across binary / MC / continuous; only
+    the signal noun, the anchor tail, the extrapolation target and the projection tail differ. The
+    deliberate-empty-section case, and why the strong push is earned, are in docs/prompts.md
+    "_strong_evidence_market_clause": read it before re-litigating this clause in a prompt audit.
     """
     if MARKET_SNAPSHOT_SECTION_HEADER not in research:
         return ""
@@ -743,9 +552,7 @@ def _strong_evidence_market_clause(
     )
 
 
-# Header the timeseries_anchor research provider emits (research/section_format.py
-# PROVIDER_SECTION_HEADERS). The numeric prompt gates its anchor clause on this substring
-# so the guidance only appears when an anchor section is actually present.
+# The timeseries_anchor provider emits it; the anchor clause gates on it. Receipt: docs/prompts.md "TS_ANCHOR_SECTION_HEADER".
 TS_ANCHOR_SECTION_HEADER = "## Time Series Anchor"
 
 
@@ -771,20 +578,7 @@ def _ts_anchor_evidence_clause() -> str:
     )
 
 
-# Resolution-metric echo — a PHASE 0 disambiguation step that fires when the
-# resolution criteria name an official statistical series. The qid 44211 miss
-# (June 2026 CBP southwest-border encounters) had all six forecasters price the
-# USBP-apprehensions *component* of a series that resolves on the *total*: the
-# research carried the definitional wedge, the historical conversion, and an
-# explicit provider warning, and every model still resolved the ambiguity the
-# same wrong way. Naming the exact series and enumerating its variants BEFORE
-# forecasting is the checklist-shaped guard (option a in
-# scratch/residual_2026-07-18/followups/border_generalizability.md) — inert on
-# questions with no named series, and a measured 3-5/30 worst-miss family.
-# Design sibling: the window-anchor block (``_forecasting_window_str``). The
-# bullets are pre-indented to 15 spaces so ``clean_indents`` keeps them nested
-# under the prompt-native step header in both the binary (baseline 12) and
-# numeric (baseline 8) prompts — the same trick ``_SOURCE_PROVENANCE_LADDER`` uses.
+# Inert unless the criteria name an official series. Receipt: docs/prompts.md "_RESOLUTION_METRIC_ECHO_HEADER".
 _RESOLUTION_METRIC_ECHO_HEADER = "Resolution-metric echo (named-series questions only)"
 
 
@@ -796,18 +590,11 @@ def _resolution_metric_echo_bullets(question_type: Literal["binary", "numeric"])
     sections to point at (the ``## Time Series Anchor`` is numeric-only). The
     reconciliation is deliberately anti-oracle: the 44211 trap was reading the
     bounds as an authority that confirmed the ~10k headline series, when the
-    true ~13k total sat at the bounds midpoint.
+    true ~13k total sat at the bounds midpoint. Receipt: docs/prompts.md
+    "_RESOLUTION_METRIC_ECHO_HEADER".
     """
     if question_type == "numeric":
-        # The range is WEAK evidence about WHICH variant resolves and NO evidence about the
-        # magnitude of the outcome. It used to say the bounds "were set by someone who could see
-        # the real series, so a candidate far outside the range is probably the wrong variant":
-        # true on Metaculus, false on Mantic, where writers are paid for bot disagreement and
-        # 24.8% of resolved discrete and 53.7% of date questions escaped their range (the receipt
-        # sits above the _MANTIC_OUT_OF_RANGE_RATE_* constants), so a forecaster that extrapolated
-        # correctly was told by this prompt to pull its percentiles back inside (roughly 195
-        # baseline points between the two outcomes). The 44211 correction survives: inside the
-        # range confirms nothing.
+        # The range is weak evidence about WHICH variant resolves and none about the magnitude.
         reconcile = (
             "Reconcile each candidate against the displayed range above, reading the range as WEAK evidence "
             "about which series variant resolves and as NO evidence about the magnitude of the outcome: a "
@@ -852,15 +639,7 @@ def _resolution_metric_echo_bullets(question_type: Literal["binary", "numeric"])
     return "\n".join(f"{indent}• {b}" for b in bullets)
 
 
-# The one sentence every forecaster prompt opens with about how it is scored, chosen by the
-# platform the question came from (``question_platform`` reads it off ``page_url``). Until
-# 2026-09-08 all six prompts named "the Metaculus peer score" or "Metaculus' log-score", which
-# was imprecise on Metaculus (the bot tournaments score SPOT peer) and false on Mantic, whose
-# Crucible leaderboard is spot BASELINE: the reference is a uniform distribution, not the other
-# forecasters, and no community prediction exists while a question is open. Both scores are
-# strictly proper, so the honest forecast is optimal on both; the Mantic wording says so
-# outright because "compared to your peers" invites contrarian drift, which a proper score only
-# punishes. Shared with the three stacking prompts, which carried the same sentence.
+# Both are strictly proper: the honest forecast is optimal on either platform. Receipt: docs/prompts.md "_METACULUS_SCORING_SENTENCE".
 _METACULUS_SCORING_SENTENCE = (
     "You will be judged on the accuracy and calibration of your forecast under Metaculus' spot peer log score, a "
     "proper score: your honest forecast is the best submission whatever other forecasters say."
@@ -1019,9 +798,12 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
 
 
 def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> str:
-    # Build the STRUCTURED FORECAST block example with the REAL option names as
-    # JSON keys — a strict parser can only map placeholder keys like "Option_A"
-    # back onto real options via prose lines, and we no longer emit those.
+    """The forecaster prompt for a multiple-choice question.
+
+    The STRUCTURED FORECAST example carries the REAL option names as JSON keys: a strict parser can
+    only map placeholder keys like "Option_A" back onto real options via prose lines, and the prompts
+    no longer emit those.
+    """
     option_probs_example = _option_probs_example(question.options)
     return clean_indents(
         f"""
@@ -1149,9 +931,7 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
 # ---------------------------------------------------------------------------
 # The continuous (numeric and date) forecaster prompt
 # ---------------------------------------------------------------------------
-#
-# One template, ``_continuous_prompt``, varied along two axes: the question kind (``_ContinuousAxis``)
-# and the elicitation (``_Elicitation``); the design and every slot are in docs/prompts.md.
+# One template, ``_continuous_prompt``, varied by question kind and elicitation; slots in docs/prompts.md.
 
 
 @dataclass(frozen=True)
@@ -1199,15 +979,7 @@ class _Elicitation:
     schema_block: str
 
 
-# The continuous scoring paragraph, shared by the numeric, date and stacking-numeric prompts.
-# Until 2026-09-08 it described Metaculus' implementation (a uniform 0.01 PDF floor, so
-# excluding the truth costs ln(0.01) = -4.6; a sharpness cap near 35), which told the model
-# the cliff below an out-of-range outcome was an order of magnitude shallower than it is on
-# Mantic, where the out-of-range bucket is scored against a fixed 5% reference with no floor
-# (1% of mass there scores -80.5 baseline points; 5% scores 0; 50% scores +115) and 28% of
-# Series 1 questions resolved out of range. The proper-scoring sentence is true on both
-# platforms and stays; the open-bound sentence replaces "scored as a binary event", which said
-# nothing about the reference the bucket is scored against.
+# Shared by the numeric, date and stacking-numeric prompts. Receipt: docs/prompts.md "_CONTINUOUS_SCORING_RULE".
 _CONTINUOUS_SCORING_RULE = (
     "Continuous questions use a log density score: score = ln f(x*), where f is your forecasted PDF evaluated "
     "at the realized value x*. Mass beyond an open bound is scored as its own outcome against a reference of a "
@@ -1225,8 +997,7 @@ _PER_BIN_SCORING_RULE = (
     "rules rule out) is simply lost, so give such a bin 0."
 )
 
-# The block rung fails on a missing key; ``min_step`` is THIS grid's floor, not the aggregate's 5% tail floor.
-# The last sentence says what ``numeric.pmf_cdf._blend_to_cell_floors`` does, so the model does not pre-subtract it.
+# ``min_step`` is THIS grid's floor, not the aggregate's 5% tail floor. Receipt: docs/prompts.md "_PER_BIN_OUTPUT_RULE".
 _PER_BIN_OUTPUT_RULE = (
     "Give one probability for EVERY key listed in the schema below, spelled exactly as listed and in that order, "
     "so that the probabilities sum to 1.0. Use 0 for a bin you are certain cannot occur; a bin you leave at 0 is "
@@ -1266,19 +1037,7 @@ _UNKNOWN_UNKNOWNS_BULLET = (
 )
 
 
-# Mantic's measured out-of-range base rates, rendered only on a Mantic question with the relevant
-# open bound (``question_platform`` reads the platform off ``page_url``). Receipt, the Series 1
-# corpus under scratch_docs_and_planning/mantic_research_2026-09-08/ (520 questions, annulled
-# excluded): 101 of 188 date questions with an open upper bound resolved ABOVE it (53.7%); 35
-# of 141 discrete (24.8%) and 16 of 133 numeric (12.0%)
-# resolved outside their range, 51 of 274 quantitative questions combined (18.6%), against 2.2 to
-# 2.6% in this bot's Metaculus archives. Seven of the numeric escapes (posts 512, 460, 426, 396
-# and 305 on linear grids, 387 and 200 on log grids) are stored as raw values outside the range
-# rather than as a bound token, which is how a filter on the tokens alone undercounts them at 9.
-# The pipeline fact both sentences end on is structural: when all 13 percentiles sit inside the
-# range, the published CDF puts exactly 1% beyond each open bound, which Mantic scores at -80.5
-# points when the outcome lands there. Metaculus questions never render either sentence, so
-# Metaculus behaviour cannot move.
+# Mantic only, and only for an open bound. Receipt: docs/prompts.md "_MANTIC_OUT_OF_RANGE_RATE_DATE".
 _MANTIC_OUT_OF_RANGE_RATE_DATE = (
     "On this platform about half of past date questions with an open upper bound resolved AFTER it (101 of 188 "
     'in Series 1), so treat "the event has not happened by the upper bound" as a live central case and not a '
@@ -1321,19 +1080,7 @@ def _mantic_out_of_range_clause(question: NumericQuestion, *, date_rate: str, qu
     return quantity_rate if (question.open_lower_bound or question.open_upper_bound) else ""
 
 
-# Mantic Series 2 "one forecast, many resolutions" (rules doc section 7; live on Preseason 2 post
-# 650, eleven daily bitcoin closes): the single submitted distribution is scored against every
-# resolution value and the scores averaged, sum_i (c_i / C) * k * ln(p_i), whose argmax is
-# p_i = E[c_i] / C. The optimum is therefore the expected EMPIRICAL distribution of the
-# resolution set, a mixture over the instances, not the predictive distribution of any one of
-# them; priced on post 650 at 77k spot and 2.5% daily vol, a day-one distribution loses 38.7
-# baseline points to the mixture. For MC and binary the same argument gives the expected
-# FREQUENCY over options and the expected fraction of Yes. Gated on the question's own
-# ``multi_resolution`` field (absent on Metaculus; ``is True`` because a test stub's chain of
-# MagicMocks is truthy). The count is deliberately NOT interpolated: ``resolutions`` is null
-# while the question is open and the count lives only in the criteria prose. Base prompts only,
-# per docs/prompts.md; a stacker on a multi-resolution question would never learn this, which
-# is a FUTURE.md note against re-enabling numeric stacking.
+# Base prompts only, gated on the payload's ``multi_resolution``. Receipt: docs/prompts.md "_MULTI_RESOLUTION_CONTINUOUS_TEMPLATE".
 _MULTI_RESOLUTION_CONTINUOUS_TEMPLATE = (
     "This question is scored against EVERY resolution value its resolution criteria name, with the scores "
     "averaged, so describe how the quantity is distributed ACROSS those values rather than where any one of them "
@@ -1363,17 +1110,14 @@ def _multi_resolution_clause(question: MetaculusQuestion, rule: str) -> str:
     return rule if question_json(question).get("multi_resolution") is True else ""
 
 
-# The scoring grid, named when the platform declares it. Mantic buckets a continuous CDF into
-# ``inbound_outcome_count`` bins and scores the bin the outcome falls in, so detail finer than a
-# bin is invisible to the score, and on a coarse grid (post 651: 12 one-day bins; Series 2 makes
-# day/week granularity and power-of-ten step sizes the default) a model that does not know the
-# grid smears a confident view across neighbouring bins. ``precision`` (quantitative) and
-# ``date_granularity`` (date) exist only on Mantic payloads, so a Metaculus question renders
-# nothing here. The bin count is the typed ``cdf_size - 1``, the number the CDF builder keys off,
-# so the prompt can only ever describe the grid the pipeline submits. Mantic's OpenAPI defines
-# ``precision`` as the additive bin width on a linear scale but the RATIO between adjacent
-# boundaries on a logarithmic one, so a ``zero_point`` grid names its geometry and no width.
 def _scoring_grid_clause(question: NumericQuestion) -> str:
+    """Name the platform's scoring grid, or ``""`` when the payload declares none.
+
+    Only Mantic payloads carry ``precision`` (quantitative) or ``date_granularity`` (date), so a
+    Metaculus question renders nothing. The bin count is the typed ``cdf_size - 1``, the number the
+    CDF builder keys off, so the prompt can only ever describe the grid the pipeline submits.
+    Receipt: docs/prompts.md "_scoring_grid_clause".
+    """
     bins = question.cdf_size - 1
     if isinstance(question, EpochDateQuestion):
         granularity = question.date_granularity
@@ -1439,10 +1183,7 @@ def _date_axis(question: EpochDateQuestion) -> _ContinuousAxis:
             "measurement points to. The one exception is a qualifying event so recent that resolution simply lags: "
             "treat its date as the anchor."
         ),
-        # The soft-clock rule is the date question's natural home: a "when will X happen" question
-        # with an announced target date is the announced-but-unbound shape the rule was measured on
-        # (binary forecasts averaged 44% on events that happened 8% of the time), and here the
-        # mass on the target date IS the timing term the rule asks to price separately.
+        # The date question is the soft-clock rule's natural home. Receipt: docs/prompts.md "_date_axis".
         reference_class_rules=f"{_COUNT_IN_PERIOD_REFERENCE_CLASS}{_SOFT_CLOCK_RULE}",
         tail_scenarios=(
             "            - Coherent pathway for an unusually early date.\n"
@@ -1547,10 +1288,7 @@ def _date_percentile_blocks(question: EpochDateQuestion) -> _PercentileBlocks:
             ),
         ]
     )
-    # The example spans the displayed range in the question's own rendering, so the model sees
-    # the exact string form its grid expects (a calendar date on a day/week grid, a timestamp on
-    # a legacy fine grid) rather than an illustrative value from another calendar; the one-day
-    # timestamp example in the notes is the range's midpoint day for the same reason.
+    # The example spans the range so the model sees its grid's string form. Receipt: docs/prompts.md "_date_percentile_blocks".
     example_epochs = np.linspace(nom_lower, nom_upper, EXPECTED_PERCENTILE_COUNT)
     example_pairs = [
         f'"{p:g}": "{format_epoch(float(x), granularity)}"'
@@ -1620,9 +1358,7 @@ def _percentile_elicitation(view: NumericQuestion) -> _Elicitation:
     )
 
 
-# How a per-bin prompt describes its keys, one sentence per label style, total over ``BinLabelStyle``. The centre
-# sentence is unconditional because ``_is_center_aligned`` admits any step (5 of the 46 coarse Mantic centre grids
-# step by 5, 500, 0.25 or 0.1), and a key ``5`` read as "5 up to 10" puts a belief of 3 one bin off.
+# One sentence per label style, the dict total over ``BinLabelStyle``. Receipt: docs/prompts.md "_PMF_KEY_RULES".
 _PMF_KEY_RULES: dict[BinLabelStyle, str] = {
     "center": (
         "Every key is the value at the centre of its bin; the bin covers half the stated width either side of that "
@@ -1733,9 +1469,7 @@ def _continuous_prompt(
     ``DateQuestion``'s ``numeric.date_axis`` view, which carries every field read here (the platform
     off ``page_url``, the Mantic flags off ``api_json``, the prose and the window) verbatim.
     """
-    # Only surface the anchor guidance when an anchor section is actually in the research:
-    # the same cheap substring gate ``_strong_evidence_market_clause`` applies to the market
-    # clause, so neither clause spends prompt on a table the forecaster does not have.
+    # The same cheap substring gate the market clause uses: no policy for a table that is absent.
     ts_anchor_clause = f"\n        {_ts_anchor_evidence_clause()}" if TS_ANCHOR_SECTION_HEADER in research else ""
     final_checks_step = "(10)" if elicitation.outcome_type_step else "(9)"
     return clean_indents(
@@ -2036,8 +1770,7 @@ def stacking_multiple_choice_prompt(
     """
     predictions_text = "\n".join([f"Model {i + 1} Analysis:\n{pred}\n" for i, pred in enumerate(base_predictions)])
     aggregation_section = _aggregated_tool_output_section(aggregated_tool_output)
-    # Build the STRUCTURED FORECAST block example with the REAL option names as
-    # JSON keys — the downstream parser can only recognize the actual options.
+    # Real option names as JSON keys: the parser can only recognize the actual options.
     option_probs_example = _option_probs_example(question.options)
 
     return clean_indents(

@@ -1656,6 +1656,95 @@ research line item at ~44% of spend. The whole pass never raises
 (it returns `""` on any error) and appends its results under
 `## Targeted Gap-Fill (second pass)`.
 
+### v1 implementation notes (`research/targeted.py`)
+
+The prose below was carried as comment blocks inside `metaculus_bot/research/targeted.py` until
+2026-09-09, when the AST smell scanner's comment rules were applied to that module. Each block left
+one line of why in the code plus a pointer to this section, and the entries here are in file order,
+each naming the function it came from. No executable code changed in that pass.
+
+**`_GAP_FILL_SOFT_FAIL_EXCEPTIONS` (module level).** The tuple is `(Exception,)`, and the breadth is
+deliberate. It names the exceptions that trigger a soft-fail, meaning a `""` return, out of
+`run_gap_fill_pass`, whose documented policy is "never raises, returns `''` on any upstream failure":
+gap-fill is an optional enrichment layer, and a forecast with only first-pass research is strictly
+better than no forecast at all. Listing specific exception classes was tractable while both stages
+ran on google-genai. After the 2026-05-20 migration of the analyzer to OpenRouter and litellm it is
+not, because the analyzer can now raise `litellm.APIError`, `openai.AuthenticationError`,
+`anthropic.RateLimitError` and more. Catching `Exception` is what matches the stated policy, and it
+keeps the catch in one place. `CancelledError` still propagates, because it inherits from
+`BaseException` rather than from `Exception`.
+
+**`extract_disagreement_crux`: the retry around the analyzer call.** The call goes through
+`invoke_with_broad_retry`, a broad retry gated at 30 seconds, because `DISAGREEMENT_ANALYZER_LLM` is
+configured `allowed_tries=1` in `llm_configs.py`. The retry recovers a fast blip or an empty response
+while obeying the universal "no retry after 30 s" deadline rule. Its `wall_timeout` mirrors the
+`CRUX_SOFT_DEADLINE` `asyncio.wait_for` that the `forecaster.py` call site (around line 697) already
+applies.
+
+**`run_targeted_search`: the wall-clock backstop, and the crux preview in the log line.** The
+backstop is now owned by `invoke_with_transient_retry`, and it shares `NATIVE_SEARCH_WALL_TIMEOUT`
+with the `native_search` research provider because both call the same LLM configuration through
+`build_native_search_llm`. The 2026-05-20 OpenRouter whitespace-drip incident defeated litellm's
+per-HTTP-request timeout, so the wall timeout is the hard cap regardless of what upstream does. The
+transient-retry wrapper additionally recovers from instant aiohttp blips (litellm issue #14895) on
+this `allowed_tries=1` LLM, and its elapsed gate means it never retries a slow stall. The INFO line
+above the call previews the crux with `crux[:100]`, which truncates a string for display and reduces
+no data; that slice carries a `HARNESS-SCAN-EXEMPT-subsampling` pragma for the scanner, held on the
+flagged line by a `# fmt: skip` (see the note at the end of this section).
+
+**`_parse_gap_list`: choosing an extractor, and the raw preview in the warning.** Fenced blocks are
+preferred, through the canonical extractor in `structured_output_schema`, and the fallback is a
+string-literal-aware balanced-brace scan for unfenced payloads with trailing commentary. Both helpers
+live in one module so the brace scanner is fixed in one place. The parse-failure warning previews the
+analyzer response with `raw[:200]`, another display truncation carrying the same pragma and the same
+`# fmt: skip`.
+
+**`_run_analyzer`: `temperature=None`.** Passing `None` defers reasoning models to the provider
+defaults. It is redundant on forecasting-tools 0.2.92, where the `GeneralLlm` constructor default is
+already `None`, and no `top_p` is set.
+
+**`_run_analyzer`: passing the multiple-choice ballot.** `options` is the multiple-choice ballot and
+is `None` on every other question type. A "no coverage of candidate X" gap is only findable when the
+analyzer knows the candidates (receipt q44952).
+
+**`_run_analyzer`: the wall-clock backstop.** Also owned by `invoke_with_transient_retry`, and given
+slight headroom over the litellm per-request timeout, 135 seconds against 120, so the cleaner
+per-request error fires first when it can. That mirrors `NATIVE_SEARCH_WALL_TIMEOUT` against
+`NATIVE_SEARCH_TIMEOUT`. The wrapper recovers from instant aiohttp blips (litellm issue #14895) on
+this `allowed_tries=1` LLM without retrying a slow stall, which the elapsed gate prevents.
+
+**`_resolve_single_gap`: the wall-clock backstop.** The same `NATIVE_SEARCH_WALL_TIMEOUT` wall, shared
+with the `native_search` provider and the targeted search because all three build the same
+`build_native_search_llm` configuration. The wall timeout is the hard cap regardless of upstream
+whitespace-drip behavior (the 2026-05-20 incident), and the transient-retry wrapper again recovers
+instant aiohttp blips (litellm issue #14895) on an `allowed_tries=1` LLM without retrying a slow stall
+(elapsed gate).
+
+**`run_gap_fill_pass`: the `GAP_FILL_ANALYZER_FAILED` marker.** The warning is a greppable marker
+rather than plain prose because the analyzer gates the entire pass: its death silently zeroes one of
+the largest research spend lines and looks identical to a question that legitimately had no gaps.
+Gap-fill is not one of the orchestrator's `_run_one` providers, so it has no `ProviderResult` and no
+`lost=` token to render, and a `record_provider_detail` entry under a `gap_fill` key would never be
+drained, which was verified, and would just accumulate in the registry. The run-log marker is the
+seam that exists for it, and its spec lives in `scripts/telemetry/markers.py`.
+
+**`run_gap_fill_pass`: the `await asyncio.sleep(0)` on the no-gaps path.** A soft-fail there is
+already an async no-op, so the sleep gives the scheduler a checkpoint and satisfies flake8-async's
+ASYNC910 on every path.
+
+**`run_gap_fill_pass`: `return_exceptions=True` on the gather.** It captures per-gap failures so one
+SDK error cannot take the whole addendum down.
+
+**`run_gap_fill_pass`: the raw-research record.** It stores the raw per-gap search results alongside
+the analyzer's declared gaps, and exceptions serialize to their `str` through the logger's encoder.
+
+**The two `# fmt: skip` directives.** Both log lines carry `# fmt: skip` ahead of the
+`HARNESS-SCAN-EXEMPT-subsampling` pragma, and the directive is load-bearing rather than cosmetic. The
+scanner honors a pragma only on the lines the flagged expression itself spans, and without the
+directive Ruff would split the `logger` call across lines and move the trailing comment onto the
+closing parenthesis, at which point the finding returns and the tag reads as stale. Do not drop
+either directive without moving the pragma onto the line that holds the slice.
+
 ### v2: agentic gap-fill (`research/agentic_gap_fill.py` `run_gap_fill_v2`)
 
 A bounded agentic tool loop, living in `metaculus_bot/research/agentic/` behind the

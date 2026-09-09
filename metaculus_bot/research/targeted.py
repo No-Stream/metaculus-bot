@@ -45,15 +45,7 @@ __all__ = [
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-# Exceptions that trigger a soft-fail (return "") from run_gap_fill_pass.
-# Broad by design — the docstring policy is "Never raises. Returns '' on any
-# upstream failure" (gap-fill is an optional enrichment layer; a forecast with
-# only first-pass research is strictly better than no forecast at all). Listing
-# specific classes was tractable when both stages used google-genai; after the
-# 2026-05-20 analyzer migration to OpenRouter/litellm, the analyzer can raise
-# litellm.APIError, openai.AuthenticationError, anthropic.RateLimitError, etc.
-# Catching `Exception` matches the policy and keeps the catch in one place
-# (CancelledError still propagates because it inherits from BaseException).
+# Broad by design; the pass soft-fails to "" and CancelledError escapes. See docs/research.md "v1 implementation notes".
 _GAP_FILL_SOFT_FAIL_EXCEPTIONS: tuple[type[BaseException], ...] = (Exception,)
 
 
@@ -75,11 +67,7 @@ async def extract_disagreement_crux(
     """
     prompt = disagreement_crux_prompt(question_text, base_prediction_texts)
     logger.info(f"Extracting disagreement crux from {len(base_prediction_texts)} forecaster analyses")
-    # Broad, 30s-gated retry (DISAGREEMENT_ANALYZER_LLM is allowed_tries=1 in
-    # llm_configs.py): recovers a fast blip / empty-response while obeying the
-    # universal "no retry after 30s" deadline rule. wall_timeout mirrors the
-    # CRUX_SOFT_DEADLINE asyncio.wait_for already applied at the forecaster.py
-    # call site (~697).
+    # A 30s-gated retry on an allowed_tries=1 analyzer. See docs/research.md "v1 implementation notes".
     crux = await invoke_with_broad_retry(
         lambda: analyzer_llm.invoke(prompt), wall_timeout=CRUX_SOFT_DEADLINE, label="disagreement_crux"
     )
@@ -103,15 +91,11 @@ async def run_targeted_search(crux: str, question_text: str, *, is_benchmarking:
     """
     llm = build_native_search_llm(role="targeted_search")
     prompt = targeted_search_prompt(crux, question_text, is_benchmarking=is_benchmarking)
-    logger.info(f"Running targeted search via {llm.model} for crux: {crux[:100]}...")
-    # Wall-clock backstop (now owned by invoke_with_transient_retry): shares
-    # NATIVE_SEARCH_WALL_TIMEOUT with the native_search research provider since
-    # both call the same LLM configuration via build_native_search_llm. The
-    # 2026-05-20 OpenRouter whitespace-drip incident defeated litellm's
-    # per-HTTP-request timeout; the wall_timeout is the hard cap regardless of
-    # upstream behavior. The transient-retry wrapper additionally recovers from
-    # instant aiohttp blips (litellm #14895) on this allowed_tries=1 LLM without
-    # ever retrying a slow stall (elapsed gate).
+    logger.info(
+        f"Running targeted search via {llm.model} for crux: "
+        f"{crux[:100]}..."  # HARNESS-SCAN-EXEMPT-subsampling: a log-line preview, not a data reduction
+    )
+    # The wall is the hard cap; litellm's per-request timeout is not. See docs/research.md "v1 implementation notes".
     result = await invoke_with_transient_retry(
         lambda: llm.invoke(prompt), wall_timeout=NATIVE_SEARCH_WALL_TIMEOUT, label="targeted_search"
     )
@@ -137,17 +121,17 @@ def _parse_gap_list(raw: str, *, max_gaps: int | None = None) -> list[dict[str, 
     if not raw or not raw.strip():
         return []
 
-    # Prefer fenced blocks (canonical extractor in structured_output_schema);
-    # fall back to a string-literal-aware balanced-brace scan for unfenced
-    # payloads with trailing commentary. Both helpers live in one module so
-    # the brace-scanner is fixed in one place.
+    # Fenced first, then a balanced-brace scan for trailing prose. See docs/research.md "v1 implementation notes".
     fenced = extract_json_block(raw)
     stripped = fenced if fenced is not None else extract_first_balanced_braces(raw) or raw.strip()
 
     try:
         data: Any = json.loads(stripped)
     except (json.JSONDecodeError, ValueError) as exc:
-        logger.warning(f"GapFill: could not parse analyzer JSON ({type(exc).__name__}): {exc}; raw[:200]={raw[:200]!r}")
+        logger.warning(
+            f"GapFill: could not parse analyzer JSON ({type(exc).__name__}): {exc}; "
+            f"raw[:200]={raw[:200]!r}"  # HARNESS-SCAN-EXEMPT-subsampling: a log-line preview, not a data reduction
+        )
         return []
 
     if not isinstance(data, dict):
@@ -200,8 +184,7 @@ async def _run_analyzer(
         model=GAP_FILL_ANALYZER_MODEL,
         role="gap_fill_analyzer",
         reasoning={"effort": "low"},
-        # temperature=None defers reasoning models to provider defaults; redundant
-        # on ft 0.2.92 (GeneralLlm ctor default is already None). No top_p.
+        # Reasoning models take the provider default. See docs/research.md "v1 implementation notes".
         temperature=None,
         timeout=GAP_FILL_ANALYZER_TIMEOUT,
         allowed_tries=1,
@@ -213,17 +196,11 @@ async def _run_analyzer(
         first_pass_research=first_pass_research,
         is_benchmarking=is_benchmarking,
         max_gaps=GAP_FILL_MAX_GAPS,
-        # The MC ballot (None on other types): a "no coverage of candidate X" gap is only
-        # findable when the analyzer knows the candidates (q44952).
+        # A "no coverage of candidate X" gap needs the ballot (q44952). See docs/research.md "v1 implementation notes".
         options=getattr(question, "options", None),
     )
     logger.info(f"GapFill: calling analyzer {GAP_FILL_ANALYZER_MODEL} for gap identification")
-    # Wall-clock backstop (now owned by invoke_with_transient_retry) has slight
-    # headroom over the litellm per-request timeout (135s vs 120s) so the cleaner
-    # per-request error fires first when possible, mirroring
-    # NATIVE_SEARCH_WALL_TIMEOUT vs NATIVE_SEARCH_TIMEOUT. The transient-retry
-    # wrapper recovers from instant aiohttp blips (litellm #14895) on this
-    # allowed_tries=1 LLM without retrying a slow stall (elapsed gate).
+    # The wall has headroom over the per-request timeout: 135s vs 120s. See docs/research.md "v1 implementation notes".
     raw_text = await invoke_with_transient_retry(
         lambda: llm.invoke(prompt), wall_timeout=GAP_FILL_ANALYZER_WALL_TIMEOUT, label="gap_fill_analyzer"
     )
@@ -261,12 +238,7 @@ async def _resolve_single_gap(
     llm = build_native_search_llm(
         GAP_FILL_RESOLVER_MODEL, reasoning_effort=GAP_FILL_RESOLVER_REASONING_EFFORT, role="gap_fill_resolver"
     )
-    # Wall-clock backstop (now owned by invoke_with_transient_retry) shared with
-    # the native_search provider / targeted search (same build_native_search_llm
-    # config); the wall_timeout is the hard cap regardless of upstream
-    # whitespace-drip behavior (2026-05-20 incident). The transient-retry wrapper
-    # recovers from instant aiohttp blips (litellm #14895) on this allowed_tries=1
-    # LLM without retrying a slow stall (elapsed gate).
+    # The same shared wall as native_search; a hard cap either way. See docs/research.md "v1 implementation notes".
     return await invoke_with_transient_retry(
         lambda: llm.invoke(prompt), wall_timeout=NATIVE_SEARCH_WALL_TIMEOUT, label="gap_fill_resolver"
     )
@@ -298,29 +270,19 @@ async def run_gap_fill_pass(
     try:
         gaps = await _run_analyzer(question, first_pass_research, is_benchmarking=is_benchmarking)
     except _GAP_FILL_SOFT_FAIL_EXCEPTIONS as exc:
-        # Greppable marker, not just prose: the analyzer GATES the entire pass, so its
-        # death silently zeroes one of the largest research spend lines and looks
-        # identical to a question that legitimately had no gaps. Gap-fill is not one of
-        # the orchestrator's _run_one providers, so it has no ProviderResult and no
-        # `lost=` token to render (a record_provider_detail entry under a "gap_fill" key
-        # would never be drained — verified — and would just accumulate in the registry).
-        # The run-log marker is the seam that exists for it; see
-        # scripts/telemetry/markers.py.
+        # A dead analyzer looks exactly like a question with no gaps. See docs/research.md "v1 implementation notes".
         logger.warning(f"GAP_FILL_ANALYZER_FAILED: question={qid} error={type(exc).__name__} detail={exc}")
 
     if not gaps:
-        # A soft-fail here is already an async no-op; give the scheduler a
-        # checkpoint so flake8-async (ASYNC910) is satisfied on every path.
+        # A scheduler checkpoint on the no-op path, for ASYNC910. See docs/research.md "v1 implementation notes".
         await asyncio.sleep(0)
         return ""
 
     search_tasks = [_resolve_single_gap(g, question, is_benchmarking=is_benchmarking) for g in gaps]
-    # return_exceptions=True captures per-gap failures so one SDK error
-    # doesn't take the whole addendum down.
+    # One SDK error must not take the whole addendum down. See docs/research.md "v1 implementation notes".
     results = await asyncio.gather(*search_tasks, return_exceptions=True)
 
-    # Raw per-gap search results (exceptions serialize to their str via the
-    # logger's encoder) alongside the analyzer's declared gaps.
+    # Exceptions serialize to their str via the logger's encoder. See docs/research.md "v1 implementation notes".
     record_raw_research(
         qid=getattr(question, "id_of_question", None),
         provider="gap_fill",

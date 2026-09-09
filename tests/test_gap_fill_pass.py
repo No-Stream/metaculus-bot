@@ -36,8 +36,7 @@ class MockQuestion:
     fine_print: str | None = "See bls.gov for data."
     id_of_question: int = 42
     page_url: str = "https://example.com/q/42"
-    # The MC ballot; None on non-MC questions, matching MetaculusQuestion's attribute surface
-    # (the analyzer call site reads it via getattr).
+    # The MC ballot, None on non-MC questions, matching MetaculusQuestion; read via getattr at the call site.
     options: list[str] | None = None
 
     _unused: dict[str, str] = field(default_factory=dict)
@@ -244,8 +243,7 @@ async def test_two_gaps_run_in_parallel() -> None:
     assert "### Gap 2: gap two text" in out
     assert "result for gap 1" in out
     assert "result for gap 2" in out
-    # Concurrency check: the fast (q2) search must finish before the slow (q1) one.
-    # A sequential implementation would always produce ["q1", "q2"].
+    # Concurrency check: the fast q2 search must land before the slow q1; a sequential run would give ["q1", "q2"].
     assert completion_order == ["q2", "q1"]
 
 
@@ -454,7 +452,10 @@ async def test_resolver_builds_native_search_llm_with_terra_low() -> None:
     ~4.5× faster (native_search v3 bench). Pinned to the constant so it stays a
     canary if either the model or effort changes again.
     """
-    from metaculus_bot.constants import GAP_FILL_RESOLVER_MODEL, GAP_FILL_RESOLVER_REASONING_EFFORT
+    from metaculus_bot.constants import (
+        GAP_FILL_RESOLVER_MODEL,
+        GAP_FILL_RESOLVER_REASONING_EFFORT,
+    )  # HARNESS-SCAN-EXEMPT-function-level-import  # constants pinned in the one test that asserts them
 
     question = MockQuestion()
     gaps = [{"gap": "g1", "search_query": "q1", "why_matters": "wm1"}]
@@ -494,8 +495,7 @@ async def test_resolver_enforces_wall_clock_timeout(monkeypatch: pytest.MonkeyPa
     gaps = [{"gap": "g1", "search_query": "q1", "why_matters": "wm1"}]
 
     async def hang(_prompt: str) -> str:
-        # Sleep well past the 0.05s wall-clock cap; the test passes only if
-        # asyncio.wait_for cancels this before it returns.
+        """Sleep well past the 0.05s wall-clock cap; the test passes only if wait_for cancels it first."""
         await asyncio.sleep(5)
         return "should never reach here"
 
@@ -549,8 +549,8 @@ async def test_analyzer_gemini_api_error_returns_empty() -> None:
 
     Covers ClientError (4xx) and ServerError (5xx) since both subclass APIError.
     """
-    import httpx
-    from google.genai.errors import APIError
+    import httpx  # HARNESS-SCAN-EXEMPT-function-level-import  # httpx response faked only by this test
+    from google.genai.errors import APIError  # HARNESS-SCAN-EXEMPT-function-level-import  # faked only by this test
 
     question = MockQuestion()
 
@@ -572,7 +572,7 @@ async def test_analyzer_gemini_api_error_returns_empty() -> None:
 @pytest.mark.asyncio
 async def test_analyzer_httpx_error_returns_empty() -> None:
     """Raw httpx.HTTPError from the analyzer → soft-fail with "" (covers mid-SDK network failures)."""
-    import httpx
+    import httpx  # HARNESS-SCAN-EXEMPT-function-level-import  # httpx error faked only by this test
 
     question = MockQuestion()
     fake_search = AsyncMock()

@@ -54,8 +54,7 @@ class TestGapFillAnalyzerPrompt:
         lowered = result.lower()
         # The benchmarking marker must be present so downstream reviewers can grep for it.
         assert "benchmarking run" in lowered
-        # The carve-out must explicitly instruct the model to avoid prediction-market data.
-        # We verify both the "DO NOT" directive AND that it's attached to "prediction market".
+        # Both halves matter: the DO NOT directive and its attachment to "prediction market".
         assert "do not flag prediction-market" in lowered or "do not request searches for prediction markets" in lowered
         # Data-leakage framing must be present so the model understands *why*.
         assert "data leakage" in lowered
@@ -269,8 +268,7 @@ class TestTsAnchorClause:
     def test_clause_present_when_section_in_research(self) -> None:
         research = f"Some news.\n\n{TS_ANCHOR_SECTION_HEADER}\n**DGS10** — latest 4.20\n- band ..."
         result = numeric_prompt(_numeric_q(), research=research, lower_bound_message="lbm", upper_bound_message="ubm")
-        # Neutral description present: it points at the section and says what the band IS,
-        # including the independent-window caveat, without telling the model how to weigh it.
+        # Neutral: it points at the section and says what the band is, not how to weigh it.
         assert self._MARKER in result
         lowered = result.lower()
         assert "empirical distribution of the series' own past changes" in lowered
@@ -346,9 +344,7 @@ class TestWebResearchPromptPrimarySources:
     winning spring-AIB-2026 comments. Matches the primary-source hints
     already present in targeted_search_prompt and gap_fill_search_prompt."""
 
-    # Domain examples we expect to see called out somewhere in the block.
-    # We assert ≥3 of these 4 show up so the list can evolve without
-    # breaking the test on single-domain renames.
+    # At least 3 of the 4, so the prompt's domain list can evolve without a rename breaking this.
     _EXAMPLE_DOMAINS = (".gov", "sec.gov", "docs.", "who.int")
 
     def _assert_primary_sources_block_present(self, prompt: str) -> None:
@@ -475,35 +471,19 @@ class TestWebResearchPromptPrimarySources:
 
 
 class TestPredictionMarketFraming:
-    """The forecaster prompts must frame prediction markets as STRONG EVIDENCE
-    to weight heavily — not the old "not beholden" footnote — with a precise
-    conditional adjustment: anchor when the market's resolution criteria AND
-    date match the question, discount proportionally to any specific mismatch,
-    and extrapolate across a date-only mismatch.
+    """The market clause: its strong-evidence framing, its conditional adjustment, and its gate.
 
-    The PM clause must NOT carry a "you may deviate from a market" carve-out:
-    that sentence undercut the strong-evidence framing. The general principle
-    that a forecaster may supplement the research with its own training
-    knowledge is a SEPARATE, prompt-wide directive — not a market-specific one.
-
-    Gate: the whole clause renders ONLY when the research carries the rendered
-    ``## Prediction Market Snapshot`` section (``MARKET_SNAPSHOT_SECTION_HEADER``), the
-    same way the numeric prompt gates its TS-anchor clause. Prod-neutral: the header is
-    emitted whenever the provider rendered anything, including the deliberate-empty "no
-    relevant market" sentence, and it is absent only when the provider returned ``""``
-    (benchmarking, flag off, soft-fail) — exactly the prompts where the market policy
-    had nothing to bear on. That also makes the leakage story simpler than it was: a
-    benchmarking prompt no longer carries three paragraphs about markets it cannot see.
-    The mode-dependent leakage guard on the RESEARCH side still lives on
-    ``web_research_prompt`` (see ``test_market_ask_present_non_benchmarking_absent_benchmarking``).
-
-    Notation vs policy: the rendered table's own legend (``MARKET_SIGNAL_LEGEND``) defines the
-    relation tiers, the evidential order, RESOLVED, the ``↳`` rows and ``[remaining N]``; the
-    prompt keeps only the three READING rules the legend does not carry.
+    Anchor when the market's criteria AND resolution date match, discount proportionally to a named
+    mismatch, extrapolate across a date-only one, and never carry a "you may deviate from a market"
+    carve-out. The clause renders only when the research carries ``MARKET_SNAPSHOT_SECTION_HEADER``.
+    The notation-versus-policy split and every receipt are in docs/prompts.md "Test pins".
     """
 
     def _assert_strong_evidence_framing(self, prompt: str) -> None:
-        # Collapse whitespace so assertions don't depend on where clean_indents wraps lines.
+        """Assert the framing, the three reading rules, and the phrases that must be gone.
+
+        Whitespace is collapsed first so no check depends on where ``clean_indents`` wraps a line.
+        """
         lowered = " ".join(prompt.lower().split())
         assert "strong evidence" in lowered
         assert "weight them heavily" in lowered
@@ -515,26 +495,19 @@ class TestPredictionMarketFraming:
         assert "extrapolate" in lowered
         assert "constant-hazard" in lowered or "base-rate-over-time" in lowered
         assert "show the arithmetic" in lowered
-        # Reading rule 1: an other-cut market is the same quantity at another date/threshold/source,
-        # so it is something to extrapolate from, not to haircut.
+        # Rule 1: an other-cut market is the same quantity, so extrapolate rather than haircut.
         assert "`same_quantity_other_cut`" in lowered
         assert "extrapolate from it rather than discount it vaguely" in lowered
-        # Reading rule 2: which label wins when the two axes disagree. A tight relation on a THIN
-        # market is the shape that cost q45189: all three forecasters imported a thin single-strike
-        # price at full weight. The rule carries its reason (a thin price is noisy however tight its
-        # relation) and is directional — widen around the implied value rather than transplant it.
+        # Rule 2: liquidity governs when the relation and liquidity axes disagree (q45189).
         assert "the liquidity warning governs" in lowered
         assert "a thin price is noisy however tight its relation" in lowered
         assert "widen around its implied value rather than transplant its price" in lowered
-        # Reading rule 3: a family of `↳` rows is a distribution over the market's own question, so
-        # reading one bracket as an equality constraint on a tail is a category error — the other
-        # half of q45189 (all three cut the resolving bucket below their own prior that way).
+        # Rule 3: a ladder is a distribution, never an equality constraint on a tail (q45189).
         assert "is a distribution over that market's own question" in lowered
         assert "read the whole ladder" in lowered
         assert "never treat one outcome's price as an equality constraint" in lowered
         assert "cut the resolving bucket below the forecaster's own prior" in lowered
-        # NOTATION is the legend's job, stated beside the table; the prompt must not re-teach it.
-        # These are the phrases the pre-2026-09 clause carried that duplicated MARKET_SIGNAL_LEGEND.
+        # NOTATION is the legend's job; these are the phrases the pre-2026-09 clause duplicated.
         assert "weight each market/crowd signal by its stated liquidity/participation label" not in lowered
         assert "listed in order of evidential value" not in lowered
         assert "realized outcome rather than a forecast" not in lowered
@@ -543,9 +516,7 @@ class TestPredictionMarketFraming:
         assert "inside a counted group with its summed price" not in lowered
         # The old "not beholden" footnote must be gone.
         assert "not beholden" not in lowered
-        # The mis-scoped "you may deviate from a market" carve-out must NOT be present —
-        # it undercut the strong-evidence framing. The general expertise principle is
-        # asserted separately below.
+        # The mis-scoped "you may deviate from a market" carve-out undercut the framing.
         assert "deviate from a market" not in lowered
 
     def _assert_market_clause_absent(self, prompt: str) -> None:
@@ -806,8 +777,7 @@ class TestResearchPromptsCarryMcOptions:
 
     @pytest.mark.parametrize("options", [None, [], ()])
     def test_non_mc_questions_carry_no_options_line(self, options) -> None:
-        # Binary/numeric questions have no ballot; an empty "Options" header would invite
-        # the model to invent one.
+        """Binary and numeric questions have no ballot, and an empty "Options" header invites one."""
         assert "Options (in resolution order)" not in web_research_prompt("Will X happen?", options=options)
         assert "Options (in resolution order)" not in _summarizer_prompt(options=options)
 
@@ -820,7 +790,7 @@ class TestSourceTierTagging:
     provenance ladder has nothing left to weight."""
 
     def _assert_tier_tag_instruction(self, prompt: str) -> None:
-        # Collapse whitespace so assertions don't depend on where clean_indents wraps lines.
+        """Assert the shared source-tier instruction, whitespace collapsed so wrapping cannot matter."""
         collapsed = " ".join(prompt.split())
         assert "SOURCE TIER TAGS" in collapsed
         # Inline tag examples using the shared vocabulary.
@@ -883,8 +853,7 @@ class TestAskNewsSummarizerPrompt:
         summarizer's existing critical rules."""
         collapsed = " ".join(_summarizer_prompt().split())
         assert "Date every fact precisely" in collapsed
-        # First occurrence carries the full tag; repeats use the short tag (display
-        # compression only — the pre-window warning semantics must stay intact).
+        # Display compression only: the pre-window warning semantics must stay intact.
         assert "[PRE-WINDOW — occurred before question open, cannot itself satisfy the criteria]" in collapsed
         assert "FIRST time such a flag appears in the briefing, use the full tag" in collapsed
         assert 'for every subsequent occurrence use the short tag "[PRE-WINDOW]"' in collapsed
