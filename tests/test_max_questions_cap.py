@@ -12,7 +12,6 @@ from main import TemplateForecaster
 
 _POST_IDS = itertools.count(start=7001)
 
-# The authenticated `with_cp=true` list-page shape, observed live 2026-09-09; `history` fills on the first forecast.
 FRESH_MY_FORECASTS: dict[str, Any] = {"history": [], "latest": None, "score_data": {}}
 PRIOR_MY_FORECASTS: dict[str, Any] = {
     "history": [{"start_time": 1.0, "forecast_values": [0.3, 0.7]}],
@@ -140,6 +139,13 @@ class TestSkipGuardFailsShut:
     payload with no ``my_forecasts`` (a list GET without ``with_cp=true``, an unauthenticated Mantic
     read, an API change) reads as never forecast and every hourly run would re-forecast and
     re-publish the whole tournament. With the guard on, such a question is not eligible at all.
+
+    Observed live 2026-09-09 on authenticated ``with_cp=true`` reads, both platforms: a never-forecast
+    question carries ``my_forecasts`` as a dict with ``latest`` null and an EMPTY ``history`` list
+    (Mantic posts 648 and 649, Metaculus post 45465); a forecast one carries a populated dict (Mantic
+    650 and 651, Metaculus 45464). The key is absent without ``with_cp`` and on Mantic's public list,
+    and null only on unauthenticated reads the bot never makes. So the check is "key present and not
+    None", and the empty-history dict MUST stay eligible.
     """
 
     def _unreadable_marker_lines(self, caplog: pytest.LogCaptureFixture) -> list[str]:
@@ -198,7 +204,10 @@ class TestSkipGuardFailsShut:
 
     @pytest.mark.asyncio
     async def test_an_empty_history_stays_eligible(self, monkeypatch, caplog):
-        """The steady state on a fresh question: the field is present, nothing forecast yet."""
+        """The steady state on a fresh question: the field is present with an empty history and a null
+        latest, and the question forecasts. Never tighten the check to a non-empty history."""
+        assert FRESH_MY_FORECASTS["history"] == []
+        assert FRESH_MY_FORECASTS["latest"] is None
         fresh = _supported_question(api_json={"question": {"my_forecasts": FRESH_MY_FORECASTS}})
         forwarded = _capture_forwarded(monkeypatch)
         bot = _bot()
