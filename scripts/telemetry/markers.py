@@ -596,6 +596,15 @@ MARKER_SPECS: list[MarkerSpec] = [
         ),
     ),
     MarkerSpec(
+        "skip_guard_unreadable",
+        # Why: the re-spend guard failed shut on this post. Receipt: docs/telemetry_markers.md "SKIP_GUARD_UNREADABLE".
+        re.compile(
+            r"SKIP_GUARD_UNREADABLE:\s*question=(?P<question>\S+)\s+post_id=(?P<post_id>\d+)"
+            r"\s+platform=(?P<platform>\S+)\s+reason=(?P<reason>\S+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # forecaster.py emits question.id_of_question beside the post id
+    ),
+    MarkerSpec(
         "gemini_ungrounded_suppressed",
         # Why: the only signal of a suppression. Receipt: docs/telemetry_markers.md "GEMINI_UNGROUNDED_SUPPRESSED".
         re.compile(

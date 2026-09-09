@@ -3169,6 +3169,36 @@ class TestQuestionCapForfeit:
         assert rec["posts"] == 38880
 
 
+# Verbatim from forecaster.py:_drop_questions_with_unreadable_forecast_history; see docs/telemetry_markers.md.
+SKIP_GUARD_UNREADABLE_LINE = (
+    PFX_WARN + "SKIP_GUARD_UNREADABLE: question=70011 post_id=7011 platform=mantic reason=my_forecasts_missing"
+)
+SKIP_GUARD_UNREADABLE_METACULUS_LINE = (
+    PFX_WARN + "SKIP_GUARD_UNREADABLE: question=45465 post_id=45464 platform=metaculus reason=my_forecasts_missing"
+)
+
+
+class TestSkipGuardUnreadable:
+    def test_fields(self):
+        rec = _parse_one(SKIP_GUARD_UNREADABLE_LINE)
+        assert rec["marker"] == "skip_guard_unreadable"
+        assert rec["post_id"] == 7011
+        assert rec["platform"] == "mantic"
+        assert rec["reason"] == "my_forecasts_missing"
+
+    def test_question_ref_is_stamped_in_the_question_id_space(self):
+        """forecaster.py emits question.id_of_question beside the post id, so a join translates from question_id."""
+        rec = _parse_one(SKIP_GUARD_UNREADABLE_LINE)
+        assert rec["qid"] == 70011
+        assert rec["qid_kind"] == "question_id"
+
+    def test_metaculus_platform(self):
+        rec = _parse_one(SKIP_GUARD_UNREADABLE_METACULUS_LINE)
+        assert rec["platform"] == "metaculus"
+        assert rec["qid"] == 45465
+        assert rec["post_id"] == 45464
+
+
 # Verbatim from research/gemini_search.py; see docs/telemetry_markers.md "GEMINI_UNGROUNDED_SUPPRESSED".
 GEMINI_UNGROUNDED_LINE = PFX_WARN + "GEMINI_UNGROUNDED_SUPPRESSED: question=38195 model=gemini-3.5-flash queries=3"
 

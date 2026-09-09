@@ -75,6 +75,7 @@ incidents behind the design.
 | `RUN_ALERTABLE_SUMMARY` (matches the log line `Run completed ... with N alertable ...`) | `cli.py` | The end-of-run alertable breakdown, emitted on every path. |
 | `ONLY_POSTS` | `cli.py:_tournament_source` | The `--only-posts` smoke filter, one line per run that set it. |
 | `QUESTION_CAP_FORFEIT` | `forecaster.py:forecast_questions` | The `max_questions_per_run` cap. |
+| `SKIP_GUARD_UNREADABLE` | `forecaster.py:_drop_questions_with_unreadable_forecast_history` | Per-question WARNING: the re-spend guard could not read `my_forecasts`, so the question was dropped rather than treated as never forecast. |
 | `GEMINI_UNGROUNDED_SUPPRESSED` | `research/gemini_search.py:_format_grounded_response` | Gemini grounded-search suppression. |
 | `GEMINI_GROUNDING_DENSITY` | `research/gemini_search.py:_format_grounded_response` | The floor's complement: one row per response that passed the grounded-chunk floor. |
 | `GEMINI_UNSUPPORTED_ATTRIBUTION` | `research/gemini_search.py:_check_attributions` | The embellishment channel, per response. |
@@ -1055,6 +1056,26 @@ is comma-separated post ids in the order the cap dropped them (a lone id coerces
 stay one string). On Mantic the fetch ceiling is 500 against a default cap of 10 and a whole
 hour's batch opens at once, so each row is a paid forecast the run never made; the only trace
 before this spec was a free-text WARNING gone with the 90-day GitHub Actions log expiry.
+
+### SKIP_GUARD_UNREADABLE
+
+The fail-shut leg of the skip-previously-forecasted guard
+(`forecaster.py:_drop_questions_with_unreadable_forecast_history`, called from
+`forecast_questions` whenever `skip_previously_forecasted_questions` is on, which `cli.py` pins for
+every tournament-shaped mode). One WARNING per dropped question: the question id, the post id, the
+platform (`metaculus` or `mantic`) and `reason`, today always `my_forecasts_missing`. The framework
+derives `already_forecasted` inside a blanket except that answers False, so a payload with no
+`my_forecasts` field (a list GET without `with_cp=true`, a Mantic read that lost its token, an API
+change) would read as never forecast and an hourly run would re-forecast and re-publish the whole
+tournament. With an external dispatcher adding firings the guard has to fail shut instead, so such a
+question is dropped before any spend; a present field with an empty `history` stays eligible. The
+drop is otherwise invisible, since the framework's own skip logs nothing, and the free-text count
+line that follows it (`Dropped N question(s) with no readable my_forecasts field`) is not a marker.
+Observed live 2026-09-09: authenticated `with_cp=true` reads carry the field on every question on
+both platforms, and the guard has never fired historically (1,054 bot comments on 1,054 distinct
+posts), so this is prevention. `qid_kind` is `question_id`; `post_id` rides beside it so the
+dropped post can be named without a join. What to do when it fires is in `docs/operations.md`
+"Scheduling reliability".
 
 ### GEMINI_UNGROUNDED_SUPPRESSED
 
