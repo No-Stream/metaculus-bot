@@ -396,6 +396,7 @@ class TestPerBinSchemaBlock:
         flat = _flat(_pmf_prompt_text())
         schema = flat[flat.rfind("structured forecast") :]
         assert "`bin_probs` is required and must contain every key below, spelled exactly and in this order" in schema
+        assert "the values shown are format placeholders, not a suggested distribution" in schema
         assert schema.count("must contain") == 1
         assert "outcome_type" not in schema
         assert "strictly increasing" not in schema

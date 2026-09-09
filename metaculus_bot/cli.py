@@ -452,7 +452,7 @@ def main() -> None:
     # the framework on its default Metaculus client.
     metaculus_client = build_mantic_client() if run_mode == "mantic" else None
     if metaculus_client is not None:
-        # One authenticated GET, still before any spend: the token's forecast permission
+        # Two authenticated GETs, still before any spend: the token's forecast permission
         # on the configured tournament (fails shut) and the MANTIC_TOURNAMENTS discovery
         # line that names a Series 2 slug the constants have not been re-pointed at.
         preflight_mantic_tournaments(metaculus_client, MANTIC_TOURNAMENT_ID)

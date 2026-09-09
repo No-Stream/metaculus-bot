@@ -1668,7 +1668,8 @@ def _pmf_schema_block(grid: PmfGrid) -> str:
     pairs = [f"{json.dumps(key)}: {prob}" for key, prob in zip(grid.keys, example_probs, strict=True)]
     rows = ",\n            ".join(", ".join(pairs[i : i + 4]) for i in range(0, len(pairs), 4))
     return f"""\
-        Schema (`bin_probs` is REQUIRED and MUST contain every key below, spelled exactly and in this order):
+        Schema (`bin_probs` is REQUIRED and MUST contain every key below, spelled exactly and in this order; the
+        values shown are format placeholders, not a suggested distribution):
 
         ```json
         {{

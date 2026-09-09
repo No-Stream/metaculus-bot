@@ -6,7 +6,7 @@ shape, ``[below, p_0, ..., p_{N-1}, above]`` with ``N + 2`` entries and a closed
 0.0. There are no percentiles to sanitise, interpolate or guard against unit errors, so the whole
 repair is one step: the smallest blend toward the server's exact per-cell floors that makes every
 cell legal (``_blend_to_cell_floors``; the arithmetic and the receipts are in
-``docs/numeric_pipeline.md``, "Per-bin elicitation on enumerable grids"). A bin the model set to 0
+``docs/numeric_pipeline.md``, "Per-bin elicitation"). A bin the model set to 0
 lands at exactly the platform minimum, a certain member keeps 0.988 to 0.992 on its bin, and a legal
 declaration comes back unchanged. Mass declared in a CLOSED tail is refused rather than pinned over,
 because a pin after the cumulative sum silently moves it into the first in-range bin.
@@ -51,8 +51,8 @@ def build_pmf_distribution(
     ``declared`` is the platform's ``N + 2`` PMF shape (``N = view.cdf_size - 1`` bins):
     ``[below, p_0, ..., p_{N-1}, above]``, a closed tail's entry 0.0, every entry finite and
     non-negative, the sum positive. The extraction ladder bounds the declared sum to
-    ``structured_output_schema.pmf_prob_sum_tolerance(len(grid.keys))`` of 1.0, a 0.02 floor plus
-    0.005 per key (0.06 on post 651's 12-key grid, 0.165 at the 33-key maximum); it is normalised
+    ``structured_output_schema.pmf_prob_sum_tolerance(len(grid.keys))`` of 1.0, the larger of a 0.02
+    floor and 0.005 per key (0.06 on post 651's 12-key grid, 0.165 at the 33-key maximum); it is normalised
     here, so only the shape is load-bearing. ``view`` is the numeric-pipeline view of the question
     (the epoch adapter for a date question); ``model_name`` only labels the ``CDF_MAXSTEP_CLIP``
     marker ``safe_cdf_bounds`` emits if the grid's cap ever binds.

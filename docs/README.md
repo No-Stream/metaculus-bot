@@ -20,11 +20,11 @@ need; the repo-root pointers at the bottom cover quick-start and design history.
 
 ## Repo-root references
 
-- [README.md](../README.md) — human quick-start: install, configure, run.
-- [AGENTS.md](../AGENTS.md) — the terse starting point for coding agents (also symlinked
-  as `CLAUDE.md`): the cost gate, the repo's overrides, the layout, the pipeline outline,
-  and the standing rules. It points here for depth rather than repeating it.
-- [FUTURE.md](../FUTURE.md) — the branch design log. Records intent and history,
+- [README.md](../README.md): the human quick-start (install, configure, run).
+- [AGENTS.md](../AGENTS.md): the terse starting point for coding agents, also symlinked as
+  `CLAUDE.md`. It carries the cost gate, the repo's overrides, the layout, the pipeline
+  outline, and the standing rules, and points here for depth rather than repeating it.
+- [FUTURE.md](../FUTURE.md): the branch design log. Records intent and history,
   including shipped, planned, and rejected ideas. Read it for the "why," not for
   the current state of the code.
 

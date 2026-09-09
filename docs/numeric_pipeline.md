@@ -6,8 +6,8 @@ set in plain text, the bot extracts and cleans them, builds a 201-point CDF that
 satisfies Metaculus' server-side constraints, aggregates across the ensemble in CDF
 space, and decides whether the ensemble disagrees enough to trigger conditional
 stacking. On a coarse Mantic grid whose bins are the outcome space, forecasters instead
-declare one probability per bin and the CDF is built from that PMF ("Per-bin elicitation
-on enumerable grids", between Steps 4 and 5). It also documents the time-series anchor
+declare one probability per bin and the CDF is built from that PMF ("Per-bin elicitation",
+between Steps 4 and 5). It also documents the time-series anchor
 research provider, which grounds numeric forecasts in the resolution series' own history.
 
 Every model name, flag, and default here is verified against the code. Where a value
@@ -53,26 +53,25 @@ block, which the prompt requires to be the last thing in the response.
 model's free-text rationale. It runs a four-rung ladder, most deterministic first, and
 stops at the first rung that produces a valid result:
 
-1. **block** — parse the fenced ```json block directly (`json.loads` plus Pydantic
+1. **block**: parse the fenced ```json block directly (`json.loads` plus Pydantic
    validation against `NumericStructured`). When the block carries a
    `declared_percentiles` dict, it is lifted straight into `Percentile` objects
    (`_numeric_from_block` in `value_extraction.py`). This is the normal path.
-2. **repair** — if the block was malformed, run deterministic JSON repair
+2. **repair**: if the block was malformed, run deterministic JSON repair
    (`json_repair`), or scan the rationale's last `_TAIL_SCAN_CHARS` characters for
    balanced braces. Skipped when rung 1 already produced a schema-valid model (repairing
    valid JSON is a no-op).
-3. **llm** — as a last resort, call the parser LLM (`parse_structured`) over the full
+3. **llm**: as a last resort, call the parser LLM (`parse_structured`) over the full
    rationale. Logged loudly as a salvage.
-4. **raise** — if every rung fails, raise `ValueExtractionError`; the caller drops or
+4. **raise**: if every rung fails, raise `ValueExtractionError`; the caller drops or
    soft-fails that forecaster.
 
 Post-rung validation is strict regardless of which rung produced the value
 (`_validate_numeric` in `value_extraction.py`): it requires every label in
 `STANDARD_PERCENTILES` and returns exactly that set, never padded. That is a SHAPE
-check, and shape alone is not enough — an earlier version of this doc claimed the LLM
-salvage rung "cannot smuggle in a fabricated set", which was false as written. A rung
-decoding under a schema must emit numbers, so the validation is also a FIDELITY check:
-values must be finite and ordered the way their labels claim. See
+check, and shape alone is not enough: a rung decoding under a schema must emit numbers,
+so the validation is also a FIDELITY check, and values must be finite and ordered the way
+their labels claim. See
 [value_extraction.md](value_extraction.md) for the fidelity rules on all three question
 types and the incidents that motivated each one.
 
@@ -95,19 +94,19 @@ declare it. That vote is carried forward to the discrete-snap decision in Step 7
 `sanitize_percentiles` (`numeric/pipeline.py`) turns the raw declared percentiles into
 a clean, strictly-increasing, in-bounds set. In order:
 
-1. `filter_to_standard_percentiles` — keep only the standard labels, drop extras and
+1. `filter_to_standard_percentiles`: keep only the standard labels, drop extras and
    duplicates.
-2. `validate_percentile_count_and_values` — assert the count and label set match
+2. `validate_percentile_count_and_values`: assert the count and label set match
    `EXPECTED_PERCENTILE_COUNT` / `STANDARD_PERCENTILES` exactly
    (`numeric/validation.py`).
-3. `sort_by_percentile_level` — order by percentile level.
-4. `_apply_jitter_and_clamp` (`numeric/pipeline.py`) — detect count-like (integer-
+3. `sort_by_percentile_level`: order by percentile level.
+4. `_apply_jitter_and_clamp` (`numeric/pipeline.py`): detect count-like (integer-
    adjacent) clusters and spread them, jitter exact duplicates, clamp values just outside a
    closed bound back inside it (the tolerance and landing rules are below), then enforce
    strictly increasing values.
    **On the 201-point continuous grid a WHOLE-SET epsilon collapse is not spread.** A model
    declaring (near-)the same value at all 13 percentiles has declared no width, and spreading
-   it manufactured a ±6-unit distribution — which was precisely what let it pass Step 8's
+   it manufactured a ±6-unit distribution, which was precisely what let it pass Step 8's
    span-ratio test, so the invented width was load-bearing for publishing a forecast the
    model never stated. There a point mass gets only the format minimum (the jitter /
    strict-ordering epsilon) and reaches the guard with its own honest span, which
@@ -122,7 +121,7 @@ a clean, strictly-increasing, in-bounds set. In order:
    n_unique=... span=... value_eps=... spread_applied=true|false` (harvested as
    `numeric_degenerate_declaration`; `spread_applied` reports which branch it took), so the
    per-model incidence is a query rather than a guess.
-5. `_maybe_widen_tails` — optional tail widening (Step 4).
+5. `_maybe_widen_tails`: optional tail widening (Step 4).
 
 The schema deliberately accepts non-decreasing values: tied values are valid concentrated
 declarations and the sanitizer can separate partial clusters. The prompt still asks for
@@ -142,10 +141,7 @@ on EVERY grid, the 201-point continuous one included, because a value within one
 edge is indistinguishable from the edge once bucketed: on a Metaculus question with range
 > 200 the drop-versus-clamp threshold is therefore `range / 200` rather than the old flat
 1.0, which removes the discontinuity where 1.0 was 1% of a 100-wide range and 0.005% of a
-20,000-wide one. In plain words: on a 201-point question whose range exceeds 200, a
-percentile that sits between 1.0 and `range / 200` outside a closed bound is now clamped to
-the bound instead of the member being dropped (an intentional, documented change of
-2026-09; inside 1.0 it always clamped, beyond `range / 200` it still drops). On a date question the axis is epoch seconds, so the flat 1.0 was a
+20,000-wide one. On a date question the axis is epoch seconds, so the flat 1.0 was a
 one-second tolerance and a date named one day outside a closed bound used to drop the
 member. The tolerance changes only drop-versus-clamp, never where a clamped value lands:
 that is `minimum_separation` (`numeric/config.py`), the same standoff the spreader and the
@@ -238,7 +234,7 @@ and `k_tail=1.25` moved away from ideal in every segment (see
 still per-call configurable, and the function raises `ValueError` if asked to narrow
 rather than widen (narrowing is not implemented) or on a negative `span_floor_gamma`.
 
-## Per-bin elicitation on enumerable grids
+## Per-bin elicitation
 
 Steps 1 to 4 and the PCHIP build in Step 5 are the percentile path. On a coarse grid whose
 bins ARE the outcome space, the bot instead asks each forecaster for one probability per bin
@@ -287,8 +283,8 @@ every stored forecast and the `MEMBER_FORECAST` marker records as `raw`). In ord
    0.297 landing in bin 1). A malformed vector (wrong length, non-finite, negative, zero sum)
    raises `ValueError` too.
 2. **Normalise** to sum 1. The ladder bounds the declared sum to
-   `pmf_prob_sum_tolerance(key_count)` of 1.0 (`structured_output_schema.py`: a 0.02 floor plus
-   0.005 per key, so 0.06 on post 651's 12-key grid and 0.165 at the 33-key maximum), and the
+   `pmf_prob_sum_tolerance(key_count)` of 1.0 (`structured_output_schema.py`: the larger of 0.02
+   and 0.005 per key, so 0.06 on post 651's 12-key grid and 0.165 at the 33-key maximum), and the
    normalisation here is why only the shape is load-bearing.
 3. **Blend toward the cell floors.** The server needs every in-range step to be at least
    `round(0.01 / N, 9)` and an open tail to be at least 0.001 (`grid_step_constraints`). Let `f`
@@ -371,14 +367,13 @@ pre-scaling cap the residual analysis reads back (`performance_analysis/analysis
 
 - **Length** = `cdf_size`, whose standard-continuous default is `PCHIP_CDF_POINTS`. On
   the platform side that is the question's `inbound_outcome_count + 1`, default 201.
-- **Min step** per bin `NUM_MIN_PROB_STEP` — no flat segments allowed. The
+- **Min step** per bin `NUM_MIN_PROB_STEP`, so no flat segments are allowed. The
   server formula is `round(0.01 / N, 9)` where `N = cdf_size - 1`, so 5e-5 at the
   default length.
-- **Max step** per bin `NUM_MAX_STEP` — a spikiness cap. Server formula
+- **Max step** per bin `NUM_MAX_STEP`, a spikiness cap. Server formula
   `0.2 * 200 / N`, so 0.2 at the default length. The server compares its 9-decimal-rounded
-  PMF against this UNROUNDED cap, so on a grid whose cap is not 9-decimal exact a bin sitting
-  exactly at the cap rounds above it and is rejected (450 bins: 0.0888... rounds to
-  0.088888889).
+  PMF against this UNROUNDED cap; `grid_step_constraints`, below, is what keeps a clipped bin
+  from rounding above it.
 - **Closed bounds** are pinned exactly: `cdf[0] == 0.0`, `cdf[-1] == 1.0`.
 - **Open bounds**: `cdf[0] >= 0.001`, `cdf[-1] <= 0.999`.
 - **Strictly increasing**, implied by min step > 0.
@@ -429,8 +424,9 @@ remainder across a ring in proportion to each side's room. The retired policy ha
 excess out in proportion to every bin's *slack*, which on a fine grid where the other
 bins are near-empty is a near-uniform spread: q45065 (2026-08-01) had all three
 forecasters declare ~0.72 on the count that resolved, and published 47% of its mass above
-35 deaths against their own ~2%, with no log line anywhere at the time. The cap itself is the platform's and is untouched — a 0.72 single-bin mass
-is simply not expressible on a 201-point grid — so the honest repair is the legal shape
+35 deaths against their own ~2%, with no log line anywhere at the time. The cap itself is
+the platform's and is untouched (a 0.72 single-bin mass is simply not expressible on a
+201-point grid), so the honest repair is the legal shape
 closest to the declaration. Every clip emits a `CDF_MAXSTEP_CLIP` WARN naming the
 forecaster, the mass displaced, and how far it travelled (`scripts/telemetry/markers.py`
 harvests it); it is deliberately **not** alertable, since a spike above a platform cap is
@@ -447,17 +443,16 @@ it, and it has no publish-time WARN on purpose. Detail:
 [performance_analysis.md](performance_analysis.md) and
 `metaculus_bot/performance_analysis/outer_tail.py`.
 
-`safe_cdf_bounds` holds the only implementation of this packing policy, and every path
-that enforces the max-step rule reaches it: the per-model build (`generate_pchip_cdf`),
-the per-model ramp pass, the ensemble CDF (`_postprocess_ensemble_cdf`),
-the discrete integer snap, the forecasting-tools fallback builder on an OPEN bound, and
-the offline pooling paths. It is not, however, a choke point every published CDF passes
-through: `BoundSafeNumericDistribution.get_cdf` in `numeric/pchip_processing.py` returns
-upstream's CDF unchanged when BOTH bounds are closed, so a closed-bound fallback
-distribution gets no step or endpoint enforcement and can emit no `CDF_MAXSTEP_CLIP`
-marker. That gap is accepted deliberately (it needs closed bounds and a PCHIP failure and
-stacking enabled, and stacking is prod-disabled); see the sentinel-value entry in
-FUTURE.md under "Sentinel-value sweep leftovers", sixth item.
+`safe_cdf_bounds` holds the only implementation of this packing policy and is the single
+choke point every CDF build passes through: the per-model build (`generate_pchip_cdf`), the
+per-model ramp pass, the per-bin build ("Per-bin elicitation", step 5), the ensemble CDF
+(`_postprocess_ensemble_cdf`), the discrete integer snap, the forecasting-tools fallback
+builder on every bound shape, and the offline pooling paths. The fallback builder's
+closed/closed branch used to return upstream's CDF raw, with no step or endpoint enforcement
+and no `CDF_MAXSTEP_CLIP` marker possible; a tight declaration on the modal Mantic date shape
+produced a 0.297 bin against the 0.2 cap and an HTTP 400 on the lone-survivor path, and the
+branch was removed on 2026-09-08 (the history is in FUTURE.md under "Sentinel-value sweep
+leftovers", sixth item).
 
 ### Open vs. closed bounds: a one-sided constraint, not a box
 
@@ -481,22 +476,42 @@ validation in `_validate_pchip_cdf` (`pchip_processing.py`) both apply this one-
 logic.
 
 If PCHIP construction fails outright, `create_fallback_numeric_distribution`
-(`pchip_processing.py`) delegates the CDF build to forecasting-tools, but still
-re-pins open-bound endpoints through `safe_cdf_bounds` (the native builder would anchor
-an open lower bound at 0% once the standard set includes P1, which Metaculus rejects).
+(`pchip_processing.py`) delegates the CDF build to forecasting-tools and runs the result
+through `safe_cdf_bounds` with the grid's own step limits, whatever the bound shape: the
+native builder would anchor an open lower bound at 0% once the standard set includes P1,
+which Metaculus rejects, and on closed bounds it can emit an over-cap bin (the 0.297 case
+above). `safe_cdf_bounds` pins nothing on a closed bound and `enforce_min_steps` caps at
+[0.0, 1.0], so closed endpoints survive it exactly.
 
 ### Piling on an open edge (`OPEN_BOUND_PILING`)
 
-A sibling WARN, `OPEN_BOUND_PILING: question=... model=... bound=... bin_mass=... declared_edge=... bound_value=...` (`numeric/diagnostics.py`, threshold `OPEN_BOUND_PILING_THRESHOLD` in `numeric/config.py`), fires when a model piles at least that fraction of mass on the terminal displayed bin of an *open*-bound numeric question without declaring any percentile beyond the edge — the "crammed the open ceiling" failure mode fixed 2026-07-12 by rendering nominal/displayed bounds in the numeric prompts (`nominal_bounds` in `numeric/utils.py`). It takes the pre-resample model-declared percentiles explicitly (the discrete resample overwrites `prediction.declared_percentiles` with a grid pinned to the raw bounds, which would defeat the above-edge exemption). The threshold is calibrated against the 201-grid per-bin cap of 0.2 and scales down with the grid's own cap on finer grids (0.044 at 451 points, 0.01 at 2,001), because the max-step repair clips a crammed terminal bin to that cap, which on a fine grid is below the fixed 0.10; the 201-point and every coarser grid keep 0.10 exactly.
+A sibling WARN, `OPEN_BOUND_PILING: question=... model=... bound=... bin_mass=...
+declared_edge=... bound_value=...` (`numeric/diagnostics.py`, threshold
+`OPEN_BOUND_PILING_THRESHOLD` in `numeric/config.py`), fires when a model piles at least that
+fraction of mass on the terminal displayed bin of an *open*-bound numeric question without
+declaring any percentile beyond the edge. That is the "crammed the open ceiling" failure mode,
+fixed 2026-07-12 by rendering nominal/displayed bounds in the numeric prompts
+(`nominal_bounds` in `numeric/utils.py`). It takes the pre-resample model-declared percentiles
+explicitly, because the discrete resample overwrites `prediction.declared_percentiles` with a
+grid pinned to the raw bounds, which would defeat the above-edge exemption. The threshold is
+calibrated against the 201-grid per-bin cap of 0.2 and scales down with the grid's own cap on
+finer grids (0.044 at 451 points, 0.01 at 2,001), because the max-step repair clips a crammed
+terminal bin to that cap, which on a fine grid is below the fixed 0.10; the 201-point and every
+coarser grid keep 0.10 exactly.
 
 ### The MIN-step repair-tier signals are dead code on real forecasts
 
-`generate_pchip_cdf` logs five repair signals: `pchip_aggressive` (aggressive
-enforcement), `clamp_frac` and `clamp_dist` (bounds-clamp corrections),
-`violated_steps_frac`, and `ramp_smoothing_delta`. On real model output none of them
-fires, because the uniform-mixture construction pre-enforces the min-step before any
-repair tier is reached: 0 of 1182 archived numeric forecasts fired any of the five, and
-the one genuinely degenerate case raises `pchip_failed` instead. Keep the guards (they
+The PCHIP build logs its repair tiers as prose lines rather than markers:
+`PCHIP minimum step enforcement required` (carrying `violated_steps=<k>/<n>`) and
+`PCHIP aggressive enforcement completed` in `pchip_cdf.py`, `CDF ramp smoothing` (carrying
+`min_prob_delta_before` and `min_prob_delta_after`) in `pchip_processing.py`, and the
+end-of-run `PCHIP Summary` line whose `required_aggressive_enforcement` and `failed_entirely`
+counters total them. On real model output none of the repair lines fires, because the
+uniform-mixture construction pre-enforces the min-step before any repair tier is reached: the
+2026-07-15 audit scored five repair signals (aggressive enforcement, two bounds-clamp
+corrections, the violated-step fraction and the ramp-smoothing delta) over 1182 archived
+numeric forecasts and found every one at zero, and the one genuinely degenerate case raised
+out of the build (the `failed_entirely` count) instead of being repaired. Keep the guards (they
 defend against pathological inputs), but their absence in logs carries no information,
 and they must not be used as model-quality features. Verified 2026-07-15; receipts in
 `scratch/coherence_2026-07-15/synthesis.md`.
@@ -512,7 +527,7 @@ review 2026-09, rank 3; `TestAllMassBeyondABoundStillBuilds` in
 `tests/test_numeric_fine_grids.py` pins 15, 201, 451 and 2,001 points, both bounds). With the
 tolerance the rebuild can only be reached by a genuine shortfall, where it raises.
 
-Do NOT generalize that to the MAX-step repair, which is a live path — see the
+Do NOT generalize that to the MAX-step repair, which is a live path; see the
 nearest-first packing section below. That the 2026-07-15 audit did not see it is an
 artifact of its old DEBUG level, not evidence it never fires.
 
@@ -521,7 +536,7 @@ artifact of its old DEBUG level, not evidence it never fires.
 The result is wrapped in a `PchipNumericDistribution` (`pchip_processing.py`), a
 subclass of forecasting-tools' `NumericDistribution` whose `get_cdf()` override returns
 the pre-computed CDF on the canonical question grid instead of rebuilding it. `get_cdf()` is the real
-override — the `.cdf` property is a deprecated shim that delegates to it, so overriding
+override: the `.cdf` property is a deprecated shim that delegates to it, so overriding
 `.cdf` alone would miss the publish and aggregate paths. The `_pchip_cdf_values` attribute
 also acts as the marker that CDF validation should be skipped (the constraints were
 already enforced) and that discrete snapping can read the CDF back out.
@@ -555,7 +570,7 @@ aggregation.
 Before a per-model prediction is accepted, `detect_unit_mismatch`
 (`numeric/validation.py`) checks whether the declared values look off by orders of
 magnitude relative to the question range. It flags a mismatch when any of three ratios
-falls below its threshold — each threshold is a keyword argument on
+falls below its threshold; each threshold is a keyword argument on
 `detect_unit_mismatch`, so the signature is where the values live:
 
 - span between lowest and highest declared value, over the range
@@ -569,7 +584,7 @@ distribution in the wrong units. No network or community stats are needed; it is
 sanity check on the numbers.
 
 The guard **fails SHUT**: it used to wrap its arithmetic in a try/except that returned
-"no mismatch" on any internal error, which is byte-identical to a passing check — so a
+"no mismatch" on any internal error, which is byte-identical to a passing check, so a
 crash inside the guard silently published the order-of-magnitude error it exists to
 block. Errors now propagate. Related: on the 201-point continuous grid a point-mass
 declaration reaches this guard with its real (zero) span rather than the cluster spreader's
@@ -593,8 +608,8 @@ are the outcome space Step 3 spreads the collapse inside its bin and the guard p
    This replaced a group-by-VALUE aggregation (a pandas groupby on float-equal `value`).
    The PCHIP grid (`np.linspace`) and the ft-fallback grid (`min + span*i/(n-1)`) differ
    in float rounding, so a mixed-path ensemble medianed over a rotating SUBSET of its
-   members at misaligned points — measured at 225 unique x-values from 3 models, 48 of
-   them with fewer than 3 contributors — and nothing recorded the partial membership.
+   members at misaligned points (measured at 225 unique x-values from 3 models, 48 of
+   them with fewer than 3 contributors), and nothing recorded the partial membership.
 3. `_postprocess_ensemble_cdf` (`numeric/utils.py`) re-pins the endpoints (one-sided
    open/closed logic), enforces monotonicity, applies ramp smoothing if any bin is below
    min-step, and runs `safe_cdf_bounds` with the step limits of the grid the CDF is on
@@ -615,7 +630,7 @@ CDFs (`base_combine` in `aggregation_pipeline.py`, because the default strategy 
 MEAN.
 
 **Per-bin members are pooled by the MEAN, on every path.** A member elicited per bin ("Per-bin
-elicitation on enumerable grids", above) can be sharp, 0.99 on one bin, and the pointwise
+elicitation", above) can be sharp, 0.99 on one bin, and the pointwise
 median of three sharp CDFs that disagree is the middle member's CDF outright: the published
 forecast then carries 0.99 on that member's bin and the platform floor on the bins the other
 two believed, the cliff a log score in the resolved bin punishes hardest. The linear opinion
@@ -628,8 +643,9 @@ agree. The pool never gives a bin less than a third of the mass any member put t
 `aggregation_pipeline._numeric_combine_strategy` returns MEAN when `elicit_per_bin` holds for
 the question's numeric view and the configured strategy otherwise, so percentile members keep
 the MEDIAN everywhere, on both platforms (the benchmarked median-over-mean decision in
-`FUTURE.md` stands for them). The `NUMERIC_AGGREGATE` marker records which rule ran in its
-trailing `method` field (`mean`, `median`, `stacked` or `single`).
+`FUTURE.md` stands for them). The `NUMERIC_AGGREGATE` marker's trailing `method=` records which rule ran: `mean` (pooled
+per-bin members), `median`, `stacked` or `single`; `unrecorded` means the aggregation never
+recorded a method and is a bug signal.
 
 ## Step 10: the numeric spread metric
 
@@ -646,7 +662,7 @@ normalizes:
 The largest of the three normalized spreads is the reported value. If it exceeds
 `CONDITIONAL_STACKING_NUMERIC_NORMALIZED_THRESHOLD` (`constants.py`), the
 aggregator extracts the disagreement crux, runs a targeted search, and invokes the
-stacker LLM; otherwise it returns the MEDIAN. (Stacking is disabled in all five bot
+stacker LLM; otherwise it returns the MEDIAN. (Stacking is disabled in all six bot
 workflows, so in prod this metric is computed but the stacker branch does not fire; the
 chain stays live in backtests and ablation.)
 
@@ -679,7 +695,11 @@ review, 2026-09-08). The interior is rescaled affinely between the new endpoints
 keeps it monotone and can only shrink steps, so the platform's max step cannot be newly
 violated; the bins that sat exactly on the min step (the uniform-mixture tails of a
 concentrated PCHIP build) do land below it, so `enforce_min_steps` (`numeric/pchip_cdf.py`)
-runs again with the new endpoints as its caps. When an endpoint moves, the distribution is
+runs again with the new endpoints as its caps. A lift under `_LIFT_TOLERANCE` (1e-10, the
+server's 10-decimal CDF rounding, so invisible to it) is not a move: an aggregate whose interior
+already sits at the minimum arrives with its endpoints a few 1e-15 off it, and without the
+tolerance the seam rebuilt the distribution for that noise and the marker's `tail_floor` read
+the tail's own raw mass as the floor applied. When an endpoint moves, the distribution is
 rebuilt through `create_pchip_numeric_distribution` on the question's numeric view (the epoch
 adapter for a date question, so `is_date` and the date rendering survive) with the floored
 heights as both its CDF and its `declared_percentiles`, on the value axis the aggregate already
@@ -721,17 +741,17 @@ multi-resolution history, a 52-week range, and a horizon-matched empirical band.
 section header in the briefing is `## Time Series Anchor` (`TS_ANCHOR_SECTION_HEADER`,
 rendered by `provider_header` in `research/section_format.py`). Gated by
 `TS_ANCHOR_ENABLED` (`_select_research_providers` in `research/orchestrator.py`); on in
-all five workflows.
+all six workflows.
 
 ### Routing (deterministic, no LLM)
 
 `route_question` (`timeseries_anchor.py`) maps a question to a series two ways, URL
 first:
 
-1. **URL extraction** from resolution criteria and fine print — a cited FRED series or
+1. **URL extraction** from resolution criteria and fine print: a cited FRED series or
    Yahoo ticker is the ground-truth resolving source and wins.
 2. **A conservative curated keyword registry** (`_TEMPLATE_REGISTRY` in
-   `timeseries_anchor.py`) — 10-year Treasury, VIX, CPI, unemployment, nonfarm
+   `timeseries_anchor.py`): 10-year Treasury, VIX, CPI, unemployment, nonfarm
    payrolls, S&P 500, gold, and so on. Deliberately small and unambiguous.
 
 Anything ambiguous (more than one series that is not a two-ticker spread, or more than
@@ -769,7 +789,7 @@ contains revised historical values not known at forecast time. So those go throu
 **ALFRED point-in-time vintages** instead of plain FRED CSV. `fetch_series`
 (`ts_fetch.py`) defaults every FRED series to ALFRED vintages *except* a small
 non-revising allowlist (`FRED_NON_REVISING_SERIES` in `ts_fetch.py`: market prices and
-survey levels like DGS10, Brent, gasoline). That default is fail-safe — an over-inclusive
+survey levels like DGS10, Brent, gasoline). That default is fail-safe: an over-inclusive
 ALFRED guess costs nothing for a non-revising series, but a revising series routed to
 plain FRED would silently leak. A belt-and-suspenders check, `_assert_no_leakage`
 (`ts_fetch.py`), raises `LeakageError` if any observation postdates the ceiling.
@@ -780,7 +800,7 @@ The provider always returns a text section. It can also render a small chart ima
 (matplotlib ribbon), stashed in a per-session side-channel for the forecaster's vision
 message, but only for plain single-level questions. The chart is gated separately by
 `TS_ANCHOR_CHART_ENABLED` (`_maybe_stash_single_chart` in `timeseries_anchor.py`), which
-is **off** in all five workflows while the text anchor is **on**. Chart render failures
+is **off** in all six workflows while the text anchor is **on**. Chart render failures
 are swallowed so a plotting hiccup never breaks the text section.
 
 ## Clamps on the other question types
@@ -789,4 +809,4 @@ The numeric CDF bounds above are one of three publish-value clamps. The binary a
 clamps live here too so that all three have one home.
 
 - **Binary**: `[BINARY_PROB_MIN, BINARY_PROB_MAX]` (`constants.py`). Applied per-model in `forecaster_runners.py` and on stacker output in `stacking.py`. Median/mean of already-clamped values stays in-bounds, so no post-aggregation clip needed.
-- **MC**: `[MC_PROB_MIN, MC_PROB_MAX]` (`constants.py`), set to match ft 0.2.92's `PredictedOptionList` validator, which clamps every option on construction — matching bounds makes it a no-op and removes publish-time `ValueError` risk on many-option ballots. Drift-free clamp-then-renormalize via `clamp_and_renormalize_probs` (`mc_processing.py`), applied BEFORE every `PredictedOptionList` construction and re-applied idempotently by `clamp_and_renormalize_mc` (`numeric/utils.py`); the repair pass keeps floored options from dividing back below the floor.
+- **MC**: `[MC_PROB_MIN, MC_PROB_MAX]` (`constants.py`), set to match ft 0.2.92's `PredictedOptionList` validator, which clamps every option on construction: matching bounds makes it a no-op and removes publish-time `ValueError` risk on many-option ballots. Drift-free clamp-then-renormalize via `clamp_and_renormalize_probs` (`mc_processing.py`), applied BEFORE every `PredictedOptionList` construction and re-applied idempotently by `clamp_and_renormalize_mc` (`numeric/utils.py`); the repair pass keeps floored options from dividing back below the floor.

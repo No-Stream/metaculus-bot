@@ -11,15 +11,16 @@ forfeit accounting.
 
 Two sibling documents own the other halves, and this doc cross-links rather than
 restates them. `docs/operations.md` § "Performance analysis and the width monitor" is
-the **runbook** — the exact commands, the `--exclude-qids` mechanics, and what each
+the **runbook**: the exact commands, the `--exclude-qids` mechanics, and what each
 report prints. `scratch_docs_and_planning/residual_analysis_playbook.md` owns the
 per-round **procedure** (Pre-pull → Recon → Pull → automated dims → per-question trace
 dossiers with adversarial verification → Synthesize). Read this doc for *why a number
 means what it means*; read those two for *what to type* and *what order to do it in*.
 
 Every constant, function, module path and CLI flag here was verified against the code
-on 2026-09-03. Measured figures are dated and carry their receipt path, because most of
-them are a snapshot of one round's archive rather than a repo constant.
+on 2026-09-03, and the Mantic and date-question passages on 2026-09-09. Measured figures are
+dated and carry their receipt path, because most of them are a snapshot of one round's
+archive rather than a repo constant.
 
 ## The round pull, and why `--prior` is mandatory
 
@@ -32,7 +33,7 @@ uv run python -m metaculus_bot.performance_analysis --tournament <slug> --output
 
 The `--tournament` default (`DEFAULT_TOURNAMENT`, `performance_analysis/cli.py`) lags
 the live season, so pass the current slug explicitly. The **pull is read-only and
-free** — it hits only the Metaculus API (the tournament's resolved posts, paged off the
+free**: it hits only the Metaculus API (the tournament's resolved posts, paged off the
 list endpoint under `with_cp=true` so each page already carries the token's own
 `my_forecasts` and no per-post GET is issued, plus the bot's own comments, user id
 275109, auth via `METACULUS_TOKEN`), makes no LLM or research calls and publishes
@@ -67,9 +68,9 @@ pulls **everything** sync-shaped in one command, and that matters because GHA ar
 expire at 90 days, so a single-source pull silently and permanently drops whatever it
 did not fetch. Three archives:
 
-- **The research archive** (`backtests/research_archive/latest/<qid>.json`) —
+- **The research archive** (`backtests/research_archive/latest/<qid>.json`):
   per-question post-summarizer research. Precedence rules below.
-- **The run-log telemetry archive** (`backtests/telemetry_archive/`) — the
+- **The run-log telemetry archive** (`backtests/telemetry_archive/`): the
   `EXTRACTION_RUNG` / `GAP_FILL_V2` / `GHOST_FORECAST` / `OPEN_BOUND_PILING` /
   `CREDIT_*` markers, plus the 2026-08-25 honesty set
   (`NUMERIC_DEGENERATE_DECLARATION`, `NUMERIC_AGGREGATE_GRID_MISMATCH`,
@@ -84,7 +85,7 @@ did not fetch. Three archives:
   `resolution_source`),
   `RESOLUTION_SOURCE_ESCALATION` (one line per escalated fetch rung, with what
   triggered it and what it cost), `AGENTIC_FETCH_LOCAL_DOC` (one line per gap-fill v2
-  document read served from the host's own bytes instead of the paid reader — fires only
+  document read served from the host's own bytes instead of the paid reader; it fires only
   where text was actually served, so its absence measures nothing),
   `AGENTIC_URLCONTEXT_ROBOTS_SKIP` (one line per paid read skipped because the host's
   robots.txt disallows `Google-Extended`) and the paid resolution-source rung's own three
@@ -95,13 +96,13 @@ did not fetch. Three archives:
   with the 2026-09-04 flag flip, so no run from before that merge carries any).
   `scripts/telemetry/markers.py` is the registry.
 - **The raw research-provider payload archive**
-  (`backtests/research_archive/raw/<run_id>.jsonl`, one file per run) — each provider's
+  (`backtests/research_archive/raw/<run_id>.jsonl`, one file per run): each provider's
   RAW return before formatting: AskNews article dicts per HOT/HISTORICAL phase,
   native-search and Gemini raw responses with grounding, prediction-market contracts,
   resolution-source per-URL fetches, gap-fill v1 search results. Written by
   `metaculus_bot.research.raw_log` when `RAW_RESEARCH_LOG_ENABLED` is set, so the raw
   evidence behind every forecast is auditable without depending on published comments.
-  `financial_data` is deliberately not captured — its raw series live only inside
+  `financial_data` is deliberately not captured; its raw series live only inside
   `to_thread` workers.
 
 `scripts/research_sync/` holds the launchd job, wired to `sync_all` for the same
@@ -109,14 +110,14 @@ reason. The telemetry archive also feeds `make score_ghosts` (the gap-fill v2
 ghost-vs-published log-score gate, ~0 scoreable until v2-era questions resolve). Dated
 round outputs land under `scratch/residual_<date>/` (gitignored).
 
-Per-question tracing is a first-class phase, not optional — operator directive
+Per-question tracing is a first-class phase, not optional. Operator directive
 2026-08-24: it is often the most valuable part of a residual round, and every miss
 dossier gets an adversarial verification pass (the 2026-08-02 round revised 6 of 6
 verified dossiers). The playbook supersedes the older `residual_rerun_workflow.js`.
 
 ## The research archive's `latest/` records come from three writers, and the difference matters
 
-**GHA run artifacts** are the source of truth for every question since 2026-05-29 — the
+**GHA run artifacts** are the source of truth for every question since 2026-05-29: the
 exact research text the forecasters saw, plus `provider_results` / `gap_fill_v2` /
 `asknews_raw` on schema-v2 records. Most older artifact records predate those fields,
 so their absence means "old record", not "degraded run".
@@ -134,19 +135,33 @@ Precedence for `latest/<qid>.json` is therefore `artifact` > `comment_backfill` 
 `log_backfill` (`record_precedence_key` in `scripts/download_research.py`), then
 newest-by-parsed-timestamp within a class. Log-backfill text is untrimmed but
 post-keyed, and `latest/` is read question-id-first, so promoting it serves the wrong
-question — measured: it made `latest/43592` return question 43591's research verbatim.
+question. Measured: it made `latest/43592` return question 43591's research verbatim.
+
+A Mantic run (`--mode mantic`) writes to the same archive and adds a second integer space
+on top. Its records carry `platform=mantic` and a `tournament_id` equal to
+`MANTIC_TOURNAMENT_ID`, but filenames are not namespaced by platform and `build_archive`
+groups on the bare `qid`, so a Mantic id and a Metaculus id that meet merge into one
+`by_qid` / `latest` / manifest entry, and `platform` is the field to filter on inside the
+group. The margin today is about 13,700 Mantic posts: open Mantic posts sit in
+the 650s, and the next Metaculus id already in the archive above them is 14333, from the
+evergreen `test_questions` set (`docs/operations.md` "How the mode works" has the
+arithmetic; the revisit is logged in `FUTURE.md`). None of this reaches the residual
+dataset. `collector.py` reads `BASE_URL = "https://www.metaculus.com/api"` with the
+Metaculus bot user id, so a Mantic question cannot become a record, and the Mantic-side
+accounting (forecast, forfeit, miss rate per release hour) lives in
+`make supply_probe_mantic` (`docs/supply_probe.md` "The Mantic mode").
 
 Reading rules that follow from this:
 
 - Read the record's `source` field (`"artifact"` | `"comment_backfill"` |
   `"log_backfill"`, mirrored as `latest_source` in `manifest.json`). **Never infer the
-  class from `run_id` alone** — log-backfill run_ids are plain GHA run ids,
+  class from `run_id` alone**; log-backfill run_ids are plain GHA run ids,
   indistinguishable from artifacts.
 - **Never pool the classes** for a presence, provider-mix, or length claim.
   `providers_used` on a comment record is reconstructed from trimmed text:
   `financial_data` reads 31 where the artifacts say 253.
 - `latest_timestamp` is the winning record's timestamp, not a freshness signal.
-- `scripts/research_sync/verify_completeness.py` gates the merge stage — a question
+- `scripts/research_sync/verify_completeness.py` gates the merge stage: a question
   holding an artifact record must be served by one in `latest/`.
 - `make backtest_with_cache` logs the source split it replays, so pre- and
   post-2026-08-03 cached-backtest numbers are not comparable.
@@ -154,7 +169,7 @@ Reading rules that follow from this:
 ## Two treatment tags read as TERNARY, and two archived fields are historically unreadable
 
 `research_tags.gfv2_loop_ran` is None on any record whose WRITER could not carry the
-`gap_fill_v2` payload — only a schema-v2 `artifact` record can, and that writer omits
+`gap_fill_v2` payload; only a schema-v2 `artifact` record can, and that writer omits
 the key when the loop did not run. So on a carryable record its absence is a
 *measurement*, and everywhere else it is *silence*. Reading it as a bool put 880
 archived can't-carry records into the untreated arm against 77 measured ones, which
@@ -169,12 +184,12 @@ The companion `gfv2_confidence` grades a False `gfv2_present` the way
 | `header` | the section header itself was found |
 | `payload_ran_no_section` | the loop ran and contributed nothing (a soft-fail) |
 | `payload_confirms_absent` | a carryable record with neither header nor payload |
-| `ambiguous_trimmed_no_payload` | a trimmed comment record — the section may have been trimmed away |
+| `ambiguous_trimmed_no_payload` | a trimmed comment record; the section may have been trimmed away |
 | `absent_no_payload` | an untrimmed record from a writer that cannot carry the payload |
 
 Separately, `metadata.nr_forecasters` (the Metaculus CROWD size) reads **0 in all 2196
 records pulled before 2026-08-25**, because the collector read it off the question
-dict, where it does not exist — it lives on the POST. Nothing rewrites the archive, so
+dict, where it does not exist; it lives on the POST. Nothing rewrites the archive, so
 treat a 0 on an older record as UNKNOWN, never as an empty crowd. Fresh pulls carry
 real counts (typically 100-250 on tournament questions) or None when the post omits the
 field, and `audit.py` renders None as `n/a`.
@@ -191,17 +206,17 @@ Three separate conclusions have flipped under era-bucketing:
 - the "current pipeline too narrow" verdict (2026-07, softened and then reversed as
   post-flip n grew);
 - the YES-side overconfidence finding (2026-07-08), which turned out to be
-  spring-2026-era-local — fall was well-calibrated, and a pooled fit would have
+  spring-2026-era-local: fall was well-calibrated, and a pooled fit would have
   degraded fall out-of-sample.
 
 Bucket by **major** config/roster changes: model swaps, aggregation changes, widening
-flips, research-stage changes. **NOT** by every git hash — a small prompt tweak does not
+flips, research-stage changes. **NOT** by every git hash: a small prompt tweak does not
 start a new era; a forecaster-roster or pipeline-behavior change does. The judgment
 call is "would this change plausibly shift the forecast distribution?" If unsure, run
 the analysis both ways.
 
 Read the merge-date rule below before fixing any boundary. In particular the whole
-july15 bundle — everything authored 2026-07-15 through 07-20 — is a SINGLE boundary at
+july15 bundle (everything authored 2026-07-15 through 07-20) is a SINGLE boundary at
 **2026-07-21T17:07:37Z (`b4e9df0`)**. It carried gap-fill v2 on, the native-search and
 crux-analyzer sol→terra swaps, both same-day forecaster-roster changes (the fable-5 →
 opus-4.7 forecaster plus opus-4.8 stacker swap, then the drop from 6 to the 3-member
@@ -211,7 +226,7 @@ is separately datable, and no shift across the boundary can be attributed to any
 them.
 
 **Fitted calibration layers (shrinks, clamps, haircuts) require a decisive
-out-of-sample era test before shipping** — fit on eras 1..k-1, must improve era k — else
+out-of-sample era test before shipping**: fit on eras 1..k-1, must improve era k, else
 they are drift bombs.
 
 ## Era boundaries are merge-to-main timestamps, never authoring dates
@@ -233,25 +248,25 @@ this has already cost real analysis twice.
 
 First, it manufactured a phantom one-record `ts_anchor` era in `width_monitor.py` out of
 a question whose own comment names the retired six-model roster (`grok-4.5`, `gpt-5.5`,
-`opus-4.6`) — all dropped by the same merge that landed the anchor, so the combination
+`opus-4.6`), all dropped by the same merge that landed the anchor, so the combination
 is impossible post-merge. That phantom is gone. **Today the `ts_anchor` row is absent
 from the width-monitor table for a different and correct reason:** empty eras are
 omitted, and no post-july15-bundle numeric has resolved yet. The two causes are
-sequential, not competing — a phantom row that was wrong, then a legitimately empty row
+sequential, not competing: a phantom row that was wrong, then a legitimately empty row
 that is omitted.
 
 Second, it made the guard-telemetry presence check read an "intermittent emission" rate
-instead of a clean 100% — **58%** on the receipt's per-slot cohort
+instead of a clean 100%: **58%** on the receipt's per-slot cohort
 (`scratch/residual_2026-08-02/dim_ghosts-and-guards.md:118`) and 78.9% on a per-comment
 recount. The spread between those two figures is itself a second reason not to lean on
 the authoring-date number. The mechanism is exact regardless of cohort: all 8 binary
 comments in the authored-but-unmerged gap window carry no anchor, and the first one that
-does is 2026-07-12, after the merge — exactly as "prod runs from main" predicts.
+does is 2026-07-12, after the merge, exactly as "prod runs from main" predicts.
 
 **Corollary: several authoring dates often collapse into one boundary.** Nothing on
-`main` changed between the 2026-07-12 merge (`f084bf7`) and `b4e9df0` — a
+`main` changed between the 2026-07-12 merge (`f084bf7`) and `b4e9df0` (a
 `git diff --stat f084bf7 b4e9df0^1 -- metaculus_bot/ .github/workflows/` comes back
-empty — so 2026-07-15 / 07-17 / 07-18 / 07-20 are **one** era boundary, not four. That
+empty), so 2026-07-15 / 07-17 / 07-18 / 07-20 are **one** era boundary, not four. That
 merge landed the TS anchor, gap-fill v2, the six-models-to-triple roster drop,
 `MIN_FORECASTERS_TO_PUBLISH` 3→1 and the sol→terra role swaps together, which also means
 no width or score shift across it can be attributed to any one of them. Treating those
@@ -271,12 +286,12 @@ questions whose published forecast came out of a since-fixed pipeline defect rat
 judgment, so pooling them into a calibration or miss-ranking row measures the retired
 bug. It currently holds five ids:
 
-- **43746 / 43747** — the pre-2026-07-07 open-bound arithmetic bug.
-- **43913**, added 2026-08-25 — the pre-`9f1175c` discrete max-step cap. All six
+- **43746 / 43747**: the pre-2026-07-07 open-bound arithmetic bug.
+- **43913**, added 2026-08-25: the pre-`9f1175c` discrete max-step cap. All six
   forecasters stated 79.5-83% on the outcome that resolved; the published CDF carried
   20.00% with its first bin pinned at exactly 0.200000 on an 11-point grid. Receipts:
   `scratch/residual_2026-08-24/dossiers/43913_dossier.md`.
-- **43147 / 41798**, added 2026-09-01 — the same defect family on pre_flip discrete
+- **43147 / 41798**, added 2026-09-01: the same defect family on pre_flip discrete
   records: published mass at the resolving value pinned at exactly 0.200000 by the
   retired flat cap, while even the least concentrated member wanted 0.525 / 0.635 there.
   Peers −34.75 / −35.50. Identified by the shipped `max_step_clamp_screen`. Receipts:
@@ -284,7 +299,7 @@ bug. It currently holds five ids:
 
 Import the constant instead of re-hardcoding the ids; every private copy in a round's
 analysis scripts has drifted from it at least once. Nothing excludes the cohort by
-default — a caller passes it explicitly (`--exclude-qids known_bug`) and the excluded
+default; a caller passes it explicitly (`--exclude-qids known_bug`) and the excluded
 count is rendered per row, so an exclusion is a visible choice rather than a silent
 filter. See `docs/operations.md` for the `--exclude-qids` mechanics.
 
@@ -294,9 +309,9 @@ The pre-fix dry-key window published eleven triple-era questions on a thinned en
 Exclude them from headline aggregates and report them separately. Since 2026-08-31 they
 live beside `KNOWN_BUG_QIDS` in `performance_analysis/cohorts.py`:
 
-- `DEGRADED_RUN_QIDS` — full 1-of-3 publishes, gemini only (the personal-key-pinned
-  slot): question ids **44870-44877**.
-- `PARTIAL_DEGRADED_QIDS` — partial 2-of-3: **44841, 44856, 44912**.
+- `DEGRADED_RUN_QIDS`: full 1-of-3 publishes, gemini only (the personal-key-pinned
+  slot), question ids **44870-44877**.
+- `PARTIAL_DEGRADED_QIDS`: partial 2-of-3, **44841, 44856, 44912**.
 
 Both are reachable as `from metaculus_bot.performance_analysis import DEGRADED_RUN_QIDS`
 and both are wired into `--exclude-qids` under the shorthands `degraded_run` /
@@ -312,7 +327,7 @@ On the research side, 44841 / 44856 are degraded identically to the full cohort 
 search errored, both gap-fill passes dead), so a research-conditioned cut must exclude
 both sets together even though the forecaster-count tagging separates them.
 
-The first two resolved in 2026-08, both favorably — 44870 spot peer **+20.11**
+The first two resolved in 2026-08, both favorably: 44870 spot peer **+20.11**
 (published on gemini alone; coverage-scaled peer +14.38), 44841 spot peer **+24.52**
 (peer +21.54). That is a two-question favorable draw, not evidence that degraded
 publishes are fine. Receipts: `scratch/residual_2026-08-24/degraded_cohort.json`.
@@ -328,7 +343,7 @@ question's `default_score_type` is `spot_peer`, and `spot_scoring_time` equals
 2026-08-31 round's 30 new records, that identity reproduces the platform's own
 `peer_score` to a **median residual of 0.69 points (max 13.05)**, and the residual is
 crowd movement in the 1.5-3h window between our submit and the close rather than
-anything the bot did. Those are that round's numbers, not a repo constant — re-derive
+anything the bot did. Those are that round's numbers, not a repo constant; re-derive
 with `scratch/residual_2026-08-31/dossiers/44798_peer_vs_spot.py`.
 
 Because the bot submits exactly once and never revises (forecast history length 1 on
@@ -340,7 +355,7 @@ scaling FLATTERS misses and dulls hits: q44872 scored peer −15.0 against spot 
 
 - use `spot_peer_score()` / `ranking_score()` rather than indexing `metaculus_scores`;
 - report peer beside it as a labelled secondary;
-- never sort a mixed set on whichever field happens to be present — `RankingScore.tier`
+- never sort a mixed set on whichever field happens to be present; `RankingScore.tier`
   keeps spot-scored and peer-only records in separate sort tiers.
 
 Bot-side scores are a different quantity entirely and are unaffected: Brier and log
@@ -385,7 +400,7 @@ uv run python -m metaculus_bot.performance_analysis.clip_threshold --cached <dat
 ```
 
 It reprices every resolved binary and MC publish under a grid of candidate floors `c`
-(binary 0.005 to 0.10, MC 0.005 to 0.10 — module constants `BINARY_FLOOR_GRID` /
+(binary 0.005 to 0.10, MC 0.005 to 0.10; module constants `BINARY_FLOOR_GRID` /
 `MC_FLOOR_GRID` in `clip_threshold_sweep.py`) and reports each in spot-peer points via
 `spot_peer_delta`, floor-only / ceiling-only / symmetric.
 
@@ -411,7 +426,7 @@ counted and bounded, never estimated:
 
 **The in-force clamp is looked up per record** from `bot_comment_created_at` against
 `WIDENING_FLIP_MERGED_AT` (binary, `0e85e1b`, 2026-05-18T17:21:19Z) and
-`FT_0292_MERGED_AT` (MC, `325b1b0`, 2026-07-24T19:16:26Z) — both merge-to-main committer
+`FT_0292_MERGED_AT` (MC, `325b1b0`, 2026-07-24T19:16:26Z), both merge-to-main committer
 dates, living beside `B4E9DF0_MERGED_AT` in `analysis.py`, and `width_monitor.WIDENING_FLIP`
 aliases the first.
 
@@ -423,12 +438,12 @@ proper, so a clip costs a calibrated forecaster that much regardless), and the b
 because the argmax is a choice over the grid and its own row's CI ignores that
 selection. The out-of-sample rule is that a floor fitted on the records older than a
 window ships only if it carries into the window, and a fit that moves nothing in its own
-complement is flagged `moves nothing` — its carry of 0 is vacuous rather than a pass. A
+complement is flagged `moves nothing`; its carry of 0 is vacuous rather than a pass. A
 row that moves no record renders `identity` rather than a CI.
 
 **Result on 2026-09-02** (`scratch/residual_2026-09-01/clip_threshold/dim_clip-threshold.md`):
 
-- The live clamp has bound NO binary publish since it went live — 70 strict post-flip
+- The live clamp has bound NO binary publish since it went live: 70 strict post-flip
   binaries span 0.034 to 0.925.
 - Raising the binary floor loses in every window and era. At c = 0.05 the pooled figure
   is **−217.48 over 447** records, of which −214.76 is the retired pre-flip regime and
@@ -442,6 +457,29 @@ row that moves no record renders `identity` rather than a CI.
 - The only pro-tightening row in either cohort is the single-survivor degraded publish
   q44874, whose shape the thin publish floor prices at **+51.08 over the 4 genuine k=1
   publishes with zero cost to the other three**.
+
+## Receipts behind the survivor-conditional markers
+
+`FORECASTERS_SURVIVED`, `EXTREME_CALL` and `THIN_PUBLISH_FLOOR` are described as mechanisms
+in `docs/architecture.md` (section 4 "Survivor and extreme-call telemetry" and section 5
+"The thin-publish floor"). The measurements that motivated them live here.
+
+**`lone=true` is the cut worth having.** The 2026-08-31 gemini-slot review found lone
+extremes (no other survivor extreme on the same side) right 4 of 9 times, against 21 of 23
+for accompanied ones. **Do not pool `EXTREME_CALL` counts with the memo's own.** The memo's
+scripts implement the looser "no other member extreme at all", which disagrees with the
+marker on 4 of 570 archived extreme member-calls and reads pre_flip lone as 48 where the marker
+reads 52 (post_flip and triple_era agree exactly). Two scope facts keep the numerator
+honest: the marker is binary only (MC concentration is a different measurement and was not
+adopted), and `lone` is vacuous at `survivors=1`, which is why the survivor count rides the
+same line.
+
+**The thin-publish floor was priced on one miss.** q44874 published a lone 0.03 on gemini
+alone during the dry-donated-key window (the degraded-run cohort above) and scored −105.27
+spot peer. Median-of-1 has no variance reduction, which is why the rule is keyed on the
+survivor count and a multi-member median is never floored. The clip-threshold sweep above
+prices the clamp at +51.08 over the four genuine k=1 publishes with zero cost to the other
+three. Receipt: `scratch/residual_2026-08-31/gemini_review/RECOMMENDATION.md` §2.
 
 ## Record fields: what each collector record carries, and the traps behind it
 
@@ -525,7 +563,7 @@ one:
   on the epoch-seconds axis of `numeric/date_axis.py`, so a resolved one does reach the
   collector, and `_process_single_question` skips it with a WARNING ahead of `parse_resolution`,
   which would otherwise file it under "Unknown question type" and make the exclusion look like a
-  parser bug. See "Date questions are excluded from the dataset, by decision" below.
+  parser bug. See "Date questions are excluded from the dataset" below.
 
 ## Recovering per-model forecasts
 
@@ -540,8 +578,8 @@ attribution from `performance_analysis/parsing.py`, which re-exports the mechani
 
 Gotchas:
 
-- Comments longer than `COMMENT_CHAR_LIMIT` are middle-trimmed (`comment/trimming.py`)
-  — summary bullets survive, but rationale-body percentile detail may not.
+- Comments longer than `COMMENT_CHAR_LIMIT` are middle-trimmed (`comment/trimming.py`);
+  summary bullets survive, but rationale-body percentile detail may not.
 - Stacked-era questions publish only the stacker's aggregate bullet; base values are
   recoverable only from self-declared rationale text (the `## Base Model Reasoning`
   sub-blocks).
@@ -549,7 +587,7 @@ Gotchas:
 - Old-era (May-June 2026) blocks carry retired tier-2 fields (`mixture_components`,
   `tails`, `distribution_family_hint`) that the strict `parse_structured_block` schemas
   reject wholesale. A tolerant raw-JSON fallback rung recovers the declared values from
-  block-only rationales that would otherwise vanish — strict block → prose regex →
+  block-only rationales that would otherwise vanish: strict block → prose regex →
   tolerant salvage, added 2026-07-15, imported from `parsing.py` and implemented in
   `performance_analysis/declared_value_recovery.py`. That rung explains the false
   "gemini missed 5/45" screening artifact. The other historical offender, an edge-value
@@ -557,14 +595,14 @@ Gotchas:
   schema reads an unusable `concentration` / `other_mass` as absent instead of rejecting
   the block, because both fields were retired from the prompt and a dormant field must
   never cost a ballot.
-- Roster drift makes era-conditioning mandatory — see the era-bucketing section above.
+- Roster drift makes era-conditioning mandatory; see the era-bucketing section above.
 
 ### Per-model cuts run on a filtered cohort; aggregates don't
 
 When no `Model:` line identifies a bullet, the parser keys it by position instead
 (`anonymous_model_key` → `Forecaster N`), and on a stacker-fired question that
 positional bucket holds the stacker's aggregate. Pooling it across questions therefore
-produces a stacker-vs-base-model mixture posing as one model — measured: 50 such
+produces a stacker-vs-base-model mixture posing as one model. Measured: 50 such
 forecasts in the 2026-04 data.
 
 Every per-model cut in `analysis.py` (`per_model_binary_scores`,
@@ -579,7 +617,7 @@ The audit's per-question rankings and the synthesis tally inherit the same guard
 `ranking_cohort.per_model_ranking_cohort`, which calls `per_model_cohort` rather than
 restating it, so the rule cannot drift between the aggregate cuts and the dossiers.
 Numeric rankings additionally drop declared percentile curves under
-`MIN_SCOREABLE_ANCHORS` (9) distinct anchors — unless EVERY member on the record is
+`MIN_SCOREABLE_ANCHORS` (9) distinct anchors, unless EVERY member on the record is
 equally sparse, which is sparse-ERA output rather than a partial recovery and still
 compares equals. Otherwise a sparse recovery gets PCHIP'd into a full CDF and
 log-scored beside 11-anchor siblings, worth ~96 points either direction.
@@ -588,13 +626,13 @@ log-scored beside 11-anchor siblings, worth ~96 points either direction.
 helper), because the screen's verdict turns on the MINIMUM member bin mass, so one
 sparse recovery can decide it. The floor lives in `parsing.py` precisely so those two
 consumers cannot drift; `stacker_detection.py` and `audit.py` read it too.
-**`declared_percentile_pit` deliberately does NOT gate on it** — it only linearly
+**`declared_percentile_pit` deliberately does NOT gate on it**: it only linearly
 interpolates the declared pairs in percentile space for a single quantile, where a
 3-anchor curve is coarse but not a fabricated distribution, and gating there would
 delete the uniformly-sparse-era records (fall-2025 comments declare 8-percentile sets)
 whose PITs are valid. It does still exclude anonymous keys.
 
-Aggregate and overall calibration paths are deliberately untouched by all of this — they
+Aggregate and overall calibration paths are deliberately untouched by all of this; they
 still count every record.
 
 ### The attribution parsers are guarded on two cohorts, and only one runs in CI
@@ -603,13 +641,13 @@ still count every record.
 per distinct SHAPE (attributable vs not, trimmed vs intact, with vs without the
 `### Research Summary` boundary marker, named vs anonymized, all four question types),
 redacted down to the structural skeleton the parsers key on. It is the deterministic CI
-floor — `TestMiniFixtureAttribution` (`tests/test_performance_analysis_attribution.py`)
+floor: `TestMiniFixtureAttribution` (`tests/test_performance_analysis_attribution.py`)
 and `TestAgainstCheckedInMiniComments` (`tests/test_comment_trimming.py`) are not
 skip-gated, so a parse or trim regression reddens every PR.
 
 The broad sweep over `scratch/performance_data.json` (283 records, every era) still runs
 locally and catches shapes the miniature has not been taught, but that file is gitignored
-and rewritten by each collector run, so it can never be the only guard — a parse
+and rewritten by each collector run, so it can never be the only guard; a parse
 regression hid behind exactly that gap until 2026-07-27.
 
 Regenerate the miniature with `uv run python scripts/derive_mini_comment_fixture.py`
@@ -626,8 +664,8 @@ Metaculus reports a resolution past the displayed range as the bare string
 miss even though that forecast deliberately put 13% of its mass above the displayed
 ceiling and won spot peer +24.4.
 
-The convention has exactly one home — `PitReading` and `out_of_range_pit_reading` in
-`performance_analysis/analysis.py` — and the two conventions riding on it differ
+The convention has exactly one home, `PitReading` and `out_of_range_pit_reading` in
+`performance_analysis/analysis.py`, and the two conventions riding on it differ
 deliberately. **Coverage** counts an interval as covered when it INTERSECTS the band, a
 miss only when the whole interval lies outside. **Point** statistics (`pit_std`,
 `mean_pit`, the histogram) EXCLUDE intervals and disclose the excluded count as
@@ -656,7 +694,7 @@ On an open bound the declared outer tail can end up routed past the displayed ra
 entirely, leaving every in-range bin above the members' declared p99 pinned at the
 platform's per-bin minimum step. Every resolution in that band then earns the same floor
 score (~−219 at any grid size), so it is a CLIFF at a fixed location rather than a band
-of the wrong width — which is why widening does not fix it, and why shipping the
+of the wrong width, which is why widening does not fix it, and why shipping the
 detector is not in tension with the standing `k_tail` hold.
 
 `scan_outer_tails` (`performance_analysis/outer_tail.py`, printed by the width monitor's
@@ -681,13 +719,23 @@ open-bound sides across 49 questions, 19 of them starved on both sides, with 44 
 sitting essentially exactly at the pipeline's own applied floor. So read a fire as "this
 question carries a cliff", not "something broke here".
 
+That calibration (the ~1.1x applied floor, the 44 sides in [1.00, 1.25)) is a Metaculus
+measurement: on a Metaculus aggregate the pipeline's structural out-of-range tail is 1% and
+the in-range band above the declared p99 sits at the platform minimum step. A published
+Mantic aggregate is shaped differently by construction, because `floor_published_tails`
+(`numeric/out_of_range_floor.py`) raises each open tail to at least 5%, as far as the other
+tail leaves room, and rescales the interior, so its `tail mass` would read 0.05 rather than 0.01 and its band multiples would
+not match these figures. Today that is moot: no Mantic record enters the dataset (the
+collector is Metaculus-only, see the archive section above). It is the first thing to
+re-derive if one ever does.
+
 There is deliberately NO publish-time `STARVED_OUTER_TAIL` WARN. The reason, and what a
 no-plumbing alternative would have to measure instead, are in the code comment above
 `STARVED_OUTER_TAIL_FLOOR_MULTIPLE` and tracked in `FUTURE.md`.
 
 ## Question-supply counts need post status `closed`
 
-`scripts/supply_probe.py` (`make supply_probe`, read-only and free — the Metaculus posts
+`scripts/supply_probe.py` (`make supply_probe`, read-only and free: the Metaculus posts
 list plus post detail) is the tracked replacement for two rounds' worth of scratch probes
 that each queried only `statuses=open` and `statuses=resolved`, and so missed the 178
 summer-tournament posts sitting at `closed` (closed to forecasting, not yet resolved),
@@ -698,24 +746,20 @@ It also reports the backlog of unresolved questions past their own
 "our pull is missing questions". Resolution is read per QUESTION, not per post, since a
 group post's members resolve on their own schedules.
 
-Since 2026-09-02 it also sweeps **FORFEITS** — every question on a `closed` or
-`resolved` post that the bot never forecast at all, with its open/close window. A
-forfeited question never enters the performance dataset and so is invisible to any sweep
-that starts from questions the bot intook. The 2026-09-01 round found the triple era had
-lost SIX questions to delivery where the prior sweep saw one: q44801 to a cron gap,
-q45085 to a late submit, q45093 / q45374 / q45375 to cancelled runs, and q45216 to a
-retroactive close.
+Since 2026-09-02 it also sweeps **FORFEITS**, every question on a `closed` or `resolved`
+post that the bot never forecast at all. A forfeited question never enters the performance
+dataset and so is invisible to any sweep that starts from questions the bot intook, which
+is why the sweep belongs in the weekly read rather than in a round's scratch scripts. The
+mechanics, the per-post cost, the `unknown` state and the six triple-era forfeits the
+2026-09-01 round found are in `docs/supply_probe.md` "The forfeit sweep". Default slugs
+come from the repo's constants; see `docs/operations.md` "Season-start checklist".
 
-The sweep costs one extra read-only detail GET per closed/resolved post whose list page
-did not already carry `my_forecasts` (`--no-forfeits` opts out), and a question whose
-state stays unreadable is reported as `unknown` rather than filed as a forfeit. Default
-slugs come from the repo's constants; see `docs/operations.md` "Season-start checklist".
+## Date questions are excluded from the dataset
 
-## Date questions are excluded from the dataset, by decision
-
-The live bot forecasts date questions since 2026-09-08 (Mantic's Crucible made them first
-class, and the Metaculus run modes forecast them too where they used to be skipped), so a
-resolved date question now reaches the collector. It does not enter the dataset:
+The live bot forecasts date questions from the merge of the Mantic Crucible bundle (authored
+2026-09-08, live only once it lands on `main`). Mantic's Crucible made them first class, and the
+Metaculus run modes forecast them too where they used to be skipped, so a resolved date question
+now reaches the collector. It does not enter the dataset:
 `collector.py` `_process_single_question` skips it with a WARNING naming the question and
 the post (`Skipping Q<id> (post <id>): date question, excluded from residual analysis by
 decision`), ahead of `parse_resolution`, which would otherwise have filed it under "Unknown
@@ -741,13 +785,13 @@ the `*_MERGED_AT` names in new code, and never introduce a third spelling.
 
 **Two anchor-count thresholds mean different things.** `MIN_SCOREABLE_ANCHORS` (9,
 `parsing.py`) is the distinct-anchor floor for per-model RANKING and the max-step clamp
-screen — below it a curve gets PCHIP-rebuilt into a full CDF and log-scored, worth ~96
+screen; below it a curve gets PCHIP-rebuilt into a full CDF and log-scored, worth ~96
 points either direction. The outer-tail scan's own rule is separate and far lower: it
 drops a member curve carrying fewer than two distinct percentile labels, because a
 single recovered pair interpolates to a constant PIT at every resolution. They are not
 in conflict; they gate different computations at different costs.
 
-**`n_oob_interval` and the rendered column `set-valued (pt n)` are the same quantity** —
+**`n_oob_interval` and the rendered column `set-valued (pt n)` are the same quantity**:
 the count of out-of-range-interval PIT readings excluded from the point statistics. The
 field name is what a script reads; the column label is what the width monitor prints.
 
@@ -756,4 +800,4 @@ one-record `ts_anchor` era once existed because the boundary was keyed on an aut
 date; its tell was that the record's own comment named the retired `grok-4.5` /
 `gpt-5.5` / `opus-4.6` roster, dropped by the same merge that landed the anchor. That is
 fixed. The row is absent *today* because empty eras are omitted and no post-july15
-numeric has resolved. Neither statement is stale — read them in that order.
+numeric has resolved. Neither statement is stale; read them in that order.

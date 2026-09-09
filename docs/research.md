@@ -53,7 +53,7 @@ priority order and returns the first provider whose credentials are present:
 
 1. **AskNews** if `ASKNEWS_CLIENT_ID` and `ASKNEWS_SECRET` are set. This is the
    production case.
-2. **Exa.ai** (`SmartSearcher`) if `EXA_API_KEY` is set — a generic rundown
+2. **Exa.ai** (`SmartSearcher`) if `EXA_API_KEY` is set: a generic rundown
    (`_exa_provider`, `research/providers.py`).
 3. **Perplexity direct** if `PERPLEXITY_API_KEY` is set. Model:
    `PERPLEXITY_RESEARCH_MODEL` (`constants.py`); the function is
@@ -62,7 +62,7 @@ priority order and returns the first provider whose credentials are present:
 4. **Perplexity via OpenRouter** if `OPENROUTER_API_KEY` is set. Same function
    called with `use_open_router=True`, same model, prefixed for the OpenRouter
    route: `PERPLEXITY_RESEARCH_MODEL_VIA_OPENROUTER`.
-5. **Empty stub** if none of the above — research is just the add-on providers.
+5. **Empty stub** if none of the above: research is just the add-on providers.
 
 In production the AskNews credentials are present, so Exa and the two Perplexity
 routes never run as the primary. They are fallbacks, not peers. To force a
@@ -105,8 +105,8 @@ LLM-written prose, so it has two distinct stages: fetch, then summarize.
 **Fetch** (`_asknews_provider`, `research/providers.py`) runs two phases
 against the AskNews SDK, asking HISTORICAL for a larger article budget than HOT:
 
-- **Phase 1 — HOT:** `strategy="latest news"`.
-- **Phase 2 — HISTORICAL:** `strategy="news knowledge"`.
+- **Phase 1, HOT:** `strategy="latest news"`.
+- **Phase 2, HISTORICAL:** `strategy="news knowledge"`.
 
 Both phases share a retry budget (`ASKNEWS_MAX_TRIES`) that only retries on
 known-transient rate/concurrency errors (429, "rate limit", "concurrency
@@ -116,13 +116,13 @@ plus a fixed wait before each phase (`WAIT_FOR_HOT_SEC` /
 `WAIT_FOR_HISTORICAL_SEC`, function-local in `_asknews_provider`), because the
 API rate-limits aggressively even when we stay under our own limits. All three
 throttles take env overrides, and the shipped `.env.template` deliberately sets a
-*lower* RPS than the `constants.py` default — the constant is the ceiling, not the
+*lower* RPS than the `constants.py` default: the constant is the ceiling, not the
 operating point, so the two disagreeing is expected rather than a drift bug. A
 hard wall-clock timeout (`ASKNEWS_WALL_TIMEOUT`) backstops a network hang so a
 stuck AskNews call can't hold the whole phase hostage.
 
-The two article lists are formatted into two labeled sections — "Historical
-Context & Background" and "Recent Developments & Current News" — with within-list
+The two article lists are formatted into two labeled sections, "Historical
+Context & Background" and "Recent Developments & Current News", with within-list
 and cross-list URL deduplication (`_format_asknews_dual_sections`,
 `research/providers.py`). Dedup normalizes URLs first (drops tracking params,
 `m.` mobile subdomains, `/amp` suffixes, fragments) so the same story from two
@@ -164,8 +164,8 @@ web-research prompt. Several rules are load-bearing for calibration:
 
 - **Never paraphrase numbers.** Percentages, probabilities, dates, and counts are
   copied exactly.
-- **Pre-window flagging.** Any event that happened before the question opened —
-  and so can't itself satisfy the resolution criteria — is tagged `[PRE-WINDOW]`
+- **Pre-window flagging.** Any event that happened before the question opened,
+  and so can't itself satisfy the resolution criteria, is tagged `[PRE-WINDOW]`
   but kept as base-rate context.
 - **Single-source labeling.** A claim resting on one outlet is tagged
   `[SINGLE-SOURCE]` with its original hedges preserved; it's never promoted to a
@@ -185,7 +185,7 @@ The 2026-07-18 revision to this prompt added three things worth calling out:
 - **Relevance screen + proportionality.** Each article is screened for direct
   bearing on the resolution criteria; anything off-topic is dropped and listed on
   a single "Screened out as not decision-relevant" line. Briefing length must
-  track surviving decision-relevant content — comprehensive when there's real
+  track surviving decision-relevant content: comprehensive when there's real
   material, short when few articles survive, never padded to look thorough.
 
 ## Add-on providers (parallel, each independently gated)
@@ -194,7 +194,7 @@ On top of the single primary, every enabled add-on provider runs in parallel.
 Each is behind its own env flag and produces its own `##` section. In production
 all of these are on.
 
-### OpenAI native search — `NATIVE_SEARCH_ENABLED`
+### OpenAI native search: `NATIVE_SEARCH_ENABLED`
 
 OpenAI web search via OpenRouter's native web plugin
 (`_native_search_provider` / `build_native_search_llm`,
@@ -209,7 +209,7 @@ overridable via `NATIVE_SEARCH_MODEL` / `NATIVE_SEARCH_REASONING_EFFORT` /
 
 The model migrated on 2026-07-09 to `gpt-5.6-sol`, then on 2026-07-17 to
 `gpt-5.6-terra` per the blind research-role audit
-(`scratch/research_role_audit_2026-07-17/` — terra 1st, sol 2nd, luna 3rd; verdict
+(`scratch/research_role_audit_2026-07-17/`: terra 1st, sol 2nd, luna 3rd; verdict
 "MARGINAL EDGE", terra at −42% cost). Effort has been low since 2026-05-20 for
 latency reasons; see `constants.py`.
 
@@ -219,14 +219,14 @@ minutes before returning malformed JSON, and retrying that call just multiplies
 the wait. `NATIVE_SEARCH_WALL_TIMEOUT` plus a single try is what bounds the worst case.
 It routes through `build_llm_with_openrouter_fallback`, so it bills the
 Metaculus-donated `OAI_ANTH_OPENROUTER_KEY` first and falls back to the personal
-`OPENROUTER_API_KEY` on credential/credit errors — that fallback is
+`OPENROUTER_API_KEY` on credential/credit errors. That fallback is
 `FallbackOpenRouterLlm` (`metaculus_bot/fallback_openrouter.py`). The donated key
 used to be blocked here by a data-policy restriction; that block has been
 RESOLVED, verified 2026-06-25 by a live call returning 200 with grounding, so
 native search now routes through and bills the donated key. The prompt is the
 shared `web_research_prompt` with markdown citations.
 
-### Gemini grounded search — `GEMINI_SEARCH_ENABLED` + `GOOGLE_API_KEY`
+### Gemini grounded search: `GEMINI_SEARCH_ENABLED` + `GOOGLE_API_KEY`
 
 Real first-party Google Search grounding via the `google-genai` SDK
 (`research/gemini_search.py`), NOT via OpenRouter. This adds a genuinely distinct
@@ -250,13 +250,13 @@ forecaster a bracket field where some brackets resolve against the rendered
 `### Sources` list and some are decoration, with nothing to tell them apart.
 `_strip_model_citation_indices` (shipped 2026-09-01) removes them. It MUST run
 after `_splice_inline_citations`, because that splice indexes the ORIGINAL
-response text by grounding-support byte offsets — rewrite the text first and our
+response text by grounding-support byte offsets: rewrite the text first and our
 real markers land mid-word, a bug class this repo has already shipped and fixed.
 It only removes a dotted run that is delimited the way a citation is AND whose
 every dot-separated component is at most two digits, so bracketed quantities,
 currency, versions, years and IP-like tokens survive. Both bounds were measured on
 the archive: across 2,609 dotted bracket groups the largest component anywhere is
-39. The plan's alternative — require at least three components — was NOT adopted,
+39. The plan's alternative (require at least three components) was NOT adopted,
 because all 165 two-component groups read in context are genuine indices, so the
 stricter rule would have left 318 fake markers standing for no safety gain. The
 strip runs on both forecaster-facing branches (the grounded path and the
@@ -272,20 +272,20 @@ prompts the tier signal they weight on and leaves the attribution check below
 nothing to check.
 
 **Attributions the response's own grounding record cannot back.** Gemini also
-writes self-invented source-tier tags — `[A: NASA]`, `[B: Reuters]`,
-`[C: Time and Date]` — and across the 323 archived sections, 478 of the 681
+writes self-invented source-tier tags (`[A: NASA]`, `[B: Reuters]`,
+`[C: Time and Date]`), and across the 323 archived sections, 478 of the 681
 outlet-named tier attributions (70%) name an outlet absent from that same
 response's grounded-domain list. q44953 claimed `[A: NASA]` for the eclipse path
 over a source list of perlan.is / guidetoiceland.is / timeanddate.com; q45401
 named 19 institutions (Bloomberg, FactSet, Goldman Sachs, Kalshi, AP, …) over a
 single grounded domain. The zero-chunk floor cannot see any of this, because it
 fires only when nothing grounded at all, and the forecaster prompts instruct
-weighting by source tier — so an unbacked tier tag is an authority claim we
+weighting by source tier, so an unbacked tier tag is an authority claim we
 manufactured. `_check_attributions` → `rewrite_unsupported_attributions`
 (`research/gemini_attribution.py`, shipped 2026-09-01)
 replaces each one with `[unverified attribution]` at format time. It runs on the
-grounded path ONLY — the url_context-only escape gets the citation strip and
-returns — after that strip and before the `### Sources` block is appended, with
+grounded path ONLY (the url_context-only escape gets the citation strip and
+returns), after that strip and before the `### Sources` block is appended, with
 `_grounded_source_labels` the single derivation of both the check's evidence base
 and the rendered block, so the two can never disagree about what our record says.
 A supported outlet in the same bracket survives verbatim with its own separator:
@@ -294,7 +294,7 @@ A supported outlet in the same bracket survives verbatim with its own separator:
 collapse to a single marker. The tier grade goes with the outlet it was read off,
 because the grade IS the claim. It never touches a word outside a bracket: the
 FACT is not what is being disputed (an aggregator domain can carry another
-outlet's copy), only the provenance claim — which is why the marker says
+outlet's copy), only the provenance claim, which is why the marker says
 *unverified* and not *false*.
 
 Generic tier words that name a CLASS rather than an outlet are skipped before
@@ -307,12 +307,12 @@ Any one of six rules credits a name: it concatenates into the domain
 domain (`The Guardian` / guardian.co.uk); the token sets intersect (`LSE Blogs` /
 lse.ac.uk); the domain's registrable core sits inside the name, the sub-brand
 shape (`Chosunbiz` / chosun.com); a single-token name is a subsequence of the
-label (`WaPo` / washingtonpost.com — single-token only, since a subsequence test
+label (`WaPo` / washingtonpost.com: single-token only, since a subsequence test
 over a multiword name credits almost anything); or the domain core abbreviates the
 name (`Times of Central Asia` / timesca.com). A response whose chunks carry no
 renderable label is skipped rather than blanket-marked (q44802): with no evidence
 base, a rewrite would dress our own render failure as the model's embellishment.
-That skip is what makes the count's ABSENCE meaningful — on a schema-v2 record an
+That skip is what makes the count's ABSENCE meaningful: on a schema-v2 record an
 absent `unsupported_attributions` means the check had no evidence base or the
 record predates the change, while a recorded 0 means it ran and found nothing.
 The token is defined where the forecaster reads it: `prompts._SOURCE_PROVENANCE_LADDER`
@@ -323,11 +323,11 @@ to weight by tier while a token it has never seen stands where the tier was.
 Per-response counts ride
 `GEMINI_UNSUPPORTED_ATTRIBUTION: question=... tagged=N unsupported=N groups=N
 labels=N` (INFO, emitted only when `unsupported` > 0, harvested as
-`gemini_unsupported_attribution`, and deliberately NOT alertable — the habit is the
+`gemini_unsupported_attribution`, and deliberately NOT alertable: the habit is the
 model's, not a bot defect) and the provider-diagnostics
 `unsupported_attributions` count (always, so a zero is a measurement); nothing
 keys on either. `labels` rides the line because the same `unsupported` count reads
-completely differently against it — q38195 named 21 outlets over ONE grounded
+completely differently against it: q38195 named 21 outlets over ONE grounded
 domain, aft.org. `groups` is the render footprint, which sits below `unsupported`
 because of the collapse. There is no `rewritten` or `stripped` field, because under
 this design `rewritten` always equals `unsupported` and the check never removes a
@@ -345,11 +345,11 @@ Measured over all 323 sections: 48 sections rewritten, 203 attributions kept, 47
 marked, 0 idempotency failures, and 0 sections where any text outside a bracket
 changed. The 70% headline reconciles with the audit's published 87% (276/318) via
 86% (590/685), which is what the audit's own matching rule gives through this
-harness's extraction — the residual gap is occurrence- versus distinct-name
-counting and the three-source union versus artifact-only — and the six keep rules
+harness's extraction (the residual gap is occurrence- versus distinct-name
+counting and the three-source union versus artifact-only), and the six keep rules
 then move 86% → 70%. All 11 fully-unsupported sections were read in context and
 all 11 are true positives; one residual arguable case is test-pinned
-(`NewsRadio WFLA` against a grounded iheart.com, 2 of 681 — Google reported only
+(`NewsRadio WFLA` against a grounded iheart.com, 2 of 681: Google reported only
 the parent domain, and no general rule recovers a subdomain the SDK never sent);
 and the deliberate false-KEEP exposure is enumerated at 20 occurrences across 10
 distinct names (2.9%), all short acronyms or shared tokens. Rules, counts, both
@@ -368,28 +368,28 @@ ICE figure came out of a one-support response, so a gate would have suppressed t
 round's best find. The marker exists so "did embellishment move" is a query over the telemetry
 archive rather than a hand audit.
 
-**Grounded-chunk floor.** A response with no grounding evidence at all — zero
-`google_search` chunks AND no successful `url_context` read — is suppressed
+**Grounded-chunk floor.** A response with no grounding evidence at all (zero
+`google_search` chunks AND no successful `url_context` read) is suppressed
 (returns `""`, logs `GEMINI_UNGROUNDED_SUPPRESSED`, records a
 `grounding: error(ungrounded_suppressed)` loss token) rather than passed through:
-ungrounded Gemini text is a demonstrated fabrication vector (Q38195, 2026-07-19 —
+ungrounded Gemini text is a demonstrated fabrication vector (Q38195, 2026-07-19:
 30 search queries, 0 grounding chunks, a confident fabricated contract table with
 fake `[primary]` tags reached forecasters). "No grounding evidence" includes a
 response carrying no candidates at all; that case used to return its text via an
 early exit that walked straight past this floor. There is now no path around it.
 
 This provider uses the operator's personal `GOOGLE_API_KEY` (a paid-tier Google
-AI Studio key). There is no Metaculus-donated key on the google-genai side — the
+AI Studio key). There is no Metaculus-donated key on the google-genai side: the
 donated path only exists for OpenRouter-routed Gemini. If grounded search starts
 soft-failing across a run, check the AI Studio prepaid-credit balance first
 (exhaustion shows up as 429s, not surprise charges).
 
-### Financial data — `FINANCIAL_DATA_ENABLED` (+ `FRED_API_KEY` for live FRED)
+### Financial data: `FINANCIAL_DATA_ENABLED` (+ `FRED_API_KEY` for live FRED)
 
 For questions about trackable financial/economic metrics
 (`research/financial_data.py`). A cheap LLM classifier
 (`FINANCIAL_CLASSIFIER_MODEL`, low effort) decides whether the question is
-financial and which tickers / FRED series apply, and — critically — resolving
+financial and which tickers / FRED series apply, and, critically, resolving
 identifiers are *also* extracted deterministically from URLs in the resolution
 criteria (`extract_financial_identifiers_from_criteria`). That extraction is the
 load-bearing guarantee: even if the classifier misreads the question, the series
@@ -411,10 +411,10 @@ the question actually resolves on still fires. The two sets are merged
   the previous observation (a row step, whatever the series' cadence), a
   date-based year-over-year change, recent observations.
 
-Both yfinance paths — live and backtest — fetch by explicit calendar start date,
+Both yfinance paths (live and backtest) fetch by explicit calendar start date,
 `as_of − FINANCIAL_YFINANCE_LOOKBACK_DAYS` (390 days; `as_of` defaults to now). A
 bare `period="Nd"` is deliberately avoided: Yahoo's chart API reads that custom
-range as N trading BARS for listed assets but ~N calendar DATES for 24/7 ones —
+range as N trading BARS for listed assets but ~N calendar DATES for 24/7 ones,
 one integer under two unit systems. Under benchmarking every fetch is
 additionally ceilinged to the question's `open_time`: yfinance sets an explicit
 `end` at `as_of` and skips the leaky live `.info` call, and FRED routes through a
@@ -436,7 +436,7 @@ renderers deliberately: `_fetch_fred_first_releases` reads
 proves that by patching `Fred` where the client is constructed, so client
 construction and the class-attribute reads have to stay in one patchable
 namespace. **Every `Fred` / `fetch_series` patch target is therefore
-`metaculus_bot.research.fred_rendering`, not `financial_data`** — fredapi's real
+`metaculus_bot.research.fred_rendering`, not `financial_data`**: fredapi's real
 class carries the identical literals, so a patch at the wrong module stays green
 while proving nothing. Tests split the same way: `tests/test_currency_pegs.py`,
 `tests/test_fred_rendering.py`, with the shared yfinance mock and synthetic series
@@ -453,14 +453,14 @@ The rendered block is no longer just derived stats. Five additions landed
   the issuing authority 2026-09-01). A pegged ticker's block carries a warning
   saying what is fixed and that day-to-day movement is mostly quote noise, then
   appends the liquid anchor cross's whole block below, labeled. Nothing is
-  SUBSTITUTED — the question still resolves on the pegged pair, so its own quote
-  stays on the page — and a dollar-pegged currency has no substitute cross, so the
+  SUBSTITUTED (the question still resolves on the pegged pair, so its own quote
+  stays on the page), and a dollar-pegged currency has no substitute cross, so the
   block says so instead of inventing one. Deliberately a static table, not a
   correlation detector: hard pegs are published policy and do not need inferring.
 - **A variance-ratio noise flag, with the robust figure as the headline.**
   `variance_ratio` (`research/ts_estimators.py`) is an overlapping Lo-MacKinlay
   ratio on log returns over the provider's full held history (~265 daily bars, NOT
-  the 30-row volatility window — the statistic is uninformative at n=30). Below
+  the 30-row volatility window: the statistic is uninformative at n=30). Below
   `FINANCIAL_VARIANCE_RATIO_FLOOR` the block prints the flag, leads with
   `multi_period_annualized_vol_pct` measured on overlapping
   `FINANCIAL_VARIANCE_RATIO_LAG`-step returns, and labels the 30-row figure
@@ -471,11 +471,11 @@ The rendered block is no longer just derived stats. Five additions landed
   figure times √VR by construction, which is the same statistic's own remedy. Both
   estimators return None on a sample with no measurable return variation, since the
   ratio there is a quotient of floating-point rounding noise (it read 0.369 on an
-  exact ramp — a confident noise flag manufactured out of mantissa bits). The
+  exact ramp, a confident noise flag manufactured out of mantissa bits). The
   screen, its `FINANCIAL_VARIANCE_RATIO_MIN_RETURNS` sample floor and the marker's
   one format string live in `research/noise_flag.py` (`screen_for_quote_noise` /
   `noise_flag_line`), shared by both surfaces, because the two copies of the vol
-  estimator had already drifted once — the q44882 `sqrt(252)`-on-a-24/7-series
+  estimator had already drifted once: the q44882 `sqrt(252)`-on-a-24/7-series
   defect was fixed in one copy weeks before the other. Only the forecaster-facing
   prose is local to each renderer, since the two say different things about what
   else in their section the noise affects.
@@ -489,7 +489,7 @@ The rendered block is no longer just derived stats. Five additions landed
   (stdlib-only, so the FRED block and the inline-chart rung in
   `research/resolution_chart_data.py` can share one rule without dragging pandas or
   fredapi into the latter): fixed-point, up to six decimals, trailing zeros
-  stripped, never scientific notation — which also cleans up float-subtraction
+  stripped, never scientific notation, which also cleans up float-subtraction
   noise, so 0.8729999999999905 renders "0.873". The time-series anchor's own
   formatter, `ts_render._fmt`, was swept the same way at the same time:
   fixed-point up to THREE decimals above 100 (three, not six, because it also
@@ -511,13 +511,13 @@ The rendered block is no longer just derived stats. Five additions landed
 three currency crosses, so on a question about any other currency the classifier
 had nothing to route to and invented an id: q45363 (the Boliviano-USD rate) got
 `DEXBOUS`, which does not exist on FRED, with no Yahoo cross named beside it, so
-the forecasters got no level and no realized volatility on a currency question —
-the verification pass measured that a member sized off the resolving series' own
+the forecasters got no level and no realized volatility on a currency question.
+The verification pass measured that a member sized off the resolving series' own
 30-print volatility would have scored +55.35 spot peer alone, better than every
 member that ran. Three changes. (1) The classifier prompt now routes every
 exchange rate to a Yahoo cross (`USD<ISO>=X` / `<ISO>USD=X`, the spelling matching
 how the question quotes the rate) and forbids inventing a FRED id. That is the fix
-at the cause, because the currency's ISO code is not recoverable downstream —
+at the cause, because the currency's ISO code is not recoverable downstream:
 FRED's country codes are not ISO currency codes and the `BO` in `DEXBOUS` is a
 country, so the classifier is the only step that can name the pair. (2) A series
 FRED reports as nonexistent raises `UnknownFredSeries`
@@ -526,10 +526,10 @@ FRED reports as nonexistent raises `UnknownFredSeries`
 so it reaches diagnostics
 as `unknown_series` rather than the ambiguous `empty` that was q45363's only trace,
 with one `FRED_UNKNOWN_SERIES: series_id=... proposed_by=classifier|resolution_url`
-WARN harvested as `fred_unknown_series` — non-alertable, since an invented id is
+WARN harvested as `fred_unknown_series`, non-alertable, since an invented id is
 the classifier's habit rather than a bot crash, and `proposed_by` separates that
 from a question whose own resolution criteria link a dead FRED page. (3) When a
-question's exchange-rate identifiers carry nothing, the section is ABSENT — no "we
+question's exchange-rate identifiers carry nothing, the section is ABSENT, no "we
 looked and found nothing" line, for the same reason AskNews returns `""` rather
 than its old `No articles were found` sentence: any non-empty return flips the
 orchestrator's status from `empty` to `ok`, counts the provider in
@@ -537,7 +537,7 @@ orchestrator's status from `empty` to `ok`, counts the provider in
 can never stand in for an absent section. What carries the signal instead is
 `counts.fx_identifiers_empty`, the number of attempted identifiers whose name has
 the shape of an exchange rate on either vendor (`DEX????` on FRED, `???=X` /
-`??????=X` on Yahoo — shape predicates `is_fred_fx_series` / `is_yahoo_fx_ticker` /
+`??????=X` on Yahoo: shape predicates `is_fred_fx_series` / `is_yahoo_fx_ticker` /
 `is_fx_identifier` in `research/fx_identifiers.py`) and whose `details["sources"]`
 token is a loss under the canonical `is_lost_source`, so `empty`,
 `unknown_series`, `error` and `skipped(no_fred_api_key)` all count. It is recorded
@@ -553,17 +553,17 @@ fredgraph cannot tell a bad id from a vintage predating the series.
 Both volatility surfaces emit
 `FINANCIAL_NOISE_FLAG: surface=financial_data|ts_anchor symbol=... vr_lag=... vr=...
 floor=... short_vol=... long_vol=... robust_vol=...` at INFO, harvested as
-`financial_noise_flag` and non-alertable — it describes the vendor's data, not a
+`financial_noise_flag` and non-alertable: it describes the vendor's data, not a
 bot defect. The sibling flag on the time-series-anchor surface
 (`ts_render._realized_vol_lines`) runs the same screen with the same constants,
 because the anchor routes to any Yahoo ticker a resolution URL cites and would
 otherwise render an equally inflated figure with no disclosure; its prose also
 states that the anchor's change BANDS are unaffected, since those are empirical
 multi-observation quantiles over which the noise cancels. `long_vol` reads `None`
-on the anchor surface, which computes no long-horizon window at all — `surface=` is
+on the anchor surface, which computes no long-horizon window at all. `surface=` is
 what tells that apart from a yfinance series too short to hold one.
 
-### Prediction-market snapshot — `PREDICTION_MARKETS_ENABLED`
+### Prediction-market snapshot: `PREDICTION_MARKETS_ENABLED`
 
 A crowd-forecast cross-check. `research/prediction_market.py` is the seam module;
 the retrieval pipeline lives in `research/market_retrieval/`. This is **ranked
@@ -599,7 +599,7 @@ Four stages per question:
    (`MARKET_QUERY_AUTHOR_LLM_CONFIG`) emitting domain vocabulary the question's own
    tokens cannot reach; its output is ADDITIVE to a deterministic query set, so its
    failure costs no recall.
-2. **Venue-native search** for Manifold and Polymarket — the two venues whose own
+2. **Venue-native search** for Manifold and Polymarket, the two venues whose own
    index is the only way in, at width 60 each. Every deterministic query plus every
    query-author addition is issued unconditionally, in parallel after dedup, with
    per-query failure isolation, and every query is stripped of digit-bearing tokens
@@ -614,7 +614,7 @@ Four stages per question:
    At PARSE time the author's own synonyms are filtered by a narrower rule than the
    blanket digit strip: a synonym is **dropped whole** (never trimmed to a remnant,
    which would reach the floorless fuzzy channel and score ~100 against every event
-   whose rules mention one generic word) only when it carries a DATE-like token — a
+   whose rules mention one generic word) only when it carries a DATE-like token: a
    four-digit group in 1900-2099, a bare number in a synonym that names nothing else,
    or a 1-2 digit day beside a month word. Digits belonging to a name survive
    verbatim (`U-3`, `S&P 500`, `10-K`, `50bp`), because series-code vocabulary is
@@ -632,16 +632,16 @@ Four stages per question:
    fan-out then fills in the
    `textDescription` rules text the search listing omits, via per-market detail
    GETs, and on a multi-outcome row its leading
-   answers — the only price such a row has, since the search reports none. A row
+   answers, the only price such a row has, since the search reports none. A row
    whose detail GET failed stays title-only rather than costing the snapshot.
-4. **Ranking**: one call (`MARKET_RANKER_LLM_CONFIG` — luna at low effort, a
+4. **Ranking**: one call (`MARKET_RANKER_LLM_CONFIG`, luna at low effort, a
    ~36k-token prompt) over the whole ~380-440
    candidate pool, returning up to 8 rows in ranked order, each stamped with a
    relation tier and a one-phrase `why`. The tier vocabulary is exactly four words,
    in this order of strength: `same_quantity_same_date` >
    `same_quantity_other_cut` > `driver_or_consequence` > `weak`.
-   Width is the model's choice in 0..8 — an empty array is a
-   VALID answer, not a failure — and nothing downstream re-orders, re-scores or
+   Width is the model's choice in 0..8 (an empty array is a
+   VALID answer, not a failure), and nothing downstream re-orders, re-scores or
    caps per venue. Exactly one deterministic pass runs after it, and it changes no row's
    POSITION: `cap_stale_top_tier` (`market_retrieval/ranking.py`) refuses
    `same_quantity_same_date` on a row whose close
@@ -652,7 +652,7 @@ Four stages per question:
    the demotion and
    its arithmetic (`demoted from same-date: closed 162d before the question opened`, a
    shape the rendered legend defines; it does not restate the withdrawn grade, which the
-   note's presence already implies because only the top tier is ever capped — the old
+   note's presence already implies because only the top tier is ever capped: the old
    wording closed the cell with `(ranker said same_quantity_same_date)` inside a table
    whose preamble tells forecasters to anchor on a same-date market's price). It shares the
    `why` cell's `WHY_CHARS` budget with the ranker's phrase (note first, phrase
@@ -673,11 +673,11 @@ Four stages per question:
    read it as a
    guard on a claim a long-closed market cannot make rather than as a measured fix: only 9
    archived rows are graded `same_quantity_same_date` at all, and q45163's own offender was
-   graded one tier below that — whether to demote that tier too (the dossier's own
+   graded one tier below that. Whether to demote that tier too (the dossier's own
    recommendation, `driver_or_consequence`) is an open operator decision in FUTURE.md,
    because that tier changes how the forecaster prompt weights the row. An actual
    demotion logs `MARKET_TIER_CAPPED: question=... rows=... capped=venue@rank` at
-   INFO — only on a real cap, harvested as `market_tier_capped`.
+   INFO, only on a real cap, harvested as `market_tier_capped`.
    Ordering WITHIN a tier is the ranker prompt's job for the
    same reason: its signals block carries a fourth bullet making `closes` a RECENCY
    tiebreaker within a tier, and that has to live in the prompt because the renderer
@@ -698,12 +698,12 @@ Four stages per question:
    failure path renders nothing and that is what keeps an outage distinguishable
    from a considered empty answer. `RankingShapeRegression` exists for exactly that
    boundary: the renamed-index case used to arrive as `ok(0)` and render the
-   deliberate-empty sentence — a forecaster-facing affirmative claim ("prediction
+   deliberate-empty sentence, a forecaster-facing affirmative claim ("prediction
    markets were retrieved and reviewed… none was judged to bear on it") on a path
    where our own prompt/parser contract had broken.
 
 The render is that order verbatim: implied probability, total volume and open
-interest (approximate USD on the real-money venues, play-money mana on Manifold —
+interest (approximate USD on the real-money venues, play-money mana on Manifold:
 the legend says which, since the two are not comparable), a liquidity/participation
 `signal` label (thin / decent / deep for real-money venues, thin / decent / high by
 bettor count for Manifold, `no-liquidity-data` for PredictIt), close date,
@@ -729,7 +729,7 @@ on the parent row: a Kalshi event that is a threshold FAMILY (86.5% of that
 catalogue), where one strike's price under the event's own title would answer a
 question the row never asked, and a Manifold multi-outcome market. Both keep their
 liquidity figures, which is what keeps the row
-worth its width — and on a Kalshi family those figures are the SUM over its live
+worth its width, and on a Kalshi family those figures are the SUM over its live
 strikes, each converted at its own price, rather than the first strike's alone.
 
 **Since 2026-08-25 (`58175a7`) a multi-outcome family renders WHOLE**, and that is
@@ -745,9 +745,9 @@ leading outcomes get full `↳` sub-rows (`MAX_CHILD_ROWS_PER_SNAPSHOT`, cut 24 
 because the bound now sizes only the FULL sub-rows), and every remaining outcome is
 NAMED with its own price in one `↳ [remaining N]` ladder row instead of being
 dropped. Under character pressure that ladder collapses groups in increasing order
-of forecast content — unquoted first (no price, nothing to say), then settled, then
+of forecast content: unquoted first (no price, nothing to say), then settled, then
 open outcomes by an escalating floor (`LADDER_PRICE_FLOORS`, walked one stage at a
-time up to `LADDER_MAX_STAGE`) — and every collapsed group states its count and its
+time up to `LADDER_MAX_STAGE`), and every collapsed group states its count and its
 summed price, a counted set rather than a silent cut. Settled is deliberately not
 collapsed before unquoted: a Manifold threshold ladder settles its crossed rungs to
 exactly 1.0 while the market stays open (10 of 17 on that module's committed
@@ -759,11 +759,11 @@ Which open outcomes count as "least informative" depends on the family's SHAPE, 
 exclusive partition's prices sum to ~1 by construction (q45189's ten margin
 brackets sum to 0.965; a real one lands in roughly 0.95-1.05), while a threshold
 ladder's nested prices are SURVIVAL probabilities and sum to roughly the rung count
-times the average survival — a median 1.46 across the archived Kalshi families, and
+times the average survival, a median 1.46 across the archived Kalshi families, and
 25.4 on the 50-rung gold ladder. On a partition the informative outcomes are the
 highest-priced ones, so the collapse is cheapest-first. On a cumulative ladder they
 are the ones nearest the CROSSING, so the collapse ranks by distance from
-certainty, `min(p, 1-p)` — a 0.99 "above $3251" rung on a gold ladder trading near
+certainty, `min(p, 1-p)`: a 0.99 "above $3251" rung on a gold ladder trading near
 $4400 is a near-certainty carrying no forecast content at all, and price-ranking is
 close to worst-possible there. Half the archived Kalshi families are cumulative
 threshold ladders. When every stage is spent and the section is still over, a
@@ -773,8 +773,8 @@ per-family hard bound keeps the highest-priced terms that fit
 with a counted, summed remainder.
 
 Every summed price names the count it covers. `_open_price_total` sums only OPEN,
-PRICED members — a settled rung's price is a realized outcome and an unquoted one
-has none — so the per-family hard bound renders `+N more (K priced, X summed)`. A
+PRICED members (a settled rung's price is a realized outcome and an unquoted one
+has none), so the per-family hard bound renders `+N more (K priced, X summed)`. A
 bare `+160 more (78.50 summed)` read as 78.50 across 160 outcomes when it was 78.50
 across 157, and on a settled ladder the same shape hid rungs realized at 1.00.
 
@@ -785,12 +785,12 @@ what survived a budget it could not see, and price-descending scrambles threshol
 ladders. And each venue BLANKS its own manufactured ~0.50 default at parse time, so
 a fabricated price reaches neither the ranker nor the render nor a disclosure figure
 (192 of 1,839 archived ranked-era child outcomes were in that class). Kalshi blanks
-on a book at least `KALSHI_NO_PRICE_SPREAD` wide — an empty book is
+on a book at least `KALSHI_NO_PRICE_SPREAD` wide: an empty book is
 `0.0000`/`1.0000`, whose midpoint is a synthetic $0.50 nobody quoted, and the cell
 then renders the raw range `0.00-1.00`, which cannot be read as a point
 probability. Polymarket blanks on Gamma's `["0.5","0.5"]` placeholder when the leg
 carries no volume and no open interest. Manifold blanks (`_priced_or_none`) an
-answer sitting at its untouched 0.5 prior with zero volume — in the ranker's
+answer sitting at its untouched 0.5 prior with zero volume, in the ranker's
 candidate segment as well as in the children, where a defaulted price had been
 distorting selection upstream of the render.
 
@@ -805,8 +805,8 @@ volume is not evidence of no trading, so the same `is not None` gate applies. An
 Kalshi contract count with no price to convert by (no book AND no last trade) leaves
 `total_vol` unknown rather than stating `$0`, which read as a market nobody traded.
 
-The forecaster prompts tell models to weight by both axes — the liquidity label and
-the relation tier, whose shared constants live in `prompts.py` — to read a RESOLVED
+The forecaster prompts tell models to weight by both axes (the liquidity label and
+the relation tier, whose shared constants live in `prompts.py`), to read a RESOLVED
 price as a realized outcome rather than a forecast, to read a family of `↳` rows as
 a DISTRIBUTION rather than an equality constraint on a tail, and to resolve a
 relation-vs-liquidity conflict in favour of liquidity: a thin market's price is
@@ -847,7 +847,7 @@ and degradation causes survive the 90-day GHA log expiry:
   strikes); and `max_stage` / `ladder_chars` say whether `LADDER_SECTION_MAX_CHARS`
   binds on real slates.
 - `MARKET_RANKING_DEGRADED: question=... pool=N reason=shape_regression|unreadable
-  detail=...`, which says WHICH failure produced a fail-open —
+  detail=...`, which says WHICH failure produced a fail-open:
   `outcome=failopen` alone cannot, and `reason=shape_regression` is the one that
   means OUR contract broke.
 
@@ -862,20 +862,20 @@ frees its slot for an eligible one instead of consuming it. As a post-hoc filter
 over the already-truncated pool it deleted rows the width had spent its slots on
 and zeroed the per-venue counts provider health reads. Prod ran with a derived
 `as_of` until 2026-08-04, and it cost real recall: it dropped every market closing
-before the question resolved — the "same quantity, adjacent month" class that
-carries most of the evidential value —
+before the question resolved (the "same quantity, adjacent month" class that
+carries most of the evidential value),
 and prod telemetry recorded 20 of 47 archived runs where Polymarket fetched
 candidates and rendered nothing because of it.
 
 The benchmarking guard is also why this provider's forecasting value can't be
-measured by the standard backtest gate — it was validated with live
+measured by the standard backtest gate: it was validated with live
 `test_bot.yaml` runs and opt-in live integration tests.
 
 The research section header is `## Prediction Market Snapshot`, and the prompts
 import it from `prompts.py` as `MARKET_SNAPSHOT_SECTION_HEADER` to decide whether to
 render their market-reading rules at all.
 
-### Resolution-source fetcher — `RESOLUTION_SOURCE_ENABLED`
+### Resolution-source fetcher: `RESOLUTION_SOURCE_ENABLED`
 
 Fetches the exact URL(s) a question cites as its grading source
 (`research/resolution_source.py`), so forecasters read the ground truth the
@@ -912,16 +912,19 @@ this API query returns" and cite the query, the old class cut it at the first br
 truncated Federal Register query answers HTTP 200 with the UNFILTERED count (10000 against a
 correct 125), which this provider would then have served as the grading evidence. Six of 556
 public Mantic posts carried such a URL. A backtick ends a URL for the same reason: ten cited
-API URLs were fenced in backticks and the fenced form 404s. It then
+URLs across nine of the 556 posts were fenced in backticks (several of them API endpoints), and
+the fenced form 404s where the clean form answers 200. It then
 skip-filters URLs that add nothing or belong to another provider (self-references
 to either question platform's own site, metaculus.com or `competitions.mantic.com`,
-refused on every run mode since the host list `QUESTION_PLATFORM_HOSTS` is module-level;
+refused on every run mode because `QUESTION_PLATFORM_HOSTS` names both hosts unconditionally:
+a question page carries no new information and, on Mantic, shows the other bots' forecasts
+and comments, which must not leak into research;
 FRED series owned by financial-data; Yahoo `/quote/` pages owned by
 yfinance), and caps at `RESOLUTION_SOURCE_MAX_URLS` *after* the skip filter so
 a run of leading self-refs doesn't starve the real sources. Fetches run in
 parallel with one-request-per-host politeness (a `Semaphore(1)` per netloc, keyed
 per redirect hop, and shared process-wide since 2026-09-03 in the loop-scoped
-`http_fetch.host_semaphores` map, handed out by `http_fetch.semaphore_for_host` —
+`http_fetch.host_semaphores` map, handed out by `http_fetch.semaphore_for_host`:
 with a map per provider
 call, six questions citing one host each held their own semaphore and hit it six times
 at once). Content is extracted with trafilatura (HTML), or read raw (JSON / text /
@@ -978,7 +981,7 @@ passes exactly the same three checks a `Location` header does, via the shared
 `research/http_fetch.py`) runs
 before every extraction: cdc.gov builds its outbreak stat blocks out of
 `<div role="table">` / `role="row"` / `role="cell"`, which is valid accessible markup
-and invisible to trafilatura's table handling — the cyclosporiasis block rendered as a
+and invisible to trafilatura's table handling: the cyclosporiasis block rendered as a
 bare "17,180 / 2" with no labels and no hospitalization count at all, because 922 sat in
 an unwrapped cell. Rewritten to real table tags, the same page extracts
 `| Hospitalizations | 922 |`. A page with no ARIA role is handed to trafilatura as the
@@ -995,7 +998,7 @@ Measured 2026-09-03,
 that path pulled 833,450 chars out of a 6.7 MB 220-page document in 5.3 s with the wanted
 passage in it, while the paid alternative returned nothing for the same file. A body the
 server did not declare as a PDF is still sniffed by its `%PDF-` magic, since several
-government hosts serve documents as `application/octet-stream` — a declared document gets
+government hosts serve documents as `application/octet-stream`: a declared document gets
 the larger `DOCUMENT_TEXT_PDF_MAX_BYTES` cap (the receipt file is over the 5 MiB response
 cap), an undeclared one keeps the smaller one. Bytes we read and could not turn into text
 get their own status, `unreadable_document`, with `status_reason` naming which of
@@ -1013,7 +1016,7 @@ already hold the document's text.
 shipped 2026-08-25 (`5f27c46`, receipt qids 44858/44841) and is narrow by design.
 When a fetched page's RAW HTML embeds a Datawrapper chart, the chart also serves its
 live "Get the data" CSV, and poll trackers lock their resolving daily series inside
-exactly those iframes — which trafilatura drops at every setting. The hop uses ONLY
+exactly those iframes, which trafilatura drops at every setting. The hop uses ONLY
 the version-free `static.dwcdn.net/data/<chart_id>.csv` route, because the page HTML
 pins a stale chart version whose `datawrapper.dwcdn.net/<id>/<version>/dataset.csv`
 form keeps serving 5-14-month-old snapshots as HTTP 200 (the naive fix the 2026-08-24
@@ -1022,7 +1025,7 @@ outside the window under the `stale_data` status rather than serving stale data 
 (the Wayback rung below uses the same status for an over-age archived capture of a cited
 page; the two are told apart by `chart_id`): older than
 `RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS`, undatable, or
-implausibly far in the FUTURE — a future date past a six-hour clock-skew tolerance
+implausibly far in the FUTURE: a future date past a six-hour clock-skew tolerance
 means a broken clock, not maximal freshness. The hop is bounded by
 `RESOLUTION_SOURCE_DATAWRAPPER_MAX_CHARTS`,
 `RESOLUTION_SOURCE_DATAWRAPPER_PER_DATASET_MAX_CHARS`,
@@ -1237,8 +1240,8 @@ own retry count, `RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS`, deliberately lower th
 reader's, because a retry inside a wall shared with every other cited URL spends the budget the
 pages already fetched need in order to render. A per-QUESTION paid-read cap,
 `RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS`, bounds how many reads a single question can pay
-for across its cited URLs — the analogue of the Wayback per-question cap and a distinct quantity
-from the SDK retry count — claimed last, only for a read that has cleared every cheaper gate, and
+for across its cited URLs (the analogue of the Wayback per-question cap and a distinct quantity
+from the SDK retry count), claimed last, only for a read that has cleared every cheaper gate, and
 a read the cap declines records a `url_context_cap` skip. Two outcomes inside the trigger statuses
 are excluded by REASON (`_URL_CONTEXT_EXCLUDED_REASONS`): `no_matching_passage`, a document we
 already hold in full, and `metaculus_self_ref`, a redirect we refused because it landed on the
@@ -1284,8 +1287,8 @@ sentence rather than the `impersonate` one, because `route` is the last rung tha
 local read is what produced the text; the impersonation fact does not change how a forecaster
 should weight the content, unlike a capture's age or a model's mediation.
 
-Every rung is self-bounding on the Datawrapper hop's pattern — wall minus elapsed
-minus `RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S`, skipped below its own floor — because
+Every rung is self-bounding on the Datawrapper hop's pattern (wall minus elapsed
+minus `RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S`, skipped below its own floor), because
 the provider's outer `asyncio.wait_for` discards
 every page that already fetched when it fires, so an overrunning rung costs the whole
 question's resolution evidence rather than just its own attempt. A rung that FIRED
@@ -1415,7 +1418,7 @@ half of `unreadable_document` (a scan, where a model really is the only route). 
 exception inside that family is `no_resolving_content`'s `no_matching_passage`: we read the
 whole document, so there is no harder fetch to try and the paid rung skips it. `empty_body`
 (a 200 whose body is empty or whitespace-only) and `unsupported_type` (including a body whose
-declared charset decodes to mojibake) are bodies that carried no information — refusals
+declared charset decodes to mojibake) are bodies that carried no information, refusals
 rather than seams, because there is nothing on the other side to fetch harder. Both
 exist because `status="success"` has to mean CONTENT: as `success`, an empty body
 rendered an empty section under the "primary grading evidence" caveat, suppressed the
@@ -1427,7 +1430,7 @@ url_context rung answered with zero successful retrievals, so what came back is 
 than a read of the page and it is discarded rather than rendered. It has its own token because
 it says something no other status does, that the host answered a third-party fetcher's request
 with nothing while refusing ours. On the reason side there are now two vocabularies rather than
-one, split by what each qualifies. `FetchStatusReason` qualifies a result's STATUS —
+one, split by what each qualifies. `FetchStatusReason` qualifies a result's STATUS:
 `embed_shell` / `thin_page` / `no_matching_passage` / `not_addressed` under
 `no_resolving_content`, `no_text_layer`
 / `encrypted` / `malformed` under `unreadable_document`, and `budget_skipped` / `parse_contention`
@@ -1458,12 +1461,12 @@ is the paid reader's, a page Gemini retrieved whose answer said it does not disc
 of them live in `research/resolution_fetch_result.py` with the rest of the vocabulary.
 
 `vacuous_body_status` (`research/resolution_fetch_result.py`) is the one place that
-decision is made, on every raw-body branch — Tier-1 JSON/text/CSV and the Tier-2
+decision is made, on every raw-body branch, Tier-1 JSON/text/CSV and the Tier-2
 dataset alike. Three ways a 200 carries nothing. It could not be DECODED: the body is
 decoded BOM-first, then by its declared charset, and an undecodable-character ratio
 above `MAX_UNDECODABLE_CHAR_RATIO` is refused as `unsupported_type`, because mojibake
 like `0�.�4�2�` type-checks as text and rendered as grading evidence. It is empty or
-whitespace-only, which is `empty_body`. Or — datasets only — it is not row-shaped, so
+whitespace-only, which is `empty_body`. Or (datasets only) it is not row-shaped, so
 nothing may claim it is the chart's live series. That third check is deliberately
 ordered BEFORE the freshness verdict, so an empty CDN body cannot borrow
 `stale_data`'s benign diagnostics token (a DATASET's `stale_data`, the one carrying a
@@ -1478,15 +1481,15 @@ HTML tags ARE stripped from raw CSV/text bodies before truncation, which is wort
 rows versus 13 at the same character budget on a live-shaped poll table.
 
 That notice says "yielded no usable content" rather than "was
-unreachable" because two of the statuses it covers — `no_resolving_content` and
-`empty_body` — are pages that answered HTTP 200 and carried nothing, and "the tracker
+unreachable" because two of the statuses it covers (`no_resolving_content` and
+`empty_body`) are pages that answered HTTP 200 and carried nothing, and "the tracker
 was down" is different evidence from "the tracker has no reading"; the per-domain status
 token beside it says which happened.
 
 `no_resolving_content` (2026-09-01) is the newest of those seams and covers the page
 that answers 200
 with nothing but chrome. The floor is what decides it: below
-`RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS` — 400 characters — of extracted text the
+`RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS` (400 characters) of extracted text the
 page is withheld under
 this status, which costs nothing because everything archived below that floor is site
 chrome and the shortest archived extraction that carries the resolving content is 401
@@ -1500,7 +1503,7 @@ third-party data embed hid figures from it one bracketed line says plainly that 
 figures are not in the text.
 
 `FetchResult.status_reason` records which shape of chrome it was. `embed_shell` means the RAW HTML
-named an embed whose numbers are real but locked inside it — Infogram, Flourish or
+named an embed whose numbers are real but locked inside it: Infogram, Flourish or
 Tableau, detected by `unreadable_data_embed_providers` because trafilatura emits no
 iframe or embed-script URLs at any setting; Datawrapper is deliberately excluded from
 that scan since the Tier-2 hop reaches it. `thin_page` means no such provider was named.
@@ -1517,7 +1520,7 @@ named a provider, among them q45088's 127-char single-page-app tab list and q452
 chars of Kazakh region names, both published under the primary-grading-evidence caveat.
 The embed half of the story still comes from qids 44554/44556, where a Senate-forecast
 tracker returned HTTP 200, extracted 2.9k chars of background, and published with zero
-polling numbers in it — byte-identical across three questions, with the resolving average
+polling numbers in it, byte-identical across three questions, with the resolving average
 sitting in two Infogram iframes and nothing anywhere saying so. `js_wall` keeps its own,
 much lower floor and is checked between the two verdicts, so generalising the chrome
 floor did not absorb the JS-walled population. A page can also draw both verdicts at once
@@ -1528,8 +1531,8 @@ whose series we can.
 One more rung (2026-09-02) reads data out of the page we already hold, with no second
 request and no
 LLM call. `resolution_chart_data.render_inline_chart_data` scans the raw HTML for a
-Highcharts config — a `data-chart="{…}"` attribute, or a `Highcharts.chart(…)` call whose
-argument is strict JSON — and, after an HTML-entity unescape plus a plain `json.loads`,
+Highcharts config (a `data-chart="{…}"` attribute, or a `Highcharts.chart(…)` call whose
+argument is strict JSON) and, after an HTML-entity unescape plus a plain `json.loads`,
 renders each series' most recent points as a compact
 labelled block that leads the page text. Nothing is summed, interpolated,
 unit-converted or re-derived: the block states the values the page's own chart holds; a
@@ -1538,13 +1541,13 @@ that
 does not parse is skipped at DEBUG. It runs on every fetched HTML page rather than only
 thin ones, because the record it exists for is q43949, whose resolving IOM page extracted
 roughly 80k chars of incident rows and prose carrying none of the resolving figures while
-its annual series sat in the attribute — reading 1,240 for 2026 in a Wayback snapshot 25
+its annual series sat in the attribute, reading 1,240 for 2026 in a Wayback snapshot 25
 days
 before a forecast that landed about 340 too high. A thin-only gate would have missed the
 record the rung exists for. Because chart data counts as content,
 it also rescues a page the chrome floor would otherwise withhold.
 
-Every fetched URL — Tier-1 page and Tier-2 dataset hop alike — emits one
+Every fetched URL (Tier-1 page and Tier-2 dataset hop alike) emits one
 `RESOLUTION_SOURCE_FETCH: question=... url=... status=... http=... embeds=...
 [reason=...] [route=...]` line, harvested as `resolution_source_fetch`. `reason` is
 appended only where the status alone is ambiguous, so archived lines stay
@@ -1556,7 +1559,7 @@ in 1,069 fetch records" into a query rather than a re-scrape of run logs
 that expire from GHA at 90 days. Because that line carries only the FINAL outcome per
 URL, each escalated rung additionally emits `RESOLUTION_SOURCE_ESCALATION` with the
 status that triggered it, the rung tried, what came back, and the wall-clock the rung
-cost — which is what makes "does this rung rescue anything, and is it worth its latency"
+cost, which is what makes "does this rung rescue anything, and is it worth its latency"
 answerable. The two lines spell one state two ways: a fetch that worked is
 `status=ok` on the fetch line (the shared `fetch_outcome_token`, whose `ok` is what the
 diagnostics formatter reads as "this source contributed") and `outcome=success` on the
@@ -1596,14 +1599,14 @@ content post-dates any backtest window), on the same leakage rationale. The sect
 header is `## Resolution Source Snapshot`, and `RESOLUTION_SOURCE_ENABLED` was flipped
 on in the three prod yamls on 2026-07-10 after a live-output eyeball.
 
-### Time-series anchor — `TS_ANCHOR_ENABLED` (chart side-channel `TS_ANCHOR_CHART_ENABLED`, off)
+### Time-series anchor: `TS_ANCHOR_ENABLED` (chart side-channel `TS_ANCHOR_CHART_ENABLED`, off)
 
 A deterministic empirical anchor for numeric questions whose resolution series is
 a fetchable FRED/yfinance series (`research/timeseries_anchor.py`). No LLM, no
-model selection — it renders the latest value, dated ("as of DATE", with an
-in-progress marker when today's bar is still forming and a stale-latest warning —
-the same `FINANCIAL_STALE_LATEST` marker as the financial-data provider — when
-the newest observation is older than its cadence explains), a multi-resolution
+model selection: it renders the latest value, dated ("as of DATE", with an
+in-progress marker when today's bar is still forming and a stale-latest warning (the
+same `FINANCIAL_STALE_LATEST` marker as the financial-data provider) when the newest
+observation is older than its cadence explains), a multi-resolution
 history, a 52-week range, and a horizon-matched empirical band built only from
 the series' own past. The Phase-A offline replay found CV-gated model picks beat naive
 out-of-sample only 43% of the time, while the naive empirical band was sharper and
@@ -1626,11 +1629,11 @@ own try/except so a defect in one can never zero the other's output. Both consum
 the pre-gap-fill bundle, which means the v2 driver's brief does not see v1's
 addendum; v2's section appends after v1's.
 
-### v1 — targeted gap-fill (`research/targeted.py` `run_gap_fill_pass`)
+### v1: targeted gap-fill (`research/targeted.py` `run_gap_fill_pass`)
 
 Two stages, gated by `GAP_FILL_ENABLED` (and skipped when the first-pass bundle is
 shorter than `GAP_FILL_MIN_RESEARCH_CHARS`, or when the question's close-derived time
-budget drops it — the fast path, or a research phase that ran out of budget):
+budget drops it: the fast path, or a research phase that ran out of budget):
 
 1. A non-grounded OpenRouter analyzer LLM (`GAP_FILL_ANALYZER_MODEL`, low effort)
    reads the
@@ -1646,16 +1649,16 @@ The resolver migrated off direct-Google grounding on 2026-06-25, which is why
 `GOOGLE_API_KEY` is no longer required for gap-fill, and its model went sol → terra on
 2026-07-20: terra was preferred-or-within-noise in all three 2026-07 blind role audits
 at ~40-50% lower cost, which matters here because these searches are the single biggest
-research line item at ~44% of spend. The whole pass never raises —
-it returns `""` on any error — and appends its results under
+research line item at ~44% of spend. The whole pass never raises
+(it returns `""` on any error) and appends its results under
 `## Targeted Gap-Fill (second pass)`.
 
-### v2 — agentic gap-fill (`research/agentic_gap_fill.py` `run_gap_fill_v2`)
+### v2: agentic gap-fill (`research/agentic_gap_fill.py` `run_gap_fill_v2`)
 
 A bounded agentic tool loop, living in `metaculus_bot/research/agentic/` behind the
 seam `research/agentic_gap_fill.py` `run_gap_fill_v2`, run by a driver LLM
 (`GAP_FILL_V2_DRIVER_MODEL` at
-`GAP_FILL_V2_DRIVER_EFFORT`, both picked by the 2026-07-17 blind driver eval —
+`GAP_FILL_V2_DRIVER_EFFORT`, both picked by the 2026-07-17 blind driver eval:
 `scratch/driver_replay_2026-07-17/blind_judge_report.md`), gated by
 `GAP_FILL_V2_ENABLED`. It has been on in every bot workflow since 2026-07-21T17:07Z
 (`b4e9df0`), with v1 left on alongside for an overlap window.
@@ -1665,7 +1668,7 @@ dry-runs a forecast to find fill/verify targets, then iterates over
 four tools (`research/agentic/tools.py`): `search_news` (AskNews, through the same
 rate gate as the primary provider), `search_web` (Exa direct), `fetch` (an
 auto-escalating ladder: plain → local PDF extraction → headless Chromium →
-`read_document`), and `read_document` (acquisition-first — the free rungs, then
+`read_document`), and `read_document` (acquisition-first: the free rungs, then
 `GAP_FILL_V2_READER_MODEL` via Gemini url_context). Two of those rungs are transports shared
 with the Tier-1 resolution-source ladder rather than copies of it: the Chromium render
 (`research/rendered_fetch.py`, over which `tools._try_rendered_fetch` is now a thin mapping onto
@@ -1689,7 +1692,7 @@ tool loop, escalation ladder, telemetry, and design rationale.
 `run_research` returns forecaster-clean text. The **provider-diagnostics block**
 (which provider succeeded, char counts, latency per provider) is computed
 separately (`format_provider_diagnostics_block`) and deliberately kept out of the
-returned research — forecasters and the v2 driver must never see it. It reaches
+returned research: forecasters and the v2 driver must never see it. It reaches
 three places instead: an INFO log line, the research archive (as its own field),
 and the published Metaculus comment (stashed per question id, popped by the
 forecaster at comment-build time via `pop_provider_diagnostics`).
@@ -1698,11 +1701,11 @@ A provider's `details` dict carries two conventions, and they answer different
 questions. `details["sources"]` is the per-source outcome map, rendered into the
 `lost=` suffix. `details["counts"]` (`provider_diagnostics._counts_suffix`) is the
 second: an ordered `{name: number}` map of provider-INTERNAL quantities that are
-neither a source outcome nor a failure — Gemini's `tier_tags` /
+neither a source outcome nor a failure: Gemini's `tier_tags` /
 `unsupported_attributions`, financial-data's `fx_identifiers_empty`, and the
 resolution-source rung counts. **A zero renders nothing**, so every healthy provider's
 `## Provider Diagnostics` line stays byte-identical to what it was before the map
-existed, while `asdict` keeps the zero in the schema-v2 archive — which is exactly what
+existed, while `asdict` keeps the zero in the schema-v2 archive, which is exactly what
 makes "the check ran and found none" distinguishable from "the check never ran".
 
 When a research sink is wired, each question's research is written for backtest
@@ -1710,16 +1713,16 @@ replay by `ResearchPersistenceWriter` (`research/persistence.py`, at
 `RESEARCH_SCHEMA_VERSION`). The record carries the assembled `research_text`, the
 per-provider
 `provider_results` (the authoritative outcome list), derived
-`providers_attempted` / `providers_succeeded`, the `gap_fill_used` flag, and —
-when they exist — the v2 agentic trace (`gap_fill_v2`), the diagnostics block, and
+`providers_attempted` / `providers_succeeded`, the `gap_fill_used` flag, and,
+when they exist, the v2 agentic trace (`gap_fill_v2`), the diagnostics block, and
 the raw pre-summarization AskNews articles (`asknews_raw`). Records flush to a
 timestamped JSONL file. `providers_used` is retained but legacy/ambiguous; prefer
 `provider_results` for any analysis.
 
 ## Production configuration
 
-All five bot workflows
-(`.github/workflows/run_bot_on_{tournament,metaculus_cup,minibench}.yaml`,
+All six bot workflows
+(`.github/workflows/run_bot_on_{tournament,metaculus_cup,minibench,mantic}.yaml`,
 `test_bot.yaml` and `test_bot_basic.yaml`) enable the full research stack:
 
 | Flag | Provider |
@@ -1740,7 +1743,9 @@ time-series
 anchor + both gap-fill passes. Env flags, models, and timeouts live in
 `metaculus_bot/constants.py`; provider models route through the shared
 donated-then-personal OpenRouter fallback (`fallback_openrouter.py`), except
-Gemini grounded search, which uses the personal Google key directly.
+Gemini grounded search, which uses the personal Google key directly. The Mantic workflow
+pins `DONATED_OPENROUTER_KEY_ENABLED` to false, so there every OpenRouter call is on the
+personal key (`docs/operations.md` "Mantic").
 
 All of that is subject to the question's close-derived time budget: a question on the
 fast path runs the primary plus the cheap hard-capped providers only, with the slow
@@ -1755,6 +1760,7 @@ time-budget step for how the budget is granted and what it cuts.
 
 The research providers hit live, paid APIs (AskNews, Exa, Perplexity, OpenRouter
 credits, Google grounding, FRED). Running the bot or a backtest spends real money
-and, in live modes, publishes to Metaculus. Do not launch a paid run without the
-operator's approval — see `AGENTS.md` "Cost discipline". The unit/integration test
+and, in live modes, publishes to the platform it forecasts (Metaculus, or
+competitions.mantic.com in `--mode mantic`). Do not launch a paid run without the
+operator's approval; see `AGENTS.md` "Cost discipline". The unit/integration test
 suite is self-contained and hits no paid APIs.

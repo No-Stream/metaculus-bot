@@ -21,7 +21,7 @@ cp .env.template .env
 
 Then fill in `.env` with your keys (see below). Never commit secrets: `.env` is
 gitignored and is the only place real keys should live locally. Run any command
-inside the project environment with `uv run <cmd>` — uv resolves the in-project
+inside the project environment with `uv run <cmd>`: uv resolves the in-project
 `.venv` automatically, so you never activate it by hand.
 
 Quick sanity checks (all free, no paid APIs):
@@ -38,16 +38,16 @@ make check_credits   # print OpenRouter balances for both keys
 `make precommit_install` installs both hook types (`pre-commit` alone installs only
 the first):
 
-- **at commit** — the ruff hooks (check with `--fix --unsafe-fixes`, then format), plus
+- **at commit**: the ruff hooks (check with `--fix --unsafe-fixes`, then format), plus
   `no-commit-to-main`, which refuses a commit whose HEAD is `main`. `main` is
   ruleset-protected on GitHub (PR required, `lint` + `test` required), so a direct push is
-  rejected — but only at push time, once the commits already sit on local `main` and have
+  rejected, but only at push time, once the commits already sit on local `main` and have
   to be replayed onto a branch. The guard moves that refusal to commit time, where the fix
   is one `git switch -c`. Its message names the recovery command and the `git commit
   --no-verify` bypass; `scripts/hooks/no_commit_to_main.sh` is a `language: script` hook,
-  so it must stay executable in the index (mode `100755` — `tests/test_no_commit_to_main_hook.py`
-  asserts that, along with the behavior on a feature branch and on a detached HEAD).
-- **at push** — the full pytest suite, `uv run --frozen pytest --cov=metaculus_bot`, which
+  so it must stay executable in the index (mode `100755`, which `tests/test_no_commit_to_main_hook.py`
+  asserts, along with the behavior on a feature branch and on a detached HEAD).
+- **at push**: the full pytest suite, `uv run --frozen pytest --cov=metaculus_bot`, which
   is the command `.github/workflows/ci.yaml` runs. ~105s, too much friction per commit but
   the right price on the thing reviewers see.
 
@@ -59,7 +59,7 @@ Two things can block or stale the install on a checkout that predates the uv mig
 - **A pre-existing `core.hooksPath` makes pre-commit refuse to install** ("Cowardly
   refusing to install hooks with `core.hooksPath` set"). Check where it points with
   `git config --show-origin --get core.hooksPath` against `git rev-parse --git-path hooks`.
-  If they match, the setting is redundant — it names git's own default hooks directory —
+  If they match, the setting is redundant (it names git's own default hooks directory),
   so `git config --unset-all core.hooksPath` unblocks the install and changes nothing
   about where git looks for hooks.
 - **The generated `.git/hooks/pre-commit` can be stale.** Hooks installed before the uv
@@ -72,12 +72,12 @@ Two things can block or stale the install on a checkout that predates the uv mig
 Before a new tournament or Cup season opens its first question. These are
 operator steps: the reads below are free metadata pulls with no inference spend,
 but they are network calls and they feed a roster decision, so an implementing
-session does not run them — it proposes, the operator runs and decides.
+session does not run them: it proposes, the operator runs and decides.
 
 - **Resolve "latest per vendor" from a LIVE model-list read, never from memory.**
   The roster design (`FORECASTER_LLMS` in `metaculus_bot/llm_configs.py`) is the
   newest frontier reasoning model from each vendor, one slot each, and nothing in
-  the repo can say what that currently resolves to — the 2026-08-31 gemini-slot
+  the repo can say what that currently resolves to. The 2026-08-31 gemini-slot
   review found that a roster decision needs this one read before anything else.
   OpenRouter's public models endpoint lists every slug with `created`, its
   listing time as a Unix timestamp (per the endpoint's OpenAPI schema):
@@ -87,7 +87,7 @@ session does not run them — it proposes, the operator runs and decides.
     | jq -r '.data[] | [.id, .created] | @tsv' | sort
   ```
 
-  Filter per vendor prefix — `openai/`, `anthropic/`, `google/`, `x-ai/` — and
+  Filter per vendor prefix (`openai/`, `anthropic/`, `google/`, `x-ai/`) and
   read the newest `created` per vendor:
 
   ```bash
@@ -105,13 +105,13 @@ session does not run them — it proposes, the operator runs and decides.
   Anthropic-only).
 - **A roster change is a config-era boundary.** Residual analysis buckets by the
   merge-to-main timestamp, so make any swap once, in the same merge as everything
-  else that shifts the forecast distribution, before the first question — never
+  else that shifts the forecast distribution, before the first question, never
   mid-window (`FUTURE.md`, "FREEZE the triple").
 - **Refresh the tournament constants** (`TOURNAMENT_ID`, the date checks in
   `constants.py`) and flip the cup reminder off once configured
   (`FALL_CUP_CONFIGURED`), or every scheduled run reddens on the reminder.
   `TOURNAMENT_END_DATE` is the project's `forecasting_end_date`, not its
-  `close_date` — on `fall-futureeval-2026` those are 2027-01-06 and 2027-03-05.
+  `close_date`. On `fall-futureeval-2026` those are 2027-01-06 and 2027-03-05.
 - **Read the project object before editing a slug, and note the route.** A project
   is served at `/api/projects/tournaments/<slug-or-id>/`; a bare
   `/api/projects/<id>/` 404s for every id, which reads exactly like "this project
@@ -119,20 +119,20 @@ session does not run them — it proposes, the operator runs and decides.
   on the working route. The list endpoint `/api/projects/tournaments/` omits
   anything whose `visibility` is `unlisted`, which is the state a new season sits
   in before its first question, so ABSENCE from that list is not evidence a
-  project does not exist — fetch the candidate directly, or walk the id space.
+  project does not exist. Fetch the candidate directly, or walk the id space.
 - **Take a question-supply census with `make supply_probe`** (Metaculus), or
   `make supply_probe_mantic` for the Crucible tournament (see "Scheduling reliability" under
   the Mantic workflow for its per-release-hour miss table). It counts posts and
   questions at each status per tournament slug, and unlike the two scratch probes
-  it replaces it counts post status `closed` — closed to forecasting but not yet
-  resolved — which is what made two consecutive residual rounds' supply
+  it replaces it counts post status `closed` (closed to forecasting but not yet
+  resolved), which is what made two consecutive residual rounds' supply
   projections miss. It also lists the backlog of unresolved questions already past
   their own `scheduled_resolve_time`, worst overdue first, which is how you tell
   "Metaculus is late resolving" from "our pull is missing questions". It also sweeps
   FORFEITS: every question on a `closed` or `resolved` post that the bot never
   forecast at all, newest window first, with each window's length in hours. That
   sweep exists because a forfeited question never enters the performance dataset, so
-  nothing downstream of the scoring pull can see one — the 2026-09-01 residual round
+  nothing downstream of the scoring pull can see one. The 2026-09-01 residual round
   found six lost to delivery (a cron gap, a late submit, three cancelled runs, one
   retroactive close) where the prior sweep had found one. Resolving "did we forecast
   this" needs `my_forecasts`, which the posts list does not reliably carry, so the
@@ -146,13 +146,13 @@ session does not run them — it proposes, the operator runs and decides.
   `FALL_CUP_SLUG`, plus minibench off `MetaculusApi.CURRENT_MINIBENCH_ID`), so it
   needs no arguments; scope or redirect it with
   `ARGS="--slugs metaculus-cup-fall-2026 --output /tmp/supply.json"`. Read-only and
-  free — the Metaculus posts list and post detail only, no LLM, research, or publish
-  call — so it sits outside the cost gate. A dead slug renders as one error row and the rest
+  free (the Metaculus posts list and post detail only, no LLM, research, or publish
+  call), so it sits outside the cost gate. A dead slug renders as one error row and the rest
   report normally, which makes this the cheapest way to watch for the fall cup
   opening: the `metaculus-cup-fall-2026` row goes from zero posts to non-zero on
   the day it does.
 
-### Fall 2026 season: what was done on 2026-09-03 and 2026-09-06, and what is left
+### Fall 2026 season: what was done on 2026-09-03, 2026-09-06 and 2026-09-09
 
 Metaculus granted $1,500 of API credits for the bot to compete in both the fall
 Metaculus Cup and the fall bot tournament. Landed in the repo:
@@ -169,7 +169,7 @@ Metaculus Cup and the fall bot tournament. Landed in the repo:
   `score_type` `peer_tournament`, `visibility` `unlisted`,
   `bot_leaderboard_status` `exclude_and_show`, `questions_count` 0. The cup is
   open but had published nothing yet, and bots forecast on it outside the human
-  leaderboard — `exclude_and_show` is what every recent cup season carries (fall
+  leaderboard. `exclude_and_show` is what every recent cup season carries (fall
   2025, spring 2026 and summer 2026 read identically), so it is the cup's normal
   setting rather than anything fall-specific. `visibility` reads `unlisted` where
   those older seasons read `normal`, which is the pre-first-question state.
@@ -177,16 +177,16 @@ Metaculus Cup and the fall bot tournament. Landed in the repo:
   `spot_peer_tournament` like the bot tournament.** Cup records therefore carry a
   coverage-scaled `peer_score` and no spot peer, so they cannot be pooled with
   tournament records on one score field. `performance_analysis/platform_scores.py`
-  already handles that — `RankingScore.tier` keeps spot-scored and peer-only records
-  in separate sort tiers — but any new cut written over fall data has to respect it.
+  already handles that (`RankingScore.tier` keeps spot-scored and peer-only records
+  in separate sort tiers), but any new cut written over fall data has to respect it.
 - `FALL_CUP_CONFIGURED` is True, so the dated reminder that would have reddened
   every run from 2026-09-15 is discharged, and its CI time bomb in
   `tests/test_tournament_dates.py` is now a pin that the cup stays pointed at a
   dated slug. Re-arming it for the spring 2027 cup means re-dating
   `FALL_CUP_REMINDER_DATE` and setting the flag back to False.
 - `run_bot_on_metaculus_cup.yaml` is at full parity with
-  `run_bot_on_tournament.yaml` — same env block, step caps, Playwright install and
-  artifact upload — and moved from `3 0 */2 * *` (00:03 every second day) to
+  `run_bot_on_tournament.yaml` (same env block, step caps, Playwright install and
+  artifact upload) and moved from `3 0 */2 * *` (00:03 every second day) to
   hourly at :13/:33/:53. Hourly costs nothing when nothing is new, because
   `skip_previously_forecasted_questions` is on, and it removes most of the
   open-to-forecast latency that forfeited six triple-era questions. The minutes
@@ -207,19 +207,18 @@ One adjacent thing the grant settles: credit alerting is back ON.
 of a $2,300 limit**, so a credit shortfall is real news again rather than the
 expected state, and `CREDIT_ALERT_RESUME_DATE` was moved up from 2026-09-10 to
 **2026-09-03** rather than left to expire. `OPENROUTER_CREDIT_FLOOR_USD` moved with
-it, from $1.00 to **$100.00**: the operator cannot refill this key — Metaculus does
-— so the warning has to arrive with runway left to ask, and $100 is roughly 250
+it, from $1.00 to **$100.00**: the operator cannot refill this key (Metaculus does),
+so the warning has to arrive with runway left to ask, and $100 is roughly 250
 questions at the measured $0.38-0.41 each. A $1 floor would have fired only once
 the key was already dry, which on an hourly cup cron is an hourly red check that
 arrives too late to act on.
 
-Still the operator's, and not doable from a merge:
-
-- **Enable the workflow on GitHub.** `run_bot_on_metaculus_cup.yaml` is
-  `disabled_manually` there, which no file in this repo can change, so the crons
-  above do not fire until it is enabled. Nothing in the repo will warn about this;
-  the way to notice is a supply-probe row showing cup questions with no bot
-  forecasts.
+The one step no merge could do is done as well: `run_bot_on_metaculus_cup.yaml` was
+`disabled_manually` on GitHub, a per-workflow state no file in this repo can change,
+and the operator enabled it for the season; `gh workflow list --repo
+No-Stream/metaculus-bot --all` read it as `active` on 2026-09-09. Nothing in the
+repo warns when a workflow is disabled; the way to notice is a supply-probe row
+showing a tournament's questions with no bot forecasts.
 
 ## API keys and the shared-vs-personal key model
 
@@ -227,7 +226,7 @@ The bot needs several credentials. `.env.template` lists them with inline
 notes; copy it and fill in real values. The one piece of routing that trips
 people up is the two OpenRouter keys.
 
-- **`OAI_ANTH_OPENROUTER_KEY` — donated / shared.** Metaculus provides credits
+- **`OAI_ANTH_OPENROUTER_KEY`: donated / shared.** Metaculus provides credits
   on this key for OpenAI, Anthropic, and Google models routed via OpenRouter.
   Its server-side allowed-providers list is locked to those three, so anything
   else (Grok via x-ai, Qwen, Perplexity) returns 404 on this key. This is the
@@ -236,12 +235,12 @@ people up is the two OpenRouter keys.
   (default `true`) is its master switch: `--mode mantic` requires it to read false
   and fails shut otherwise, because the key was donated for Metaculus tournaments
   (see "Mantic" below).
-- **`OPENROUTER_API_KEY` — personal.** Pays for what the donated key can't
+- **`OPENROUTER_API_KEY`: personal.** Pays for what the donated key can't
   (Grok, Qwen, Perplexity-via-OpenRouter) and serves as the fallback when the
   donated key hits a credential, credit, or allowed-providers error. The
   fallback wrapper is `FallbackOpenRouterLlm` in
   `metaculus_bot/fallback_openrouter.py`.
-- **`GOOGLE_API_KEY` — personal.** The operator's Google AI Studio key on a
+- **`GOOGLE_API_KEY`: personal.** The operator's Google AI Studio key on a
   billing-enabled project. Powers the Gemini grounded-search provider and gap-
   fill v2's document reads. There is no donated Google AI Studio path. In CI
   this is stored as the `GEMINI_API_KEY` secret and surfaced to the workflow as
@@ -253,7 +252,7 @@ Gemini has two separate routes, which is the other easy thing to confuse:
   donated-key-first with personal-key fallback, controlled by
   `GEMINI_USE_DONATED_OPENROUTER_KEY` (default `true`, since 2026-06-16). It is on
   by default because Metaculus raised the Google rate limits, so the donated key
-  now serves most Gemini models — verified by live call, `gemini-3.5-flash` and
+  now serves most Gemini models. Verified by live call, `gemini-3.5-flash` and
   `gemini-3.1-flash-lite` both succeed on it. Setting the toggle to a false-y
   value (`false`/`0`/`no`) forces personal-key-only routing for ALL Gemini; the
   three prod workflow YAMLs and `test_bot.yaml` pin it to `'true'` explicitly.
@@ -263,21 +262,21 @@ Gemini has two separate routes, which is the other easy thing to confuse:
   `fallback_openrouter.py` (read the blocklist for which models it currently
   covers). `should_route_via_donated_key` returns `False` for anything on it even
   with the toggle ON, so there is no donated attempt, no 429, and no
-  personal-key-fallback-counter bump — which would otherwise redden CI on every
-  question — and a credit error on one of those models is always a personal-key
+  personal-key-fallback-counter bump (which would otherwise redden CI on every
+  question), and a credit error on one of those models is always a personal-key
   issue. It is pinned rather than falling back because that model routes through a
   free-tier Google AI Studio BYOK key on the donated account with no Pro free tier
   (quota 0 → `is_byok:true` + `FreeTier limit: 0`). This is a temporary workaround
   tagged `TODO(gemini-3.1-pro-donated)` in code: remove the blocklist entry once
-  Metaculus fixes the BYOK routing — enable Cloud billing on the BYOK key's GCP
+  Metaculus fixes the BYOK routing (enable Cloud billing on the BYOK key's GCP
   project, remove the Google AI Studio BYOK integration so native OpenRouter
   Google credits are used, or disable "Always use for this provider" on that BYOK
-  key — then re-verify with one live call. See
+  key), then re-verify with one live call. See
   `metaculus_bot/fallback_openrouter.py:should_route_via_donated_key` and
   `FUTURE.md` "Gemini on the donated OpenRouter key".
 - **Gemini grounded search** (`research/gemini_search.py`) always uses the
   personal `GOOGLE_API_KEY`. The donated toggle does not touch it, and neither
-  does anything else on the OpenRouter side — what that key costs is its own
+  does anything else on the OpenRouter side. What that key costs is its own
   subsection below.
 
 Other keys, all personal, no shared variants: `METACULUS_TOKEN`, `MANTIC_TOKEN`
@@ -291,7 +290,7 @@ Diagnosing auth errors: an OpenRouter 401/402 on an OpenAI or Anthropic call
 means suspect the donated key first (it's always tried first for those
 providers). A 401/402/credit error on an OpenRouter Gemini call also means the
 donated key first, since OpenRouter Gemini routes donated-first by default with
-personal fallback — unless `GEMINI_USE_DONATED_OPENROUTER_KEY` has been forced
+personal fallback, unless `GEMINI_USE_DONATED_OPENROUTER_KEY` has been forced
 OFF, in which case suspect `OPENROUTER_API_KEY`; and anything on
 `DONATED_KEY_BLOCKED_GOOGLE_MODELS` is pinned to the personal key with no donated
 attempt, so a credit error on one of those models is always a personal-key issue.
@@ -301,19 +300,19 @@ A 401/402 on Grok, Qwen, or Perplexity is always the personal key
 `GOOGLE_API_KEY`. A `403` splits three ways, with the reported status deciding the
 branch and the spend-cap phrase outranking it:
 
-- Body says `Key limit exceeded` — a drained spend cap. Falls back to the
+- Body says `Key limit exceeded`: a drained spend cap. Falls back to the
   personal key and is credit-classified, whatever status came with it.
-- Body says `no allowed providers`, `guardrail`, or `data policy` — scoped to
+- Body says `no allowed providers`, `guardrail`, or `data policy`: scoped to
   the donated key's routing, so the personal key genuinely can serve the call.
   Falls back, but is NOT credit-classified.
-- Anything else — a moderation or permission refusal. Does not fall back, since
+- Anything else: a moderation or permission refusal. Does not fall back, since
   both keys would refuse the same prompt. Those two phrasings are the only ways
   out of this branch, so it holds even when the body happens to contain ordinary
   credit English like "insufficient funds": on a reported 403 the body is the
   least trustworthy input we have (see the `flagged_input` prompt replay below),
   and credit wording there classifies as neither credit nor a key issue.
 
-The routing half of that decision — fall back to the personal key, or don't —
+The routing half of that decision (fall back to the personal key, or don't)
 lives in `should_retry_with_general_key` (`fallback_openrouter.py`); the credit
 classification is `_is_credit_failure`. Whether a spend-cap 403 is additionally
 SUPPRESSED from CI alerting is a third, separate question, answered by the
@@ -331,7 +330,7 @@ the workflow env as `GOOGLE_API_KEY` so the `google-genai` SDK picks it up. Ther
 is NO Metaculus-donated Google AI Studio key.
 
 Billing mechanics, verified against the ai.google.dev pricing / billing /
-google-search docs on 2026-07-17 — don't re-litigate without fetching them again:
+google-search docs on 2026-07-17 (don't re-litigate without fetching them again):
 Gemini 3.x grounding is paid-tier-ONLY (the free-tier column reads "Not
 available") and includes **5,000 free grounded prompts/month shared across all
 Gemini 3 models per project, then $14/1k individual search queries**. Multi-query
@@ -352,8 +351,8 @@ the prepaid balance. A reconstruction of the whole summer season
 (`scratch/fetch_ladder_2026-09-03/`, plan doc
 `scratch_docs_and_planning/fetch_ladder_plan_2026-09-03.md`) puts June 2026 alone
 at ≈ 6,600 queries, because the pre-06-25 gap-fill resolver added ≈ 4 grounded
-calls per question. Any future feature that multiplies grounded-call counts — or
-Gemini-grounded backtests at scale — re-eats the same monthly pool.
+calls per question. Any future feature that multiplies grounded-call counts, or
+Gemini-grounded backtests at scale, re-eats the same monthly pool.
 
 **Watch item: prepaid-balance exhaustion produces 429s, not surprise charges.** If
 Gemini grounded search starts soft-failing across a run, check the AI Studio credit
@@ -398,11 +397,11 @@ Turning it off again, or widening its trigger population, is the operator's cost
 `RESOLUTION_SOURCE_URLCONTEXT_NOT_ADDRESSED`, under "Reading run logs") say how often the free
 pre-check saved a read and how often a paid read served nothing.
 
-Model prices, read from ai.google.dev on 2026-09-03: the two live native surfaces —
-grounded search and gap-fill v2's `read_document` — run `gemini-3.8-flash` since
+Model prices, read from ai.google.dev on 2026-09-03: the two live native surfaces
+(grounded search and gap-fill v2's `read_document`) run `gemini-3.8-flash` since
 2026-09-03, verified live on the google-genai SDK. It draws the same grounding
 pool (grounding costs $0 to switch) and its tokens are $0.75/$3.75 per M through
-2026-12-31, then $1.50/$7.50 — against $0.50/$3.00 for the
+2026-12-31, then $1.50/$7.50, against $0.50/$3.00 for the
 `gemini-3-flash-preview` it replaced on search and $1.50/$9.00 for the
 `gemini-3.5-flash` it replaced on the reader. Either way that is a few dollars a
 month, from prepaid credits. `url_context` carries no per-request fee; retrieved
@@ -542,7 +541,7 @@ hit nor a hostile page can inflate the install-failed signal.
 | Workflow | Trigger | Mode | What it does |
 |---|---|---|---|
 | `run_bot_on_tournament.yaml` | cron at :03/:23/:43 hourly, plus manual | `tournament` | Forecasts new questions in the current AI benchmark tournament (`TOURNAMENT_ID` in `constants.py`); publishes to Metaculus |
-| `run_bot_on_minibench.yaml` | cron at :08/:38 hourly in the YAML, but the workflow is disabled on GitHub — see below | `minibench` | Forecasts the current MiniBench question set; publishes |
+| `run_bot_on_minibench.yaml` | cron at :08/:38 hourly in the YAML, but the workflow is disabled on GitHub (see below) | `minibench` | Forecasts the current MiniBench question set; publishes |
 | `run_bot_on_metaculus_cup.yaml` | cron at :13/:33/:53 hourly, plus manual | `metaculus_cup` | Forecasts open Metaculus Cup questions (`METACULUS_CUP_ID` in `constants.py`, the season's dated slug); publishes |
 | `run_bot_on_mantic.yaml` | cron at :05/:15/:25 hourly, plus manual | `mantic` | Forecasts open questions in the Mantic Crucible tournament (`MANTIC_TOURNAMENT_ID` in `constants.py`) on the operator's personal keys only; publishes to competitions.mantic.com. See "Mantic" below |
 | `test_bot.yaml` | manual only (`workflow_dispatch`) | `test_questions` | Runs a fixed handful of example questions end-to-end in prod mode; publishes comments |
@@ -553,16 +552,17 @@ workflows are `workflow_dispatch` and never fire on their own.
 
 **A `schedule:` block in the YAML is not the same as a workflow that runs.**
 GitHub carries a per-workflow enabled/disabled state that no file in this repo can
-set, and `run_bot_on_minibench.yaml` is `disabled_manually` there by operator
-design — it has NEVER been enabled (confirmed 2026-09-03), so despite the :08/:38
-crons above the bot does not forecast MiniBench at all. Read the row above as
-"would fire hourly if enabled". The practical consequence is that a
+set. `run_bot_on_minibench.yaml` is `disabled_manually` there by operator design
+and has NEVER been enabled (confirmed 2026-09-03 and again 2026-09-09), so despite
+the :08/:38 crons above the bot does not forecast MiniBench at all. Read the row
+above as "would fire hourly if enabled". The practical consequence is that a
 `make supply_probe` row showing minibench posts closed with zero bot forecasts is
-the EXPECTED state, not a forfeit and not a `METACULUS_TOKEN` problem. The same
-mechanism currently applies to `run_bot_on_metaculus_cup.yaml` (see the
-season-start checklist above), with the difference that the cup one is meant to be
-enabled and is waiting on the operator; minibench is off on purpose. To check the
-live state rather than the YAML:
+the EXPECTED state, not a forfeit and not a `METACULUS_TOKEN` problem. It is the
+only disabled bot workflow: `run_bot_on_metaculus_cup.yaml` sat in the same state
+until the operator enabled it for the fall 2026 season and now reads `active`
+(the season-start checklist above has the history), and `run_bot_on_mantic.yaml`
+will be enabled the moment it merges to `main` (see "Mantic" below). To check the live state
+rather than the YAML:
 
 ```bash
 gh workflow list --repo No-Stream/metaculus-bot --all
@@ -588,7 +588,7 @@ All six bot workflows (the four prod tournaments plus `test_bot` and
 2026-08-03: they previously uploaded `logs-<run_id>` with only `run_logs/` and
 set no persist flag, which was framed as keeping test runs out of the research
 archive but in practice just discarded their research. Three runs' worth of
-assembled per-question research is gone that way — we still hold their raw
+assembled per-question research is gone that way. We still hold their raw
 provider payloads and telemetry markers, but not the briefing the forecasters
 read. Test runs now contribute to the archive on purpose; they forecast the
 evergreen questions, so their records are the ones backtest replay wants most.
@@ -599,8 +599,8 @@ repo automation unrelated to forecasting.
 ### The one-question smoke test (`test_bot_basic.yaml`)
 
 This is the cheapest way to exercise the whole live pipeline end to end. It
-forecasts exactly one question — Q14333, "Age of Oldest Human as of 2100", a
-plain-continuous numeric — chosen because numeric carries the deepest
+forecasts exactly one question (Q14333, "Age of Oldest Human as of 2100", a
+plain-continuous numeric), chosen because numeric carries the deepest
 type-specific pipeline and is the likeliest thing to break. Every research flag
 matches `test_bot.yaml`, so a run touches AskNews, native search, Gemini
 grounded search, financial data, both gap-fill passes, prediction markets, the
@@ -627,36 +627,36 @@ gh workflow run test_bot_basic.yaml --repo No-Stream/metaculus-bot --ref <branch
 The workflow has no inputs, so the only choice is which ref to run. Two things
 about the plumbing are easy to get wrong.
 
-First, pass `--repo`. This checkout has two remotes — `origin` is the operator's
+First, pass `--repo`. This checkout has two remotes (`origin` is the operator's
 fork `No-Stream/metaculus-bot`, `upstream` is the Metaculus template it was
-forked from — and no `gh` default repo is configured, so a bare
+forked from) and no `gh` default repo is configured, so a bare
 `gh workflow run` or `gh workflow list` resolves against the *upstream* template
 and reports a workflow list that does not include this one.
 
 Second, and the yaml header calls this out: a `workflow_dispatch` workflow only
 appears in the Actions "Run workflow" UI once its file exists on the **default**
 branch. A brand-new dispatch-only workflow on a feature branch is invisible
-until it merges to `main`. That is already satisfied here — the file is on
+until it merges to `main`. That is already satisfied here: the file is on
 `origin/main` and `gh workflow list --repo No-Stream/metaculus-bot` shows "Test
-Bot Basic (1 numeric Q smoke)" as active — so the `--ref` argument can point at
+Bot Basic (1 numeric Q smoke)" as active, so the `--ref` argument can point at
 any branch you want to test.
 
 Afterward, the log is in the `research-<run_id>` artifact (90-day retention),
 tee'd from `run_logs/` during the run, alongside the run's
 `research_outputs/` JSONL. Worth grepping in the downloaded log:
 
-- `PAID PERSONAL-KEY FALLBACK` (`fallback_openrouter.py`) — a call fell off the
+- `PAID PERSONAL-KEY FALLBACK` (`fallback_openrouter.py`): a call fell off the
   donated key onto the operator's personal one.
-- `DONATED_KEY_STATE:` (`credit_telemetry.py`) — the `/auth/key` probe's verdict
+- `DONATED_KEY_STATE:` (`credit_telemetry.py`): the `/auth/key` probe's verdict
   on why a credit-shaped failure happened (`drained`, `zeroed`, `revoked`,
   `funded`, `unknown`).
-- `CREDIT_BALANCE:` / `CREDIT_SPEND:` / `CREDIT_FLOOR_BREACH:` — the per-key
+- `CREDIT_BALANCE:` / `CREDIT_SPEND:` / `CREDIT_FLOOR_BREACH:`: the per-key
   balances at start and end, the run's spend delta, and the refill warning. Read
   `CREDIT_SPEND`'s `source=` field before trusting the number:
   - `source=remaining_delta` (the donated key) is reliable.
   - `source=usage_delta_unsettled` (the personal key, which reports no
     `limit_remaining`) is a **lower bound**, and frequently `0.00` on a run that
-    spent real money — OpenRouter has usually not settled the spend by the time
+    spent real money: OpenRouter has usually not settled the spend by the time
     the end snapshot fires. A `CREDIT_SPEND_UNSETTLED` warning accompanies it.
     **Do not read `0.00` here as "this run was free."** Measured over 178
     archived personal-key runs: the markers captured 58% of true spend and 160 of
@@ -666,12 +666,12 @@ tee'd from `run_logs/` during the run, alongside the run's
     telemetry archive). It differences each run's start usage against the next
     run's, which is the only place the lagged spend is observable. The most
     recent run has no successor yet, so it shows as unsettled until another runs.
-- `CREDIT_ROLE_SPEND:` (`credit_telemetry.py`) — one line per (role, key): which
+- `CREDIT_ROLE_SPEND:` (`credit_telemetry.py`): one line per (role, key), which
   pipeline stage spent what, off OpenRouter's own per-call accounting. On a
   one-question smoke run expect three `forecaster:<vendor>` rows plus the
   research roles; `usd=n/a` means no cost data, `role=untagged` means a builder
   call site is missing its `role=`. Described under "Credit telemetry" below.
-- `FORECASTERS_SURVIVED:` (`forecaster.py`) — the answer to "did every forecaster
+- `FORECASTERS_SURVIVED:` (`forecaster.py`): the answer to "did every forecaster
   survive?", as `survived=n/N models=...`. Check it rather than inferring: the
   minimum to publish is low enough that a thinned ensemble still exits zero, and
   the failure-path "Only n/N forecasters succeeded" line stays silent on a
@@ -689,7 +689,8 @@ The API is the same shape as Metaculus (Swagger UI at
 <https://competitions.mantic.com/api/>, spec at `/static/openapi.e7df88a15335.yml`),
 authentication is the same `Authorization: Token <40-char token>` header, and the
 bot's user there is `nostreambot-bot`. Mantic pays $3 per forecast; the bot's
-per-question cost is about $2.60, all of it on the operator's personal keys.
+per-question cost is about $3 (the post-650 smoke spent $3.17), all of it on the operator's
+personal keys.
 `--mode mantic` runs the whole per-question pipeline unchanged and swaps only the
 platform client. Everything in this section was verified against the live API on
 2026-09-08.
@@ -710,14 +711,9 @@ up to three questions per hour. The Series 2 cadence is unannounced. Forecast ev
 question: a miss costs more than a poor forecast under that scoring. When Series 2
 opens, re-point `MANTIC_TOURNAMENT_ID` and `MANTIC_TOURNAMENT_END_DATE` in
 `constants.py`; an unknown slug answers HTTP 400 on the posts list and 404 on the
-tournament route. Two things make that hand-over hard to miss (both from the 2026-09-08
-readiness review, item 5): every Mantic run logs a `MANTIC_TOURNAMENTS` line naming the
-ongoing bots-only tournaments on the API, at WARNING when one is not the configured slug,
-and from the UTC day after `MANTIC_TOURNAMENT_END_DATE` every Mantic run exits non-zero after
-publishing (the constant names the last open day, and Preseason 2 forecasts until 12:00 UTC on
-it), because a zero-question run is otherwise green and the shared two-week hard stop would
-have kept the preseason's dead slug green and silent while Series 2 questions opened and
-closed unforecast.
+tournament route. Two startup checks make that hand-over hard to miss, the Series 2
+discovery line and the red exit on a stale slug; both are described under "Startup checks
+and robustness rules" below.
 
 ### How the mode works
 
@@ -792,9 +788,6 @@ Three Metaculus-shaped guards were generalized rather than bypassed.
   as blog.mantic.com, stays fetchable as an outside source. The function name and
   the `metaculus_self_ref` status token are unchanged, as data contracts.
 
-`check_tournament_dates` runs with the Mantic slug and end date, and in mantic mode its
-verdict is alertable (below).
-
 ### Startup checks and robustness rules
 
 Five rules from the 2026-09-08 readiness review
@@ -814,7 +807,7 @@ identity preflight and the first paid call. Every one is free.
   abort on a slug that exists but is not yet listed, while a slug no tournament has 404s there
   and stops the run naming `MANTIC_TOURNAMENT_ID`. A token that may only view reads the
   tournament fine and would otherwise research and forecast every question and fail at the
-  publish POST, hourly, at about $2.60 a question. Because the GETs are authenticated, a revoked
+  publish POST, hourly, at about $3 a question. Because the GETs are authenticated, a revoked
   or mistyped token fails here too, as a 403 `Invalid token.` on either route (verified live),
   which the unauthenticated identity preflight cannot see. A DNS, TLS or connect failure and a
   200 that is not JSON (a captive portal) are the same `ApiIdentityError`, so every stop is one
@@ -864,8 +857,8 @@ and names the bin granularity; `DateStructured` (`structured_output_schema.py`) 
 declared percentiles as datetimes; then the same PCHIP pipeline, CDF-space aggregation and
 publish path run with `is_date` set so the comment renders dates. On a coarse grid (post 651's
 twelve daily bins) the date question is instead elicited per bin, one probability per calendar
-day, and its members are pooled by the mean; see "Per-bin elicitation" under
-"Mantic-optimized forecasting" below. Two conventions live in the
+day, and its members are pooled by the mean; see the "Per-bin elicitation on enumerable grids"
+bullet under "Mantic-optimized forecasting" below. Two conventions live in the
 adapter and nowhere else: nominal bounds are read from the API's `scaling` block, never
 derived (Mantic sets `nominal_max` to the last bin's left edge), and a date-only value means
 noon UTC of that day, so its mass lands inside that day's bin under the platform's
@@ -909,9 +902,10 @@ prompts already carried the same wording: `_scoring_sentence` renders in all thr
   `numeric/out_of_range_floor.py` from `TemplateForecaster._aggregate_predictions` to the Mantic
   aggregate CDF on open sides only, never on Metaculus, never on a closed bound, and never
   reducing a tail already at or above the floor. Moving each
-  open side from 1% to 5% gains 80.5 points when the outcome escapes and costs 4.26 when it does
-  not, and the same floor applied to the eleven Series 1 competitors' own published
-  distributions cost at most 1.9 points per question for any type. The additive `oor_low=` /
+  open side from 1% to 5% gains 80.5 points when the outcome escapes and, when it does not,
+  costs 4.26 with both sides open (2.06 with one); the same floor applied to the eleven
+  Series 1 competitors' own published distributions cost at most 1.9 points per question for
+  any type. The additive `oor_low=` /
   `oor_high=` fields on the per-member `MEMBER_FORECAST` line keep measuring the models'
   unfloored behaviour, and the per-question `NUMERIC_AGGREGATE` marker carries the published
   tails beside additive `oor_low_raw=` / `oor_high_raw=` / `tail_floor=` fields, so the floor
@@ -928,8 +922,9 @@ prompts already carried the same wording: `_scoring_sentence` renders in all thr
 - **Series-variant clause** (item 9). The displayed range is stated as weak evidence about which
   series variant resolves and as no evidence about the magnitude of the outcome. The old premise,
   that the bounds were set by someone who could see the real series, is false on Mantic, where
-  question writers are paid for bot disagreement and 54% of date questions with an open upper
-  bound (101 of 188) resolved above the ceiling.
+  question writers are paid for bot disagreement and more than half of the date questions with
+  an open upper bound resolved above the ceiling (the Series 1 counts are in the out-of-range
+  bullet above).
 - **Multi-resolution questions** (post 650's shape, `multi_resolution: true`). Gated on the
   question's own API flag (`_multi_resolution_clause`, an identity test on `is True`) and
   type-aware: continuous and date questions forecast each resolution instance and report the
@@ -975,11 +970,14 @@ prompts already carried the same wording: `_scoring_sentence` renders in all thr
   those resolves; the pool gives each believed bin a third); percentile members keep the MEDIAN.
   Telemetry: the `MEMBER_FORECAST` line carries `elicitation=pmf` with the `N + 2` PMF as `raw`
   and `published` (an absent field means percentiles), `NUMERIC_AGGREGATE` ends
-  `method=mean|median|stacked|single`, and `EXTRACTION_RUNG` reads `qtype=pmf` for this ladder.
+  `method=mean|median|stacked|single` (`unrecorded` marks a bug), and `EXTRACTION_RUNG` reads `qtype=pmf` for this ladder.
   The Metaculus switch is adding `PLATFORM_METACULUS` to `PMF_ELICITATION_PLATFORMS`, its own
   config-era change (it would move about half of all Metaculus discrete questions), once a
-  Mantic season shows the per-bin declaration is faithful. The paid smoke and its verification
-  list are under "Running it" below.
+  Mantic season shows the per-bin declaration is faithful. Neither the per-bin gate nor the 5%
+  tail floor has an environment flag: `PMF_ELICITATION_PLATFORMS`, `PMF_ELICITATION_MAX_BINS`
+  and `MANTIC_OUT_OF_RANGE_TAIL_FLOOR` are plain constants, so disabling either is a code edit
+  and a commit, not a workflow env change. The paid smoke and its verification list are under
+  "Running it" below.
 
 ### Personal keys only, and the switch fails shut
 
@@ -1027,12 +1025,14 @@ where GitHub's scheduling burst lives.
 
 The three entries all sit in the first half of the hour, and that is deliberate. Mantic
 questions open on the hour with 60-minute windows, and the per-question budget is the close
-time minus now minus the 60-second publish reserve (`time_budget.py`), so a pickup after about
+time minus now minus the 60-second publish reserve (`time_budget.py`). A pickup after about
 :30 falls under the 1815-second fast-path threshold and gets only the degraded research path,
-while the last quarter-hour falls under the 300-second viability floor and gets nothing.
-Entries past :30 buy little and :45 or :55 buy nothing, so the workflow does not carry them.
-`tests/test_workflow_reliability.py` pins that every Mantic entry fires early enough for the
-full research path and that no two bot workflows share a minute.
+and a pickup within six minutes of close falls under the 300-second viability floor
+(`TIME_BUDGET_MIN_VIABLE_S`) and gets nothing. A :45 entry would therefore buy only the
+degraded fast path, and only if GitHub delivered it promptly. A :55 entry would buy nothing.
+The workflow carries neither. `tests/test_workflow_reliability.py` pins that every
+Mantic entry fires early enough for the full research path and that no two bot workflows share
+a minute.
 
 ### Scheduling reliability
 
@@ -1055,17 +1055,18 @@ involved, and running the bot directly on a box loses the artifact pipeline that
 `make sync_all` harvests (`research_outputs/`, `run_logs/`, the 90-day retention). The
 operator is deciding between these; the decision is recorded as open in `FUTURE.md`.
 
-Unlike the cup and minibench workflows, this one is not `disabled_manually`: GitHub
-runs a new scheduled workflow as soon as its file is on the default branch, so
-merging the branch to `main` starts the hourly crons with no further UI step.
+GitHub runs a new scheduled workflow as soon as its file is on the default branch, so
+merging the branch to `main` starts the hourly crons with no further UI step. The
+per-workflow enabled state only ever bites a workflow someone has disabled in the Actions
+UI, and today that is minibench alone (see "GitHub Actions workflows" above).
 
 The instrument that settles the cadence question is `make supply_probe_mantic` (free,
 read-only; `ARGS="--slugs <series-2-slug> --output scratch/mantic_supply_$(date -u +%Y%m%d).json"`
-after the first Series 2 week). It pages the tournament's closed and resolved posts, classifies
-each question as forecast, no_forecast or unknown, and prints the miss rate per UTC release hour
-(the hour of `open_time`, which on a 60-minute window is the hour a run had to land in) plus the
-realized open-to-close window distribution, so the 60-minute assumption is checked by the same
-run. `with_cp=true` rides every list GET: it is what puts the public spot-time snapshot on the list
+after the first Series 2 week). It pages the tournament's open, closed and resolved posts,
+sweeps the closed and resolved ones for forfeits, classifying each as forecast, no_forecast or
+unknown, and prints the miss rate per UTC release hour (the hour of `open_time`, which on a
+60-minute window is the hour a run had to land in) plus the realized open-to-close window
+distribution, so the 60-minute assumption is checked by the same run. `with_cp=true` rides every list GET: it is what puts the public spot-time snapshot on the list
 page, so without a token the probe still classifies every RESOLVED question from that snapshot
 (`score_data.disagreement_forecasts.forecasts[]`, author id against `MANTIC_BOT_USER_ID`), which is
 exactly what is scored, and a closed-but-unresolved question reads `unknown`. `MANTIC_TOKEN` adds
@@ -1077,8 +1078,8 @@ its snapshot names the bot (`docs/supply_probe.md` "The Mantic mode" has the num
 
 ### Running it, and what is left for the operator
 
-The local QA run is paid and publishes. It spends about $2.60 per question on the
-personal OpenRouter, AskNews, Exa and Google keys, posts a forecast for every open
+The local QA run is paid and publishes. It spends about $3 per question (the post-650 smoke
+spent $3.17) on the personal OpenRouter, AskNews, Exa and Google keys, posts a forecast for every open
 question the bot has not yet forecast to Mantic, and goes through the ask-first
 gate like every other live mode:
 
@@ -1087,70 +1088,81 @@ DONATED_OPENROUTER_KEY_ENABLED=false uv run python main.py --mode mantic
 # or: make run_mantic
 ```
 
-The smoke run is the same command narrowed to one chosen question. `--only-posts`
-takes comma-separated post ids (the number in the question URL) and forecasts only
-those of the tournament's open questions. The Phase 1 smoke was this command on post 650
-(the multi-resolution discrete question); it ran and passed on 2026-09-08 at 18:00 PT:
+The smoke run is the same command narrowed to one chosen question. The Phase 1 smoke was
+this command on post 650 (the multi-resolution discrete question); it ran and passed on
+2026-09-08 at 18:00 PT:
 
 ```bash
 DONATED_OPENROUTER_KEY_ENABLED=false uv run python main.py --mode mantic --only-posts 650
 # or: make run_mantic_one POST=650
 ```
 
+`--only-posts` takes comma-separated post ids (the number in the question URL) and
+forecasts only those of the tournament's open questions. It works in every
+tournament-shaped mode (`tournament`, `minibench`, `metaculus_cup`, `mantic`) and is
+refused with `test_questions`. It fetches the tournament's open questions exactly as an
+unfiltered run does, on the same client, keeps the listed posts, and logs one line such as
+`ONLY_POSTS: requested=650 matched=650 dropped=3`, a registered marker, so the archive
+records which question a smoke run spent on. `matched` is which of the requested ids were
+among the open questions; when none are, the run logs a warning and forecasts nothing
+rather than the whole tournament. The re-spend guard still applies, so a listed post the
+bot has already forecast is skipped like any other.
+
 The per-bin smoke (Wave C) is the same command on the preseason's date question, post 651
 (twelve daily bins, both bounds closed), which the gate now elicits per bin. About $3, it
-publishes, and like every paid run it fires once per approval:
+publishes, and like every paid run it fires once per approval. The forecast-permission
+preflight it runs first passes against the live token: on 2026-09-09 the tournament route read
+`user_permission` `forecaster`, `is_ongoing` true and `bot_leaderboard_status` `bots_only`.
 
 ```bash
 DONATED_OPENROUTER_KEY_ENABLED=false uv run python main.py --mode mantic --only-posts 651
 # or: make run_mantic_one POST=651
 ```
 
-Verify it afterwards with the authenticated read
-`curl -s -H "Authorization: Token $MANTIC_TOKEN" "https://competitions.mantic.com/api/posts/651/?with_cp=true"`
-and the run log:
+Verify it afterwards. The authoritative confirmation is the authenticated read
+`curl -s -H "Authorization: Token $MANTIC_TOKEN" "https://competitions.mantic.com/api/posts/651/?with_cp=true"`;
+the run log is the second witness, with one trap: forecasting-tools logs
+`Posted prediction on question 651` and `Posted comment on post 651` BEFORE it checks the HTTP
+status, so both lines also appear in the log of a run whose POST the server rejected, and
+neither counts as evidence. Check:
 
-- `my_forecasts.latest.forecast_values` is a 13-value CDF the server accepted, with
+- `my_forecasts.latest.forecast_values` on the read is a 13-value CDF the server accepted, with
   `cdf[0] == 0.0` and `cdf[12] == 1.0` (both bounds closed);
-- the weekend bins, 12, 13 and 19 September (bins 4, 5 and 11), each carry the platform minimum,
-  `round(0.01 / 12, 9)` plus the 1e-9 margin, and nothing more;
+- every bin carries at least the platform minimum, `round(0.01 / 12, 9)` plus the 1e-9 margin.
+  The weekend bins (labelled 2026-09-12, 2026-09-13 and 2026-09-19) sit exactly at that minimum
+  only when all three members declared 0 on them; the members are pooled by the pointwise
+  mean, so one member putting 0.02 on a Saturday lifts the pooled bin above the minimum, which
+  is the pool working rather than a defect;
 - the run log has three `MEMBER_FORECAST ... qtype=date ... elicitation=pmf` lines whose `raw` and
   `published` are 14-entry vectors, and one `NUMERIC_AGGREGATE ... method=mean` line;
+- the run log has one `CLOSE_MARGIN: question=651` line (the question id, which equals the post
+  id for 651), no match for `grep -E 'PUBLISH_HARDENING|PUBLISH_SKIPPED_CLOSED|HTTPError|Traceback'`,
+  and ends with `Run completed clean with 0 alertable degradation event(s)`; the command itself
+  exits 0;
 - the comment renders ISO dates and no epoch second.
 
-The Phase 2 percentile date smoke on 651 that earlier notes list is no longer a prerequisite for
-anything; the per-bin smoke supersedes it.
-
-The flag works in every tournament-shaped mode (`tournament`, `minibench`,
-`metaculus_cup`, `mantic`) and is refused with `test_questions`. It fetches the
-tournament's open questions exactly as an unfiltered run does, on the same client,
-keeps the listed posts, and logs one line such as
-`ONLY_POSTS: requested=650 matched=650 dropped=3`, a registered marker, so the
-archive records which question a smoke run spent on. `matched` is which of the
-requested ids were among the open questions; when none are, the run logs a warning
-and forecasts nothing rather than the whole tournament. The re-spend guard still
-applies, so a listed post the bot has already forecast is skipped like any other.
-
-Both commands need `MANTIC_TOKEN` in `.env` (the operator also keeps it at
-`~/.keys/MANTIC_TOKEN`). Without the switch the run stops at
-`_assert_personal_keys_only` before any spend.
+All three commands need `MANTIC_TOKEN` in `.env` (the operator also keeps it at
+`~/.keys/MANTIC_TOKEN`). Without `DONATED_OPENROUTER_KEY_ENABLED=false` the run stops
+at `_assert_personal_keys_only` before any spend.
 
 Operator steps, in order:
 
 1. Done 2026-09-08: the token is stored as the `MANTIC_TOKEN` repository secret
    (`gh secret list --repo No-Stream/metaculus-bot` shows it, set 2026-09-08 20:32 UTC).
-2. Merge to `main`. The schedule is live from that moment; there is nothing to
+2. Fire the per-bin smoke once, `make run_mantic_one POST=651` (about $3, publishes), and
+   check the five points above.
+3. Merge to `main`. The schedule is live from that moment; there is nothing to
    enable in the Actions UI.
-3. When Series 2 opens, update `MANTIC_TOURNAMENT_ID` and
-   `MANTIC_TOURNAMENT_END_DATE`. The `MANTIC_TOURNAMENTS` line names the new slug on the
-   first run that sees it, and from 2026-09-21 every Mantic run exits red until the
-   constants move. Then take the cadence decision described under "The workflow".
+4. When Series 2 opens, update `MANTIC_TOURNAMENT_ID` and `MANTIC_TOURNAMENT_END_DATE`;
+   the "Series 2 discovery" and "Stale slug goes red" checks above are what flag the
+   hand-over. Then take the cadence decision described under "Scheduling reliability".
 
 ## Cost discipline
 
 Every credit spend goes through the operator. Anything that hits a live LLM or
-research API spends real money, and the run modes also publish comments to
-Metaculus, which is a visible external action that is hard to retract. Nothing
+research API spends real money, and the run modes also publish forecasts and
+comments to the platform they forecast (Metaculus, or competitions.mantic.com in
+`--mode mantic`), a visible external action that is hard to retract. Nothing
 in that class launches without the operator saying yes first. `AGENTS.md` at the
 repo root carries the terse agent-facing version of the same rule.
 
@@ -1181,38 +1193,39 @@ The paid run is the operator's last step.
 ### Paid and externally visible
 
 - `uv run python main.py` / `make run` in any live mode (`tournament`,
-  `minibench`, `metaculus_cup`, `test_questions`) — spends credits and publishes
+  `minibench`, `metaculus_cup`, `test_questions`): spends credits and publishes
   to Metaculus. `cli.py` builds the bot with `publish_reports_to_metaculus=True`
   in every mode.
 - `--mode mantic` / `make run_mantic`: spends the operator's personal keys
-  (about $2.60 per question; the donated key is refused) and publishes to
+  (about $3 per question, $3.17 on the post-650 smoke; the donated key is refused) and publishes to
   competitions.mantic.com. `--only-posts <ids>` / `make run_mantic_one POST=<id>`
   is the same run narrowed to the listed post ids, so one question's worth of
   spend. See "Mantic" above.
-- `make backtest_smoke_test` / `_small` / `_medium` / `_large` — spends on every
+- `make backtest_smoke_test` / `_small` / `_medium` / `_large`: spends on every
   forecaster and research call, plus one `LEAKAGE_DETECTOR_MODEL` call per
   question for the leakage screen. No publish (the benchmark config sets
   `publish_reports_to_metaculus=False` and `is_benchmarking=True`), but real
   money. The per-target question counts are the `--num-questions` values in the
   Makefile.
-- `make backtest_with_cache` — the `--research-dir` flag replays archived
+- `make backtest_with_cache`: the `--research-dir` flag replays archived
   research instead of fetching it, so the research and leakage-screen calls go
   away. The live ensemble still forecasts every question, so forecaster spend is
   real. A question with no archived record falls back to live research and the
   run logs a warning saying so.
 - `make ablation_qa_research` / `ablation_smoke` / `ablation_small` /
-  `ablation_medium` — real research plus forecaster spend.
-- `make benchmark_run_*` — deprecated, since `community_benchmark.py` baseline
+  `ablation_medium`: real research plus forecaster spend.
+- `make benchmark_run_*`: deprecated, since `community_benchmark.py` baseline
   scoring broke when Metaculus dropped `aggregations` from the list API, but the
   `run` and `custom` modes still fan the real ensemble over real questions.
   Prefer `make backtest_*`.
-- `make test_live` — the only test target that leaves the network. It pins a
+- `make test_live`: the only test target that leaves the network. It pins a
   `:free` OpenRouter model slug so the dollar figure is near zero, but the calls
   are real and need a live key, so it still goes through the operator.
 - GitHub Actions runs of any bot workflow. A dispatched run spends exactly what
-  the same mode spends locally and publishes to Metaculus the same way. See the
-  workflow table above for triggers, and the smoke-test subsection there for the
-  one-question variant.
+  the same mode spends locally and publishes to the platform that workflow forecasts,
+  Metaculus for every other bot workflow and competitions.mantic.com for
+  `run_bot_on_mantic.yaml`. See the workflow table above for triggers, and the
+  smoke-test subsection there for the one-question variant.
 - Any script that invokes a research provider or the ensemble against real
   questions, including one an agent writes on the spot.
 
@@ -1220,18 +1233,20 @@ The paid run is the operator's last step.
 
 - Gates and formatting: `make test`, `make test_fast`, `make test_e2e`,
   `make lint`, `make format`, `make typecheck`, `make typecheck_ty`, `make cov`,
-  `make audit`, `make precommit*`. One blind spot in `make audit`: osv-scanner reads
-  `uv.lock`, and the `curl_cffi` wheel behind the impersonated retry vendors its own
+  `make audit`, `make deps`, `make lint_imports`, `make precommit*`. One blind spot in
+  `make audit`: osv-scanner reads `uv.lock`, and the `curl_cffi` wheel behind the impersonated retry vendors its own
   libcurl and BoringSSL binaries that no lockfile entry names, so a libcurl CVE is not
   reported by that gate and is picked up only by bumping `curl_cffi`.
-- Read-only Metaculus and GitHub-artifact pulls: `make sync_all` and its parts
+- Read-only Metaculus, Mantic and GitHub-artifact pulls: `make sync_all` and its parts
   (`sync_research`, `sync_telemetry`, `sync_raw_research`, the `download_*` and
   `backfill_*` targets), the `performance_analysis` package and its width
-  monitor, `make score_ghosts`, and `make close_margin_watch`.
-- `make ablation_score` — `--stages score` hydrates every artifact off disk
+  monitor, `make score_ghosts`, `make close_margin_watch`, `make supply_probe` and
+  `make supply_probe_mantic` (public Mantic reads; `MANTIC_TOKEN` is optional there,
+  see "Scheduling reliability" above).
+- `make ablation_score`: `--stages score` hydrates every artifact off disk
   (`_hydrate_working_set_from_cache`) and makes no provider call.
-- `make benchmark_display` — views saved benchmark results, no forecasting.
-- `make check_credits` — reads the `/auth/key` balance for both OpenRouter keys.
+- `make benchmark_display`: views saved benchmark results, no forecasting.
+- `make check_credits`: reads the `/auth/key` balance for both OpenRouter keys.
 
 The test suite is safe by construction, not by convention. The `e2e` marker
 means a full-pipeline test with mocked LLMs, and `tests/conftest.py` installs an
@@ -1257,16 +1272,16 @@ stderr), so per-run spend is durably grep-able:
 - `CREDIT_BALANCE: key=<donated|personal> phase=<start|end> remaining=... usage=...`
 - `CREDIT_SPEND: key=... run_delta_usd=... remaining=... source=...` at end of
   run. `source` is `remaining_delta` (reliable), `usage_delta_unsettled` (a lower
-  bound — see the smoke-test grep list above), or `unavailable`.
+  bound: see the smoke-test grep list above), or `unavailable`.
 - `CREDIT_SPEND_UNSETTLED: key=... run_delta_usd=... is a LOWER BOUND ...` beside
   every `usage_delta_unsettled` figure, so a `0.00` is never mistaken for
   no-spend. `scripts/reconcile_credit_spend.py` recovers the settled number.
 - `CREDIT_ROLE_SPEND: role=... key=... usd=... calls=... costed_calls=...
-  byok_usd=...` — one line per (role, key) at end of run, saying WHERE the
+  byok_usd=...`: one line per (role, key) at end of run, saying WHERE the
   OpenRouter dollars went. See "Per-role spend" below.
 - `CREDIT_FLOOR_BREACH: key=donated remaining=... floor=...` when the donated
   key's remaining balance drops below `OPENROUTER_CREDIT_FLOOR_USD`
-  (`constants.py`, $100). That level is an early warning, not an empty tank — read
+  (`constants.py`, $100). That level is an early warning, not an empty tank. Read
   it as "ask Metaculus for a top-up", not "the key is dry".
 
 ### Per-role spend (`CREDIT_ROLE_SPEND`)
@@ -1292,12 +1307,12 @@ How the number is produced, because it decides how to read it:
   `usage.cost_details.upstream_inference_cost` (the provider's charge on a BYOK
   route). `usd` is their sum; `byok_usd` is the upstream part on its own. The
   donated key routes through Metaculus's BYOK integrations, so on that key nearly
-  everything is `byok_usd` — the same money `/auth/key` books as `byok_usage` and
+  everything is `byok_usd`, the same money `/auth/key` books as `byok_usage` and
   subtracts from `limit_remaining`; the personal key is not BYOK, so its rows read
   `byok_usd=0.0000`. This is the provider's figure, not litellm's price table.
 - `usd=n/a` means none of that row's calls carried cost data. It is never a
   fabricated zero; `costed_calls` says how many of `calls` the sum covers.
-- `role=untagged` means a completion nobody stamped — forecasting-tools' own
+- `role=untagged` means a completion nobody stamped: forecasting-tools' own
   helpers, or a builder call site that forgot its `role=`. `key=unknown` is the
   same for the key.
 - Not on OpenRouter, so never in this ledger: Gemini grounded search and gap-fill
@@ -1319,16 +1334,16 @@ How the number is produced, because it decides how to read it:
 
 Harvested as `credit_role_spend.jsonl` in the telemetry archive.
 `uv run python scripts/reconcile_credit_spend.py --roles` (free, offline) prints
-each run's role-ledger total beside its settled per-key spend — the two measure
+each run's role-ledger total beside its settled per-key spend (the two measure
 the same money from opposite ends, so their ratio is the ledger's own coverage
-check — plus a per-role table over the selected runs.
+check), plus a per-role table over the selected runs.
 
 **The per-question spend figure to quote is `$0.38–0.41`**, measured over 29
 triple-era runs across 33 questions, and it is an OpenRouter-only LOWER bound: it
 excludes Google AI Studio prepaid (Gemini grounded search and gap-fill v2 document
 reads), the AskNews subscription, and Exa. The older "~$3.05 → ~$1.65 after the
 6→3 roster drop" estimate was never measured, is an order of magnitude too high,
-and is superseded — it must not appear in a roster re-add decision. `FUTURE.md`'s
+and is superseded: it must not appear in a roster re-add decision. `FUTURE.md`'s
 "Cost context for the re-add decision" holds the receipt path, and
 `CREDIT_ROLE_SPEND` plus `scripts/reconcile_credit_spend.py --roles` is how a
 re-add gets priced per role rather than estimated.
@@ -1351,7 +1366,7 @@ drained and the operator started funding the season out of pocket, so an empty
 donated key was the expected state rather than a defect. Metaculus granted $1,500
 of credits on 2026-09-03, and `CREDIT_ALERT_RESUME_DATE` in `constants.py` was
 moved up from 2026-09-10 to `2026-09-03` that day: a credit shortfall reddens CI
-again. The machinery below is unchanged and re-armable — push
+again. The machinery below is unchanged and re-armable: push
 `CREDIT_ALERT_RESUME_DATE` forward in `constants.py`, or set
 `OPENROUTER_CREDIT_ALERT_RESUME_DATE` in the workflow env, and the window reopens
 with no other edit. Inside a window two paths are gated, because either one alone
@@ -1367,7 +1382,7 @@ would keep the check red:
    back out while alerting is suppressed. Every event is counted exactly once:
    generic adds it, at most one subset subtracts it. That is why the whole
    accounting block in `record_donated_key_fallback` has to contain no `await`
-   after the threaded probe — `+=` on a module global is interruptible between
+   after the threaded probe: `+=` on a module global is interruptible between
    bytecodes, so an await there would let N forecasters failing on one dry key
    race the increment, undercount the generic total, and take a degraded run
    green.
@@ -1400,18 +1415,18 @@ every 429 as an empty wallet and silently exempt real rate-limit breakage from
 alerting for the whole suppression window.
 
 Text alone cannot tell a genuinely **drained** key from one Metaculus
-**revoked** or **re-capped to zero** — all three produce that same 403 — and the
+**revoked** or **re-capped to zero** (all three produce that same 403), and the
 operator wants opposite CI colors for them. So on the first spend-cap failure of
 a run, `credit_telemetry.classify_donated_key_state` reads the free, read-only
 `/auth/key` endpoint once (verdict cached for the process) and classifies:
 
 | `/auth/key` says | State | Alerting |
 | --- | --- | --- |
-| 200, cap > 0, nothing remaining | `drained` | suppressible — the expected empty wallet |
-| 200, cap == 0 | `zeroed` | **red** — Metaculus cut us off, never an "empty wallet" |
-| 401 / 404 | `revoked` | **red** — key is gone, not empty |
-| 200, money remaining | `funded` | **red** — the failure was not about credit |
-| probe failed, or no donated key configured | `unknown` | **red** — fail safe |
+| 200, cap > 0, nothing remaining | `drained` | suppressible: the expected empty wallet |
+| 200, cap == 0 | `zeroed` | **red**: Metaculus cut us off, never an "empty wallet" |
+| 401 / 404 | `revoked` | **red**: key is gone, not empty |
+| 200, money remaining | `funded` | **red**: the failure was not about credit |
+| probe failed, or no donated key configured | `unknown` | **red**: fail safe |
 
 Only `drained` is ever subtracted from `alertable`, and only inside a suppression
 window (none is open since 2026-09-03). A probe that errors or times out classifies
@@ -1421,15 +1436,15 @@ green.
 The probe is what the *ambiguous* spend-cap 403 needs, so it is the only path that
 pays for one. A documented 402 or plain insufficient-credit response says the
 wallet is empty and nothing else, so `is_suppressible_credit_error` suppresses that
-family before reaching the probe at all — deliberately, since it predates the
+family before reaching the probe at all. That is deliberate, since it predates the
 discriminator and an unreachable `/auth/key` must not change long-standing
 behavior. Read the table above as the verdict on a spend-cap 403 specifically, not
 on every credit failure (`test_documented_402_needs_no_probe` in
 `tests/test_fallback_openrouter.py` pins the carve-out).
 
 `DONATED_KEY_PROBE_TIMEOUT_S` bounds the probe, but read what shape of promise
-that is: httpx applies a bare float **per network operation** — connect, read,
-write and pool each get the full budget independently — so it is not a cap on
+that is: httpx applies a bare float **per network operation** (connect, read,
+write and pool each get the full budget independently), so it is not a cap on
 elapsed time. A server trickling bytes slower than the read timeout resets the
 clock on every chunk, and a probe can run many multiples of the nominal budget
 (measured against a local trickling server, a one-second timeout took ten
@@ -1438,8 +1453,8 @@ latency-sensitive call site rather than in the timeout: on the fallback path
 `record_donated_key_fallback` runs the probe on `asyncio.to_thread` under an
 `asyncio.wait_for`, so the awaiting coroutine gives up on schedule however long
 the socket takes. `wait_for` doesn't kill the worker thread, so a trickling probe
-outlives that cap — orphaned, holding a socket and (under the probe's lock)
-writing the cache — while the fallback proceeds without it. Callers outside that
+outlives that cap, orphaned, holding a socket and (under the probe's lock)
+writing the cache, while the fallback proceeds without it. Callers outside that
 path (the CLI, the start/end telemetry) run outside the forecasting window and
 take the per-operation budget only. The state is logged as
 `DONATED_KEY_STATE: state=<state>` (INFO for `drained`, WARNING for everything
@@ -1453,7 +1468,7 @@ wording; a reported 402 always falls back; an exception carrying no status falls
 back on text alone. The
 `/auth/key` probe is consulted for alerting only (`is_suppressible_credit_error`),
 so a stale or cached read reporting `funded` can never strand the ensemble on a
-dry key — that is the exact failure this change exists to fix.
+dry key. That is the exact failure this change exists to fix.
 
 Two related hardenings ride along, both about how little the body can be trusted.
 
@@ -1468,9 +1483,9 @@ three tiers in a fixed order:
    moderation cue and generic HTTP boilerplate, so gating the phrase behind the
    veto would keep the dry key from falling back all over again.
 2. Otherwise, a reported status decides alone: credit means exactly 402. So a
-   reported 402 outranks moderation wording — `APIError(status_code=402,
+   reported 402 outranks moderation wording (`APIError(status_code=402,
    message="Blocked by moderation policy")` both falls back and is
-   credit-classified — and credit English on any other reported status does not
+   credit-classified), and credit English on any other reported status does not
    classify.
 3. With no status reported, moderation wording (`moderation`, `forbidden`,
    `flagged_input`, `flagged for`) vetoes; failing that, a bare `402` or one of
@@ -1483,8 +1498,8 @@ That last ordering is why `insufficient credit` alone classifies as credit while
 Second, OpenRouter moderation 403 bodies include `flagged_input`, up to ~100
 characters of our own prompt replayed back, and a forecasting prompt full of
 dollar figures and bill numbers can easily contain the token `402`. A bare `402`
-substring match therefore read an ordinary moderation refusal as an empty wallet
-— billing the personal key for a call that would refuse again, and exempting a
+substring match therefore read an ordinary moderation refusal as an empty wallet,
+billing the personal key for a call that would refuse again, and exempting a
 real moderation block from alerting. Everything after a prompt-echo marker is now
 stripped before any word cue reads the body, and the bare digits are only trusted
 when nothing in what remains looks like a moderation refusal. Word cues only,
@@ -1556,7 +1571,7 @@ The old `community_benchmark.py` path is deprecated: Metaculus removed the
 
 ## Performance analysis and the width monitor (read-only, free)
 
-This section is the runbook — the commands, and what each one prints. The
+This section is the runbook: the commands, and what each one prints. The
 methodology and the conventions that make a number trustworthy (era bucketing and
 the merge-to-main rule, the exclusion cohorts, the PIT convention, the starved
 outer tail, the supply probe, per-model recovery, the spot-peer rule,
@@ -1627,7 +1642,7 @@ flagged or not. This is a DETECTOR: any width response stays gated on the
 standing `k_tail` hold, and there is no publish-time twin of it.
 
 Its era boundaries are **merge-to-main timestamps** (`WIDENING_FLIP`,
-`TS_ANCHOR_ENABLE`), not authoring dates — prod runs from `main`, so a change is
+`TS_ANCHOR_ENABLE`), not authoring dates: prod runs from `main`, so a change is
 live only once its merge commit lands there, and keying on the authoring date
 files every run in the author-to-merge gap under the wrong config. Empty eras are
 omitted, so while no post-july15-bundle numeric has resolved the `ts_anchor` row
@@ -1638,9 +1653,9 @@ uv run python -m metaculus_bot.performance_analysis.width_monitor --tournament <
 # or against a cached dataset:
 uv run python -m metaculus_bot.performance_analysis.width_monitor --cached <path>
 # drop a standing exclusion cohort from every row; the excluded count is rendered
-# in the table, so the exclusion is never silent. Three shorthands — known_bug
+# in the table, so the exclusion is never silent. Three shorthands, known_bug
 # (since-fixed pipeline defects), degraded_run (dry-key 1-of-3 publishes) and
-# partial_degraded (2-of-3) — compose with each other and with explicit ids; the
+# partial_degraded (2-of-3), compose with each other and with explicit ids; the
 # id sets live in performance_analysis/cohorts.py (EXCLUSION_COHORTS):
 uv run python -m metaculus_bot.performance_analysis.width_monitor --cached <path> --exclude-qids known_bug,degraded_run
 ```
@@ -1650,7 +1665,7 @@ local archives are fresh: the per-provider research archive
 (`backtests/research_archive/latest/`), the run-log telemetry archive
 (`backtests/telemetry_archive/`), and the raw research-provider payload archive
 (`backtests/research_archive/raw/`). Use `sync_all` rather than one of the
-narrower `sync_*` targets — it is a single download pass over the union of
+narrower `sync_*` targets: it is a single download pass over the union of
 artifact families, so it is cheaper than running them in sequence, and GHA
 artifacts expire at 90 days, which makes anything a partial pull skipped
 permanently unrecoverable. The twice-weekly launchd job in
@@ -1659,13 +1674,13 @@ permanently unrecoverable. The twice-weekly launchd job in
 ### The persisted artifact store, and re-parsing for free
 
 `sync_all` downloads each artifact into `backtests/gha_artifact_store/<artifact-name>/`
-and leaves it there — the extracted contents as `gh run download` unzipped them,
+and leaves it there: the extracted contents as `gh run download` unzipped them,
 plus a `_meta.json` holding `artifact_id` / `name` / `created_at` / `run_id`. All
 three archives are parsed FROM that store, never from a self-destructing temp
 dir, which is the point: 90 days is a hard ceiling for this repo
 (`{"days":90,"maximum_allowed_days":90}`), so GHA is a staging area and local
 disk is the source of truth the moment an artifact is grabbed. An artifact
-already in the store is never re-downloaded — uploads are immutable, so only
+already in the store is never re-downloaded: uploads are immutable, so only
 absent or half-extracted dirs are fetched.
 
 ```bash
@@ -1675,7 +1690,7 @@ make resync_from_store    # rebuild all three archives from local disk, zero net
 Reach for that after fixing an ingest or parse bug: the bytes are already on
 disk, so a corrected harvest costs nothing and still works on artifacts GitHub
 has since deleted. Each sync script also accepts `--from-store` / `--store-dir`.
-In `download_research.py` the two offline flags differ in an important way —
+In `download_research.py` the two offline flags differ in an important way:
 `--rebuild-only` re-merges the records already in `by_qid/`, while `--from-store`
 re-reads the persisted JSONL and so can RECOVER records a past ingest bug
 dropped. The offline path cannot ask GitHub which workflow a run belonged to, so
@@ -1686,13 +1701,13 @@ until the next online sync.
 Storage is not a concern at this scale: 859 artifacts occupy 38 MB (median 4.4
 KiB, mean 44 KiB, largest under 1 MB), and at ~13 artifacts/day that is roughly
 17 MB/month, so about 210 MB after a year. Nothing needs compression, and
-nothing is pruned on purpose — permanence is the whole point.
+nothing is pruned on purpose: permanence is the whole point.
 
 `uv run python -m scripts.research_sync.verify_completeness` checks store
 coverage as its own FAIL condition (a live artifact missing from the store is
 research one clock-tick from unrecoverable), separately from archive coverage.
 Read the two signals differently: most artifacts legitimately hold no research at
-all — 632 of the 859 carry only `run_logs/`, which is why the archive holds
+all: 632 of the 859 carry only `run_logs/`, which is why the archive holds
 artifact records from 227 runs rather than 859.
 
 ## Reading run logs
@@ -1700,15 +1715,15 @@ artifact records from 227 runs rather than 859.
 Each run tees to `run_logs/run_<run_id>_<timestamp>.log`, uploaded as a workflow
 artifact (`research-<run_id>` for every bot workflow; the two test
 workflows used `logs-<run_id>` before 2026-08-03, and those older artifacts are
-still harvested — `RUN_LOG_ARTIFACT_PREFIXES` covers both names). Grep these for
+still harvested: `RUN_LOG_ARTIFACT_PREFIXES` covers both names). Grep these for
 the telemetry markers:
 
-- `EXTRACTION_RUNG: question=... model=... qtype=... rung=... block_present=...`
-  — one line per forecast value extraction. Watch for `rung=llm` (LLM salvage
+- `EXTRACTION_RUNG: question=... model=... qtype=... rung=... block_present=...`:
+  one line per forecast value extraction. Watch for `rung=llm` (LLM salvage
   fired) and `block_present=false` (a forecaster stopped emitting a well-formed
   structured block). Emitted by `_log_extraction` in `value_extraction.py`.
-- `MEMBER_FORECAST: question=... model=... role=member|stacker qtype=... raw=... published=...`
-  — one line per forecast VALUE that leaves a runner, for every ensemble member and
+- `MEMBER_FORECAST: question=... model=... role=member|stacker qtype=... raw=... published=...`:
+  one line per forecast VALUE that leaves a runner, for every ensemble member and
   for the stacker. `raw` is what the extraction ladder read off the rationale before
   any clamp, renormalise or sanitise; `published` is what the runner handed on.
   Both are whitespace-free JSON literals, so `json.loads` them whatever the type:
@@ -1723,13 +1738,13 @@ the telemetry markers:
   formatter in `member_forecast.py`. Added 2026-09-02 because no marker carried a
   member's value on every question and the published comment, the only other
   writer, is middle-trimmed and carries the block only since 2026-05.
-- `OPEN_BOUND_PILING: question=... model=... bound=... bin_mass=... ...` — a
+- `OPEN_BOUND_PILING: question=... model=... bound=... bin_mass=... ...`: a
   forecaster put enough mass on the terminal displayed bin of an open-bound
   numeric question, without declaring any percentile beyond the edge, to trip
   `OPEN_BOUND_PILING_THRESHOLD` (`numeric/config.py`). Emitted by
   `numeric/diagnostics.py`.
-- `EXTREME_CALL: question=... model=... p=... side=low|high lone=... survivors=...`
-  — one line per surviving ensemble member of a BINARY question whose probability
+- `EXTREME_CALL: question=... model=... p=... side=low|high lone=... survivors=...`:
+  one line per surviving ensemble member of a BINARY question whose probability
   sat at or past an edge of the extreme band (`EXTREME_CALL_LOW` /
   `EXTREME_CALL_HIGH` in `constants.py`, currently 0.05 / 0.95, inclusive).
   Emitted by `extreme_call.py` right after `FORECASTERS_SURVIVED`, which supplies
@@ -1737,13 +1752,13 @@ the telemetry markers:
   survivor list too. `lone=true` means no other survivor was extreme on the same
   side, which is the measurement: the 2026-08-31 round found lone extremes right 4
   of 9 against 21 of 23 for accompanied ones (those counts used a looser
-  either-side rule — `extreme_call.py` explains the difference before you pool old
+  either-side rule, and `extreme_call.py` explains the difference before you pool old
   and new numbers). `survivors=1` marks a record where "lone" is vacuous because
   that member was the whole ensemble; drop those from a lone rate. This band
   membership check gates and clamps nothing; the single-survivor publish clamp
   below is a separate rule, keyed on the survivor count, that reuses the same two
   constants.
-- `THIN_PUBLISH_FLOOR: question=... raw=... clamped=... survivors=1` — a WARN
+- `THIN_PUBLISH_FLOOR: question=... raw=... clamped=... survivors=1`: a WARN
   that a BINARY question published on exactly ONE surviving forecaster had its
   published probability clamped into `[THIN_PUBLISH_BINARY_FLOOR,
   THIN_PUBLISH_BINARY_CEIL]`, which `constants.py` defines by aliasing
@@ -1764,14 +1779,14 @@ the telemetry markers:
   rendered=... reads=... dup_tool_calls=... deadline_hit=... concluded_early=...
   wall_s=... findings=... pending_leads=... lint_rejections=...
   provenance_rejections=... quote_mismatch_warnings=... plan_gaps=...
-  plan_skipped=... conclude_gate_rejections=... error=...` — one summary line per
+  plan_skipped=... conclude_gate_rejections=... error=...`: one summary line per
   gap-fill v2 loop, emitted by `_log_completion` in `research/agentic/loop.py`.
   `error=` is what separates a step-zero crash from an idle run; both otherwise
   emit `steps=0 tool_calls=0 findings=0`. Companion `GHOST_PRE` /
   `GHOST_PRE_JSON` and `GHOST_FORECAST` / `GHOST_FORECAST_JSON` lines log the
   loop's pre- and post-research private forecasts for telemetry only; neither is
   ever published. `docs/agentic_gap_fill.md` reads the fields in full.
-- `AGENTIC_FETCH_THROTTLED: url=... method=... chars=... phrase=...` — a WARN, one per
+- `AGENTIC_FETCH_THROTTLED: url=... method=... chars=... phrase=...`: a WARN, one per
   gap-fill v2 fetch whose HTTP 200 body was the host's rate-limit interstitial rather than
   the page (a body at or under `FETCH_THROTTLE_PAGE_MAX_CHARS` carrying one of
   `FETCH_THROTTLE_PHRASES`, both in `research/agentic/fetch_outcomes.py`). Such a fetch
@@ -1783,10 +1798,10 @@ the telemetry markers:
   `agentic_fetch_throttled`. Receipt: q45191, where two throttled ogimet.com fetches reached
   the driver as successful ones and the driver's own retry was served the cached refusal.
 - `AGENTIC_FETCH_LOCAL_DOC: url=... method=pdf_local|digest_local chars=... pages=...
-  passages=...` — an INFO, one per document the gap-fill v2 ladder read without paying a
+  passages=...`: an INFO, one per document the gap-fill v2 ladder read without paying a
   Gemini `url_context` call for it. `passages=0` on a `digest_local` is the reading that
-  matters — the document does not discuss what was asked, which in the block itself reads
-  exactly like a successful read — and `pages` is `n/a` for a page with no page structure.
+  matters (the document does not discuss what was asked, which in the block itself reads
+  exactly like a successful read), and `pages` is `n/a` for a page with no page structure.
   The line fires only where text was actually served, so its absence measures nothing: a
   refused digest leaves no line and the paid read that followed shows up only in the spend.
   `docs/agentic_gap_fill.md` defines the two methods and the `chars` convention. Emitted by
@@ -1795,7 +1810,7 @@ the telemetry markers:
   the local-first rung is measured at all: before it every PDF the driver met went to a paid
   reader, 191 calls over the 2026 summer season, and the only trace of one was the spend.
 - `RESOLUTION_SOURCE_FETCH: question=... url=... status=... http=... embeds=... [reason=...]
-  [route=...]` — one line per URL the resolution-source provider fetched, emitted by
+  [route=...]`: one line per URL the resolution-source provider fetched, emitted by
   `_log_fetch_outcome_markers` in `research/resolution_source.py`. `status` is `ok`
   for a success and the verbatim `FetchStatus` otherwise (`blocked`, `js_wall`,
   `no_resolving_content`, `stale_data`, `ungrounded`, ...). Since the escalation ladder it may
@@ -1808,7 +1823,7 @@ the telemetry markers:
   arrived; `embeds` names the routeless data-embed providers (Infogram / Flourish /
   Tableau) found in the page's raw HTML, which is what makes an unreadable-embed
   page queryable even when its prose made the fetch a legitimate `ok`. `reason` is
-  appended only where the status alone is ambiguous — `no_resolving_content` is
+  appended only where the status alone is ambiguous: `no_resolving_content` is
   `embed_shell` when the page named such a provider, `thin_page` when the extraction was
   simply under the chrome floor (the population the floor gained on 2026-09-02 when it
   stopped being gated on a named provider), and `no_matching_passage` when a cited
@@ -1844,7 +1859,7 @@ the telemetry markers:
   decode score, an unread content-type, an SSRF rejection) carrying what the marker
   cannot.
 - `RESOLUTION_SOURCE_ESCALATION: question=... url=... from_status=... rung=... outcome=...
-  wall_s=...` — one line per escalated rung attempt, emitted by
+  wall_s=...`: one line per escalated rung attempt, emitted by
   `research/resolution_source.py` when the direct fetch could not read a page and a
   heavier route was tried. `from_status` is the verbatim `FetchStatus` that triggered
   the escalation, and its domain is per rung rather than shared, because each rung's trigger set
@@ -1932,7 +1947,7 @@ the telemetry markers:
   2026-09-04 with the check itself, so no archived run from before that merge carries one, and a
   local probe of 22 real render targets on that date produced zero of them. Harvested as
   `rendered_fetch_off_host`.
-- `AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED: url=... [statuses=...]` — a WARN, one per
+- `AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED: url=... [statuses=...]`: a WARN, one per
   gap-fill v2 `read_document` call whose `url_context` retrieval brought back nothing,
   so the answer would have been unsourced recall and the `fetched` verification tier is
   withheld (`research/agentic/tools.py`). Worth watching because a `fetched` document
@@ -1943,7 +1958,7 @@ the telemetry markers:
   failed for a nameable reason from one that never happened. Both `none` and an absent
   field harvest as null, so an archived pre-field line reads the same way. Harvested as
   `agentic_document_ungrounded_suppressed`.
-- `AGENTIC_URLCONTEXT_ROBOTS_SKIP: url=... host=...` — an INFO, one per paid `url_context`
+- `AGENTIC_URLCONTEXT_ROBOTS_SKIP: url=... host=...`: an INFO, one per paid `url_context`
   read skipped because the host's robots.txt disallows `Google-Extended`, the product token
   Gemini's retrieval obeys, so the read would have been spend with a known-zero return
   (`research/agentic/tools.py`; the group parser is `research/robots_policy.py`, moved out of
@@ -1953,7 +1968,7 @@ the telemetry markers:
   the check. Harvested as `agentic_urlcontext_robots_skip`. `docs/agentic_gap_fill.md` covers
   the group parser and what a high rate would mean.
 - `FINANCIAL_NOISE_FLAG: surface=financial_data|ts_anchor symbol=... vr_lag=... vr=...
-  floor=... short_vol=... long_vol=... robust_vol=...` — the series behind a rendered
+  floor=... short_vol=... long_vol=... robust_vol=...`: the series behind a rendered
   volatility is noise-dominated: its variance ratio sits below
   `FINANCIAL_VARIANCE_RATIO_FLOOR`, meaning most of each day's move is reversed the
   next, which inflates any volatility computed from one-day returns. The flagged
@@ -1962,16 +1977,16 @@ the telemetry markers:
   screen and the line itself (`research/noise_flag.py`): `financial_data.py`'s
   `_volatility_lines` and `ts_render.py`'s `_realized_vol_lines`. Only the
   financial-data surface computes a long-horizon window, so a `ts_anchor` record
-  reads `long_vol` as null rather than zero — `surface` is what tells that apart
+  reads `long_vol` as null rather than zero. `surface` is what tells that apart
   from a yfinance series too short to hold one. Per-identifier, so
-  one question can fire several and the line carries no question id — `symbol` (the
+  one question can fire several and the line carries no question id. `symbol` (the
   ticker or FRED series id, same field position as `FINANCIAL_STALE_LATEST`) is what
   tells two flagged identifiers in one run apart and joins a noise-flag record to the
-  stale-latest record for the same series. Informational and NOT alertable — it
+  stale-latest record for the same series. Informational and NOT alertable: it
   describes the vendor's data, not a bot defect.
 - `GEMINI_USAGE: role=grounded_search|read_document|resolution_source model=... prompt_tokens=...
   tool_use_prompt_tokens=... candidates_tokens=... thoughts_tokens=... total_tokens=...
-  search_queries=... [question=...]` — one line per response from the paths that call
+  search_queries=... [question=...]`: one line per response from the paths that call
   Google natively rather than through OpenRouter, so their spend on the operator's personal
   AI Studio key is readable from a run log. Emitted by `log_gemini_usage`
   (`research/gemini_usage.py`), called from `gemini_search.py` (`grounded_search`, before
@@ -1991,19 +2006,19 @@ the telemetry markers:
   did not report reads `n/a` rather than 0, since `thoughts_tokens=0` is a real reading;
   `search_queries` is the exception and reads a genuine 0 when the search tool issued none
   (an absent `web_search_queries` list IS a count of none), `n/a` only when the grounding
-  metadata could not be walked — so separate the two surfaces on `role`, never on this
+  metadata could not be walked, so separate the two surfaces on `role`, never on this
   field. **The ledger covers COMPLETED responses only.** `log_gemini_usage` runs after the
-  SDK returns, so a call that timed out or raised billed unknown tokens and emitted no row —
+  SDK returns, so a call that timed out or raised billed unknown tokens and emitted no row:
   14 of 154 archived `read_document` calls (9.1%) hit that handler. A spend total from these
   rows is a LOWER bound, biased toward undercounting the largest calls; the denominator is
   `provider_results['gemini_search'].status` per question plus `research_provider_failures`,
-  never this marker's row count. `thoughts_tokens` is the field worth watching — 71% of
+  never this marker's row count. `thoughts_tokens` is the field worth watching: 71% of
   grounded-search output tokens were thinking before the
   explicit levels (`GEMINI_SEARCH_THINKING_LEVEL`, `GAP_FILL_V2_READER_THINKING_LEVEL`) were
   set. Nothing about this is alertable; it is spend accounting, not degradation. Harvested as
   `gemini_usage`.
-- `CREDIT_BALANCE` / `CREDIT_SPEND` / `CREDIT_ROLE_SPEND` / `CREDIT_FLOOR_BREACH`
-  — credit telemetry, described above. `CREDIT_FLOOR_BREACH` fires whatever the
+- `CREDIT_BALANCE` / `CREDIT_SPEND` / `CREDIT_ROLE_SPEND` / `CREDIT_FLOOR_BREACH`:
+  credit telemetry, described above. `CREDIT_FLOOR_BREACH` fires whatever the
   credit-alert window says, so a breach on a GREEN run means a suppression window
   is open (none is, since 2026-09-03); the adjacent INFO line names the resume
   date.
@@ -2011,20 +2026,20 @@ the telemetry markers:
   OpenRouter spend; a run with no completions logs a single no-completions line
   under the same token instead of rows.
 - `TIME_BUDGET: question=... budget_s=... close_time=... close_limited=...
-  fast_path=...` — one line per question, emitted by `time_budget.py` before any
+  fast_path=...`: one line per question, emitted by `time_budget.py` before any
   research runs. Emitted even on roomy questions on purpose: `CLOSE_MARGIN` fires
   only after a SUCCESSFUL submission, so it is censored on exactly the thin-window
   questions this budget exists for. `close_limited=true` means the question's own
   close time, not the static `PER_QUESTION_WALL_CLOCK_DEADLINE`, set the budget.
   `fast_path=true` means it fell below `TIME_BUDGET_FAST_PATH_THRESHOLD`, so the
-  optional research stages were dropped to protect the prediction POST — companion
+  optional research stages were dropped to protect the prediction POST. Companion
   `TIME_BUDGET_FAST_PATH` and `GAP_FILL_SKIPPED_FOR_BUDGET` WARNs say so too, and
   `RESEARCH_PHASE_DEADLINE` names any provider cancelled at the phase deadline.
   A question with no publishable budget at all (close already passed, or so near
   that the prediction POST cannot fit) is skipped before any spend and bumps
   `questions_failed_to_publish`.
 - `QUESTION_CAP_FORFEIT: platform=<metaculus|mantic> cap=<n> total=<n> dropped=<n>
-  posts=<ids>` — one WARNING per run, from `forecast_questions` (`forecaster.py`), when
+  posts=<ids>`: one WARNING per run, from `forecast_questions` (`forecaster.py`), when
   more questions are open than `max_questions_per_run` allows. Questions are sorted
   tightest close first before the cap, so the posts named are the latest-closing ones
   left behind; on Mantic, which opens an hour's batch at once, each is a real forfeit,
@@ -2035,7 +2050,7 @@ the telemetry markers:
   summarizer_failures=..., gap_fill_v2_errors=...,
   prediction_market_degraded=..., prediction_market_source_losses=...,
   provider_degradation=..., publish_attempt_failures=...,
-  publish_skipped_closed=..., time_budget_fast_path=...` — the
+  publish_skipped_closed=..., time_budget_fast_path=...`: the
   end-of-run summary from `forecaster.py`'s `forecast_questions`, and the line
   that decides CI color: these are exactly the counters `alertable_count` sums, so
   any one of them non-zero exits the run non-zero.
@@ -2043,7 +2058,7 @@ the telemetry markers:
   the other three fire once a publish has already failed or been withheld, while
   this one fires while the question is still savable and says latency is closing in
   on a close deadline.
-  `research_provider_failures` counts any provider exception, not only timeouts —
+  `research_provider_failures` counts any provider exception, not only timeouts:
   it was named `research_provider_timeouts` until 2026-07-26, when
   `prediction_market_platform_failures` also became
   `prediction_market_source_losses`. `scripts/telemetry/markers.py` matches both
@@ -2051,7 +2066,7 @@ the telemetry markers:
   `prediction_market_degraded` kept its name when the counter behind it moved off
   the retired Kalshi `/series` index onto the full events-catalogue pull, so the
   field name is stable across that change while what it guards got strictly more
-  load-bearing — the catalogue feeds both the settlement-source join and the fuzzy
+  load-bearing: the catalogue feeds both the settlement-source join and the fuzzy
   channel. Note that a lost catalogue pull bumps BOTH this counter and
   `prediction_market_source_losses`, so one outage adds 2 to `alertable_count`;
   that is deliberate over-counting (the two carry different marker fields) and not
@@ -2071,8 +2086,8 @@ reconstruction is lossy by construction and always was.
 
 `outcome=` alone does not say WHY a question fell back, so read the sibling
 `MARKET_RANKING_DEGRADED:` line beside it: `reason=shape_regression` means a
-well-formed but non-empty ranking array yielded no usable row — a renamed index key,
-or every index outside the pool — i.e. OUR prompt/parser contract broke, and before
+well-formed but non-empty ranking array yielded no usable row (a renamed index key,
+or every index outside the pool), i.e. OUR prompt/parser contract broke, and before
 2026-08-25 that case was reported as `ok(0)` and rendered the deliberate-empty
 sentence ("prediction markets were retrieved and reviewed… none was judged to bear on
 it") to forecasters. `reason=unreadable` means the completion was not a ranking array
@@ -2081,8 +2096,8 @@ at all. Both are harvested as `market_ranking_degraded`, so the split survives t
 degraded sibling in the archive predates this marker.
 
 A third market line, `MARKET_TIER_CAPPED: question=... rows=... capped=venue@rank`,
-fires only when the deterministic staleness pass refuses a row the top relation tier
-— the ranker graded a market that stopped trading more than
+fires only when the deterministic staleness pass refuses a row the top relation tier:
+the ranker graded a market that stopped trading more than
 `MARKET_STALENESS_TIER_CAP_DAYS` (60, in `market_retrieval/ranking.py`) before the
 question opened as `same_quantity_same_date`. The row keeps its rank, price and
 liquidity cells; what it gains is a note in the `why` cell stating the demotion and
@@ -2093,8 +2108,8 @@ archived snapshot as `MarketMatch.tier_cap_note`, so its incidence is answerable
 offline; this line is the prod-log half and the one that survives a run whose
 snapshot the research archive never captured.
 
-A run can also exit non-zero for degradation alerts — the counters above,
-personal-key fallbacks, or the model-deprecation tripwire — even when every
+A run can also exit non-zero for degradation alerts (the counters above,
+personal-key fallbacks, or the model-deprecation tripwire) even when every
 question that met the minimum-forecaster threshold was published. The non-zero
 exit is the CI red-check signal to investigate; it does not mean publishing
 failed. Credit-caused shortfalls alert again as of 2026-09-03, and are exempt only

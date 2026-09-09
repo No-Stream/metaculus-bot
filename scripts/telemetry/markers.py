@@ -8,6 +8,15 @@ against the ACTUAL emitted format strings (the source of truth):
   is the BLOCK type: a question type, or ``pmf`` for the per-bin block a Mantic enumerable grid
   is elicited with since 2026-09-09; the question's own type is on the MEMBER_FORECAST line with
   the same ``question`` and ``model``)
+* ``BLOCK_FALLBACK``    — ``metaculus_bot/value_extraction.py`` ``_run_ladder`` (per-FORECAST,
+  only when the value came from a candidate other than the first one the best-first walk
+  tried: ``skipped`` is how many higher-ranked
+  candidates failed first, ``rung`` the mechanism that read the winner, ``reasons`` the
+  ``" | "``-joined failure list to end of line. The observed shape is a benign trailing
+  schema-example block, so the rate is the signal, not any one record: a rising rate means
+  the prompt's block-last contract is eroding. ``reasons`` is NOT in ``raw_fields``: every
+  entry carries a ``block:`` or ``repair:`` prefix, so ``coerce_value`` can never
+  read it as a number, bool or sentinel and hands the string back unchanged)
 * ``GAP_FILL_V2``       — ``metaculus_bot/research/agentic/loop.py`` ``_log_completion``
 * ``GHOST_PRE`` / ``GHOST_PRE_JSON`` — ``metaculus_bot/research/agentic/loop.py``
   ``_set_research_plan_tool`` (the pre-research counterpart to the concluding
@@ -37,12 +46,28 @@ against the ACTUAL emitted format strings (the source of truth):
   configured slug, so a Series 2 slug is named the run it appears)
 * ``FORECASTER_DROPS`` — ``metaculus_bot/drop_telemetry.py`` ``emit_drop_telemetry``
   (per-RUN summary: which models dropped and why)
+* ``SYSTEMATIC_FORECASTER_FAILURE`` — ``metaculus_bot/drop_telemetry.py`` ``emit_drop_telemetry``
+  (per-RUN, per-MODEL WARN, one line for each model the drops summary lists as ``systematic``:
+  how many questions it dropped on, ``qids``, the comma-joined QUESTION ids, and ``causes`` as
+  ``cause:count`` pairs. ``qids`` is the field the summary does not carry; it always holds two
+  or more ids, so it stays one string. No ``question=`` ref, so ``qid_kind`` is None; the regex
+  stops before the prose tail)
 * ``Degradation counters`` — ``metaculus_bot/degradation_counters.py``
   ``format_degradation_summary`` (per-RUN counter set that decides CI color)
 * ``FORECASTERS_SURVIVED`` — ``metaculus_bot/forecaster.py``
   ``_research_and_make_predictions`` (per-QUESTION positive survivor count; the
   drop marker above is silent on a healthy question, and its comment-side twin
   ``FORECASTERS_USED`` never reaches stdout)
+* ``WALLCLOCK_ABORT``   — ``metaculus_bot/forecaster.py`` ``_gather_predictions_with_wall_clock``
+  (per-QUESTION WARN when the close-derived budget ran out with forecasters still running:
+  seconds elapsed, how many of the configured forecasters had finished, how many were
+  cancelled, and the budget left, negative once overrun. Each cancelled member also lands in
+  FORECASTER_DROPS as ``timeout_wall_clock``, but that is a per-run count; this is the
+  per-question record of a missed deadline. The emitter spells the ref ``qid=`` and the regex
+  names the group ``question`` so the record is stamped like every other question-keyed
+  marker. ``stacking_route.py`` reuses the token on a prose line, ``WALLCLOCK_ABORT: skipping
+  stacking for Q ...``, which the ``qid=`` anchor excludes; that skip is archived as the
+  ``wall_clock_budget`` STACKER_SKIP_REASON)
 * ``QUESTION_CAP_FORFEIT`` — ``metaculus_bot/forecaster.py`` ``forecast_questions`` (per-RUN,
   only when ``max_questions_per_run`` cut the sorted question list: the platform, the cap,
   how many questions were open, how many were forfeited and their post ids. On a tournament
@@ -139,6 +164,11 @@ the unit-mismatch withhold rides ``FORECASTER_DROPS`` rather than its own marker
   variance ratio says most of each day's move is reversed the next, so every
   volatility computed from one-day returns is inflated and the block leads with the
   noise-robust multi-period figure instead; informational, NOT alertable)
+* ``ASKNEWS_NO_ARTICLES`` — ``metaculus_bot/research/providers.py`` ``_asknews_provider``
+  (per-QUESTION WARN: both AskNews phases came back empty, so the provider returned ``""``
+  rather than a prose "no articles" sentence, with the hot and historical counts. The
+  ``articles: empty(no_articles)`` loss token it records beside this line travels only with
+  the question's ``provider_results`` row in the research archive; this is the run-log record)
 * ``RESOLUTION_SOURCE_FETCH`` — ``metaculus_bot/research/resolution_source.py``
   ``_log_fetch_outcome_markers`` (per-URL Tier-1 page fetch AND Tier-2 Datawrapper
   dataset hop: the outcome, the HTTP code, and the routeless data-embed providers
@@ -199,6 +229,13 @@ the unit-mismatch withhold rides ``FORECASTER_DROPS`` rather than its own marker
   spent on)
 * ``CREDIT_BALANCE`` / ``CREDIT_SPEND`` / ``CREDIT_ROLE_SPEND`` / ``CREDIT_FLOOR_BREACH`` — ``metaculus_bot/credit_telemetry.py``
   (``CREDIT_ROLE_SPEND`` is per-RUN, per-(role, key): where the run's OpenRouter dollars went)
+* ``DONATED_KEY_STATE`` — ``metaculus_bot/credit_telemetry.py`` ``classify_donated_key_state``
+  (per-RUN, at most once, at the first credit-shaped donated-key failure: the ``/auth/key``
+  probe's verdict, ``drained`` / ``zeroed`` / ``revoked`` / ``funded`` / ``unknown``, INFO for
+  ``drained`` and WARNING otherwise. The end-of-run summary echoes the same verdict as
+  ``donated_key=``; this line is the primary record, timestamped at the failure. The prose
+  ``DONATED_KEY_STATE: /auth/key probe failed`` line that precedes an ``unknown`` verdict has
+  no ``state=`` and is not harvested)
 * ``LITELLM_CALLBACK_DRAIN_TIMEOUT`` — ``metaculus_bot/credit_telemetry.py``
   ``drain_litellm_callbacks`` (per-RUN, at most one line: the callback drain hit its
   bound, so the ``CREDIT_ROLE_SPEND`` rows of that run are a lower bound)
@@ -355,6 +392,15 @@ MARKER_SPECS: list[MarkerSpec] = [
         re.compile(
             r"EXTRACTION_RUNG:\s*question=(?P<question>\S+)\s+model=(?P<model>.+?)"
             r"\s+qtype=(?P<qtype>\S+)\s+rung=(?P<rung>\S+)\s+block_present=(?P<block_present>\S+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # value_extraction.py emits question.id_of_question
+    ),
+    MarkerSpec(
+        "block_fallback",
+        # Why: reasons runs to end of line; its block:/repair:/llm: prefixes keep coerce_value from ever converting it.
+        re.compile(
+            r"BLOCK_FALLBACK:\s*question=(?P<question>\S+)\s+model=(?P<model>.+?)\s+qtype=(?P<qtype>\S+)"
+            r"\s+skipped=(?P<skipped>\d+)\s+rung=(?P<rung>\S+)\s+reasons=(?P<reasons>.*)$"
         ),
         qid_kind=QID_KIND_QUESTION_ID,  # value_extraction.py emits question.id_of_question
     ),
@@ -817,6 +863,13 @@ MARKER_SPECS: list[MarkerSpec] = [
         re.compile(r"FRED_UNKNOWN_SERIES:\s*series_id=(?P<series_id>\S+)\s+proposed_by=(?P<proposed_by>\S+)"),
     ),
     MarkerSpec(
+        "asknews_no_articles",
+        re.compile(
+            r"ASKNEWS_NO_ARTICLES:\s*question=(?P<question>\S+)\s+hot=(?P<hot>\d+)\s+historical=(?P<historical>\d+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # providers.py logs question.id_of_question
+    ),
+    MarkerSpec(
         "resolution_source_fetch",
         # One line per FETCHED URL, emitted at the per-question aggregation point in the
         # provider (that is where the question id exists — threading it down through the
@@ -1056,6 +1109,14 @@ MARKER_SPECS: list[MarkerSpec] = [
         # a comma-joined model list (or the "none" sentinel -> None).
         re.compile(
             r"FORECASTER_DROPS:\s*total=(?P<total>\S+)\s+systematic=(?P<systematic>\S+)\s+detail=(?P<detail>\{.*\})\s*$"
+        ),
+    ),
+    MarkerSpec(
+        "systematic_forecaster_failure",
+        # Why: the regex stops at causes=; the emitter appends a prose tail after an em dash.
+        re.compile(
+            r"SYSTEMATIC_FORECASTER_FAILURE:\s*model=(?P<model>\S+)\s+dropped_on_questions=(?P<dropped_on_questions>\d+)"
+            r"\s+qids=(?P<qids>\S+)\s+causes=(?P<causes>\S+)"
         ),
     ),
     MarkerSpec(
@@ -1377,6 +1438,16 @@ MARKER_SPECS: list[MarkerSpec] = [
         qid_kind=QID_KIND_QUESTION_ID,  # forecaster.py emits question.id_of_question
     ),
     MarkerSpec(
+        "wallclock_abort",
+        # Why: the qid= anchor keeps stacking_route's prose "WALLCLOCK_ABORT: skipping stacking for Q" line out.
+        re.compile(
+            r"WALLCLOCK_ABORT:\s*qid=(?P<question>\S+)\s+elapsed=(?P<elapsed_s>[\d.]+)s"
+            r"\s+forecasters_completed=(?P<forecasters_completed>\d+)/(?P<forecasters_configured>\d+)"
+            r"\s+cancelled=(?P<cancelled>\d+)\s+remaining_budget=(?P<remaining_budget_s>-?[\d.]+)s"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # forecaster.py emits question.id_of_question
+    ),
+    MarkerSpec(
         "research_phase_deadline",
         # Research-phase deadline WARN (research/provider_fanout.py
         # await_providers_within_deadline): the outer budget bound cancelled
@@ -1654,6 +1725,11 @@ MARKER_SPECS: list[MarkerSpec] = [
     MarkerSpec(
         "credit_floor_breach",
         re.compile(r"CREDIT_FLOOR_BREACH:\s*key=(?P<key>\S+)\s+remaining=(?P<remaining>\S+)\s+floor=(?P<floor>\S+)"),
+    ),
+    MarkerSpec(
+        "donated_key_state",
+        # Why: the state= anchor keeps the prose "DONATED_KEY_STATE: /auth/key probe failed" line out.
+        re.compile(r"DONATED_KEY_STATE:\s*state=(?P<state>\S+)"),
     ),
     MarkerSpec(
         "litellm_callback_drain_timeout",

@@ -15,35 +15,22 @@
 #
 # Merging this file to main auto-enables the schedule: GitHub runs a new scheduled workflow
 # as soon as its file is on the default branch, unless someone disables it in the Actions
-# UI. The MANTIC_TOKEN repository secret is set, so the merge is the only step left. Every
-# run spends the personal OpenRouter and research keys (~$2.60 per question) and publishes to
-# Mantic.
+# UI. The MANTIC_TOKEN repository secret is set; the remaining operator steps (one paid
+# per-bin smoke on post 651, then the merge) are listed in docs/operations.md "Running it,
+# and what is left for the operator". Every run spends the personal OpenRouter and research
+# keys (about $3 per question; the post-650 smoke spent $3.17) and publishes to Mantic.
 name: Forecast on Mantic tournament
 
 on:
   workflow_dispatch:
   schedule:
-    # Three entries in the first half of the hour, because of two facts. GitHub delivers only
-    # a minority of this repository's scheduled firings: measured through the GitHub API on
-    # the three-cron tournament workflow, 2026-08-27 through 2026-09-07, it delivered 7 to 23
-    # of the 72 expected runs a day (about 22%), with gaps of up to 3.5 hours, and the cup
-    # workflow reads the same, so this is repository-wide and outside our control. And Mantic
-    # questions open on the hour with 60-minute windows: the per-question budget is the close
-    # time minus now minus a 60 s publish reserve, so a pickup after about :30 falls under the
-    # 1815 s fast-path threshold and gets only the degraded research path, while the last
-    # quarter-hour falls under the 300 s viability floor and gets nothing. Entries past :30
-    # therefore buy little and :45/:55 buy nothing; the three here are the useful ones. Minutes
-    # are staggered off the tournament workflow's :03/:23/:43, minibench's :08/:38 and the
-    # cup's :13/:33/:53 (separate concurrency groups, so a shared minute would start two full
-    # bot runs at once on the same runner pool and shared research quotas; the distinct-minute
-    # pin in tests/test_workflow_reliability.py holds this) and off the top of the hour, where
-    # GitHub's scheduling burst lives. A delivered run that finds nothing new spends nothing
-    # (cli pins the re-spend guard on). The durable fix is an external dispatcher, an
-    # always-on cron or a free Cloudflare Worker cron trigger calling GitHub's
-    # workflow-dispatch API at :01, since dispatch events are not subject to schedule
-    # dropping; the operator is deciding on it (edge review item 2,
-    # scratch_docs_and_planning/mantic_research_2026-09-08/; docs/operations.md "Scheduling
-    # reliability").
+    # Three entries, all early in the hour. Mantic questions open on the hour with 60-minute
+    # windows, so a pickup after about :30 gets only the degraded fast path and one in the
+    # last six minutes gets nothing, and GitHub delivers only about a fifth of this
+    # repository's scheduled firings, so one entry is not enough. The minutes sit off every
+    # other bot workflow's entries (a shared minute starts two full runs at once; the pin is
+    # in tests/test_workflow_reliability.py) and off the :00 scheduling burst. The delivery
+    # numbers and the external-dispatcher fix: docs/operations.md "Scheduling reliability".
     # Make sure to skip already forecasted questions!
     - cron: "5 * * * *" # every hour at :05
     - cron: "15 * * * *" # every hour at :15
@@ -62,7 +49,7 @@ jobs:
     # Backstop only; the per-step caps below are the real hang defense. Sized above the
     # bot's OWN contract rather than off the measured distribution: constants.py caps a
     # question at PER_QUESTION_WALL_CLOCK_DEADLINE (3510s) and reserves
-    # WALL_CLOCK_STACKING_MIN_BUDGET (90s) to publish — a 3600s cycle — and questions
+    # WALL_CLOCK_STACKING_MIN_BUDGET (90s) to publish (a 3600s cycle), and questions
     # run concurrently (forecasting-tools gathers them), so 60 min is the longest a
     # healthy run may legitimately need whatever it picked up. 80 = that 60 + the
     # Playwright cap + setup + upload + margin. A cap at or below 60 would kill a
@@ -71,9 +58,9 @@ jobs:
     timeout-minutes: 80
     steps: # sets up the steps that will be run in order
       # Every step below carries its own timeout-minutes. The job cap is the wrong
-      # instrument for a hang: it fires late, it reports `cancelled` — indistinguishable
+      # instrument for a hang: it fires late, it reports `cancelled` (indistinguishable
       # from a concurrency eviction, which is how 2026-08-19's four wedges hid among the
-      # day's 54 evictions — and it cannot let a run continue past a step that is
+      # day's 54 evictions), and it cannot let a run continue past a step that is
       # allowed to fail. Caps run 5x-100x the worst of 200 successful runs (checkout 4s,
       # setup-uv 3s, uv sync 22s, Playwright 55s, upload 2s), so none can fire on a
       # healthy run. Receipts: scratch/residual_2026-08-24/track_c_step_timings.json.
@@ -98,7 +85,7 @@ jobs:
         continue-on-error: true
         # 2026-08-19: apt hung here on four runs after the Azure Ubuntu mirror failed
         # over, each burning the full 300-min job cap while holding the concurrency
-        # group (18 of 24 hours; q45374 and q45375 forfeited). A kill costs nothing —
+        # group (18 of 24 hours; q45374 and q45375 forfeited). A kill costs nothing:
         # the run proceeds with the rendered-fetch rung degraded to plain fetch, which
         # is what continue-on-error already intends. 5 min is 5.5x the worst of 200
         # healthy runs (55s, p50 24s); the 3 min shipped in 41ee30f was sized off an
@@ -108,7 +95,7 @@ jobs:
       - name: Warn if Playwright install failed
         # No cap: a bash echo with no network and no subprocess cannot hang.
         if: steps.playwright_install.outcome == 'failure'
-        run: echo "::warning title=Playwright install failed::Chromium install failed — gap-fill v2 rendered-fetch rung will degrade to plain fetch this run. Transient apt/CDN blips are common; investigate only if this recurs."
+        run: echo "::warning title=Playwright install failed::Chromium install failed. The gap-fill v2 rendered-fetch rung will degrade to plain fetch this run. Transient apt/CDN blips are common; investigate only if this recurs."
       - name: Run bot
         shell: bash
         # Repo is public, so uploaded artifacts are effectively public. Log content
@@ -123,7 +110,7 @@ jobs:
         # a healthy run may legitimately need, and 70 leaves headroom for the question
         # fetch, the identity preflight and the publish retries. A kill here FAILS the
         # step rather than cancelling the job, so the always() upload below still ships
-        # the partial log — the observability the 2026-08-06 streak had none of.
+        # the partial log (the observability the 2026-08-06 streak had none of).
         timeout-minutes: 70
         run: |
           mkdir -p run_logs
@@ -168,7 +155,7 @@ jobs:
           # Gemini grounded search (Google AI Studio SDK) adds a 3rd distinct source.
           # GOOGLE_API_KEY is the operator's personal Google AI Studio key (stored
           # in CI as secrets.GEMINI_API_KEY). The grounded-search side has no
-          # donated/shared path — Google AI Studio doesn't offer one.
+          # donated/shared path, because Google AI Studio doesn't offer one.
           GOOGLE_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_SEARCH_ENABLED: 'true'
           # OpenRouter Gemini routing (forecaster, stacker, summarizer when the

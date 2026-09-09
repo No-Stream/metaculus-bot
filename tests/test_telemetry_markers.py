@@ -6,6 +6,8 @@ Each example line below is copied from the format string in the emitting code
 tests loudly instead of silently dropping records from the archive:
 
 * EXTRACTION_RUNG   -> metaculus_bot/value_extraction.py:_log_extraction
+* BLOCK_FALLBACK    -> metaculus_bot/value_extraction.py:_run_ladder (the value came from a
+  candidate other than the first the best-first walk tried; ``reasons`` is free text)
 * GAP_FILL_V2       -> metaculus_bot/research/agentic/loop.py:_log_completion
 * GHOST_PRE[_JSON]  -> metaculus_bot/research/agentic/loop.py:_set_research_plan_tool
 * GHOST_FORECAST    -> metaculus_bot/research/agentic/loop.py:_run_ghost_phase
@@ -28,6 +30,14 @@ tests loudly instead of silently dropping records from the archive:
   metaculus_bot/research/resolution_source.py (one emitter shape, three surfaces,
   told apart by the role field)
 * CREDIT_BALANCE/SPEND/FLOOR_BREACH -> metaculus_bot/credit_telemetry.py
+* DONATED_KEY_STATE  -> metaculus_bot/credit_telemetry.py:classify_donated_key_state (the
+  /auth/key probe's verdict, once per run)
+* SYSTEMATIC_FORECASTER_FAILURE -> metaculus_bot/drop_telemetry.py:emit_drop_telemetry (one
+  line per model FORECASTER_DROPS lists as systematic, with the question ids it dropped on)
+* WALLCLOCK_ABORT    -> metaculus_bot/forecaster.py:_gather_predictions_with_wall_clock (the
+  per-question budget ran out with forecasters still running; the key is spelled ``qid=``)
+* ASKNEWS_NO_ARTICLES -> metaculus_bot/research/providers.py:_asknews_provider (both AskNews
+  phases empty, so the provider returned "" rather than prose)
 * LITELLM_CALLBACK_DRAIN_TIMEOUT -> metaculus_bot/credit_telemetry.py:drain_litellm_callbacks
   (the completeness flag on that run's CREDIT_ROLE_SPEND rows)
 * ONLY_POSTS         -> metaculus_bot/cli.py:_tournament_source (the --only-posts smoke filter)
@@ -285,6 +295,60 @@ class TestExtractionRung:
         assert rec["rung"] == "llm"
         assert rec["qid"] is None
         assert rec["block_present"] is False
+
+
+# Captured from the real emitter under tests/test_value_extraction.py's unrepairable-final-block test.
+BLOCK_FALLBACK_EMITTED_LINE = (
+    "2026-09-09 10:15:32,417 - metaculus_bot.value_extraction - INFO - "
+    "BLOCK_FALLBACK: question=11 model=m qtype=binary skipped=1 rung=block "
+    "reasons=repair: candidate 1/2: repaired JSON failed schema validation"
+)
+# The format string with prod-shaped values: two failed candidates joined by " | ", quotes and colons inside.
+BLOCK_FALLBACK_TWO_REASONS_LINE = (
+    PFX + "BLOCK_FALLBACK: question=45163 model=openrouter/google/gemini-3.1-pro-preview qtype=numeric "
+    "skipped=2 rung=repair reasons=block: candidate 1/3: block declares 'above_range' but the question's "
+    "upper bound is closed | repair: candidate 2/3: repaired JSON failed schema validation"
+)
+
+
+class TestBlockFallback:
+    def test_emitted_line_fields(self):
+        rec = _parse_one(BLOCK_FALLBACK_EMITTED_LINE)
+        assert rec["marker"] == "block_fallback"
+        assert rec["question"] == "11"
+        assert rec["qid"] == 11
+        assert rec["model"] == "m"
+        assert rec["qtype"] == "binary"
+        assert rec["skipped"] == 1
+        assert rec["rung"] == "block"
+        assert rec["reasons"] == "repair: candidate 1/2: repaired JSON failed schema validation"
+
+    def test_qid_kind_is_question_id(self):
+        """Same emitter module and the same question_id variable as EXTRACTION_RUNG."""
+        assert _parse_one(BLOCK_FALLBACK_EMITTED_LINE)["qid_kind"] == "question_id"
+
+    def test_reasons_is_kept_verbatim_to_end_of_line(self):
+        """No raw_fields entry: the block:/repair:/llm: prefix can never read as a number, bool or sentinel."""
+        rec = _parse_one(BLOCK_FALLBACK_TWO_REASONS_LINE)
+        assert rec["reasons"] == (
+            "block: candidate 1/3: block declares 'above_range' but the question's upper bound is closed"
+            " | repair: candidate 2/3: repaired JSON failed schema validation"
+        )
+        assert isinstance(rec["reasons"], str)
+
+    def test_prod_shaped_fields(self):
+        rec = _parse_one(BLOCK_FALLBACK_TWO_REASONS_LINE)
+        assert rec["qid"] == 45163
+        assert rec["model"] == "openrouter/google/gemini-3.1-pro-preview"
+        assert rec["qtype"] == "numeric"
+        assert rec["skipped"] == 2
+        assert rec["rung"] == "repair"
+
+    def test_does_not_steal_the_extraction_rung_line_beside_it(self):
+        """_run_ladder logs EXTRACTION_RUNG right after BLOCK_FALLBACK for the same forecast; one record each."""
+        harvested = parse_log_text(BLOCK_FALLBACK_EMITTED_LINE + "\n" + EXTRACTION_RUNG_LINE + "\n", **_META)
+        assert len(harvested["block_fallback"]) == 1
+        assert len(harvested["extraction_rung"]) == 1
 
 
 class TestGapFillV2:
@@ -1222,6 +1286,23 @@ RESOLUTION_SOURCE_FETCH_TRANSPORT_ERROR_LINE = (
 )
 
 
+class TestAsknewsNoArticles:
+    def test_fields(self):
+        """Both AskNews phases came back empty, so the provider returned the empty string (providers.py)."""
+        rec = _parse_one(PFX_WARN + "ASKNEWS_NO_ARTICLES: question=45085 hot=0 historical=0")
+        assert rec["marker"] == "asknews_no_articles"
+        assert rec["qid"] == 45085
+        assert rec["qid_kind"] == "question_id"
+        assert rec["hot"] == 0
+        assert rec["historical"] == 0
+
+    def test_question_without_an_id_parses_with_qid_none(self):
+        """The provider reads the id with getattr(..., None), so a question with no id logs question=None."""
+        rec = _parse_one(PFX_WARN + "ASKNEWS_NO_ARTICLES: question=None hot=0 historical=0")
+        assert rec["qid"] is None
+        assert rec["question"] == "None"
+
+
 class TestResolutionSourceFetch:
     """Per-URL fetch outcomes, harvested (item 19d).
 
@@ -1696,6 +1777,38 @@ class TestCredit:
         rec = _parse_one(CREDIT_SPEND_LINE)
         assert rec.get("source") is None
 
+    def test_donated_key_state_drained_is_the_info_shape(self):
+        """Verbatim from credit_telemetry.classify_donated_key_state: the one expected verdict."""
+        line = (
+            PFX + "DONATED_KEY_STATE: state=drained — the donated OpenRouter key spent its whole allocation "
+            "with the cap itself intact. Credit-caused personal-key fallbacks are exempt from alerting only "
+            "while the dated suppression window is open, i.e. before 2026-09-03; from that date on they "
+            "redden CI like any other fallback."
+        )
+        rec = _parse_one(line)
+        assert rec["marker"] == "donated_key_state"
+        assert rec["state"] == "drained"
+        assert "qid" not in rec
+
+    def test_donated_key_state_other_verdicts_are_the_warning_shape(self):
+        for state in ("zeroed", "revoked", "funded", "unknown"):
+            line = (
+                PFX_WARN + f"DONATED_KEY_STATE: state={state} — a credit-shaped donated-key failure that is NOT an "
+                "expected drained wallet (zeroed = cap set to 0, revoked = key rejected, funded = the key still "
+                "has money so the failure was not about credit, unknown = the probe could not answer). "
+                "Personal-key fallbacks stay alertable, so this run will exit non-zero."
+            )
+            assert _parse_one(line)["state"] == state
+
+    def test_probe_failed_prose_line_is_not_harvested(self):
+        """The logger.exception line before an unknown verdict shares the token but carries no state=."""
+        line = (
+            "2026-07-17 14:30:00,456 - metaculus_bot.credit_telemetry - ERROR - "
+            "DONATED_KEY_STATE: /auth/key probe failed; classifying as unknown (stays alertable)"
+        )
+        harvested = parse_log_text(line + "\n", **_META)
+        assert all(records == [] for records in harvested.values()), harvested
+
     def test_floor_breach(self):
         rec = _parse_one(CREDIT_FLOOR_BREACH_LINE)
         assert rec["marker"] == "credit_floor_breach"
@@ -1956,6 +2069,35 @@ class TestForecasterDrops:
         assert rec["total"] == 0
         assert rec["systematic"] is None  # "none" sentinel coerces to None
         assert json.loads(rec["detail"]) == {}
+
+
+# Verbatim from drop_telemetry.emit_drop_telemetry: one WARN per systematic model, then a prose tail after an em dash.
+SYSTEMATIC_FORECASTER_FAILURE_LINE = (
+    PFX_WARN + "SYSTEMATIC_FORECASTER_FAILURE: model=openrouter/anthropic/claude-opus-4.8 dropped_on_questions=2 "
+    "qids=45085,45163 causes=timeout_soft_deadline:1,zero_output:1 — one model failed across multiple "
+    "questions this run (likely a refusal class or routing problem, not a blip); investigate or consider "
+    "pulling it from the roster."
+)
+
+
+class TestSystematicForecasterFailure:
+    def test_fields(self):
+        rec = _parse_one(SYSTEMATIC_FORECASTER_FAILURE_LINE)
+        assert rec["marker"] == "systematic_forecaster_failure"
+        assert rec["model"] == "openrouter/anthropic/claude-opus-4.8"
+        assert rec["dropped_on_questions"] == 2
+        # Two or more ids by construction, so the comma keeps the list one string rather than a lone int.
+        assert rec["qids"] == "45085,45163"
+        assert rec["causes"] == "timeout_soft_deadline:1,zero_output:1"
+
+    def test_per_run_line_carries_no_question_ref(self):
+        rec = _parse_one(SYSTEMATIC_FORECASTER_FAILURE_LINE)
+        assert "qid" not in rec
+        assert "qid_kind" not in rec
+
+    def test_prose_tail_does_not_leak_into_causes(self):
+        rec = _parse_one(SYSTEMATIC_FORECASTER_FAILURE_LINE)
+        assert "one model failed" not in rec["causes"]
 
 
 # Verbatim from metaculus_bot/forecaster.py:_research_and_make_predictions — the
@@ -2636,6 +2778,31 @@ class TestTimeBudgetLoudMarkers:
             assert rec["marker"] == "gap_fill_cut_for_budget"
             assert rec["qid"] == 45085
             assert rec["gap_fill_pass"] == gap_fill_pass
+
+    def test_wallclock_abort_roundtrip(self):
+        """forecaster.py's shape: two of three forecasters still running; remaining_budget negative once overrun."""
+        line = (
+            "2026-08-25 12:19:00,000 - metaculus_bot.forecaster - WARNING - "
+            "WALLCLOCK_ABORT: qid=45085 elapsed=1140.2s forecasters_completed=1/3 cancelled=2 remaining_budget=-0.2s"
+        )
+        rec = _parse_one(line)
+        assert rec["marker"] == "wallclock_abort"
+        assert rec["qid"] == 45085
+        assert rec["qid_kind"] == "question_id"
+        assert rec["elapsed_s"] == pytest.approx(1140.2)
+        assert rec["forecasters_completed"] == 1
+        assert rec["forecasters_configured"] == 3
+        assert rec["cancelled"] == 2
+        assert rec["remaining_budget_s"] == pytest.approx(-0.2)
+
+    def test_stacking_skip_line_with_the_same_token_is_not_harvested(self):
+        """stacking_route.py reuses the token on a prose line; its record is the wall_clock_budget STACKER_SKIP_REASON."""
+        line = (
+            "2026-08-25 12:19:00,000 - metaculus_bot.stacking_route - WARNING - "
+            "WALLCLOCK_ABORT: skipping stacking for Q 45085; remaining=12.0s < 60s; forcing fallback_median fallback"
+        )
+        harvested = parse_log_text(line + "\n", **_META)
+        assert all(records == [] for records in harvested.values()), harvested
 
 
 # The per-run provider-degradation summary (metaculus_bot/research/provider_health.py

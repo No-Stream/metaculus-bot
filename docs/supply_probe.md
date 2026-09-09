@@ -80,7 +80,8 @@ the sweep can classify:
   and under a token it also puts `my_forecasts` there, so closed-but-unresolved questions classify
   too. No detail GET is ever issued on Mantic. A 100-post page with the flag is
   about 6 MB and 4 to 5 seconds, well inside the 45-second request timeout.
-- Without a token, a RESOLVED question is classified from that snapshot,
+- Wherever `my_forecasts` does not answer (no token, or a payload that carries the block as
+  null), a RESOLVED question is classified from that snapshot,
   `question.aggregations.recency_weighted.score_data.disagreement_forecasts.forecasts[]`, one entry
   per competitor keyed by `author_id`, read against `MANTIC_BOT_USER_ID` (81, `nostreambot-bot`).
   The snapshot is exactly what the platform scores, which is why every eventually-resolved

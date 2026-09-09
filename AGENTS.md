@@ -1,4 +1,4 @@
-# Metaculus Forecasting Bot — Agent Guidelines
+# Metaculus Forecasting Bot: Agent Guidelines
 
 General coding guidelines (style, testing, error handling, etc.) live in the operator's private
 global config; this file covers **repo-specific** context only.
@@ -8,23 +8,23 @@ the layout, the pipeline outline, and the standing rules whose violation is sile
 expensive. Everything else lives in `docs/`, indexed at the bottom. When a task needs depth,
 open the doc rather than expecting it here.
 
-## ⚠️ Cost discipline — every credit spend goes through the operator
+## ⚠️ Cost discipline: every credit spend goes through the operator
 
 **Any command that hits live LLM or research APIs spends real money (OpenRouter credits,
-AskNews, Exa, Perplexity, Google). NEVER launch one autonomously — ask first, every time, even
+AskNews, Exa, Perplexity, Google). NEVER launch one autonomously. Ask first, every time, even
 after clean gates and a clean `/forge`.** `--mode test_questions` also publishes comments to
 Metaculus, which is hard to retract.
 
 Four clarifications, each load-bearing:
 
 - **The gate is on the SPEND, not the mechanism.** A local command, a GitHub Actions dispatch,
-  an edit that flips a schedule, a script that wraps any of those — all the same rule. An agent
+  an edit that flips a schedule, a script that wraps any of those: all the same rule. An agent
   proposes and prices the run; the operator decides. There is no clean-gates exemption and no
   "small enough to skip asking" threshold; a $2-3 run still goes through the operator. If a paid
   run is the only way to verify the work, say so and stop.
 - **What the gate forbids is an agent DECIDING to spend.** An explicit instruction from the
   operator IS the approval: when they say to fire a run already discussed, run it and don't
-  re-ask. Approval is per-run and does not carry forward — one "go" is not standing
+  re-ask. Approval is per-run and does not carry forward. One "go" is not standing
   authorization for the next run, nor for re-running the same one after further changes.
 - **Paid runs are a final pre-merge check, not part of the verification loop.** The smoke test
   exists to be fired ONCE, deliberately, when a change is otherwise finished. An agent that
@@ -33,7 +33,7 @@ Four clarifications, each load-bearing:
 - **When verification needs a paid run, surface the exact command and rough cost** and let the
   operator decide.
 
-Paid or externally visible — ask before each:
+Paid or externally visible. Ask before each:
 
 - `uv run python main.py` / `make run` in any live mode (`--mode test_questions`, `tournament`,
   `metaculus_cup`, `minibench`, `mantic`): spends credits AND publishes.
@@ -41,10 +41,11 @@ Paid or externally visible — ask before each:
   (`competitions.mantic.com`, a fork of the Metaculus platform) and publishes there. It spends
   the operator's PERSONAL keys only: the Metaculus-donated OpenRouter key is refused, the run
   requires `DONATED_OPENROUTER_KEY_ENABLED=false` and fails shut without it, and with a single
-  key there is no key-swap fallback. About $2.60 per question. `--only-posts <ids>` (or
-  `make run_mantic_one POST=<id>`) narrows any tournament-shaped mode to the listed post ids:
-  the one-question smoke run, still paid and still published. Detail: `docs/operations.md`
-  "Mantic".
+  key there is no key-swap fallback. About $3 per question (the post-650 smoke spent $3.17).
+  `--only-posts <ids>` (or `make run_mantic_one POST=<id>`) narrows any tournament-shaped mode
+  to the listed post ids: the one-question smoke run, still paid and still published. `cli.py` refuses it with
+  `--mode test_questions`, whose fixed question set is not a tournament's open questions.
+  Detail: `docs/operations.md` "Mantic".
 - `make backtest_smoke_test` / `_small` / `_medium` / `_large`: every forecaster and research
   call, plus the `LEAKAGE_DETECTOR_MODEL` screen. No publish, real money. Question counts are
   the `--num-questions` values in the Makefile.
@@ -53,37 +54,30 @@ Paid or externally visible — ask before each:
   question, so forecaster spend is real. A question with no archived record falls back to live
   research and the run logs a warning.
 - `make ablation_*` (`qa_research` / `smoke` / `small` / `medium`): real research and forecaster
-  spend. `ablation_score` is the free exception — `--stages score` hydrates every artifact off
+  spend. `ablation_score` is the free exception: `--stages score` hydrates every artifact off
   disk and makes no provider call.
 - `make benchmark_run_*`: deprecated (`community_benchmark.py` baseline scoring is broken), but
   the `run` / `custom` modes still fan the real ensemble over real questions. Use
   `make backtest_*` instead; `make benchmark_display` is the free view-only mode.
 - `make test_live`: the only suite that leaves the network. It pins a `:free` OpenRouter slug so
   dollar spend is near-zero, but the calls are real and need a key. Ask anyway.
-- **GitHub Actions runs of any bot workflow**, which spend exactly as a local run does and
-  publish to the platform they forecast (Metaculus, or competitions.mantic.com for
-  `run_bot_on_mantic.yaml`). `test_bot_basic.yaml` (one numeric question, ~$2.60) and
-  `test_bot.yaml` are `workflow_dispatch`-only. The four `run_bot_on_*.yaml` prod workflows are
-  additionally on `schedule:` crons (`run_bot_on_mantic.yaml`, :05/:15/:25, all in the first
-  half hour because a later pickup of a 60-minute Mantic window gets only the fast path; GitHub
-  delivers about 22% of this repo's scheduled firings, see `docs/operations.md` "Scheduling
-  reliability"; the file holds no Metaculus secret and is auto-enabled once it lands on
-  `main`). Never dispatch one, and never edit
-  a `schedule:` block or a research/model flag in a way that adds runs or raises per-run cost,
-  without the operator's say-so. `gh` needs
-  `--repo No-Stream/metaculus-bot` here: `origin` is the fork, `upstream` is the Metaculus
-  template, and no default repo is set, so a bare `gh workflow` command silently targets
-  upstream. Two standing facts about enablement, both confirmed 2026-09-03:
-  **`run_bot_on_minibench.yaml` is `disabled_manually` on GitHub by operator design and has
-  NEVER been enabled**, so a supply-probe row showing minibench with closed questions and zero
-  bot forecasts is expected rather than a forfeit or a token problem — do not ask the operator
-  about it again. **The Metaculus Cup workflow is being ENABLED for the fall 2026 season**
-  (Metaculus granted $1,500 of API credits on 2026-09-03; the repo-side configuration landed the
-  same day), but until the operator flips it on in the GitHub UI it is still `disabled_manually`
-  and fires nothing, so a cup row with no bot forecasts also stays expected for now.
-  `docs/operations.md` tracks what landed and what is left.
-- `fetch_diagnostic.yaml` is NOT a bot workflow — `workflow_dispatch`-only, no secrets,
-  structurally incapable of spending or publishing — but a dispatch burns Actions minutes and
+- **GitHub Actions runs of any bot workflow** spend exactly as a local run does and publish to
+  the platform they forecast (Metaculus, or competitions.mantic.com for `run_bot_on_mantic.yaml`).
+  The four `run_bot_on_*.yaml` prod workflows are on `schedule:` crons; the two `test_bot*.yaml`
+  workflows are `workflow_dispatch`-only. Never dispatch one, and never edit a `schedule:` block
+  or a research/model flag in a way that adds runs or raises per-run cost, without the operator's
+  say-so. `gh` needs `--repo No-Stream/metaculus-bot` here: `origin` is the fork, `upstream` is
+  the Metaculus template, and no default repo is set, so a bare `gh workflow` command silently
+  targets upstream. Two standing facts about enablement: **`run_bot_on_minibench.yaml` is
+  `disabled_manually` on GitHub by operator design and has NEVER been enabled**, so a
+  supply-probe row showing minibench with closed questions and zero bot forecasts is expected
+  rather than a forfeit or a token problem; do not ask the operator about it again. **The
+  Metaculus Cup workflow is enabled for the fall 2026 season** (`active` on GitHub as of
+  2026-09-09). The smoke-test cost and GitHub's delivery rate: `docs/operations.md` "GitHub Actions
+  workflows" and "Scheduling reliability"; the Mantic cron placement and the fall-2026 credit
+  receipts: its "Mantic (Crucible) tournament" and "Fall 2026 season" sections.
+- `fetch_diagnostic.yaml` is NOT a bot workflow (`workflow_dispatch`-only, no secrets,
+  structurally incapable of spending or publishing), but a dispatch burns Actions minutes and
   probes federal hosts from the runner IP, so ask before dispatching it too.
 - `uv run python scripts/probes/gemini_verify.py --i-accept-spend`: three live google-genai calls
   on the operator's personal AI Studio key (one grounded search plus two `url_context` reads).
@@ -99,7 +93,7 @@ Paid or externally visible — ask before each:
 - Anything invoking research providers or the ensemble against real questions, including a
   one-off script an agent writes to do so.
 
-Free and safe — run freely:
+Free and safe. Run freely:
 
 - Gates and formatting: `make test`, `make test_fast`, `make test_e2e`, `make lint`,
   `make format`, `make typecheck`, `make typecheck_ty`, `make cov`, `make audit`, `make deps`
@@ -113,8 +107,8 @@ Free and safe — run freely:
   `make supply_probe`, `make supply_probe_mantic` (public Mantic reads; `MANTIC_TOKEN` optional),
   `make benchmark_display`. These hit only the Metaculus API, Mantic's public API and GitHub
   artifacts.
-- `make check_credits` — reads both OpenRouter key balances.
-- `uv run python scripts/probes/fetch_diagnostic.py` — probes A/B/C are public GETs, and column D
+- `make check_credits`: reads both OpenRouter key balances.
+- `uv run python scripts/probes/fetch_diagnostic.py`: probes A/B/C are public GETs, and column D
   runs the production ladder but forces its one paid rung (the Gemini `url_context` read) off in
   the process environment before any probe runs, so it stays free even on a laptop whose `.env`
   has the flag and a `GOOGLE_API_KEY`. No key is spent (`curl_cffi` is a runtime dependency, so
@@ -126,7 +120,7 @@ Free and safe — run freely:
 - **Package manager: uv.** `uv.lock` is the lockfile; there is no `poetry.lock`. `uv sync --dev`
   installs the package editable, so no `PYTHONPATH=.`. Add deps with `uv add <pkg>` /
   `uv add --dev <pkg>`, then commit `pyproject.toml` + `uv.lock`. **NEVER use `pip` or
-  `poetry`** — both are blocked here. The project requires uv 0.12.10+ and sets
+  `poetry`**; both are blocked here. The project requires uv 0.12.10+ and sets
   `exclude-newer = "1 week"`, so `uv lock` avoids just-published packages.
 - **Build backend `uv_build`**, flat layout (`metaculus_bot/` at repo root, `module-root = ""`).
 - **Formatter: Ruff**, 120-char lines (not Black).
@@ -151,21 +145,21 @@ the raw forecasts.**
 
 Top level:
 
-- `main.py` — thin shim: re-exports `TemplateForecaster` from `metaculus_bot/forecaster.py` and
-  invokes the CLI.
-- `backtest.py` — primary benchmarking; scores bot predictions against real resolutions.
-- `community_benchmark.py` — **DEPRECATED** (Metaculus removed `aggregations` from the list API).
+- `main.py`: thin shim that re-exports `TemplateForecaster` from `metaculus_bot/forecaster.py`
+  and invokes the CLI.
+- `backtest.py`: primary benchmarking; scores bot predictions against real resolutions.
+- `community_benchmark.py`: **DEPRECATED** (Metaculus removed `aggregations` from the list API).
   `make benchmark_display` still works for old runs.
-- `FUTURE.md` — the design log: intent and history, including rejected ideas. Read it for the
-  why, not for current state.
-- `docs/` — the current-state guides (index at the bottom of this file).
-- `scratch_docs_and_planning/` — plans and audits, including
+- `FUTURE.md`: the design log: intent, history, and rejected ideas. Read it for the why, not
+  for current state.
+- `docs/`: the current-state guides (index at the bottom of this file).
+- `scratch_docs_and_planning/`: plans and audits, including
   `residual_analysis_playbook.md` (the per-round residual procedure),
   `probabilistic_tools_activation.md` (activation pending) and
   `fetch_escalation_ladder_design.md` (superseded by `fetch_ladder_plan_2026-09-03.md`, whose
   ladder is built; the TLS-impersonation rung it deferred is built per
-  `impersonate_rung_plan_2026-09-04.md`). `metaculus_api_doc_LARGE_FILE.yml` there is the full Metaculus
-  API spec — read it with offset/limit.
+  `impersonate_rung_plan_2026-09-04.md`). `metaculus_api_doc_LARGE_FILE.yml` there is the full
+  Metaculus API spec; read it with offset/limit.
 - `tests/`, `.github/workflows/` (CI on PRs, plus the scheduled bot runs), `scripts/`.
 
 Inside `metaculus_bot/`:
@@ -188,6 +182,7 @@ Inside `metaculus_bot/`:
 | Numeric percentiles → CDF | `numeric/` |
 | Date question as a numeric question on the epoch-seconds axis | `numeric/date_axis.py` |
 | Per-bin PMF elicitation on enumerable grids (Mantic, 31 bins or fewer): the gate, the bin labels, the PMF → CDF build | `numeric/config.py` (`elicit_per_bin`), `numeric/pmf_grid.py`, `numeric/pmf_cdf.py` |
+| Mantic out-of-range tail floor, the last touch on every published Mantic numeric, discrete or date CDF | `numeric/out_of_range_floor.py` (`floor_published_tails`; `MANTIC_OUT_OF_RANGE_TAIL_FLOOR` in `constants.py`), applied in `forecaster.py` `_aggregate_predictions` |
 | MC clamp / renormalize | `mc_processing.py` |
 | Aggregation routing and stacking | `stacking_route.py`, `aggregation_pipeline.py`, `stacking.py`, `spread_metrics.py` |
 | Publish hardening and close gate | `publish_hardening.py`, `publish_gate.py` |
@@ -215,11 +210,11 @@ Per question, inside `forecaster.py:_research_and_make_predictions`. Detail:
    optional providers and both gap-fill passes (and makes the resolution-source fetcher's two
    expensive rungs, the browser render and the paid read, decline), and a research-phase
    deadline that cancels stragglers. Every question logs a `TIME_BUDGET` marker.
-1. **Research** — `run_research` (`research/orchestrator.py`) picks exactly one primary provider
+1. **Research**: `run_research` (`research/orchestrator.py`) picks exactly one primary provider
    by priority and runs the add-on providers alongside it in parallel, each independently
    env-gated, then two gap-fill passes append their own sections. Detail: `docs/research.md`,
    `docs/agentic_gap_fill.md`.
-2. **Forecaster fan-out** — N forecaster LLMs in parallel via `_forecaster_with_soft_deadline`
+2. **Forecaster fan-out**: N forecaster LLMs in parallel via `_forecaster_with_soft_deadline`
    (capped per model by `FORECASTER_SOFT_DEADLINE`) → `_make_prediction` → the type-specific
    runner in `forecaster_runners.py`. Each forecaster emits its value inside a fenced ```json
    STRUCTURED FORECAST block, read by the extraction ladder in `value_extraction.py`. A Mantic
@@ -228,20 +223,25 @@ Per question, inside `forecaster.py:_research_and_make_predictions`. Detail:
    built into a CDF by `numeric/pmf_cdf.py` with none of the percentile sanitizing, PCHIP repair
    or unit-mismatch guard, and the `MEMBER_FORECAST` line carries `elicitation=pmf`. Detail:
    `docs/value_extraction.md`, `docs/prompts.md`, `docs/numeric_pipeline.md`.
-3. **Min-forecasters guard** — drops the question below `MIN_FORECASTERS_TO_PUBLISH`
+3. **Min-forecasters guard**: drops the question below `MIN_FORECASTERS_TO_PUBLISH`
    (`constants.py`). With the floor at 1 a lone survivor publishes, and `route_after_forecasts`
    (`stacking_route.py`) short-circuits n == 1 before spread computation, because the
    `spread_metrics` helpers require two predictions and raise otherwise. Every question past the
    guard logs `FORECASTERS_SURVIVED`.
-4. **Aggregation** — `aggregation_pipeline.py`. Spread below the per-type threshold gives the
+4. **Aggregation**: `aggregation_pipeline.py`. Spread below the per-type threshold gives the
    MEDIAN; above it, a crux extraction plus targeted search plus a stacker rewrite, with a
    second stacker and then MEDIAN as fallbacks. In prod the per-type gates are off, so this is
    always MEDIAN, with one exception: per-bin members (the Mantic coarse grids above) are pooled
    by the pointwise MEAN of their CDFs, because the median of sharp per-bin members is one
-   member's CDF outright and a log score in the resolved bin punishes that cliff;
-   `NUMERIC_AGGREGATE ... method=mean|median` records which rule ran. Numeric aggregation happens
-   pointwise in CDF space (`aggregate_numeric`, `numeric/utils.py`), not in percentile space.
-   Detail: `docs/architecture.md`, `docs/numeric_pipeline.md`.
+   member's CDF outright and a log score in the resolved bin punishes that cliff. Numeric
+   aggregation happens pointwise in CDF space (`aggregate_numeric`, `numeric/utils.py`), not in
+   percentile space. On Mantic the out-of-range tail floor then lifts each OPEN tail of the
+   published CDF toward 5%, as far as the other tail leaves room, because Mantic scores an
+   out-of-range resolution against a fixed 5% reference; Metaculus aggregates are untouched.
+   `NUMERIC_AGGREGATE ... method=` records which combine
+   rule ran (`mean`, `median`, `stacked` or `single`; `unrecorded` marks a bug), beside the
+   tails before and after the floor. Detail: `docs/architecture.md`,
+   `docs/numeric_pipeline.md` "Step 11: the Mantic out-of-range tail floor".
 5. **Publish, behind a close-time gate** (`publish_gate.py`, layer 4 of `publish_hardening.py`).
    A question whose window has passed is skipped entirely, prediction and comment together, and
    the skip is alertable. Detail: `docs/architecture.md`.
@@ -343,10 +343,10 @@ Each of these has cost real work at least once. The pointer is where the reasoni
 - **Rank and aggregate on SPOT PEER, never on the coverage-scaled `peer_score`.** Use
   `spot_peer_score()` / `ranking_score()` in `performance_analysis/platform_scores.py` rather
   than indexing `metaculus_scores`, and price a counterfactual with `spot_peer_delta` rather than
-  by hand — the continuous-question halving gets applied twice or not at all otherwise.
+  by hand; the continuous-question halving gets applied twice or not at all otherwise.
 - **The exclusion cohorts have one home: `performance_analysis/cohorts.py`** (`KNOWN_BUG_QIDS`,
   `DEGRADED_RUN_QIDS`, `PARTIAL_DEGRADED_QIDS`, `EXCLUSION_COHORTS`). Import them; every private
-  copy has drifted at least once. These are QUESTION ids — translate through
+  copy has drifted at least once. These are QUESTION ids: translate through
   `performance_analysis/id_mapping`, never match raw integers against post ids.
 - **Never pool the three research-archive record classes** (`artifact`, `comment_backfill`,
   `log_backfill`) for a presence, provider-mix or length claim, and read the `source` field
@@ -378,14 +378,14 @@ Each of these has cost real work at least once. The pointer is where the reasoni
 `/loop` and `set_goal` serve closely related purposes: keeping multi-phase work moving until
 the objective is complete. Use `set_goal` (or the environment's equivalent goal tool) in place
 of `/loop` when available. When subagents are running and there is no independent work left,
-wait for their results; waits of 5–60 minutes can support the same supervision pattern, subject
+wait for their results; waits of 5 to 60 minutes can support the same supervision pattern, subject
 to the environment's wait limits. Keep cache TTL in mind when choosing the interval: shorter
 waits may preserve the prompt cache and cost less. Resume supervision when results arrive and
 mark the goal complete only when the whole task is finished.
 
 - **Install**: `uv sync --dev` (or `make install`). Run anything with `uv run <cmd>`; no manual
   activation.
-- **Run the bot**: `uv run python main.py` (or `make run`) — paid, see the cost gate.
+- **Run the bot**: `uv run python main.py` (or `make run`). Paid, see the cost gate.
 - **Tests**: `make test` (full), `make test_fast`, `make test_e2e`, or
   `uv run pytest tests/test_specific.py`.
 - **Lint and format**: `make lint` (Ruff check), `make format` (Ruff format + autofix).
@@ -397,7 +397,7 @@ mark the goal complete only when the whole task is finished.
 - **Dependency hygiene**: `make deps` (deptry). **Import contracts**: `make lint_imports`
   (import-linter; the contracts live in `pyproject.toml` `[tool.importlinter]`). Both are free
   and both run in CI's lint job and in `make all`.
-- **Pre-commit**: `make precommit_install` installs both hook types — the Ruff hooks on commit,
+- **Pre-commit**: `make precommit_install` installs both hook types: the Ruff hooks on commit,
   plus a `pytest-full-suite` pre-push hook running the same command CI runs. Per-push rather than
   per-commit because the suite takes about 105 s.
 - **Benchmarking** (all paid except `benchmark_display`): `make backtest_smoke_test` (4),
@@ -410,7 +410,7 @@ mark the goal complete only when the whole task is finished.
   `docs/performance_analysis.md`.
 
 **CI green is the gate, not a local green run.** A test that depends on the developer's
-environment — a hardcoded absolute path, the checkout location, `$HOME`, gitignored local data —
+environment (a hardcoded absolute path, the checkout location, `$HOME`, gitignored local data)
 passes locally by construction, so CI is the first place it can fail. This has shipped: a test
 asserted a launchd plist's `ProgramArguments` equalled a path derived from `__file__`, which
 holds only on the machine whose absolute path the plist hardcodes. Never assert an absolute path
@@ -446,13 +446,13 @@ After pushing, check the run:
 | `docs/architecture.md` | End-to-end map: entry points, the per-question pipeline stage by stage, the time budget, aggregation, the publish gate, import conventions, where every module lives. |
 | `docs/research.md` | Every research provider: AskNews and its summarizer, OpenAI native search, Gemini grounded search (citation strip, attribution check), financial data (pegs, variance ratio, FRED), the prediction-market snapshot, the resolution-source fetcher and its rungs, the time-series anchor, and both gap-fill passes. |
 | `docs/agentic_gap_fill.md` | Gap-fill v2: the bounded agentic tool loop, its four tools, the fetch ladder, the findings artifact, the ghost forecast, and its telemetry. |
-| `docs/numeric_pipeline.md` | Percentiles to PCHIP CDF: sanitizing, tail widening, min/max-step enforcement, bound pinning, the repair tiers, discrete snapping, CDF-space aggregation, the unit-mismatch guard, and the binary and MC clamps. |
+| `docs/numeric_pipeline.md` | Percentiles to PCHIP CDF: sanitizing, tail widening, min/max-step enforcement, bound pinning, the repair tiers, discrete snapping, per-bin elicitation on the small Mantic grids, CDF-space aggregation, the unit-mismatch guard, the Mantic out-of-range tail floor, and the binary and MC clamps. |
 | `docs/value_extraction.md` | The four-rung extraction ladder, its fidelity checks, and the `EXTRACTION_RUNG` / `MEMBER_FORECAST` markers with the raw-versus-published convention. |
 | `docs/prompts.md` | Every forecasting-prompt rule, the constant that carries it, its receipt, and the size accounting from the 2026-09 de-bloat. |
 | `docs/roster_history.md` | The roster design rule, the dated roster-change history and its era boundary, the support-model roles, and the dormant `probabilistic_tools` / `tool_runner` paths. |
 | `docs/operations.md` | Running the bot: setup, the season-start checklist, the shared-versus-personal API keys, Google AI Studio billing, credit telemetry and the refill floor, the dry-donated-key semantics, the workflows and their env flags, the Mantic (Crucible) mode and its personal-keys-only rule, backtesting, and reading run logs. |
-| `docs/performance_analysis.md` | Residual-analysis conventions: era bucketing and the merge-date rule, the exclusion cohorts, the archive's record classes, the PIT and spot-peer conventions, `spot_peer_delta`, the starved outer tail, per-model recovery, and the clip-threshold sweep. |
+| `docs/performance_analysis.md` | Residual-analysis conventions: era bucketing and the merge-date rule, the exclusion cohorts, the archive's record classes and the Mantic id overlap, the PIT and spot-peer conventions, `spot_peer_delta`, the starved outer tail, per-model recovery, the clip-threshold sweep, and why no Mantic or date record enters the dataset. |
 | `README.md` | Human quick-start: install, configure, run. |
-| `FUTURE.md` | The design log — intent, history, and rejected ideas. Read it for the why, not for current state. |
+| `FUTURE.md` | The design log: intent, history, and rejected ideas. Read it for the why, not for current state. |
 | `docs/supply_probe.md` | The question-supply probe: why it exists, what each report block means, the Mantic mode and its public-snapshot caveat, the API facts it is built around. |
 | `scratch_docs_and_planning/residual_analysis_playbook.md` | The per-round residual procedure. |
