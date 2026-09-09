@@ -389,6 +389,105 @@ question type rather than silently taking the un-halved branch, and
 `tests/test_peer_delta_convention.py` pins both conversions. Corrected q45065 figures
 and the full per-script sweep: `scratch/residual_2026-09-01/DOSSIER_SYNTHESIS.md` §7.2.
 
+## The era gap and the horizon confound
+
+**Horizon matching is a standing part of the era read, and the roster watch is two-sided.**
+Entry point `metaculus_bot/performance_analysis/era_gap.py`, read-only and offline:
+
+```bash
+uv run python -m metaculus_bot.performance_analysis.era_gap --dataset <round>/perf_all_tagged.json \
+    --treated-era triple_era --comparison-era post_flip --strict [--output-json <path>]
+```
+
+Run it twice per round, once with `--strict` (the exclusion cohorts from `cohorts.py` dropped
+from BOTH arms, the count shown in the `excl` column) and once unfiltered, the same pairing the
+clip sweep uses. The dataset is the round's tagged pull: every record carries `config_era`,
+written by the round's tagging pass off `bot_comment_created_at` against the merge-date era map
+(the treated and comparison eras are whatever values that field holds). Every number is spot
+peer through `platform_scores.spot_peer_score`. The report prints four blocks:
+
+- **Arms.** n, effective n (distinct UTC resolution days), exclusions, unscoreable records
+  (no spot peer, submit time or resolve time), spot mean and median, fraction negative, lag
+  median and maximum, type mix and tournament mix, for the treated arm, the comparison arm and
+  the comparison arm after the horizon cap.
+- **Spot mean by within-arm lag quartile.** The confound made visible: a comparison arm whose
+  mean falls across its quartiles was asked longer-horizon questions than the treated arm could
+  have been.
+- **Gap under each control**, treated minus comparison: unadjusted; type-adjusted (the
+  pre-registered estimator of the 2026-09-01 and 2026-09-09 rounds); type-adjusted and
+  horizon-matched (the watch row); type x lag-quintile adjusted, with and without the cap. Each
+  carries a cluster-bootstrap 95% interval, `P(gap<0)`, the by-record interval and the verdict.
+- **Per-type gap** against the horizon-matched comparison arm, on the types both arms carry.
+
+**The estimator.** Each record's spot peer is residualized on the mean for its question type
+over both arms pooled, and the arms are differenced. The pool is taken after the cohort
+exclusions (bug records do not inform the nuisance means) and before the horizon cap, and the
+lag-quintile cuts and cell means come from the same pool, so every row differs from the
+type-adjusted row by exactly the control it names. Lag is `actual_resolve_time` minus
+`bot_comment_created_at` in days: the forecast horizon, the thing the question asked of the
+bot. It is deliberately not `resolution_set_time`, the batch date on which Metaculus set the
+resolution, and calendar batching is not treated as clustering. The horizon match caps the
+comparison arm at the treated arm's longest lag (inclusive) and leaves the treated arm alone;
+the lag-quintile form is the reweighting counterpart, which attenuates a within-bin trend
+rather than removing it (`tests/test_era_gap.py::TestHorizonConfound` pins both behaviours on
+a synthetic arm whose score falls linearly with lag).
+
+**Why horizon, the receipt.** On 2026-09-09 the retired six-model arm's spot mean fell
+monotonically across its submit-to-resolve lag quartiles, **+18.33, +10.96, +9.57, +4.94**,
+its longest lag was 113.1 days and its median 43.5, while the live three-model arm had never
+been asked anything beyond 45.2 days (median 24.9). Type adjustment cannot see any of that:
+the type-adjusted gap was +10.71 with a cluster interval of [+1.72, +19.69], and capping the
+comparison arm at 45.2 days took it to +8.19 with [-3.21, +19.90]. A season's final wave is
+always its long tail, so the comparison arm inherits the season's long-horizon questions the
+treated arm was never asked, and the drift is one-directional (the roster that was around
+longer looks worse the longer its questions took to resolve). This is the third conclusion in
+this file's era-bucketing section that a control would have changed, and it is why the control
+now runs every round rather than being re-derived by hand in a scratch script.
+
+**Clusters.** One UTC resolution day is one cluster, on both arms, and `eff n` counts them.
+That is coarser than a hand-curated cluster file (20 resolution days against 58 curated clusters
+for the 63-record triple arm on 2026-09-09), so the clustered interval is conservative: same-day
+questions need not share a world state. The by-record interval is printed beside it as the other
+bracket; a curated-cluster interval lies between the two, and when the two brackets disagree on
+whether zero is inside, the verdict depends on the cluster convention and that round should say
+so. The 2026-09-09 round found the convention not load-bearing on its curated file (intervals
+moved by under a point between its cluster variants).
+
+**The two-sided watch** (`era_gap.two_sided_watch`, read on the STRICT type-adjusted
+horizon-matched row): a **concern** reopens only when the point estimate is below -5 spot-peer
+points AND the 95% interval excludes zero; a **favourable** gap with an interval excluding zero
+is reported, never flagged; anything else is **no measurable difference**. This replaces the
+2026-09-01 ledger rule "reopen the underperformance flag if the estimate leaves
+[-6.67, +13.90]", whose upper edge would have reopened an *under*performance concern on
+evidence that the roster is better (operator ruling 2026-09-09).
+
+**Reconciliation with the 2026-09-09 round**, whose primary estimator was ASYMMETRIC (treated
+STRICT, comparison arm with its three flagged records kept) and pooled type means over all 256
+summer records including the excluded ones. The module's symmetric `--strict` read on the same
+dataset, 63 against 181 records:
+
+| read | n | gap | 95% CI (clustered) | 95% CI (by record) | verdict |
+|---|--:|--:|---|---|---|
+| type-adjusted | 63 / 181 | +8.78 | [-1.56, +17.14] | [-0.09, +17.52] | no measurable difference |
+| type-adjusted, horizon-matched (lag <= 45.2 d) | 63 / 95 | +5.56 | [-7.69, +16.06] | [-5.53, +16.59] | no measurable difference |
+| type x lag-quintile adjusted | 63 / 181 | +8.15 | [-1.89, +16.43] | [-0.43, +16.65] | no measurable difference |
+| type x lag-quintile adjusted, horizon-matched | 63 / 95 | +7.45 | [-5.63, +17.71] | [-3.37, +18.15] | no measurable difference |
+
+The symmetric horizon-matched arm holds 95 rather than the round's 97 because the two
+known-bug numerics (43746 and 43747, at -110 and -132) sit inside the 45-day window; that is
+most of the move from +8.19 to +5.56. Composing the module's functions asymmetrically (treated
+STRICT, comparison all 184) reproduces the round's rows within the pool convention: +10.79
+against +10.71, horizon-matched +8.12 against +8.19, quintile-adjusted +10.42 against +10.21;
+with the round's own 256-record pool the module's arms give exactly +10.71, +8.19 and +8.91 (the
+round's "symmetric exclusions" row). The per-type horizon-matched rows match the round exactly
+(discrete +27.41 on 12 a side, multiple choice -9.46 on 10 against 18). The unadjusted gap
+against all 184 is +11.04 on both.
+
+**Retarget the comparison each season.** The summer six-model arm is nearly exhausted; from
+the next round the interesting cut is the September `fall_config` merges against the
+`ranked_markets` sub-era (or the whole `triple_era`), which the tagging pass has to write into
+`config_era` (or a sub-era field passed as the era) before the module can read it.
+
 ## The clip-threshold sweep
 
 **The clip floors are priced by a standing sweep, and a looser clip is censored, never

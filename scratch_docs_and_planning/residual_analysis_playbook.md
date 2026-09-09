@@ -74,6 +74,16 @@ The standing set, each reconciling explicitly with the prior round's same-named 
   peer over `all` / `last_N` / `last_90d` / `current_clamp_regime` / `triple_era` and the disjoint `era_*`
   slices; a floor fitted on older records must carry into the window (a fit that moves nothing is
   vacuous, not a pass); a candidate looser than the in-force clamp is CENSORED, read `cen` / `cen_m` bounds
+- era scoreboard and era gap (`performance_analysis.era_gap`; `--strict` plus one unfiltered, treated
+  era = the live roster, comparison era = the one it replaced): per-arm spot mean / median / frac neg with
+  effective n by resolution day, the type-adjusted gap AND its horizon-matched form (comparison arm capped
+  at the treated arm's longest submit-to-resolve lag, plus the lag-quintile-adjusted form; the per-arm lag
+  quartile table is the receipt), each with a cluster-bootstrap interval and the by-record bracket. The
+  standing two-sided watch reads the STRICT type-adjusted horizon-matched row: a concern reopens only
+  below -5 with the interval excluding zero; a favourable gap is reported, never flagged. Never headline the
+  type-adjusted gap without the horizon-matched one beside it (2026-09-09: +10.71 became +8.19), and never
+  reopen an underperformance flag on a positive gap. `docs/performance_analysis.md` "The era gap and the
+  horizon confound".
 
 ## Phase 4 — Per-question tracing (the centerpiece; often the highest-value output)
 
@@ -151,6 +161,11 @@ after clustering (same-day resolutions share a world state).
   figures means multiplying it by ln 2 ≈ 0.693, not dividing. Import `spot_peer_delta` from
   `metaculus_bot.performance_analysis.scoring`.
 - Merge dates, not authoring dates, for every era boundary.
+- **Horizon before verdict.** A season's final wave is its long tail, so the retired roster's arm
+  inherits long-horizon questions the live roster was never asked and its score falls with lag
+  (2026-09-09 quartiles +18.33, +10.96, +9.57, +4.94). Type adjustment cannot see that; the era-gap
+  module's horizon-matched row can. Lag is `actual_resolve_time` minus `bot_comment_created_at`, never
+  `resolution_set_time`.
 - `performance_analysis.id_mapping` for any marker↔record join; never "match either id".
 - Never pool research-archive record classes (`artifact` / `comment_backfill` /
   `log_backfill`) for presence, provider-mix, or length claims; comment-backfill re-heads
