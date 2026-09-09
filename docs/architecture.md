@@ -199,6 +199,22 @@ forecaster fan-out, aggregation, and publish all draw from that one budget.
         └────────────────────────────────────────────────┘
 ```
 
+### Intake: `forecast_questions`
+
+Every entry path (`forecast_on_tournament`, `forecast_question`) funnels through
+`forecast_questions` (`forecaster.py`) before the per-question pipeline starts. When
+`skip_previously_forecasted_questions` is on, which `cli.py` pins for every
+tournament-shaped mode, the re-spend guard runs here, and since 2026-09-09 it fails shut.
+The framework derives `already_forecasted` inside a blanket except that answers False, so a
+payload with no readable `my_forecasts` field (a list GET without `with_cp=true`, a Mantic
+read that lost its token, an API change) would read as never forecast, and an hourly run
+would re-forecast and re-publish the whole tournament.
+`_drop_questions_with_unreadable_forecast_history` drops such a question before any spend,
+with one `SKIP_GUARD_UNREADABLE: question=... post_id=... platform=... reason=my_forecasts_missing`
+WARNING per post plus a count line; a present field with an empty history stays eligible.
+The marker is registered as `skip_guard_unreadable`, and what to do when it fires is in
+`docs/operations.md` "Scheduling reliability".
+
 ### 0. Close-derived time budget
 
 The budget is granted at intake by `metaculus_bot/time_budget.py`, before any spend: `total_s = min(PER_QUESTION_WALL_CLOCK_DEADLINE, close_time − now − PUBLISH_RESERVE_SECONDS)`, so the static 3510 s deadline is now only the UPPER bound on a question's budget (non-publishing runs, the backtests and ablations, keep exactly the static budget; `close_aware` gates on `publish_reports_to_metaculus`). Three consequences: (a) **intake skip**: a question whose budget is non-positive, or close-limited below `TIME_BUDGET_MIN_VIABLE_S`, is skipped before any research or forecaster spend (counted under `publish_skipped_closed`: latency cost us the question, however early we noticed); (b) **fast path**: below `TIME_BUDGET_FAST_PATH_THRESHOLD` (= the full pipeline's configured worst case) the slow optional search providers and BOTH gap-fill passes are dropped, and the resolution-source fetcher's two expensive escalation rungs (the Chromium render, the paid `url_context` read) decline with a `fast_path` skip while its direct fetch and cheap rungs still run, counted by the alertable `time_budget_fast_path`; (c) **research-phase deadline**: the provider phase and each gap-fill pass are bounded by `RESEARCH_PHASE_BUDGET_SHARE` of the remaining budget, cancelling stragglers (`RESEARCH_PHASE_DEADLINE` WARN; off the fast path such cuts count under the alertable `research_budget_cuts`). Every question logs a `TIME_BUDGET` marker; the loud markers (`TIME_BUDGET_FAST_PATH`, `GAP_FILL_SKIPPED_FOR_BUDGET`, `GAP_FILL_V1/V2_CUT_FOR_BUDGET`) all have telemetry-archive specs.

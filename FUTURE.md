@@ -220,7 +220,9 @@ C6 await live data, each with its read-only command):
   the miss rate per UTC release hour plus the realized window-length distribution. This is the
   instrument for the cadence decision below; the command that settles it after the first Series
   2 week is in `docs/operations.md` "Scheduling reliability".
-- **External dispatcher: OPEN operator decision** (review item 2). GitHub drops most of this
+- **External dispatcher: RESOLVED 2026-09-09.** cron-job.org dispatches each bot workflow twice
+  an hour; the jobs, cadence, token and monitoring are in `docs/operations.md` "Scheduling
+  reliability". The entry as it stood while open (review item 2): GitHub drops most of this
   repo's scheduled firings (the measured delivery rate and gap lengths live in
   `docs/operations.md` "Scheduling reliability"). The Mantic workflow runs three crons at
   :05/:15/:25, not six: a pickup after about :30 of a 60-minute window falls under the 1815 s

@@ -76,6 +76,12 @@ Paid or externally visible. Ask before each:
   2026-09-09). The smoke-test cost and GitHub's delivery rate: `docs/operations.md` "GitHub Actions
   workflows" and "Scheduling reliability"; the Mantic cron placement and the fall-2026 credit
   receipts: its "Mantic (Crucible) tournament" and "Fall 2026 season" sections.
+- `make cronjob_dispatch_setup ARGS="--apply"`: creates or changes the live cron-job.org schedule
+  that dispatches the bot workflows, and every firing it adds is a paid, publishing bot run. The
+  bare `make cronjob_dispatch_setup` is a dry run (one read-only GET of the account when
+  `CRONJOB_API_KEY` and `GH_DISPATCH_TOKEN` are set, no request otherwise), and `--enable-mantic`
+  flips the Mantic job on and must wait for `run_bot_on_mantic.yaml` to be on `main`. Detail:
+  `docs/operations.md` "Scheduling reliability".
 - `fetch_diagnostic.yaml` is NOT a bot workflow (`workflow_dispatch`-only, no secrets,
   structurally incapable of spending or publishing), but a dispatch burns Actions minutes and
   probes federal hosts from the runner IP, so ask before dispatching it too.
@@ -107,6 +113,9 @@ Free and safe. Run freely:
   `make supply_probe`, `make supply_probe_mantic` (public Mantic reads; `MANTIC_TOKEN` optional),
   `make benchmark_display`. These hit only the Metaculus API, Mantic's public API and GitHub
   artifacts.
+- `make dispatch_watch` (one `gh run list`, tabulated per bot workflow and UTC day into scheduled
+  versus dispatched runs) and the bare `make cronjob_dispatch_setup` dry run: read-only views of
+  trigger delivery and of the cron-job.org jobs, with no dispatch and no spend.
 - `make check_credits`: reads both OpenRouter key balances.
 - `uv run python scripts/probes/fetch_diagnostic.py`: probes A/B/C are public GETs, and column D
   runs the production ladder but forces its one paid rung (the Gemini `url_context` read) off in

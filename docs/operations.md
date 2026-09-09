@@ -548,7 +548,10 @@ hit nor a hostile page can inflate the install-failed signal.
 | `test_bot_basic.yaml` | manual only (`workflow_dispatch`) | `test_questions` | One-question smoke test; publishes one comment. See below |
 
 The four prod workflows are the only ones with a `schedule:` block; both test
-workflows are `workflow_dispatch` and never fire on their own.
+workflows are `workflow_dispatch` and never fire on their own. Since 2026-09-09 an
+external dispatcher (cron-job.org) also fires the enabled prod workflows twice an hour
+through `workflow_dispatch`, because GitHub delivers only about a fifth of the crons; the
+jobs, their minutes and the monitoring are under "Scheduling reliability" below.
 
 **A `schedule:` block in the YAML is not the same as a workflow that runs.**
 GitHub carries a per-workflow enabled/disabled state that no file in this repo can
@@ -1045,22 +1048,66 @@ hour, while a delivered run that finds nothing new spends nothing because cli pi
 re-spend guard on. The delivered runs also cluster inside good hours, so more cron entries
 buy less than independent drops would imply and cannot cover a multi-hour blackout.
 
-The durable fix is an external dispatcher, because `workflow_dispatch` events are not
-subject to schedule dropping: an always-on cron, or a free Cloudflare Worker cron trigger,
-calling GitHub's workflow-dispatch API at :01 each hour, either through `gh workflow run`
-or through the REST dispatch endpoint with a fine-grained personal access token scoped to
-this repository's Actions. Two options that look like fixes are not: a self-hosted runner
-does not help, because the drops happen in GitHub's scheduler before any runner is
-involved, and running the bot directly on a box loses the artifact pipeline that
-`make sync_all` harvests (`research_outputs/`, `run_logs/`, the 90-day retention). The
-operator is deciding between these; the decision is recorded as open in `FUTURE.md`.
+The fix is an external dispatcher, because `workflow_dispatch` events are not subject to
+schedule dropping, and it went live on 2026-09-09: three cron-job.org jobs call GitHub's
+workflow-dispatch REST endpoint twice an hour, one job per bot workflow. Job 8417341
+dispatches `run_bot_on_tournament.yaml` at :02 and :32 UTC, job 8417342 dispatches
+`run_bot_on_metaculus_cup.yaml` at :12 and :42, and job 8417343 dispatches
+`run_bot_on_mantic.yaml` at :01 and :16. The Mantic job was created disabled, because
+GitHub answers 404 to a dispatch for a workflow file that `main` does not have, and
+`make cronjob_dispatch_setup ARGS="--apply --enable-mantic"` turns it on once the Mantic
+branch has merged. The first firing of each hour sits just ahead of the workflow's first
+cron entry (:02 before :03, :12 before :13, :01 before :05), so when GitHub does deliver
+that cron the dispatched run already holds the workflow's concurrency group and the cron
+run queues behind it, finds nothing new and spends nothing. The six minutes are distinct
+across the three jobs, so two full bot runs never share the runners or the research
+quotas. On Mantic, :01 is the earliest pickup of a window that opens on the hour and :16 a
+second chance inside the first half hour, after which a pickup gets only the fast path.
+Two options that look like fixes are not: a self-hosted runner does not help, because the
+drops happen in GitHub's scheduler before any runner is involved, and running the bot
+directly on a box loses the artifact pipeline that `make sync_all` harvests
+(`research_outputs/`, `run_logs/`, the 90-day retention).
+
+Each job POSTs with a fine-grained GitHub personal access token scoped to this repository
+with Actions read and write only, expiring one year after issue (September 2027). The
+setup script reads it as `GH_DISPATCH_TOKEN` and the cron-job.org key as `CRONJOB_API_KEY`
+from `.env`, and prints neither. GitHub answers a successful dispatch with 204, and
+cron-job.org emails the operator when a job fails, so an expired or revoked token surfaces
+as failure mail rather than as silence; that email is the dead-token monitor.
+`make dispatch_watch` (free, one `gh run list`) is the delivery read: per bot workflow and
+per UTC day, how many `schedule` and `workflow_dispatch` runs arrived and how they
+concluded, against what the cron entries and the two-an-hour dispatcher say should have.
+`make cronjob_dispatch_setup` is the idempotent re-creation path after a token rotation or
+an accidental deletion: it matches the account's jobs by exact title, creates the missing
+ones, patches the ones whose spec differs and leaves the rest alone; the bare target is a
+dry run that prints the payloads with the token redacted and writes nothing, and
+`ARGS="--apply"` is the paid step behind the ask-first gate. The GitHub crons stay in the
+workflow files as the backstop.
+
+The extra firings are safe because of two guards. The workflow-level `concurrency` group
+queues an overlapping run instead of running it in parallel, and the
+skip-previously-forecasted guard, which `cli.py` pins on in every tournament-shaped mode,
+makes a run that finds no new question spend nothing. Since 2026-09-09 that guard fails
+shut. The framework derives `already_forecasted` inside a blanket except that answers
+False, so a list payload with no `my_forecasts` field would have read every question as
+never forecast and re-published the whole tournament on every firing. Such a question is
+now dropped before any spend, with one
+`SKIP_GUARD_UNREADABLE: question=<id> post_id=<id> platform=<metaculus|mantic> reason=my_forecasts_missing`
+WARNING per post and a count line. When it fires, the list read lost `with_cp=true`, which
+is what puts the field on the list page, or the platform token (`METACULUS_TOKEN`, or
+`MANTIC_TOKEN` on Mantic, whose public list lacks the field entirely), or the API changed
+shape. Check the run's environment and the token, and read one post by hand with
+`?with_cp=true` to see whether the field is back. Nothing was double-forecast, and the
+dropped questions are picked up by the next firing once the field reads again. A present
+field with an empty history is a never-forecast question and stays eligible. The marker
+is registered in `scripts/telemetry/markers.py`, so the drops outlive the log expiry.
 
 GitHub runs a new scheduled workflow as soon as its file is on the default branch, so
 merging the branch to `main` starts the hourly crons with no further UI step. The
 per-workflow enabled state only ever bites a workflow someone has disabled in the Actions
 UI, and today that is minibench alone (see "GitHub Actions workflows" above).
 
-The instrument that settles the cadence question is `make supply_probe_mantic` (free,
+The instrument that checks the cadence is `make supply_probe_mantic` (free,
 read-only; `ARGS="--slugs <series-2-slug> --output scratch/mantic_supply_$(date -u +%Y%m%d).json"`
 after the first Series 2 week). It pages the tournament's open, closed and resolved posts,
 sweeps the closed and resolved ones for forfeits, classifying each as forecast, no_forecast or
@@ -1152,10 +1199,12 @@ Operator steps, in order:
 2. Fire the per-bin smoke once, `make run_mantic_one POST=651` (about $3, publishes), and
    check the five points above.
 3. Merge to `main`. The schedule is live from that moment; there is nothing to
-   enable in the Actions UI.
+   enable in the Actions UI. Then enable the Mantic dispatcher job with
+   `make cronjob_dispatch_setup ARGS="--apply --enable-mantic"` (paid, ask-first; see
+   "Scheduling reliability" above).
 4. When Series 2 opens, update `MANTIC_TOURNAMENT_ID` and `MANTIC_TOURNAMENT_END_DATE`;
    the "Series 2 discovery" and "Stale slug goes red" checks above are what flag the
-   hand-over. Then take the cadence decision described under "Scheduling reliability".
+   hand-over.
 
 ## Cost discipline
 
@@ -1226,6 +1275,10 @@ The paid run is the operator's last step.
   Metaculus for every other bot workflow and competitions.mantic.com for
   `run_bot_on_mantic.yaml`. See the workflow table above for triggers, and the
   smoke-test subsection there for the one-question variant.
+- `make cronjob_dispatch_setup ARGS="--apply"`: creates or changes the live cron-job.org
+  jobs that dispatch the bot workflows, so every firing it adds is a paid, publishing bot
+  run; `--enable-mantic` turns the Mantic job on and waits for `run_bot_on_mantic.yaml` to
+  be on `main`. See "Scheduling reliability" above.
 - Any script that invokes a research provider or the ensemble against real
   questions, including one an agent writes on the spot.
 
@@ -1245,6 +1298,10 @@ The paid run is the operator's last step.
   see "Scheduling reliability" above).
 - `make ablation_score`: `--stages score` hydrates every artifact off disk
   (`_hydrate_working_set_from_cache`) and makes no provider call.
+- `make dispatch_watch`: one `gh run list`, tabulated per bot workflow and UTC day into
+  scheduled versus dispatched runs. The bare `make cronjob_dispatch_setup` is a dry run:
+  one read-only GET of the cron-job.org account when both secrets are set, no request at
+  all otherwise, and never a write.
 - `make benchmark_display`: views saved benchmark results, no forecasting.
 - `make check_credits`: reads the `/auth/key` balance for both OpenRouter keys.
 
@@ -2044,6 +2101,14 @@ the telemetry markers:
   tightest close first before the cap, so the posts named are the latest-closing ones
   left behind; on Mantic, which opens an hour's batch at once, each is a real forfeit,
   and the marker is registered so the loss outlives the 90-day log expiry.
+- `SKIP_GUARD_UNREADABLE: question=<id> post_id=<id> platform=<metaculus|mantic>
+  reason=my_forecasts_missing`: one WARNING per question, from `forecast_questions`
+  (`forecaster.py`), when the skip-previously-forecasted guard could not read the
+  `my_forecasts` field it derives "already forecast" from, so the question was dropped
+  before any spend rather than treated as new; a count line follows. It means the list
+  read lost `with_cp=true` or the platform token, or the API changed shape. Nothing was
+  double-forecast, and the next firing picks the question up once the field reads again.
+  What to check is under "Scheduling reliability" above.
 - `Degradation counters: forecasters_dropped=..., questions_failed_to_publish=...,
   stacker_primary_failed=..., stacker_fallback_used=...,
   stacker_fallback_failed=..., research_provider_failures=...,
