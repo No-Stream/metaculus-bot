@@ -12,19 +12,30 @@ research="r")`` calls elsewhere are deliberately left as they are.
 """
 
 import re
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
+from forecasting_tools.data_models.questions import DateQuestion
+
+from metaculus_bot.constants import MANTIC_HOST, METACULUS_HOST
+from metaculus_bot.numeric.date_axis import as_epoch_question
+from metaculus_bot.numeric.utils import bound_messages
 from metaculus_bot.prompts import (
     MARKET_SNAPSHOT_SECTION_HEADER,
     asknews_summarizer_prompt,
     binary_prompt,
+    date_prompt,
     multiple_choice_prompt,
     numeric_prompt,
     stacking_binary_prompt,
     stacking_multiple_choice_prompt,
     stacking_numeric_prompt,
 )
+from tests.mantic_fakes import DATE_POST_ID, load_preseason_posts
+
+# One page URL per platform, so a test can build the same stub as a Metaculus or a Mantic question.
+METACULUS_PAGE_URL = f"https://www.{METACULUS_HOST}/questions/1/"
+MANTIC_PAGE_URL = f"https://{MANTIC_HOST}/questions/1/"
 
 # Research that carries a rendered prediction-market section. The market clause in the three
 # forecaster prompts is gated on this header (see ``tests/prompts/test_research_clauses.py``),
@@ -44,6 +55,13 @@ def _binary_q(
     q.fine_print = "fp"
     q.open_time = open_time if open_time is not None else datetime.now() - timedelta(days=30)
     q.scheduled_resolution_time = resolve_time if resolve_time is not None else datetime.now() + timedelta(days=365)
+    # A Metaculus question with no platform-specific flags. Both are read by the prompts: the
+    # platform off ``page_url``'s host, and Mantic's per-question flags (``multi_resolution``,
+    # ``precision``, ``date_granularity``) off ``api_json["question"]``. Left as MagicMocks, the
+    # first would raise inside ``urlparse`` and the second would render every Mantic clause,
+    # since a MagicMock attribute chain is truthy.
+    q.page_url = METACULUS_PAGE_URL
+    q.api_json = {"question": {}}
     return q
 
 
@@ -59,6 +77,60 @@ def _numeric_q(**kwargs) -> MagicMock:
     q.lower_bound = 0
     q.upper_bound = 1000
     return q
+
+
+def _date_q() -> DateQuestion:
+    """The recorded Mantic post 651: a closed 12-bin, day-granularity date question, as the API sent it.
+
+    A real ``DateQuestion`` rather than a MagicMock because ``date_prompt`` builds the epoch view
+    through ``numeric.date_axis.as_epoch_question``, which reads the API's ``scaling`` block.
+    """
+    post = next(post for post in load_preseason_posts() if post["id"] == DATE_POST_ID)
+    return DateQuestion.from_metaculus_api_json(post)
+
+
+def _open_upper_date_q() -> DateQuestion:
+    """The modal live Mantic date shape: a legacy fine-grid "when will X happen" question, open above.
+
+    Granularity empty (the platform sends ``""`` on 50 of 51 live date questions), 201-point CDF,
+    closed lower bound at the question open and an OPEN upper bound, which is where 101 of 188
+    Series 1 date questions resolved.
+    """
+    lower = datetime(2026, 9, 1, tzinfo=UTC)
+    upper = datetime(2027, 3, 1, tzinfo=UTC)
+    return DateQuestion(
+        id_of_question=777,
+        id_of_post=777,
+        page_url=MANTIC_PAGE_URL,
+        question_text="When will X happen?",
+        background_info="bg",
+        resolution_criteria="rc",
+        fine_print="fp",
+        published_time=None,
+        close_time=None,
+        open_time=datetime.now(UTC) - timedelta(days=30),
+        scheduled_resolution_time=datetime.now(UTC) + timedelta(days=365),
+        lower_bound=lower,
+        upper_bound=upper,
+        open_lower_bound=False,
+        open_upper_bound=True,
+        zero_point=None,
+        cdf_size=201,
+        api_json={
+            "question": {
+                "date_granularity": "",
+                "inbound_outcome_count": 200,
+                "scaling": {"nominal_min": lower.timestamp(), "nominal_max": upper.timestamp()},
+            }
+        },
+    )
+
+
+def _date_prompt_text(question: DateQuestion | None = None, research: str = "r") -> str:
+    """``date_prompt`` on ``question`` (default post 651) with its real, date-rendered bound messages."""
+    q = question if question is not None else _date_q()
+    upper_message, lower_message = bound_messages(as_epoch_question(q))
+    return date_prompt(q, research=research, lower_bound_message=lower_message, upper_bound_message=upper_message)
 
 
 def _flat(text: str) -> str:

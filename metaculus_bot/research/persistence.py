@@ -5,14 +5,13 @@ import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
+from metaculus_bot.constants import PLATFORM_MANTIC, PLATFORM_METACULUS
+
 logger = logging.getLogger(__name__)
 
 RESEARCH_SCHEMA_VERSION = 2
 
-# The ``platform`` vocabulary: which question platform a record's ids and page_url belong to.
-# Data-contract tokens (the archive keys off the exact spelling); add, never re-spell.
-PLATFORM_METACULUS = "metaculus"
-PLATFORM_MANTIC = "mantic"
+__all__ = ["PLATFORM_MANTIC", "PLATFORM_METACULUS", "RESEARCH_SCHEMA_VERSION", "ResearchPersistenceWriter"]
 
 
 class ResearchPersistenceWriter:

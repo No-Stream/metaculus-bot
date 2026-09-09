@@ -43,12 +43,15 @@ import litellm
 import pytest
 from forecasting_tools import GeneralLlm, MetaculusApi
 
+from metaculus_bot import mantic as mantic_module
 from metaculus_bot.aggregation_pipeline import AggregationPipeline
 from metaculus_bot.aggregation_strategies import AggregationStrategy
+from metaculus_bot.api_preflight import ApiIdentityError
 from metaculus_bot.cli import (
     CliArgs,
     RunMode,
     _assert_personal_keys_only,
+    _check_tournament_dates,
     _configure_process,
     _forecast_with_callback_drain,
     _parse_cli_args,
@@ -68,6 +71,7 @@ from metaculus_bot.constants import (
     PERSIST_RESEARCH_ENABLED_ENV,
     PROVIDER_DEGRADATION_SUPPRESSED_UNTIL,
     TOURNAMENT_ID,
+    TournamentExpiredError,
     credit_alerts_active,
 )
 from metaculus_bot.credit_telemetry import DonatedKeyState, RoleSpendTracker, reset_donated_key_state_cache
@@ -77,7 +81,7 @@ from metaculus_bot.fallback_openrouter import (
     reset_generic_key_fallback_count,
 )
 from metaculus_bot.forecaster import TemplateForecaster
-from metaculus_bot.mantic import ManticClient
+from metaculus_bot.mantic import ManticClient, reset_post_drop_count
 from metaculus_bot.research.provider_health import (
     VENUE_EXPECTED_LIQUIDITY_FIELDS,
     VenueObservation,
@@ -141,6 +145,7 @@ def _reset_fallback_counters() -> None:
     reset_credit_key_fallback_count()
     reset_donated_key_state_cache()
     reset_provider_health()
+    reset_post_drop_count()
 
 
 @contextmanager
@@ -149,6 +154,7 @@ def _cli_main_test_mode(
     *,
     donated_below_floor: bool = False,
     fall_cup_reminder: bool = False,
+    tournament_stale: bool = False,
     today: date | None = None,
     stub_bot: MagicMock | None = None,
     mode: str = "test_questions",
@@ -180,6 +186,9 @@ def _cli_main_test_mode(
     the run-mode-dependent tests (the research archive's ``tournament_id`` label) pass
     the mode they are about. ``only_posts`` is the raw ``--only-posts`` value, when a test
     puts that flag on argv too.
+
+    ``tournament_stale`` is the verdict of the stale-slug check, which reads the real clock in
+    prod and whose verdict reddens a Mantic run; pinned the way the fall-cup reminder is.
     """
     if stub_bot is None:
         stub_bot = MagicMock()
@@ -215,7 +224,7 @@ def _cli_main_test_mode(
             # exit-status wiring, not the hardening install (covered by its own tests).
             patch("metaculus_bot.cli.apply_publish_hardening"),
             patch("metaculus_bot.cli.apply_fetch_hardening"),
-            patch("metaculus_bot.cli.check_tournament_dates"),
+            patch("metaculus_bot.cli.check_tournament_dates", return_value=tournament_stale),
             # Pin the fall-cup reminder the same way as credit_alerts_active: it reads
             # the real clock in prod, and left unpinned it would flip this whole suite
             # red from FALL_CUP_REMINDER_DATE. The one test allowed to read the real
@@ -227,6 +236,9 @@ def _cli_main_test_mode(
             # (their own behavior is covered in test_api_preflight.py).
             patch("metaculus_bot.cli.verify_metaculus_api_identity"),
             patch("metaculus_bot.cli.verify_api_identity"),
+            # The Mantic tournament preflight is an authenticated GET on the real client main
+            # builds in mantic mode; its own behavior is covered in test_mantic_robustness.py.
+            patch("metaculus_bot.cli.preflight_mantic_tournaments"),
             # Patch log_report_summary: a classmethod on TemplateForecaster that
             # iterates forecast_reports. Our stub returns []; patch the method
             # anyway to keep the test surface small.
@@ -342,6 +354,33 @@ class TestCliExitStatus:
         with _cli_main_test_mode(alertable_count=0):
             # Must NOT raise SystemExit.
             cli_main()
+
+    def test_a_dropped_mantic_post_alone_triggers_sys_exit_1(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The Mantic parse-drop counter (mantic.py) is folded into ``alertable`` like the key fallback.
+
+        The framework's per-post loop swallows a parse failure as a warning, so the counter is the
+        only thing that turns a forfeited post into a red run. The breakdown names the term so a
+        reader can see why ``alertable`` is 1 with bot=0 and no key fallback; the counter itself is
+        read through ``get_post_drop_count`` because ``_configure_process`` resets it at startup,
+        before the fetch that bumps it in prod.
+        """
+        with (
+            _cli_main_test_mode(alertable_count=0),
+            patch("metaculus_bot.cli.get_post_drop_count", return_value=1),
+            caplog.at_level(logging.WARNING, logger="metaculus_bot.cli"),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                cli_main()
+            assert exc_info.value.code == 1
+        [summary] = [r.getMessage() for r in caplog.records if "alertable degradation event" in r.getMessage()]
+        assert "with 1 alertable" in summary
+        assert summary.endswith("credit=0, mantic_post_drops=1); exiting non-zero so CI marks this run red."), summary
+
+    def test_the_mantic_drop_term_is_absent_when_nothing_was_dropped(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Rendered only when it applies, so the registry's optional group and the reader agree."""
+        with _cli_main_test_mode(alertable_count=0), caplog.at_level(logging.INFO, logger="metaculus_bot.cli"):
+            cli_main()
+        assert "mantic_post_drops" not in caplog.text
 
 
 class TestCliCreditFloor:
@@ -469,7 +508,6 @@ class TestCliRoleSpendWiring:
 
         with (
             patch("metaculus_bot.cli.MetaculusApi", MagicMock()),
-            patch("metaculus_bot.cli.check_tournament_dates"),
             patch("metaculus_bot.cli.drain_litellm_callbacks", drained),
         ):
             assert _run_forecasts(bot, run_mode) == ["report"]
@@ -494,7 +532,6 @@ class TestCliRoleSpendWiring:
         drained = AsyncMock()
 
         with (
-            patch("metaculus_bot.cli.check_tournament_dates"),
             patch("metaculus_bot.cli.drain_litellm_callbacks", drained),
             pytest.raises(RuntimeError, match="forecasting blew up"),
         ):
@@ -529,6 +566,42 @@ class TestCliFallCupReminderExit:
 
     def test_no_reminder_returns_normally(self) -> None:
         with _cli_main_test_mode(alertable_count=0, fall_cup_reminder=False):
+            cli_main()
+
+
+class TestCliManticStaleSlugExit:
+    """A Mantic slug past its end date reddens the run the way the fall-cup reminder does.
+
+    ``check_tournament_dates`` warns for TOURNAMENT_HARD_STOP_WEEKS before it raises, and a
+    zero-question run is green, so once Preseason 2 closes every scheduled run would stay green
+    and silent for two weeks while a Series 2 slug went unforecast (edge review item 5). The
+    verdict is held at startup and turned into a non-zero exit AFTER publishing; the shared hard
+    stop is untouched, and the Metaculus tournament keeps the warning advisory.
+    """
+
+    def test_a_stale_mantic_slug_publishes_first_then_exits_non_zero(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        _mantic_env(monkeypatch)
+        with (
+            caplog.at_level(logging.INFO, logger="metaculus_bot.cli"),
+            _cli_main_test_mode(alertable_count=0, mode="mantic", tournament_stale=True) as telemetry,
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                cli_main()
+            assert exc_info.value.code == 1
+            telemetry.log_start.assert_called_once()
+            telemetry.log_end_and_check_floor.assert_called_once()
+        assert "Run completed clean" not in caplog.text
+        assert "re-point MANTIC_TOURNAMENT_ID" in caplog.text
+
+    def test_a_current_mantic_slug_returns_normally(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _mantic_env(monkeypatch)
+        with _cli_main_test_mode(alertable_count=0, mode="mantic", tournament_stale=False):
+            cli_main()
+
+    def test_a_stale_metaculus_tournament_stays_advisory(self) -> None:
+        with _cli_main_test_mode(alertable_count=0, mode="tournament", tournament_stale=True):
             cli_main()
 
 
@@ -870,29 +943,74 @@ class TestConfigureProcess:
         stubs["publish_hardening"].assert_called_once_with()
         stubs["fetch_hardening"].assert_called_once_with()
 
+    @pytest.mark.parametrize("run_mode", get_args(RunMode))
+    def test_the_mantic_parse_drop_counter_is_reset_at_startup(
+        self, run_mode: RunMode, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Reset here rather than in forecast_questions, whose resets run AFTER the fetch that bumps it."""
+        _mantic_env(monkeypatch)
+        mantic_module._post_drop_count = 3
+        with _configure_process_stubs():
+            _configure_process(run_mode)
+        assert mantic_module.get_post_drop_count() == 0
+
 
 class TestManticQuestionSource:
-    """``--mode mantic`` mirrors the tournament mode over the Mantic slug: the stale-date check on
-    the Mantic dates, the re-spend guard on, and the forecast over ``MANTIC_TOURNAMENT_ID``."""
+    """``--mode mantic`` mirrors the tournament mode over the Mantic slug: the re-spend guard on and
+    the forecast over ``MANTIC_TOURNAMENT_ID``. The stale-date check runs at startup (next class)."""
 
     def test_mantic_mode_forecasts_the_mantic_tournament(self) -> None:
         bot = MagicMock()
         bot.skip_previously_forecasted_questions = False
         bot.forecast_on_tournament = AsyncMock(return_value=["report"])
 
-        with (
-            patch("metaculus_bot.cli.check_tournament_dates") as check_dates,
-            patch("metaculus_bot.cli.drain_litellm_callbacks", AsyncMock()),
-        ):
+        with patch("metaculus_bot.cli.drain_litellm_callbacks", AsyncMock()):
             assert _run_forecasts(bot, "mantic") == ["report"]
 
+        bot.forecast_on_tournament.assert_awaited_once_with(MANTIC_TOURNAMENT_ID, return_exceptions=True)
+        assert bot.skip_previously_forecasted_questions is True
+
+
+class TestTournamentDateCheck:
+    """The stale-slug check runs once at startup, per mode, and only the Mantic verdict is held.
+
+    ``check_tournament_dates`` warns for TOURNAMENT_HARD_STOP_WEEKS before it raises, and a
+    zero-question run is green, so on Mantic the fortnight between the two was a silent forfeit
+    of every Series 2 question (edge review item 5). The Metaculus tournament keeps the warning
+    advisory: its questions are open for weeks. ``TestCliManticStaleSlugExit`` pins what main
+    does with the verdict.
+    """
+
+    def test_mantic_mode_checks_the_mantic_dates_and_returns_the_verdict(self) -> None:
+        with patch("metaculus_bot.cli.check_tournament_dates", return_value=True) as check_dates:
+            assert _check_tournament_dates("mantic") is True
         check_dates.assert_called_once_with(
             logging.getLogger("metaculus_bot.cli"),
             tournament_id=MANTIC_TOURNAMENT_ID,
             end_date_str=MANTIC_TOURNAMENT_END_DATE,
         )
-        bot.forecast_on_tournament.assert_awaited_once_with(MANTIC_TOURNAMENT_ID, return_exceptions=True)
-        assert bot.skip_previously_forecasted_questions is True
+
+    def test_tournament_mode_checks_the_metaculus_dates_but_stays_advisory(self) -> None:
+        with patch("metaculus_bot.cli.check_tournament_dates", return_value=True) as check_dates:
+            assert _check_tournament_dates("tournament") is False
+        check_dates.assert_called_once_with(logging.getLogger("metaculus_bot.cli"))
+
+    @pytest.mark.parametrize("run_mode", ["minibench", "quarterly_cup", "metaculus_cup", "test_questions"])
+    def test_undated_modes_check_nothing(self, run_mode: RunMode) -> None:
+        with patch("metaculus_bot.cli.check_tournament_dates") as check_dates:
+            assert _check_tournament_dates(run_mode) is False
+        check_dates.assert_not_called()
+
+    def test_the_shared_hard_stop_still_raises_before_the_forecaster_is_built(self) -> None:
+        forecaster_class = MagicMock()
+        with (
+            _cli_main_test_mode(alertable_count=0, mode="tournament"),
+            patch("metaculus_bot.cli.TemplateForecaster", forecaster_class),
+            patch("metaculus_bot.cli.check_tournament_dates", side_effect=TournamentExpiredError("stale")),
+            pytest.raises(TournamentExpiredError),
+        ):
+            cli_main()
+        forecaster_class.assert_not_called()
 
 
 def _open_question(post_id: int) -> MagicMock:
@@ -1136,6 +1254,56 @@ class TestManticClientWiring:
             for name in ("guard", "verify_api_identity", "build_mantic_client", "TemplateForecaster")
         ]
         assert order == sorted(order), call_names
+
+    def test_the_tournament_preflight_runs_on_the_built_client_before_the_forecaster(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Ordered like the test above: client built (token read), then the authenticated tournament
+        GET on THAT client, then the forecaster. Nothing has been spent when the preflight raises."""
+        _mantic_env(monkeypatch)
+        manager = MagicMock()
+        forecaster_class = self._forecaster_class()
+        with (
+            _cli_main_test_mode(alertable_count=0, mode="mantic"),
+            patch("metaculus_bot.cli.TemplateForecaster", forecaster_class),
+            patch("metaculus_bot.cli.build_mantic_client") as build_client,
+            patch("metaculus_bot.cli.preflight_mantic_tournaments") as preflight,
+        ):
+            manager.attach_mock(build_client, "build_mantic_client")
+            manager.attach_mock(preflight, "preflight_mantic_tournaments")
+            manager.attach_mock(forecaster_class, "TemplateForecaster")
+            cli_main()
+
+        call_names = [name for name, _, _ in manager.mock_calls]
+        order = [
+            call_names.index(name)
+            for name in ("build_mantic_client", "preflight_mantic_tournaments", "TemplateForecaster")
+        ]
+        assert order == sorted(order), call_names
+        preflight.assert_called_once_with(build_client.return_value, MANTIC_TOURNAMENT_ID)
+
+    def test_a_failed_tournament_preflight_stops_before_the_forecaster_is_built(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _mantic_env(monkeypatch)
+        forecaster_class = self._forecaster_class()
+        with (
+            _cli_main_test_mode(alertable_count=0, mode="mantic"),
+            patch("metaculus_bot.cli.TemplateForecaster", forecaster_class),
+            patch("metaculus_bot.cli.preflight_mantic_tournaments", side_effect=ApiIdentityError("viewer")),
+            pytest.raises(ApiIdentityError, match="viewer"),
+        ):
+            cli_main()
+        forecaster_class.assert_not_called()
+
+    @pytest.mark.parametrize("run_mode", sorted(set(get_args(RunMode)) - {"mantic"}))
+    def test_metaculus_modes_never_run_the_tournament_preflight(self, run_mode: RunMode) -> None:
+        with (
+            _cli_main_test_mode(alertable_count=0, mode=run_mode),
+            patch("metaculus_bot.cli.preflight_mantic_tournaments") as preflight,
+        ):
+            cli_main()
+        preflight.assert_not_called()
 
 
 class TestCliCreditAlertSuppression:

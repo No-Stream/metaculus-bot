@@ -24,6 +24,7 @@ from forecasting_tools import (
     clean_indents,
 )
 from forecasting_tools.ai_models.ai_utils.openai_utils import VisionMessageData
+from forecasting_tools.data_models.questions import DateQuestion
 from pydantic import ValidationError
 
 from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN, FORECASTER_SOFT_DEADLINE
@@ -33,18 +34,20 @@ from metaculus_bot.member_forecast import (
     MEMBER_FORECAST_ROLE_MEMBER,
     format_member_forecast_marker,
     option_vector,
+    out_of_range_mass,
     percentile_pairs,
 )
 from metaculus_bot.numeric.config import EXPECTED_PERCENTILE_COUNT, STANDARD_PERCENTILES_CSV
+from metaculus_bot.numeric.date_axis import EpochDateQuestion, as_epoch_question, format_epoch, numeric_qtype
 from metaculus_bot.numeric.diagnostics import log_final_prediction, log_open_bound_piling_diagnostics
 from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
 from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
 from metaculus_bot.numeric.utils import bound_messages, clamp_and_renormalize_mc
 from metaculus_bot.numeric.validation import detect_unit_mismatch
-from metaculus_bot.prompts import binary_prompt, multiple_choice_prompt, numeric_prompt
+from metaculus_bot.prompts import binary_prompt, date_prompt, multiple_choice_prompt, numeric_prompt
 from metaculus_bot.structured_output_schema import NumericStructured, parse_structured_block
 from metaculus_bot.structured_parse import parse_structured
-from metaculus_bot.value_extraction import extract_binary, extract_mc, extract_numeric
+from metaculus_bot.value_extraction import extract_binary, extract_date, extract_mc, extract_numeric
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +124,49 @@ def build_parse_notes(question: NumericQuestion) -> str:
         f"{question.upper_bound}] — use it only to infer scale, not as a constraint. "
         f"{lower_note} {upper_note} "
         "If your text uses B/M/k, convert numerically to base unit (e.g., 350B → 350000000000). No suffixes."
+    )
+
+
+def build_date_parse_notes(question: EpochDateQuestion) -> str:
+    """The parser LLM's extraction instructions for a date question.
+
+    The date sibling of ``build_parse_notes``, with the same one job (EXTRACT the declared
+    dates, never interpret them) and the same open-versus-closed distinction, which matters
+    MORE here: an open upper bound is the norm on a date question, and a date after it is the
+    forecaster saying "it may not happen inside the window at all", so it must be kept verbatim.
+    The value format is strict ISO-8601 in UTC: a bare year or a year-month is ambiguous on a
+    day grid and is refused rather than guessed.
+    """
+    granularity = question.date_granularity
+    lower_label = format_epoch(question.lower_bound, granularity)
+    upper_label = format_epoch(question.upper_bound, granularity)
+
+    if question.open_lower_bound:
+        lower_note = (
+            f"The lower bound {lower_label} is only the start of the displayed range; the outcome can resolve "
+            f"before it. If the forecaster's text states a date before {lower_label}, extract that date "
+            "verbatim — never move it later into range."
+        )
+    else:
+        lower_note = f"Dates are at or after the lower bound {lower_label}."
+
+    if question.open_upper_bound:
+        upper_note = (
+            f"The upper bound {upper_label} is only the end of the displayed range; the outcome can resolve "
+            f"after it, which is how the forecaster says the event may not happen inside the window. If the "
+            f"forecaster's text states a date after {upper_label}, extract that date verbatim — never move it "
+            "earlier into range."
+        )
+    else:
+        upper_note = f"Dates are at or before the upper bound {upper_label}."
+
+    return (
+        f"Return exactly these {EXPECTED_PERCENTILE_COUNT} percentiles and no others: {STANDARD_PERCENTILES_CSV}. "
+        "Do not include 0 or 100. Use keys 'percentile' (decimal in [0,1]) and 'value' (an ISO-8601 string in "
+        "UTC: 'YYYY-MM-DD' for a calendar day, or 'YYYY-MM-DDTHH:MM:SSZ' when the forecaster gave a time). "
+        "Never return a bare year, a year-month or a number; if the forecaster named only a month, use the date "
+        f"they most plausibly meant within it. The displayed range is [{lower_label}, {upper_label}] — use it only "
+        f"to read which century and year the forecaster means, not as a constraint. {lower_note} {upper_note}"
     )
 
 
@@ -269,6 +315,45 @@ async def run_numeric_forecast(
     return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning), discrete_vote
 
 
+async def run_date_forecast(
+    question: DateQuestion,
+    research: str,
+    forecaster_llm: GeneralLlm,
+    parser_llm: GeneralLlm,
+    *,
+    chart_b64: str | None = None,
+) -> ReasonedPrediction[NumericDistribution]:
+    """Run a date forecast: the numeric runner on the question's epoch-seconds view.
+
+    The prompt and the parse notes read as dates; the extracted percentiles are epoch seconds
+    and go through the SAME guarded numeric build as a numeric question, on the adapter
+    (``numeric.date_axis.as_epoch_question``), so the published distribution carries
+    ``is_date`` and the comment renders dates. No discrete-integer vote: integer snapping on an
+    epoch axis is meaningless.
+    """
+    epoch_question = as_epoch_question(question)
+    upper_bound_message, lower_bound_message = bound_messages(epoch_question)
+    prompt = date_prompt(epoch_question, research, lower_bound_message, upper_bound_message)
+    forecaster_input = _forecaster_input(prompt, chart_b64)
+    # Broad, 30s-gated retry — see run_binary_forecast for the rationale.
+    reasoning = await invoke_with_broad_retry(
+        lambda: forecaster_llm.invoke(forecaster_input),
+        wall_timeout=FORECASTER_SOFT_DEADLINE,
+        label="forecaster_date",
+    )
+    _log_llm_output(forecaster_llm.model, question.id_of_question, reasoning)
+
+    outcome = await extract_date(
+        reasoning,
+        parser_llm,
+        prompt_notes=build_date_parse_notes(epoch_question),
+        question_id=question.id_of_question,
+        model_name=forecaster_llm.model,
+    )
+    prediction = _build_guarded_numeric_distribution(outcome.value, epoch_question, forecaster_llm)
+    return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
+
+
 async def _resolve_discrete_vote(
     reasoning: str, parser_llm: GeneralLlm, forecaster_llm: GeneralLlm, qid: int | None
 ) -> bool | None:
@@ -320,25 +405,30 @@ def _build_guarded_numeric_distribution(
 ) -> NumericDistribution:
     """Sanitize -> build the PCHIP CDF -> withhold on a unit mismatch.
 
+    Shared by the numeric and date runners: on a date question ``question`` is the epoch-seconds
+    adapter, which is what makes the MEMBER_FORECAST line read ``qtype=date`` and the built
+    distribution carry ``is_date``. The line is emitted after the build so it can report the
+    CDF's out-of-range mass, and before the guard so a withheld member still leaves it.
+
     The unit-mismatch guard fails SHUT: it raises rather than returning a distribution, so an
     order-of-magnitude error can never reach publish.
     """
     sanitized_percentiles, zero_point = sanitize_percentiles(
         declared_percentiles, question, model_name=forecaster_llm.model
     )
+    prediction = build_numeric_distribution(
+        sanitized_percentiles, question, zero_point, model_name=forecaster_llm.model
+    )
     logger.info(
         format_member_forecast_marker(
             question_id=question.id_of_question,
             model=forecaster_llm.model,
             role=MEMBER_FORECAST_ROLE_MEMBER,
-            qtype="numeric",
+            qtype=numeric_qtype(question),
             raw=percentile_pairs(declared_percentiles),
             published=percentile_pairs(sanitized_percentiles),
+            out_of_range=out_of_range_mass(prediction),
         )
-    )
-
-    prediction = build_numeric_distribution(
-        sanitized_percentiles, question, zero_point, model_name=forecaster_llm.model
     )
 
     mismatch, reason = detect_unit_mismatch(sanitized_percentiles, question)

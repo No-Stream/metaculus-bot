@@ -664,6 +664,7 @@ class TestTightestCloseFirstOrdering:
         question = MagicMock(spec=BinaryQuestion)
         question.already_forecasted = False
         question.id_of_question = qid
+        question.id_of_post = qid  # the cap WARNING names the posts it drops
         question.close_time = datetime.now(UTC) + close_in if close_in is not None else None
         return question
 

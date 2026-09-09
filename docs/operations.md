@@ -542,7 +542,7 @@ hit nor a hostile page can inflate the install-failed signal.
 | `run_bot_on_tournament.yaml` | cron at :03/:23/:43 hourly, plus manual | `tournament` | Forecasts new questions in the current AI benchmark tournament (`TOURNAMENT_ID` in `constants.py`); publishes to Metaculus |
 | `run_bot_on_minibench.yaml` | cron at :08/:38 hourly in the YAML, but the workflow is disabled on GitHub — see below | `minibench` | Forecasts the current MiniBench question set; publishes |
 | `run_bot_on_metaculus_cup.yaml` | cron at :13/:33/:53 hourly, plus manual | `metaculus_cup` | Forecasts open Metaculus Cup questions (`METACULUS_CUP_ID` in `constants.py`, the season's dated slug); publishes |
-| `run_bot_on_mantic.yaml` | cron at :17/:47 hourly, plus manual | `mantic` | Forecasts open questions in the Mantic Crucible tournament (`MANTIC_TOURNAMENT_ID` in `constants.py`) on the operator's personal keys only; publishes to competitions.mantic.com. See "Mantic" below |
+| `run_bot_on_mantic.yaml` | cron at :05/:15/:25 hourly, plus manual | `mantic` | Forecasts open questions in the Mantic Crucible tournament (`MANTIC_TOURNAMENT_ID` in `constants.py`) on the operator's personal keys only; publishes to competitions.mantic.com. See "Mantic" below |
 | `test_bot.yaml` | manual only (`workflow_dispatch`) | `test_questions` | Runs a fixed handful of example questions end-to-end in prod mode; publishes comments |
 | `test_bot_basic.yaml` | manual only (`workflow_dispatch`) | `test_questions` | One-question smoke test; publishes one comment. See below |
 
@@ -707,7 +707,14 @@ resolutions. Series 1 windows were exactly one hour long, opened on the hour, wi
 up to three questions per hour. The Series 2 cadence is unannounced. Forecast every
 question: a miss costs more than a poor forecast under that scoring. When Series 2
 opens, re-point `MANTIC_TOURNAMENT_ID` and `MANTIC_TOURNAMENT_END_DATE` in
-`constants.py`; an unknown slug answers HTTP 400.
+`constants.py`; an unknown slug answers HTTP 400 on the posts list and 404 on the
+tournament route. Two things make that hand-over hard to miss (both from the 2026-09-08
+readiness review, item 5): every Mantic run logs a `MANTIC_TOURNAMENTS` line naming the
+ongoing bots-only tournaments on the API, at WARNING when one is not the configured slug,
+and from the day after `MANTIC_TOURNAMENT_END_DATE` every Mantic run exits non-zero after
+publishing, because a zero-question run is otherwise green and the shared two-week hard
+stop would have kept the preseason's dead slug green and silent while Series 2 questions
+opened and closed unforecast.
 
 ### How the mode works
 
@@ -782,11 +789,131 @@ Three Metaculus-shaped guards were generalized rather than bypassed.
   as blog.mantic.com, stays fetchable as an outside source. The function name and
   the `metaculus_self_ref` status token are unchanged, as data contracts.
 
-`check_tournament_dates` runs with the Mantic slug and end date.
+`check_tournament_dates` runs with the Mantic slug and end date, and in mantic mode its
+verdict is alertable (below).
 
-Date questions are Phase 2 and are not forecast yet; the bot's type guard skips
-them, so the preseason's date question is left alone. The plan is in
-`scratch_docs_and_planning/mantic_integration_plan_2026-09-08.md`.
+### Startup checks and robustness rules
+
+Five rules from the 2026-09-08 readiness review
+(`scratch_docs_and_planning/mantic_research_2026-09-08/edge_case_report.md`) sit between the
+identity preflight and the first paid call. Every one is free.
+
+- **Forecast-permission preflight** (review item 20). After `build_mantic_client()` and before
+  the forecaster is built, `mantic.preflight_mantic_tournaments` makes ONE authenticated GET of
+  `/api/projects/tournaments/` and raises `ApiIdentityError` unless the configured slug is on
+  the list with a `user_permission` that allows forecasting: `forecaster`, `curator`, `admin`
+  or `creator`, the Metaculus backend's `ObjectPermission` vocabulary (the live token reads
+  `forecaster`). A token that may only view reads the tournament fine and would otherwise
+  research and forecast every question and fail at the publish POST, hourly, at about $2.60 a
+  question. Because the GET is authenticated, a revoked or mistyped token fails here with a
+  401 too, which the unauthenticated identity preflight cannot see. Not retried, like the
+  identity preflight: the next cron is the retry.
+- **Series 2 discovery** (item 5). The same response logs
+  `MANTIC_TOURNAMENTS: ongoing=<slugs> configured=<slug> new=<slugs>`, where `new` is the
+  ongoing bots-only tournaments that are not the configured one, at WARNING when that set is
+  non-empty and INFO otherwise (`none` for an empty list). A registered marker, so the first
+  run that sees a Series 2 slug is findable in the archive.
+- **Stale slug goes red** (item 5). `check_tournament_dates` warns from a slug's end date and
+  raises at the shared two-week hard stop, and a zero-question run is green, so once
+  Preseason 2 closes on 2026-09-20 every scheduled run would have stayed green and silent for
+  a fortnight while a Series 2 slug went unforecast, about seventy questions at Series 1's
+  rate. In mantic mode the check's verdict (`cli._check_tournament_dates`) is held and turned
+  into a non-zero exit AFTER publishing, the fall-cup reminder's shape. The Metaculus tournament
+  keeps the warning advisory and `TOURNAMENT_HARD_STOP_WEEKS` is untouched.
+- **Parse drops are counted** (item 12). A post the framework cannot parse (a new Mantic type
+  string, a missing field) is caught by the framework's per-post loop, logged as one warning
+  and otherwise forfeited silently on every run. `ManticClient` now counts the drop and logs
+  `MANTIC_POST_DROPPED: post=<id> type=<wire type or n/a> error=<ExceptionClass>` before
+  re-raising (nothing is swallowed), and cli adds the counter to the alertable arithmetic, so
+  a dropped post reddens the run and the end-of-run breakdown carries
+  `mantic_post_drops=<n>` whenever it is non-zero. The telemetry-only reads in the client
+  (`id`, `type`) use `.get`, so the marker can never be what drops a question.
+- **Pagination ceiling** (item 21). The tournament fetch asks the framework for
+  `MANTIC_FETCH_QUESTION_CEILING` (500) questions with `error_if_question_target_missed=False`,
+  so it walks offsets until an EMPTY page instead of reading one page of 100 and trusting
+  Mantic's `next` link, which is advertised past the last page. With four open questions that
+  is one extra GET of an empty page.
+
+Cited-source URLs with brackets or backticks are extracted whole since the same review
+(item 4): a truncated Federal Register API query answered 200 with the unfiltered count.
+See `docs/research.md` "Resolution-source fetcher".
+
+### Date questions
+
+Every Mantic question type is forecast, date questions included. The question stays a
+`DateQuestion` end to end (the framework builds a `DateReport`, telemetry says `qtype=date`)
+and the numeric math runs on an adapter: `numeric/date_axis.py` views the question as a
+`NumericQuestion` on the epoch-seconds axis, which is how forecasting-tools and the Metaculus
+backend both treat a date question. The forecaster dispatches `DateQuestion` to
+`run_date_forecast` (`forecaster_runners.py`); `date_prompt` (`prompts.py`) asks for ISO dates
+and names the bin granularity; `DateStructured` (`structured_output_schema.py`) carries the
+declared percentiles as datetimes; then the same PCHIP pipeline, CDF-space aggregation and
+publish path run with `is_date` set so the comment renders dates. Two conventions live in the
+adapter and nowhere else: nominal bounds are read from the API's `scaling` block, never
+derived (Mantic sets `nominal_max` to the last bin's left edge), and a date-only value means
+noon UTC of that day, so its mass lands inside that day's bin under the platform's
+right-closed bucketing. The design and its receipts are in
+`scratch_docs_and_planning/mantic_phase2_plan_2026-09-08.md`; the pipeline map is in
+`docs/architecture.md`.
+
+### Mantic-optimized forecasting
+
+The scoring reader and the edge-case review in
+`scratch_docs_and_planning/mantic_research_2026-09-08/` priced what the Metaculus-shaped prompts
+and numeric repairs cost under Mantic's baseline scoring, and the Phase 2 merge ships the fixes.
+Every prompt clause is a named constant in `prompts.py` with its reason, has presence and absence
+pins under `tests/prompts/`, and none of them appears in the three stacking prompts.
+
+- **Out-of-range base rate** (review item 1, the largest lever). Mantic scores a resolution
+  outside the displayed range as its own outcome against a fixed 5% reference: a 1% tail scores
+  -80.5, 5% scores 0, 50% scores +115, verified to zero error against the platform's own scores
+  on 146 of 146 resolved out-of-range questions. The pipeline publishes exactly 1% beyond an open
+  bound whenever every percentile sits inside the range, and Mantic escapes its ranges far more
+  often than Metaculus: 22% of resolved discrete questions, 7% of numeric and 51% of date
+  questions, against 2 to 3% in the Metaculus archive. `_MANTIC_OUT_OF_RANGE_RATE_QUANTITY` and
+  `_MANTIC_OUT_OF_RANGE_RATE_DATE` state that base rate in the bound messages on Mantic only
+  (`question_platform.question_platform` reads the platform off `page_url`, so the Metaculus
+  prompts are unchanged). **The mechanical 5% tail floor is HELD.** Moving each open side from
+  1% to 5% gains 80.5 points when the outcome escapes and costs 4.26 when it does not, break-even
+  at a 5% escape rate against the measured 15% and 51%, so it is probably right, but it would
+  override an honest forecaster and would be inert if the models already place percentiles
+  beyond the bound. The additive `oor_low=` / `oor_high=` fields on the per-member
+  `MEMBER_FORECAST` line and the new per-question `NUMERIC_AGGREGATE` marker record the
+  published out-of-range mass, which is what decides the floor after the first live runs.
+- **Platform-aware scoring text** (item 6). The numeric prompt no longer claims a uniform 0.01
+  PDF floor or that sharpness above 35 stops paying, two Metaculus facts that told the model the
+  out-of-range cliff was an order of magnitude shallower than it is; `_CONTINUOUS_SCORING_RULE`
+  says mass beyond an open bound is scored as its own outcome against a reference of a few
+  percent. `_METACULUS_SCORING_SENTENCE` names the spot peer score and `_MANTIC_SCORING_SENTENCE`
+  names Crucible's spot baseline score, compared to a uniform distribution rather than to other
+  forecasters, so nothing is gained by disagreeing with the obvious answer and nothing is lost by
+  giving it.
+- **Series-variant clause** (item 9). The displayed range is stated as weak evidence about which
+  series variant resolves and as no evidence about the magnitude of the outcome. The old premise,
+  that the bounds were set by someone who could see the real series, is false on Mantic, where
+  question writers are paid for bot disagreement and 51% of date questions resolved above the
+  ceiling.
+- **Multi-resolution questions** (post 650's shape, `multi_resolution: true`). Gated on the
+  question's own API flag (`_multi_resolution_clause`, an identity test on `is True`) and
+  type-aware: continuous and date questions forecast each resolution instance and report the
+  mixture's percentiles, multiple choice the expected share of resolutions per option, binary the
+  expected fraction of Yes. Priced on post 650: a single-day distribution loses 38.7 points. The
+  count of resolutions is never interpolated; it lives only in the criteria prose while the
+  question is open.
+- **Coarse grids** (item 7). The prompt names the bin width and bin count, and the count-like
+  cluster spread that used to spread a plateau a full unit per position is capped by the grid's
+  bin width (`numeric/config.grid_bin_width`), so a concentrated forecast on a 3 to 21-bin grid
+  publishes as declared rather than flattened, worth 24 to 43 points per affected question. The
+  discrete-snap guard keys on the question type and the 201-point grid rather than on
+  `cdf_size == 201` alone, because a 200-bin Mantic discrete question has that size too.
+- **Near-total out-of-range forecasts build** (item 3). The min-step rebuild trigger and its
+  raise in `numeric/pchip_cdf.py` carry the `_MIN_STEP_TOLERANCE` (1e-10) the file already used
+  elsewhere, so a forecast with essentially all its mass beyond an open bound, the
+  highest-scoring shape here (+148.8 baseline points at 0.98), builds instead of dropping the
+  member on a float epsilon.
+- **Bounds clamp on bin-defined grids** (item 11). The clamp buffer is at least one bin width, so
+  a date one day outside a closed bound clamps instead of dropping the member; a scale error
+  still raises.
 
 ### Personal keys only, and the switch fails shut
 
@@ -820,7 +947,7 @@ every OpenRouter auth error is the personal key.
 ### The workflow
 
 `run_bot_on_mantic.yaml` is a copy of `run_bot_on_tournament.yaml` with four
-differences: the crons are `17 * * * *` and `47 * * * *`; the run step passes
+differences: three cron entries at :05, :15 and :25; the run step passes
 `--mode mantic`; the env block has `MANTIC_TOKEN` instead of `METACULUS_TOKEN` and
 no `OAI_ANTH_OPENROUTER_KEY` at all; and it sets both
 `DONATED_OPENROUTER_KEY_ENABLED: 'false'` and `GEMINI_USE_DONATED_OPENROUTER_KEY:
@@ -830,9 +957,37 @@ artifact keeps the `research-<run_id>` name so `make sync_all` harvests Mantic r
 into the archive. The minutes sit off the tournament's :03/:23/:43, minibench's
 :08/:38 and the cup's :13/:33/:53, because the workflows are in separate concurrency
 groups and a shared minute means simultaneous runs, and off the top of the hour,
-where GitHub's scheduling burst lives. If Series 2 restores one-hour windows opened
-on the hour, a :17 pickup leaves about 43 minutes; move to three entries per hour
-if that proves tight.
+where GitHub's scheduling burst lives.
+
+The three entries all sit in the first half of the hour, and that is deliberate. Mantic
+questions open on the hour with 60-minute windows, and the per-question budget is the close
+time minus now minus the 60-second publish reserve (`time_budget.py`), so a pickup after about
+:30 falls under the 1815-second fast-path threshold and gets only the degraded research path,
+while the last quarter-hour falls under the 300-second viability floor and gets nothing.
+Entries past :30 buy little and :45 or :55 buy nothing, so the workflow does not carry them.
+`tests/test_workflow_reliability.py` pins that every Mantic entry fires early enough for the
+full research path and that no two bot workflows share a minute.
+
+### Scheduling reliability
+
+GitHub delivers only a minority of this repository's scheduled firings. Measured through the
+GitHub API on the three-cron tournament workflow from 2026-08-27 through 2026-09-07: 7 to 23
+of the 72 expected runs a day were delivered, about 22%, with gaps of up to 3.5 hours, and
+the cup workflow reads the same, so the loss is repository-wide and outside our control. On
+Mantic's one-hour windows a question is forfeited whenever no run lands in its first half
+hour, while a delivered run that finds nothing new spends nothing because cli pins the
+re-spend guard on. The delivered runs also cluster inside good hours, so more cron entries
+buy less than independent drops would imply and cannot cover a multi-hour blackout.
+
+The durable fix is an external dispatcher, because `workflow_dispatch` events are not
+subject to schedule dropping: an always-on cron, or a free Cloudflare Worker cron trigger,
+calling GitHub's workflow-dispatch API at :01 each hour, either through `gh workflow run`
+or through the REST dispatch endpoint with a fine-grained personal access token scoped to
+this repository's Actions. Two options that look like fixes are not: a self-hosted runner
+does not help, because the drops happen in GitHub's scheduler before any runner is
+involved, and running the bot directly on a box loses the artifact pipeline that
+`make sync_all` harvests (`research_outputs/`, `run_logs/`, the 90-day retention). The
+operator is deciding between these; the decision is recorded as open in `FUTURE.md`.
 
 Unlike the cup and minibench workflows, this one is not `disabled_manually`: GitHub
 runs a new scheduled workflow as soon as its file is on the default branch, so
@@ -859,6 +1014,17 @@ DONATED_OPENROUTER_KEY_ENABLED=false uv run python main.py --mode mantic --only-
 # or: make run_mantic_one POST=650
 ```
 
+The approved date smoke is the same command on the preseason's date question, post 651
+(twelve daily bins, both bounds closed), once per approval:
+
+```bash
+DONATED_OPENROUTER_KEY_ENABLED=false uv run python main.py --mode mantic --only-posts 651
+# or: make run_mantic_one POST=651
+```
+
+Verify it on the API afterwards: a 13-value CDF accepted, the comment rendering ISO dates,
+and `my_forecasts.history` populated on the question.
+
 The flag works in every tournament-shaped mode (`tournament`, `minibench`,
 `metaculus_cup`, `mantic`) and is refused with `test_questions`. It fetches the
 tournament's open questions exactly as an unfiltered run does, on the same client,
@@ -884,7 +1050,9 @@ Operator steps, in order:
 2. Merge to `main`. The schedule is live from that moment; there is nothing to
    enable in the Actions UI.
 3. When Series 2 opens, update `MANTIC_TOURNAMENT_ID` and
-   `MANTIC_TOURNAMENT_END_DATE`, and revisit the cron cadence.
+   `MANTIC_TOURNAMENT_END_DATE`. The `MANTIC_TOURNAMENTS` line names the new slug on the
+   first run that sees it, and from 2026-09-21 every Mantic run exits red until the
+   constants move. Then take the cadence decision described under "The workflow".
 
 ## Cost discipline
 

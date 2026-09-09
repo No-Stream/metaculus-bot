@@ -69,8 +69,9 @@ What's inside:
    competitions.mantic.com, a fork of the Metaculus platform with the same API shape. It needs
    `MANTIC_TOKEN` in `.env`, publishes to Mantic rather than Metaculus, and spends only your
    personal keys: the run refuses to start unless `DONATED_OPENROUTER_KEY_ENABLED=false` is set,
-   because the Metaculus-donated OpenRouter key is for Metaculus tournaments. Details in
-   `docs/operations.md` "Mantic".
+   because the Metaculus-donated OpenRouter key is for Metaculus tournaments. Every Mantic
+   question type is forecast, date questions included (they run through the numeric pipeline on
+   an epoch-seconds axis). Details in `docs/operations.md` "Mantic".
 
 ## Core Architecture
 

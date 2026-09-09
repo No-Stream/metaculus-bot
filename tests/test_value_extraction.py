@@ -8,6 +8,8 @@ emits one EXTRACTION_RUNG INFO line.
 from __future__ import annotations
 
 import logging
+import time
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -21,9 +23,11 @@ from pydantic import ValidationError
 from metaculus_bot.exceptions import ValueExtractionError
 from metaculus_bot.numeric.config import STANDARD_PERCENTILES
 from metaculus_bot.simple_types import OptionProbability
+from metaculus_bot.structured_parse import IsoDatePercentile
 from metaculus_bot.value_extraction import (
     ExtractionOutcome,
     extract_binary,
+    extract_date,
     extract_mc,
     extract_numeric,
 )
@@ -67,6 +71,36 @@ def mc_block(probs: list[float], *, trailing_comma: bool = False) -> str:
 
 def full_percentile_list() -> list[Percentile]:
     return [Percentile(percentile=p, value=float(i + 1)) for i, p in enumerate(STANDARD_PERCENTILES)]
+
+
+_DATE_ORIGIN = datetime(2026, 9, 8, tzinfo=UTC)
+
+
+def date_strings(*, tie_at: int | None = None) -> list[str]:
+    """Thirteen calendar dates a day apart from 2026-09-08; ``tie_at`` repeats the previous day there."""
+    days = [(_DATE_ORIGIN + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(len(STANDARD_PERCENTILES))]
+    if tie_at is not None:
+        days[tie_at] = days[tie_at - 1]
+    return days
+
+
+def date_block(values: list[str] | None = None, *, trailing_comma: bool = False) -> str:
+    """A full-13-percentile date block over ISO-8601 strings."""
+    values = values if values is not None else date_strings()
+    pcts = ", ".join(f'"{p}": "{v}"' for p, v in zip(STANDARD_PERCENTILES, values, strict=True))
+    tail = "," if trailing_comma else ""
+    return f'{{"question_type": "date", "declared_percentiles": {{{pcts}}}{tail}}}'
+
+
+def full_date_percentile_list() -> list[IsoDatePercentile]:
+    return [
+        IsoDatePercentile.model_validate({"percentile": p, "value": v})
+        for p, v in zip(STANDARD_PERCENTILES, date_strings(), strict=True)
+    ]
+
+
+def noon_utc_epoch(day: str) -> float:
+    return datetime.fromisoformat(day).replace(hour=12, tzinfo=UTC).timestamp()
 
 
 def make_pol(probs: list[float]) -> PredictedOptionList:
@@ -632,6 +666,129 @@ class TestSalvageFidelity:
         assert outcome.rung == "repair"
         assert outcome.value == 0.28
         llm.assert_not_awaited()
+
+
+class TestDateExtraction:
+    """``extract_date``: the numeric ladder on the calendar axis, returning epoch seconds.
+
+    Both readers (the block rung's ``DateStructured`` and the salvage rung's ``IsoDatePercentile``)
+    go through ``numeric.date_axis.parse_iso_utc``, so a date-only value lands at noon UTC inside
+    its day bin on every path and a naive timestamp is never read as host time.
+    """
+
+    @pytest.mark.asyncio
+    async def test_block_rung_returns_epoch_seconds_at_noon_utc(self, caplog: pytest.LogCaptureFixture) -> None:
+        caplog.set_level(logging.INFO, logger="metaculus_bot.value_extraction")
+        with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock()) as llm:
+            outcome = await extract_date(rationale_with(date_block()), PARSER_LLM, question_id=651, model_name="m")
+        assert outcome.rung == "block"
+        assert outcome.block_present is True
+        assert [float(p.percentile) for p in outcome.value] == STANDARD_PERCENTILES
+        assert [float(p.value) for p in outcome.value] == [noon_utc_epoch(day) for day in date_strings()]
+        llm.assert_not_awaited()
+        telemetry = [r.getMessage() for r in caplog.records if "EXTRACTION_RUNG:" in r.getMessage()]
+        assert len(telemetry) == 1
+        assert "qtype=date" in telemetry[0]
+        assert "question=651" in telemetry[0]
+
+    @pytest.mark.asyncio
+    async def test_epoch_values_do_not_depend_on_the_host_timezone(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """forecasting-tools' own date template reads a naive date in host-local time (an 8-hour
+        error on a Pacific laptop); the ladder reads UTC whatever ``TZ`` says."""
+        monkeypatch.setenv("TZ", "America/Los_Angeles")
+        time.tzset()
+        try:
+            with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock()):
+                outcome = await extract_date(rationale_with(date_block()), PARSER_LLM)
+        finally:
+            monkeypatch.delenv("TZ")
+            time.tzset()
+        assert float(outcome.value[0].value) == noon_utc_epoch("2026-09-08")
+
+    @pytest.mark.asyncio
+    async def test_repair_rung_fixes_a_trailing_comma(self) -> None:
+        with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock()) as llm:
+            outcome = await extract_date(rationale_with(date_block(trailing_comma=True)), PARSER_LLM)
+        assert outcome.rung == "repair"
+        assert len(outcome.value) == 13
+        llm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_truncated_date_is_never_completed_by_the_repair_rung(self) -> None:
+        """The rationale is cut inside the last date. ``json_repair`` closes the quote and hands back
+        an invented ``"2026-09-2"``; the repair rung's numeric-literal guard cannot see it (a date is
+        a string), so ``DateStructured``'s strict parse is what fails the candidate, and the ladder
+        goes to the LLM rung instead of publishing a date nobody declared."""
+        block = date_block()
+        truncated = block[: block.rfind('"2026-09-20"') + len('"2026-09-2')]
+        llm_mock = AsyncMock(return_value=full_date_percentile_list())
+        with patch("metaculus_bot.value_extraction.parse_structured", new=llm_mock):
+            outcome = await extract_date(rationale_with(truncated), PARSER_LLM)
+        assert outcome.rung == "llm"
+        assert len(outcome.value) == 13
+        llm_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_bare_years_and_numbers_fail_the_block_rung(self) -> None:
+        for bad in ('"2027"', '"2027-06"', "2027", '"June 1 2027"'):
+            values = date_strings()
+            block = date_block(values).replace(f'"{values[-1]}"', bad)
+            llm_mock = AsyncMock(return_value=full_date_percentile_list())
+            with patch("metaculus_bot.value_extraction.parse_structured", new=llm_mock):
+                outcome = await extract_date(rationale_with(block), PARSER_LLM)
+            assert outcome.rung == "llm", bad
+
+    @pytest.mark.asyncio
+    async def test_ties_are_accepted_and_a_decrease_fails_the_rung(self) -> None:
+        with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock()) as llm:
+            outcome = await extract_date(rationale_with(date_block(date_strings(tie_at=5))), PARSER_LLM)
+        assert outcome.rung == "block"
+        assert float(outcome.value[5].value) == float(outcome.value[4].value)
+        llm.assert_not_awaited()
+
+        disordered = date_strings()
+        disordered[6] = "2026-09-01"
+        llm_mock = AsyncMock(side_effect=ValueError("no salvage"))
+        with (
+            patch("metaculus_bot.value_extraction.parse_structured", new=llm_mock),
+            pytest.raises(ValueExtractionError),
+        ):
+            await extract_date(rationale_with(date_block(disordered)), PARSER_LLM)
+
+    @pytest.mark.asyncio
+    async def test_llm_rung_salvages_through_the_iso_date_wrapper(self) -> None:
+        captured: dict[str, object] = {}
+
+        async def capture(text, output_type, parser_llm, *, prompt_notes=""):
+            captured["output_type"] = output_type
+            captured["notes"] = prompt_notes
+            return full_date_percentile_list()
+
+        with patch("metaculus_bot.value_extraction.parse_structured", new=capture):
+            outcome = await extract_date("prose with no block", PARSER_LLM, prompt_notes="DATE NOTES")
+        assert outcome.rung == "llm"
+        assert outcome.block_present is False
+        assert captured["output_type"] == list[IsoDatePercentile]
+        assert captured["notes"] == "DATE NOTES"
+        assert [float(p.value) for p in outcome.value] == [noon_utc_epoch(day) for day in date_strings()]
+
+    @pytest.mark.asyncio
+    async def test_a_partial_llm_salvage_fails_the_rung(self) -> None:
+        partial = full_date_percentile_list()[:3]
+        with (
+            patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock(return_value=partial)),
+            pytest.raises(ValueExtractionError, match="missing standard percentiles"),
+        ):
+            await extract_date("prose only", PARSER_LLM)
+
+    @pytest.mark.asyncio
+    async def test_a_numeric_block_does_not_satisfy_a_date_question(self) -> None:
+        """A block declaring ``question_type: numeric`` on a date question is refused by the
+        question_type mismatch guard, as every other cross-type block is."""
+        llm_mock = AsyncMock(return_value=full_date_percentile_list())
+        with patch("metaculus_bot.value_extraction.parse_structured", new=llm_mock):
+            outcome = await extract_date(rationale_with(VALID_NUMERIC_BLOCK), PARSER_LLM)
+        assert outcome.rung == "llm"
 
 
 class TestMcCanonicalization:

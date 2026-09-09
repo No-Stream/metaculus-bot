@@ -26,6 +26,12 @@ against the ACTUAL emitted format strings (the source of truth):
 * ``MANTIC_QUESTION`` — ``metaculus_bot/mantic.py`` ``_log_mantic_question`` (per-QUESTION,
   every question the Mantic client parses: the type as it arrived on the wire and the
   fields Mantic's platform fork adds that the framework does not model)
+* ``MANTIC_POST_DROPPED`` — ``metaculus_bot/mantic.py`` ``_count_dropped_post`` (per-POST the
+  framework could not parse: counted and logged before the error is re-raised into the
+  framework's per-post loop, which swallows it as a warning; the same counter reddens the run)
+* ``MANTIC_TOURNAMENTS`` — ``metaculus_bot/mantic.py`` ``preflight_mantic_tournaments``
+  (per-RUN, at startup: the ongoing bots-only tournaments on the Mantic API against the
+  configured slug, so a Series 2 slug is named the run it appears)
 * ``FORECASTER_DROPS`` — ``metaculus_bot/drop_telemetry.py`` ``emit_drop_telemetry``
   (per-RUN summary: which models dropped and why)
 * ``Degradation counters`` — ``metaculus_bot/degradation_counters.py``
@@ -35,11 +41,17 @@ against the ACTUAL emitted format strings (the source of truth):
   drop marker above is silent on a healthy question, and its comment-side twin
   ``FORECASTERS_USED`` never reaches stdout)
 * ``MEMBER_FORECAST``   — ``metaculus_bot/member_forecast.py`` ``format_member_forecast_marker``,
-  emitted from ``forecaster_runners.py`` (each member, all three types), ``stacking.py``
-  (stacker binary / MC) and ``aggregation_pipeline.py`` (stacker numeric): per-VALUE
+  emitted from ``forecaster_runners.py`` (each member, all four types), ``stacking.py``
+  (stacker binary / MC) and ``aggregation_pipeline.py`` (stacker numeric and date): per-VALUE
   record of what the ladder extracted and what the runner handed on, both as compact
   JSON. The one marker that carries a member's forecast value on every question; before
-  it the raw value lived only in the trim-lossy published comment
+  it the raw value lived only in the trim-lossy published comment. Since 2026-09-08 a
+  numeric or date line ends with the built CDF's out-of-range mass, ``oor_low`` /
+  ``oor_high`` (optional in the regex, so older lines still parse)
+* ``NUMERIC_AGGREGATE``  — ``metaculus_bot/member_forecast.py`` ``format_numeric_aggregate_marker``,
+  emitted from ``forecaster.py`` ``_aggregate_predictions`` (per-QUESTION, numeric and date:
+  the PUBLISHED distribution's grid size and out-of-range mass, the aggregate twin of the
+  member fields above; what decides whether a mechanical tail floor is ever warranted)
 * ``CLOSE_MARGIN``      — ``metaculus_bot/close_margin.py`` (emitted at submit time in ``forecaster.py``)
 * ``MARKET_RANKING``    — ``metaculus_bot/research/prediction_market.py``
   ``_log_ranking_telemetry`` (per-QUESTION ranked-retrieval outcome: pool size,
@@ -1115,12 +1127,37 @@ MARKER_SPECS: list[MarkerSpec] = [
         # ``json.loads`` — otherwise a binary line would coerce to a float while the MC
         # and numeric vectors stayed strings. ``model`` is ``.+?`` like extraction_rung's,
         # since the same ``forecaster_llm.model`` feeds both.
+        #
+        # ``oor_low`` / ``oor_high`` (2026-09-08, additive): the out-of-range mass of the CDF the
+        # runner built from ``published``, ``cdf[0]`` and ``1 - cdf[-1]``, on numeric and date
+        # lines only. Optional in the regex so every earlier line and every binary / MC line
+        # (no CDF, no fields) still harvests, with both fields None on those records.
         re.compile(
             r"MEMBER_FORECAST:\s*question=(?P<question>\S+)\s+model=(?P<model>.+?)\s+role=(?P<role>\S+)"
             r"\s+qtype=(?P<qtype>\S+)\s+raw=(?P<raw>\S+)\s+published=(?P<published>\S+)"
+            r"(?:\s+oor_low=(?P<oor_low>\S+)\s+oor_high=(?P<oor_high>\S+))?"
         ),
         qid_kind=QID_KIND_QUESTION_ID,  # every emitter passes question.id_of_question
         raw_fields=frozenset({"raw", "published"}),
+    ),
+    MarkerSpec(
+        "numeric_aggregate",
+        # Per-QUESTION record of the PUBLISHED numeric or date distribution
+        # (metaculus_bot/member_forecast.py format_numeric_aggregate_marker, emitted from
+        # forecaster.py _aggregate_predictions, the one seam every aggregation path returns
+        # through): the grid it was submitted on and its out-of-range mass, ``cdf[0]`` below
+        # the lower bound and ``1 - cdf[-1]`` above the upper. The platform scores an
+        # out-of-range resolution against a fixed 0.05 reference (a 1% tail scores -80.5, 5%
+        # scores 0), Mantic's Series 1 resolved half its date questions and a fifth of its
+        # discrete ones outside the displayed range, and this pipeline publishes exactly 1%
+        # there whenever every percentile sits inside; these two fields, joined with the
+        # per-member ``oor_*`` fields on MEMBER_FORECAST, are how "do the models already place
+        # mass beyond the bounds?" gets answered before any mechanical tail floor is built.
+        re.compile(
+            r"NUMERIC_AGGREGATE:\s*question=(?P<question>\S+)\s+qtype=(?P<qtype>\S+)"
+            r"\s+cdf_size=(?P<cdf_size>\d+)\s+oor_low=(?P<oor_low>\S+)\s+oor_high=(?P<oor_high>\S+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # forecaster.py passes question.id_of_question
     ),
     MarkerSpec(
         "degradation_counters",
@@ -1229,6 +1266,31 @@ MARKER_SPECS: list[MarkerSpec] = [
         qid_kind=QID_KIND_QUESTION_ID,  # mantic.py emits question.id_of_question as question=
     ),
     MarkerSpec(
+        "mantic_post_dropped",
+        # Per-POST ERROR from metaculus_bot/mantic.py (_count_dropped_post): a post the framework
+        # could not parse into a question. Before this line the framework's per-post loop logged
+        # one warning and moved on, so a new Mantic type string or a missing field forfeited a
+        # whole question class on every run with nothing harvestable. ``post`` is the post id as
+        # it arrived, ``type`` the wire ``question.type`` read with .get (``n/a`` when absent) and
+        # ``error`` the exception class. A post-level census rather than a per-question record:
+        # the post never became a question, so there is no question id and no qid is stamped.
+        re.compile(r"MANTIC_POST_DROPPED:\s*post=(?P<post>\S+)\s+type=(?P<type>\S+)\s+error=(?P<error>\S+)"),
+    ),
+    MarkerSpec(
+        "mantic_tournaments",
+        # Per-RUN startup line from metaculus_bot/mantic.py (preflight_mantic_tournaments), off the
+        # one authenticated GET of /api/projects/tournaments/ that also confirms the token's
+        # forecast permission. ``ongoing`` is the comma-joined sorted slugs with is_ongoing true,
+        # ``configured`` is MANTIC_TOURNAMENT_ID and ``new`` the ongoing bots-only slugs that are
+        # NOT the configured one (WARNING when non-empty, INFO otherwise; ``none`` for an empty
+        # list). It exists because a zero-question run is green: without it a Series 2 slug could
+        # open and every hourly run would keep fetching the ended preseason silently. Run-level, so
+        # no question ref; several slugs stay one comma-separated string.
+        re.compile(
+            r"MANTIC_TOURNAMENTS:\s*ongoing=(?P<ongoing>\S+)\s+configured=(?P<configured>\S+)\s+new=(?P<new>\S+)"
+        ),
+    ),
+    MarkerSpec(
         "time_budget",
         # Per-QUESTION budget grant INFO (metaculus_bot/time_budget.py), emitted for
         # EVERY question including the roomy ones. That is the point: CLOSE_MARGIN,
@@ -1332,7 +1394,10 @@ MARKER_SPECS: list[MarkerSpec] = [
             r"\(bot=(?P<bot>\S+?), personal_key_fallback=(?P<personal_key_fallback>\S+?) of which "
             r"donated_404=(?P<donated_404>\S+?), credit=(?P<credit>\S+?)"
             r"(?: with (?P<suppressed_credit>\S+?) credit event\(s\) suppressed until (?P<resume_date>\S+?))?"
-            r"(?:, donated_key=(?P<donated_key>\S+?))?\);"
+            r"(?:, donated_key=(?P<donated_key>\S+?))?"
+            # ``mantic_post_drops`` (2026-09-08, additive): posts the Mantic client could not parse,
+            # folded into ``alertable`` and rendered ONLY when non-zero, so absent harvests as None.
+            r"(?:, mantic_post_drops=(?P<mantic_post_drops>\S+?))?\);"
         ),
     ),
     MarkerSpec(

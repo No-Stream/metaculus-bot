@@ -11,6 +11,10 @@ tests loudly instead of silently dropping records from the archive:
 * GHOST_FORECAST    -> metaculus_bot/research/agentic/loop.py:_run_ghost_phase
 * OPEN_BOUND_PILING -> metaculus_bot/numeric/diagnostics.py:log_open_bound_piling_diagnostics
 * MANTIC_QUESTION   -> metaculus_bot/mantic.py:_log_mantic_question
+* MANTIC_POST_DROPPED -> metaculus_bot/mantic.py:_count_dropped_post (a post the framework
+  could not parse; counted into the alertable arithmetic)
+* MANTIC_TOURNAMENTS -> metaculus_bot/mantic.py:preflight_mantic_tournaments (Series 2
+  discovery off the startup tournament-list GET)
 * CLOSE_MARGIN       -> metaculus_bot/close_margin.py:format_close_margin_marker
 * MARKET_RANKING    -> metaculus_bot/research/prediction_market.py:_log_ranking_telemetry
 * RESOLUTION_SOURCE_FETCH -> metaculus_bot/research/resolution_source.py:_log_fetch_outcome_markers
@@ -2106,6 +2110,91 @@ class TestMemberForecast:
         assert _parse_one(THIN_PUBLISH_FLOOR_LOW_LINE)["raw"] == 0.03
 
 
+# Verbatim from metaculus_bot/member_forecast.py:format_member_forecast_marker with the
+# 2026-09-08 additive tail: a numeric or date line ends with the built CDF's out-of-range
+# mass. The date line is a Mantic day-granularity question (post 651) whose values are
+# epoch seconds; the numeric line is a member of an open-upper-bound question.
+MEMBER_FORECAST_DATE_LINE = (
+    PFX + "MEMBER_FORECAST: question=651 model=openrouter/openai/gpt-5.6-sol role=member qtype=date "
+    "raw=[[0.01,1789560000.0],[0.5,1789603200.0],[0.99,1789646400.0]] "
+    "published=[[0.01,1789560000.0],[0.5,1789603200.0],[0.99,1789646400.0]] oor_low=0.000000 oor_high=0.000000"
+)
+MEMBER_FORECAST_NUMERIC_TAILS_LINE = (
+    PFX + "MEMBER_FORECAST: question=45065 model=openrouter/google/gemini-3.1-pro-preview role=member qtype=numeric "
+    "raw=[[0.025,9.2],[0.05,9.6],[0.5,12.1]] published=[[0.025,9.2],[0.05,9.6],[0.5,12.1]] "
+    "oor_low=0.000000 oor_high=0.037500"
+)
+
+# Verbatim from metaculus_bot/member_forecast.py:format_numeric_aggregate_marker, emitted by
+# forecaster.py _aggregate_predictions once per numeric or date question with the PUBLISHED
+# distribution's grid size and out-of-range mass.
+NUMERIC_AGGREGATE_DATE_LINE = (
+    PFX + "NUMERIC_AGGREGATE: question=651 qtype=date cdf_size=13 oor_low=0.000000 oor_high=0.000000"
+)
+NUMERIC_AGGREGATE_NUMERIC_LINE = (
+    PFX + "NUMERIC_AGGREGATE: question=45065 qtype=numeric cdf_size=201 oor_low=0.001000 oor_high=0.037500"
+)
+
+
+class TestOutOfRangeMassFields:
+    """The two additive tail fields (plan B10) and the aggregate marker that carries them.
+
+    The platform scores an out-of-range resolution against a fixed 0.05 reference, and this
+    pipeline publishes exactly 1% out of range whenever every percentile sits inside; these
+    fields are how the archive answers whether the models already put mass beyond the bounds
+    before any mechanical tail floor is considered.
+    """
+
+    def test_a_date_member_line_parses_with_both_tails(self):
+        rec = _parse_one(MEMBER_FORECAST_DATE_LINE)
+        assert rec["marker"] == "member_forecast"
+        assert rec["qtype"] == "date"
+        assert rec["oor_low"] == 0.0
+        assert rec["oor_high"] == 0.0
+        # The value axis is epoch seconds; the JSON literal survives whole.
+        assert json.loads(rec["raw"])[1] == [0.5, 1789603200.0]
+
+    def test_a_numeric_member_line_parses_with_both_tails(self):
+        rec = _parse_one(MEMBER_FORECAST_NUMERIC_TAILS_LINE)
+        assert rec["oor_low"] == 0.0
+        assert rec["oor_high"] == 0.0375
+        assert json.loads(rec["published"]) == [[0.025, 9.2], [0.05, 9.6], [0.5, 12.1]]
+
+    def test_lines_without_the_tail_still_parse_and_read_none(self):
+        # Every pre-2026-09-08 line and every binary / MC line: the fields are optional, and a
+        # record without them says None rather than a measured zero.
+        for line in (MEMBER_FORECAST_BINARY_LINE, MEMBER_FORECAST_MC_LINE, MEMBER_FORECAST_NUMERIC_STACKER_LINE):
+            rec = _parse_one(line)
+            assert rec["oor_low"] is None
+            assert rec["oor_high"] is None
+
+    def test_numeric_aggregate_date_line(self):
+        rec = _parse_one(NUMERIC_AGGREGATE_DATE_LINE)
+        assert rec["marker"] == "numeric_aggregate"
+        assert rec["qtype"] == "date"
+        assert rec["cdf_size"] == 13
+        assert rec["oor_low"] == 0.0
+        assert rec["oor_high"] == 0.0
+        assert rec["qid"] == 651
+        assert rec["qid_kind"] == "question_id"
+
+    def test_numeric_aggregate_numeric_line(self):
+        rec = _parse_one(NUMERIC_AGGREGATE_NUMERIC_LINE)
+        assert rec["qtype"] == "numeric"
+        assert rec["cdf_size"] == 201
+        assert rec["oor_low"] == 0.001
+        assert rec["oor_high"] == 0.0375
+
+    def test_the_grid_mismatch_marker_is_not_claimed_by_the_aggregate_spec(self):
+        # NUMERIC_AGGREGATE_GRID_MISMATCH shares the prefix; each line must land in its own spec.
+        line = PFX_WARN + (
+            "NUMERIC_AGGREGATE_GRID_MISMATCH: question=45065 model_index=1 got_points=201 expected_points=13 — "
+            "resampling in cdf-location space before aggregation"
+        )
+        rec = _parse_one(line)
+        assert rec["marker"] == "numeric_aggregate_grid_mismatch"
+
+
 # Verbatim from metaculus_bot/aggregation_pipeline.py:_floor_single_survivor_binary —
 # the single-survivor binary publish floor, logged at WARNING from the base-combine
 # re-entry only when the lone value actually moved.
@@ -2731,6 +2820,96 @@ class TestManticQuestion:
         rec = _parse_one(MANTIC_QUESTION_QUANTITATIVE_LINE)
         assert rec["type"] == "quantitative"
         assert rec["cdf_size"] == 451
+
+
+# A post the framework could not parse (metaculus_bot/mantic.py _count_dropped_post), ERROR
+# level, emitted before the error is re-raised into the framework's per-post loop.
+_PFX_MANTIC_ERROR = "2026-09-08 14:23:01,123 - metaculus_bot.mantic - ERROR - "
+MANTIC_POST_DROPPED_LINE = _PFX_MANTIC_ERROR + "MANTIC_POST_DROPPED: post=650 type=quantitative_v3 error=ValueError"
+MANTIC_POST_DROPPED_NO_QUESTION_LINE = _PFX_MANTIC_ERROR + "MANTIC_POST_DROPPED: post=651 type=n/a error=KeyError"
+
+
+class TestManticPostDropped:
+    """A post-level census: the post never became a question, so no qid is stamped."""
+
+    def test_unknown_type_shape(self):
+        rec = _parse_one(MANTIC_POST_DROPPED_LINE)
+        assert rec["marker"] == "mantic_post_dropped"
+        assert rec["post"] == 650
+        assert rec["type"] == "quantitative_v3"
+        assert rec["error"] == "ValueError"
+        assert "qid" not in rec
+
+    def test_a_post_without_a_question_key_harvests_type_as_none(self):
+        rec = _parse_one(MANTIC_POST_DROPPED_NO_QUESTION_LINE)
+        assert rec["post"] == 651
+        assert rec["type"] is None
+        assert rec["error"] == "KeyError"
+
+
+# The startup discovery line (metaculus_bot/mantic.py preflight_mantic_tournaments): INFO when
+# every ongoing bots-only tournament is the configured one, WARNING when a new slug appears.
+MANTIC_TOURNAMENTS_LINE = (
+    "2026-09-08 14:23:01,123 - metaculus_bot.mantic - INFO - "
+    "MANTIC_TOURNAMENTS: ongoing=preseason-2 configured=preseason-2 new=none"
+)
+MANTIC_TOURNAMENTS_NEW_SLUG_LINE = (
+    "2026-09-08 14:23:01,123 - metaculus_bot.mantic - WARNING - "
+    "MANTIC_TOURNAMENTS: ongoing=preseason-2,series-2 configured=preseason-2 new=series-2"
+)
+
+
+class TestManticTournaments:
+    def test_quiet_shape(self):
+        rec = _parse_one(MANTIC_TOURNAMENTS_LINE)
+        assert rec["marker"] == "mantic_tournaments"
+        assert rec["ongoing"] == "preseason-2"
+        assert rec["configured"] == "preseason-2"
+        assert rec["new"] is None
+        # Run-level: no question ref, so no qid or id space is stamped.
+        assert "qid" not in rec
+
+    def test_a_new_slug_shape_keeps_several_slugs_as_one_string(self):
+        rec = _parse_one(MANTIC_TOURNAMENTS_NEW_SLUG_LINE)
+        assert rec["ongoing"] == "preseason-2,series-2"
+        assert rec["new"] == "series-2"
+
+
+# The end-of-run breakdown with the Mantic parse-drop term (cli.py), rendered only when the
+# count is non-zero; the second line pins its order after the optional donated_key clause.
+RUN_SUMMARY_MANTIC_DROPS_LINE = PFX_WARN + (
+    "Run completed with 1 alertable degradation event(s) (bot=0, personal_key_fallback=0 of which "
+    "donated_404=0, credit=0, mantic_post_drops=1); exiting non-zero so CI marks this run red."
+)
+RUN_SUMMARY_DONATED_KEY_AND_MANTIC_DROPS_LINE = PFX_WARN + (
+    "Run completed with 2 alertable degradation event(s) (bot=0, personal_key_fallback=1 of which "
+    "donated_404=0, credit=0, donated_key=revoked, mantic_post_drops=1); exiting non-zero so CI marks this run red."
+)
+
+
+class TestRunAlertableSummaryManticDrops:
+    def test_the_drop_term_harvests(self):
+        rec = _parse_one(RUN_SUMMARY_MANTIC_DROPS_LINE)
+        assert rec["marker"] == "run_alertable_summary"
+        assert rec["alertable"] == 1
+        assert rec["bot"] == 0
+        assert rec["personal_key_fallback"] == 0
+        assert rec["credit"] == 0
+        assert rec["mantic_post_drops"] == 1
+        assert rec["outcome"] is None
+
+    def test_the_drop_term_follows_the_donated_key_clause(self):
+        rec = _parse_one(RUN_SUMMARY_DONATED_KEY_AND_MANTIC_DROPS_LINE)
+        assert rec["donated_key"] == "revoked"
+        assert rec["mantic_post_drops"] == 1
+
+    def test_a_line_without_the_term_harvests_it_as_none(self):
+        rec = _parse_one(
+            PFX + "Run completed clean with 0 alertable degradation event(s) (bot=0, personal_key_fallback=0 "
+            "of which donated_404=0, credit=0); nothing degraded, so this run stays green."
+        )
+        assert rec["outcome"] == "clean"
+        assert rec["mantic_post_drops"] is None
 
 
 class TestTimeBudget:

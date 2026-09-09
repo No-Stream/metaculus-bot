@@ -8,11 +8,12 @@ tests exercise the FULL production code path with deterministic outputs.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import numpy as np
 from forecasting_tools import BinaryQuestion, GeneralLlm, MultipleChoiceQuestion, NumericQuestion
+from forecasting_tools.data_models.questions import DateQuestion
 
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
@@ -259,6 +260,58 @@ def make_real_numeric_question(
         zero_point=zero_point,
         unit_of_measure="%",
         api_json={"my_forecasts": {"latest": {"forecast_values": None}}},
+    )
+
+
+def make_real_date_question(
+    qid: int = 4001,
+    *,
+    lower_bound: datetime = datetime(2026, 9, 8, tzinfo=UTC),
+    upper_bound: datetime = datetime(2026, 9, 20, tzinfo=UTC),
+    open_lower_bound: bool = False,
+    open_upper_bound: bool = False,
+    cdf_size: int = 13,
+    date_granularity: str = "day",
+    with_scaling: bool = True,
+) -> DateQuestion:
+    """A real DateQuestion in post 651's shape: twelve one-day bins, both bounds closed.
+
+    ``api_json`` carries the ``question.scaling`` block the epoch adapter reads its nominal bounds
+    from, in the wire convention: ``nominal_max`` one bin below ``range_max`` on a day- or
+    week-granularity question, equal to it on a legacy one. ``with_scaling=False`` omits the block,
+    the shape of a question not built from API JSON.
+    """
+    question_json: dict[str, Any] = {"date_granularity": date_granularity}
+    if with_scaling:
+        bin_width = (upper_bound - lower_bound) / (cdf_size - 1)
+        nominal_max = upper_bound - bin_width if date_granularity in ("day", "week") else upper_bound
+        question_json["scaling"] = {
+            "range_min": lower_bound.timestamp(),
+            "range_max": upper_bound.timestamp(),
+            "nominal_min": lower_bound.timestamp(),
+            "nominal_max": nominal_max.timestamp(),
+            "zero_point": None,
+            "inbound_outcome_count": cdf_size - 1,
+        }
+    return DateQuestion(
+        question_text="On which date will the S&P 500 post its largest single-day percentage move?",
+        id_of_question=qid,
+        id_of_post=qid + 10000,
+        page_url=f"https://competitions.mantic.com/questions/{qid}/",
+        background_info="The window covers the trading days between the open and the close of the question.",
+        resolution_criteria=(
+            "Resolves to the UTC calendar date of the trading day with the largest absolute percentage "
+            "move in the S&P 500 index during the window."
+        ),
+        fine_print="Ties resolve to the earlier date.",
+        open_time=_OPEN_TIME,
+        scheduled_resolution_time=_RESOLVE_TIME,
+        lower_bound=lower_bound,
+        upper_bound=upper_bound,
+        open_lower_bound=open_lower_bound,
+        open_upper_bound=open_upper_bound,
+        cdf_size=cdf_size,
+        api_json={"question": question_json, "my_forecasts": {"latest": {"forecast_values": None}}},
     )
 
 

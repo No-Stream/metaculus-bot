@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import UTC, datetime
 from typing import get_args
 
 import pytest
@@ -17,6 +18,7 @@ from metaculus_bot.structured_output_schema import (
     BaseRateAnchor,
     BinaryStructured,
     CriteriaClause,
+    DateStructured,
     DiscreteCountStructured,
     EvidenceItem,
     MultipleChoiceStructured,
@@ -839,6 +841,83 @@ class TestNumericDeclaredPercentiles:
                 question_type="numeric",
                 declared_percentiles={0.1: 1.0, 0.5: 5.0, 0.9: 9.0, 1.5: 15.0},
             )
+
+
+# ===========================================================================
+# DateStructured
+# ===========================================================================
+
+
+class TestDateStructured:
+    """The date block: ISO-8601 strings parsed by ``numeric.date_axis.parse_iso_utc`` and nothing else."""
+
+    @staticmethod
+    def _block(declared: dict[str, object], **extra: object) -> DateStructured:
+        """Validate a raw block the way the ladder does: string keys and string values, as JSON carries them."""
+        return DateStructured.model_validate({"question_type": "date", "declared_percentiles": declared, **extra})
+
+    def test_date_only_values_parse_to_noon_utc_and_keep_the_numeric_key_checks(self) -> None:
+        block = self._block({"0.1": "2026-09-10", "0.5": "2026-09-15", "0.9": "2026-09-18T18:00:00Z"})
+        assert block.declared_percentiles[0.1] == datetime(2026, 9, 10, 12, tzinfo=UTC)
+        assert block.declared_percentiles[0.9] == datetime(2026, 9, 18, 18, tzinfo=UTC)
+
+    def test_the_example_block_the_prompt_teaches_parses_through_the_registry(self) -> None:
+        raw = json.dumps(
+            {
+                "question_type": "date",
+                "declared_percentiles": {
+                    "0.01": "2026-09-08",
+                    "0.025": "2026-09-08",
+                    "0.05": "2026-09-09",
+                    "0.1": "2026-09-10",
+                    "0.2": "2026-09-11",
+                    "0.4": "2026-09-14",
+                    "0.5": "2026-09-15",
+                    "0.6": "2026-09-16",
+                    "0.8": "2026-09-17",
+                    "0.9": "2026-09-18",
+                    "0.95": "2026-09-18",
+                    "0.975": "2026-09-19",
+                    "0.99": "2026-09-22",
+                },
+            }
+        )
+        block = parse_structured_payload(raw, "date")
+        assert isinstance(block, DateStructured)
+        assert parse_structured_block(f"reasoning\n```json\n{raw}\n```", "date") is not None
+
+    @pytest.mark.parametrize("bad", ["2027", "2027-06", "2027-06-1", "June 1 2027", "2027/06/01", ""])
+    def test_non_iso_and_truncated_spellings_are_rejected(self, bad: str) -> None:
+        """This is the truncation guard for dates: the repair rung's numeric-literal check cannot
+        see a string, so ``json_repair`` hands back ``"2027-06-1"`` from a cut-off rationale and only
+        the strict parse here stops it publishing."""
+        with pytest.raises(ValidationError, match="not a strict ISO-8601"):
+            self._block({"0.1": "2026-09-10", "0.5": bad, "0.9": "2027-09-10"})
+
+    @pytest.mark.parametrize("bad", [2027, 1788825600.0, None, True])
+    def test_non_string_values_are_rejected_rather_than_read_as_unix_timestamps(self, bad: object) -> None:
+        with pytest.raises(ValidationError, match="must be an ISO-8601 date string"):
+            self._block({"0.1": "2026-09-10", "0.5": bad, "0.9": "2027-09-10"})
+
+    def test_a_decrease_with_rising_percentile_raises_and_ties_parse(self) -> None:
+        with pytest.raises(ValidationError, match="non-decreasing"):
+            self._block({"0.1": "2026-09-15", "0.5": "2026-09-10", "0.9": "2026-09-18"})
+        tied = self._block({"0.1": "2026-09-15", "0.5": "2026-09-15", "0.9": "2026-09-18"})
+        assert tied.declared_percentiles[0.1] == tied.declared_percentiles[0.5]
+
+    def test_missing_required_key_and_out_of_range_key_raise(self) -> None:
+        with pytest.raises(ValidationError, match="declared_percentiles must include"):
+            self._block({"0.5": "2026-09-15", "0.9": "2026-09-18"})
+        with pytest.raises(ValidationError, match="Percentile keys"):
+            self._block({"0.1": "2026-09-10", "0.5": "2026-09-15", "0.9": "2026-09-18", "1.5": "2026-09-19"})
+
+    def test_extra_fields_and_outcome_type_are_forbidden(self) -> None:
+        with pytest.raises(ValidationError):
+            self._block({"0.1": "2026-09-10", "0.5": "2026-09-15", "0.9": "2026-09-18"}, outcome_type="continuous")
+
+    def test_a_numeric_block_cannot_masquerade_as_a_date_block(self) -> None:
+        raw = '{"question_type": "numeric", "declared_percentiles": {"0.1": 1.0, "0.5": 2.0, "0.9": 3.0}}'
+        assert parse_structured_payload(raw, "date") is None
 
 
 # ===========================================================================

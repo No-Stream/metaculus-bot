@@ -22,16 +22,31 @@ name: Forecast on Mantic tournament
 on:
   workflow_dispatch:
   schedule:
-    # Split across multiple cron entries to avoid GitHub Actions silently dropping
-    # */N schedules under runner load. Minutes staggered off the tournament workflow's
-    # :03/:23/:43, minibench's :08/:38 and the cup's :13/:33/:53 (separate concurrency
-    # groups, so a shared minute would start two full bot runs at once on the same runner
-    # pool and shared research quotas), and off the top of the hour: Series 1 windows
-    # opened on the hour and lasted exactly one hour, so a :17 pickup leaves ~43 minutes
-    # if Series 2 restores that cadence. Move to three per hour if it does.
+    # Three entries in the first half of the hour, because of two facts. GitHub delivers only
+    # a minority of this repository's scheduled firings: measured through the GitHub API on
+    # the three-cron tournament workflow, 2026-08-27 through 2026-09-07, it delivered 7 to 23
+    # of the 72 expected runs a day (about 22%), with gaps of up to 3.5 hours, and the cup
+    # workflow reads the same, so this is repository-wide and outside our control. And Mantic
+    # questions open on the hour with 60-minute windows: the per-question budget is the close
+    # time minus now minus a 60 s publish reserve, so a pickup after about :30 falls under the
+    # 1815 s fast-path threshold and gets only the degraded research path, while the last
+    # quarter-hour falls under the 300 s viability floor and gets nothing. Entries past :30
+    # therefore buy little and :45/:55 buy nothing; the three here are the useful ones. Minutes
+    # are staggered off the tournament workflow's :03/:23/:43, minibench's :08/:38 and the
+    # cup's :13/:33/:53 (separate concurrency groups, so a shared minute would start two full
+    # bot runs at once on the same runner pool and shared research quotas; the distinct-minute
+    # pin in tests/test_workflow_reliability.py holds this) and off the top of the hour, where
+    # GitHub's scheduling burst lives. A delivered run that finds nothing new spends nothing
+    # (cli pins the re-spend guard on). The durable fix is an external dispatcher, an
+    # always-on cron or a free Cloudflare Worker cron trigger calling GitHub's
+    # workflow-dispatch API at :01, since dispatch events are not subject to schedule
+    # dropping; the operator is deciding on it (edge review item 2,
+    # scratch_docs_and_planning/mantic_research_2026-09-08/; docs/operations.md "Scheduling
+    # reliability").
     # Make sure to skip already forecasted questions!
-    - cron: "17 * * * *" # every hour at :17
-    - cron: "47 * * * *" # every hour at :47
+    - cron: "5 * * * *" # every hour at :05
+    - cron: "15 * * * *" # every hour at :15
+    - cron: "25 * * * *" # every hour at :25
 
 # Add concurrency group to prevent parallel runs
 concurrency:

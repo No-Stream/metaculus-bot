@@ -19,8 +19,9 @@ from forecasting_tools import (
     PredictedOptionList,
 )
 from forecasting_tools.data_models.numeric_report import Percentile
-from forecasting_tools.data_models.questions import MetaculusQuestion
+from forecasting_tools.data_models.questions import DateQuestion, MetaculusQuestion
 
+from metaculus_bot.numeric.date_axis import numeric_view
 from metaculus_bot.numeric.percentile_set import EXPECTED_KEYS, PercentileSet, percentile_key
 from metaculus_bot.prob_math_utils import logit
 
@@ -221,12 +222,16 @@ def numeric_percentile_spread(
 
 
 def compute_spread(question: MetaculusQuestion, prediction_values: list[Any]) -> float:
-    """Dispatch to the appropriate spread metric based on question type."""
+    """Dispatch to the appropriate spread metric based on question type.
+
+    A date question's members are numeric distributions on the epoch-seconds axis, so it takes
+    the numeric metric against its epoch view (the range denominator is then in seconds).
+    """
     if isinstance(question, BinaryQuestion):
         return binary_prob_range_spread(prediction_values)
     if isinstance(question, MultipleChoiceQuestion):
         return mc_max_option_spread(prediction_values)
-    if isinstance(question, NumericQuestion):
+    if isinstance(question, (NumericQuestion, DateQuestion)):
         percentile_lists = [pv.declared_percentiles for pv in prediction_values]
-        return numeric_percentile_spread(percentile_lists, question)
+        return numeric_percentile_spread(percentile_lists, numeric_view(question))
     raise ValueError(f"Unsupported question type for spread metrics: {type(question).__name__}")

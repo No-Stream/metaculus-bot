@@ -1,19 +1,25 @@
 # HARNESS-SCAN-EXEMPT-monolithic-file-loc  # prompt-template registry; text length, not control flow — splitting fragments prompt review
 import json
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Any, Literal
 
+import numpy as np
 from forecasting_tools import (
     BinaryQuestion,
+    MetaculusQuestion,
     MultipleChoiceQuestion,
     NumericQuestion,
     clean_indents,
 )
+from forecasting_tools.data_models.questions import DateQuestion
 
-from metaculus_bot.constants import MC_PROB_MIN
+from metaculus_bot.constants import MC_PROB_MIN, PLATFORM_MANTIC
 from metaculus_bot.numeric.config import EXPECTED_PERCENTILE_COUNT, STANDARD_PERCENTILES
+from metaculus_bot.numeric.date_axis import EpochDateQuestion, as_epoch_question, format_epoch
 from metaculus_bot.numeric.utils import nominal_bounds
+from metaculus_bot.question_platform import question_platform
 from metaculus_bot.time_utils import _as_utc
 
 # Width of a rendered percentile label at minimum: "0." plus two decimals, so P10
@@ -70,6 +76,7 @@ def _build_example_probs(n_opts: int) -> list[float]:
 __all__ = [
     "asknews_summarizer_prompt",
     "binary_prompt",
+    "date_prompt",
     "disagreement_crux_prompt",
     "gap_fill_analyzer_prompt",
     "gap_fill_search_prompt",
@@ -106,9 +113,7 @@ def _benchmarking_warning(context: BenchmarkingContext = "search") -> str:
     )
 
 
-def _forecasting_window_str(
-    question: BinaryQuestion | MultipleChoiceQuestion | NumericQuestion,
-) -> str:
+def _forecasting_window_str(question: MetaculusQuestion) -> str:
     """Return a window-anchor block: open date, today, resolution date, deltas.
 
     Prevents a common failure mode where bots treat questions like "Will a
@@ -786,12 +791,20 @@ def _resolution_metric_echo_bullets(question_type: Literal["binary", "numeric"])
     true ~13k total sat at the bounds midpoint.
     """
     if question_type == "numeric":
+        # The range is WEAK evidence about WHICH variant resolves and NO evidence about the
+        # magnitude of the outcome. It used to say the bounds "were set by someone who could see
+        # the real series, so a candidate far outside the range is probably the wrong variant":
+        # true on Metaculus, false on Mantic, where writers are paid for bot disagreement and 22%
+        # of resolved discrete and 51% of date questions escaped their range, so a forecaster that
+        # extrapolated correctly was told by this prompt to pull its percentiles back inside
+        # (roughly 195 baseline points between the two outcomes). The 44211 correction survives:
+        # inside the range confirms nothing.
         reconcile = (
-            "Reconcile each candidate against the displayed range above: the bounds were set by someone "
-            "who could see the real series, so a candidate that falls far outside the range is probably "
-            'the wrong variant. But do NOT read "inside the range" as confirming the headline or component '
-            "series — if several candidates fit, the range does not pick between them (the resolving value "
-            "can sit anywhere inside, including near the midpoint)."
+            "Reconcile each candidate against the displayed range above, reading the range as WEAK evidence "
+            "about which series variant resolves and as NO evidence about the magnitude of the outcome: a "
+            'candidate that falls outside an open bound may still be the right variant, and do NOT read "inside '
+            'the range" as confirming the headline or component series (if several candidates fit, the range does '
+            "not pick between them, and the resolving value can sit anywhere inside, including near the midpoint)."
         )
         sections = (
             "The `## Resolution Source Snapshot` and `## Time Series Anchor` sections (when present in the "
@@ -830,6 +843,33 @@ def _resolution_metric_echo_bullets(question_type: Literal["binary", "numeric"])
     return "\n".join(f"{indent}• {b}" for b in bullets)
 
 
+# The one sentence every forecaster prompt opens with about how it is scored, chosen by the
+# platform the question came from (``question_platform`` reads it off ``page_url``). Until
+# 2026-09-08 all six prompts named "the Metaculus peer score" or "Metaculus' log-score", which
+# was imprecise on Metaculus (the bot tournaments score SPOT peer) and false on Mantic, whose
+# Crucible leaderboard is spot BASELINE: the reference is a uniform distribution, not the other
+# forecasters, and no community prediction exists while a question is open. Both scores are
+# strictly proper, so the honest forecast is optimal on both; the Mantic wording says so
+# outright because "compared to your peers" invites contrarian drift, which a proper score only
+# punishes. Shared with the three stacking prompts, which carried the same sentence.
+_METACULUS_SCORING_SENTENCE = (
+    "You will be judged on the accuracy and calibration of your forecast under Metaculus' spot peer log score, a "
+    "proper score: your honest forecast is the best submission whatever other forecasters say."
+)
+_MANTIC_SCORING_SENTENCE = (
+    "You will be judged on the accuracy and calibration of your forecast under Crucible's spot baseline log "
+    "score, which compares you to a uniform distribution over the outcomes rather than to other forecasters, so "
+    "nothing is gained by disagreeing with the obvious answer and nothing is lost by giving it."
+)
+
+
+def _scoring_sentence(question: MetaculusQuestion) -> str:
+    """The platform's own scoring sentence for ``question``."""
+    if question_platform(question) == PLATFORM_MANTIC:
+        return _MANTIC_SCORING_SENTENCE
+    return _METACULUS_SCORING_SENTENCE
+
+
 def binary_prompt(question: BinaryQuestion, research: str) -> str:
     """
     Return the forecasting prompt for binary questions.
@@ -838,7 +878,7 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
     return clean_indents(
         f"""
             You are a senior forecaster preparing a public report for expert peers.
-            You will be judged based on the accuracy _and calibration_ of your forecast with the Metaculus peer score (log score).
+            {_scoring_sentence(question)}
             Use your own expertise and knowledge, not only the provided research — if you know a relevant fact from
             your training that the research reports don't cover, you may rely on it. You are not required to ground
             every claim in the research; just be clear when you're drawing on your own knowledge versus the research.
@@ -858,7 +898,7 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
             )
         }
 
-            Your Metaculus question is:
+            Your question is:
             {question.question_text}
 
             Question background:
@@ -869,6 +909,7 @@ def binary_prompt(question: BinaryQuestion, research: str) -> str:
             {question.resolution_criteria}
 
             {question.fine_print}
+            {_multi_resolution_clause(question, _MULTI_RESOLUTION_BINARY_RULE)}
 
 
             Your research assistant says:
@@ -976,7 +1017,7 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
     return clean_indents(
         f"""
         You are a **senior forecaster** preparing a rigorous public report for expert peers.
-        Your accuracy and *calibration* will be scored with Metaculus' log-score, so avoid over-confidence.
+        {_scoring_sentence(question)} Avoid over-confidence.
         Use your own expertise and knowledge, not only the provided research — if you know a relevant fact from your
         training that the research reports don't cover, you may rely on it. You are not required to ground every claim
         in the research; just be clear when you're drawing on your own knowledge versus the research.
@@ -1008,6 +1049,7 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
 
         {question.resolution_criteria}
         {question.fine_print}
+        {_multi_resolution_clause(question, _MULTI_RESOLUTION_MC_RULE)}
 
         ── Intelligence Briefing (assistant research) ────────────────────────
         {research}
@@ -1095,22 +1137,353 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
     )
 
 
-def numeric_prompt(
-    question: NumericQuestion,
+# ---------------------------------------------------------------------------
+# The continuous (numeric and date) forecaster prompt
+# ---------------------------------------------------------------------------
+#
+# ``numeric_prompt`` and ``date_prompt`` render ONE template, ``_continuous_prompt``, with the
+# axis-specific text handed in as a ``_ContinuousAxis``. A date question is a numeric question on
+# the epoch-seconds axis (``numeric.date_axis``), so every reasoning step that is about a
+# distribution applies verbatim; what differs is how the axis is described (units versus calendar
+# dates), what the status quo means (a latest measurement versus "it has not happened"), and the
+# STRUCTURED FORECAST schema (floats versus ISO-8601 strings). Copying the template would have
+# put every shared rule in two places, which is what docs/prompts.md's one-statement rule forbids.
+
+
+@dataclass(frozen=True)
+class _ContinuousAxis:
+    """The text that differs between the numeric and date renderings of the continuous template.
+
+    Each field is one slot of ``_continuous_prompt``; every line of the template not named here
+    is shared. Multi-line blocks are pre-indented to the template's 8-space baseline so
+    ``clean_indents`` nests them the way it nests the template's own lines.
+    """
+
+    axis_block: str
+    status_quo_question: str
+    reference_class_rules: str
+    tail_scenarios: str
+    forecastability_bullet: str
+    outcome_type_step: str
+    final_check_lead: str
+    schema_block: str
+
+
+def _question_json(question: MetaculusQuestion) -> dict[str, Any]:
+    """The API's ``question`` object, or ``{}`` for a question not built from API JSON.
+
+    Mantic's per-question flags (``multi_resolution``, ``precision``, ``date_granularity``) live
+    here and nowhere on the ``forecasting_tools`` model; Metaculus payloads never carry them,
+    which is what lets the clauses below self-disable there without a run-mode flag.
+    """
+    question_json = question.api_json.get("question")
+    return question_json if isinstance(question_json, dict) else {}
+
+
+# The continuous scoring paragraph, shared by the numeric, date and stacking-numeric prompts.
+# Until 2026-09-08 it described Metaculus' implementation (a uniform 0.01 PDF floor, so
+# excluding the truth costs ln(0.01) = -4.6; a sharpness cap near 35), which told the model
+# the cliff below an out-of-range outcome was an order of magnitude shallower than it is on
+# Mantic, where the out-of-range bucket is scored against a fixed 5% reference with no floor
+# (1% of mass there scores -80.5 baseline points; 5% scores 0; 50% scores +115) and 28% of
+# Series 1 questions resolved out of range. The proper-scoring sentence is true on both
+# platforms and stays; the open-bound sentence replaces "scored as a binary event", which said
+# nothing about the reference the bucket is scored against.
+_CONTINUOUS_SCORING_RULE = (
+    "Continuous questions use a log density score: score = ln f(x*), where f is your forecasted PDF evaluated "
+    "at the realized value x*. Mass beyond an open bound is scored as its own outcome against a reference of a "
+    "few percent, so starving it is heavily punished. This is a proper scoring rule: to maximize expected score, "
+    "report your true uncertainty and resist overconfident, narrow shapes."
+)
+
+
+# Mantic's measured out-of-range base rates, rendered only on a Mantic question with the relevant
+# open bound (``question_platform`` reads the platform off ``page_url``). Receipt, Series 1 (520
+# resolved questions, 2026-09-08 corpus read): 101 of 188 date questions with an open upper
+# bound resolved ABOVE it (53.7%); 35 of 141 discrete (24.8%) and 9 of 133 numeric (6.8%)
+# resolved outside their range, 15% of quantitative questions combined, against 2.2 to 2.6% in
+# this bot's Metaculus archives. The pipeline fact both sentences end on is structural: when all
+# 13 percentiles sit inside the range, the published CDF puts exactly 1% beyond each open
+# bound, which Mantic scores at -80.5 points when the outcome lands there. Metaculus questions
+# never render either sentence, so Metaculus behaviour cannot move.
+_MANTIC_OUT_OF_RANGE_RATE_DATE = (
+    "On this platform about half of past date questions with an open upper bound resolved AFTER it (101 of 188 "
+    'in Series 1), so treat "the event has not happened by the upper bound" as a live central case and not a '
+    "tail: if that is your view, your P50 belongs above the upper bound. Keeping every percentile inside the "
+    "displayed range asserts a 1% chance of an out-of-range outcome."
+)
+_MANTIC_OUT_OF_RANGE_RATE_QUANTITY = (
+    "On this platform about one in seven past quantitative questions resolved outside the displayed range (one "
+    "in five of the discrete ones, one in fifteen of the continuous ones), so keeping every percentile inside the "
+    "range asserts a 1% chance of an out-of-range outcome; if your view puts more than that beyond an open bound, "
+    "place percentiles beyond it."
+)
+
+
+def _mantic_out_of_range_clause(question: MetaculusQuestion, view: NumericQuestion) -> str:
+    """The Mantic base-rate sentence for ``view``'s open bound, or ``""``.
+
+    Appended after the bound messages so ``numeric.utils.bound_messages`` stays platform-agnostic.
+    The date sentence is about the open UPPER bound specifically (that is where the measured half
+    lands; 10 of 520 Series 1 questions resolved below a lower bound), so a date question open
+    only at the bottom renders nothing.
+    """
+    if question_platform(question) != PLATFORM_MANTIC:
+        return ""
+    if isinstance(view, EpochDateQuestion):
+        return _MANTIC_OUT_OF_RANGE_RATE_DATE if view.open_upper_bound else ""
+    return _MANTIC_OUT_OF_RANGE_RATE_QUANTITY if (view.open_lower_bound or view.open_upper_bound) else ""
+
+
+# Mantic Series 2 "one forecast, many resolutions" (rules doc section 7; live on Preseason 2 post
+# 650, eleven daily bitcoin closes): the single submitted distribution is scored against every
+# resolution value and the scores averaged, sum_i (c_i / C) * k * ln(p_i), whose argmax is
+# p_i = E[c_i] / C. The optimum is therefore the expected EMPIRICAL distribution of the
+# resolution set, a mixture over the instances, not the predictive distribution of any one of
+# them; priced on post 650 at 77k spot and 2.5% daily vol, a day-one distribution loses 38.7
+# baseline points to the mixture. For MC and binary the same argument gives the expected
+# FREQUENCY over options and the expected fraction of Yes. Gated on the question's own
+# ``multi_resolution`` field (absent on Metaculus; ``is True`` because a test stub's chain of
+# MagicMocks is truthy). The count is deliberately NOT interpolated: ``resolutions`` is null
+# while the question is open and the count lives only in the criteria prose. Base prompts only,
+# per docs/prompts.md; a stacker on a multi-resolution question would never learn this, which
+# is a FUTURE.md note against re-enabling numeric stacking.
+_MULTI_RESOLUTION_CONTINUOUS_RULE = (
+    "This question is scored against EVERY resolution value its resolution criteria name, with the scores "
+    "averaged, so describe how the quantity is distributed ACROSS those values rather than where any one of them "
+    "lands: forecast each resolution instance, then pool those forecasts into a single mixture and report the "
+    "mixture's percentiles (a distribution fitted to one instance is scored as though it had excluded every other "
+    "value in the set)."
+)
+_MULTI_RESOLUTION_MC_RULE = (
+    "This question is scored against EVERY resolution its resolution criteria name, with the scores averaged, so "
+    "each option's probability is the share of those resolutions you expect to land on it, not the probability "
+    "that any single one does."
+)
+_MULTI_RESOLUTION_BINARY_RULE = (
+    "This question is scored against EVERY resolution its resolution criteria name, with the scores averaged, so "
+    "your probability is the fraction of those resolutions you expect to be Yes, not the probability that any "
+    "single one is."
+)
+
+
+def _multi_resolution_clause(question: MetaculusQuestion, rule: str) -> str:
+    """``rule`` when the question's own API JSON declares ``multi_resolution: true``, else ``""``."""
+    return rule if _question_json(question).get("multi_resolution") is True else ""
+
+
+# The scoring grid, named when the platform declares it. Mantic buckets a continuous CDF into
+# ``inbound_outcome_count`` bins and scores the bin the outcome falls in, so detail finer than a
+# bin is invisible to the score, and on a coarse grid (post 651: 12 one-day bins; Series 2 makes
+# day/week granularity and power-of-ten step sizes the default) a model that does not know the
+# grid smears a confident view across neighbouring bins. ``precision`` (quantitative) and
+# ``date_granularity`` (date) exist only on Mantic payloads, so a Metaculus question renders
+# nothing here. The bin count is read from the same ``question`` object rather than re-derived.
+def _scoring_grid_clause(question: MetaculusQuestion, view: NumericQuestion) -> str:
+    question_json = _question_json(question)
+    if isinstance(view, EpochDateQuestion):
+        granularity = view.date_granularity
+        if not granularity:
+            return ""
+        bins = int(question_json["inbound_outcome_count"])
+        return (
+            f"Scoring grid: {bins} bins of one calendar {granularity} each, in UTC. A date selects the bin that "
+            f"contains it (a date with no time of day means that whole day), so detail finer than one "
+            f"{granularity} is wasted."
+        )
+    precision = question_json.get("precision")
+    if precision is None:
+        return ""
+    bins = int(question_json["inbound_outcome_count"])
+    unit = view.unit_of_measure or "base units"
+    return (
+        f"Scoring grid: {bins} bins of width {float(precision):g} {unit}. A percentile's value selects the bin it "
+        "falls in, so detail finer than one bin is wasted."
+    )
+
+
+def _bullet_lines(*sentences: str, indent: int = 8) -> str:
+    """Render the non-empty ``sentences`` as ``•`` bullets at ``indent`` spaces, one per line."""
+    return "\n".join(f"{' ' * indent}• {sentence}" for sentence in sentences if sentence)
+
+
+def _numeric_axis(question: NumericQuestion) -> _ContinuousAxis:
+    unit_str = question.unit_of_measure or "unknown units, assume unitless (e.g. raw count)"
+    nom_upper, nom_lower = nominal_bounds(question)
+    axis_block = "\n".join(
+        [
+            "        ── Units & Bounds ──",
+            _bullet_lines(
+                f"Base units for output values: {unit_str}",
+                f"Displayed range (in base units): [{nom_lower}, {nom_upper}]",
+                "Note: displayed range is suggestive of units! If needed, you may use it to infer units.",
+                f"All {EXPECTED_PERCENTILE_COUNT} percentiles you output must be numeric values in the base unit. "
+                "Keep them within a closed bound (the outcome cannot cross it); an open bound is only the displayed "
+                "range, so a percentile may sit at or beyond it when warranted (see the bound notes below).",
+                "If your reasoning uses billions/millions/thousands, convert to base unit numerically (e.g., 350B → "
+                "350000000000). No suffixes or scientific notation, just numbers.",
+                _scoring_grid_clause(question, question),
+            ),
+        ]
+    )
+    schema_block = f"""\
+        Schema (`declared_percentiles` is REQUIRED and MUST contain all {EXPECTED_PERCENTILE_COUNT} standard
+        percentiles — {_STANDARD_PERCENTILES_DECIMAL_CSV}; `outcome_type` is REQUIRED):
+
+        ```json
+        {{
+          "question_type": "numeric",
+          "declared_percentiles": {{
+            "0.01": 0.5, "0.025": 1.2, "0.05": 10.1, "0.1": 12.3, "0.2": 23.4, "0.4": 34.5, "0.5": 45.6,
+            "0.6": 56.7, "0.8": 67.8, "0.9": 78.9, "0.95": 89.0, "0.975": 123.4, "0.99": 140.2
+          }},
+          "outcome_type": "continuous"
+        }}
+        ```
+
+        Notes:
+        - Values must be strictly increasing across percentiles (e.g. p20 > p10, not
+          equal); floating-point numbers in the base unit; no scientific notation.
+        - `outcome_type`: set to "discrete_integer" if the quantity is inherently a
+          whole number (counts, rankings, number of events, number of countries),
+          "continuous" otherwise (temperatures, percentages, dollar amounts, ratios)."""
+    return _ContinuousAxis(
+        axis_block=axis_block,
+        status_quo_question=(
+            'If nothing changed between now and resolution, what value would it resolve at?" Derive that value '
+            "from the platform state and the most recent authoritative measurement alone. Note: an open question "
+            "generally means the resolution criteria have not yet been satisfied, with one exception — if a "
+            "qualifying event or measurement is so recent that resolution simply lags, treat that recent value as "
+            "the anchor and weight your distribution accordingly."
+        ),
+        reference_class_rules=_COUNT_IN_PERIOD_REFERENCE_CLASS,
+        tail_scenarios=(
+            "            - Coherent pathway for unusually low results.\n"
+            "            - Coherent pathway for unusually high results."
+        ),
+        forecastability_bullet=(
+            "Decide how forecastable this quantity is from current information on this horizon. An administered or "
+            "slow-moving series (a policy rate, a home-price index, a monthly unemployment print) is largely "
+            "predictable from its latest value and historical variance: anchor tightly on recent observations. A "
+            "traded price, a volatile count or a novel metric on a short horizon is close to a random walk: center "
+            "on the current value, take the width from its realized variability over comparable windows, and do not "
+            "expect movement you cannot source to a named cause."
+        ),
+        outcome_type_step=(
+            "        (9) Outcome type: decide whether the resolution value is inherently a whole integer and record "
+            "it in `outcome_type` in the block below (definition in the schema notes).\n"
+        ),
+        final_check_lead=(
+            "Units: what are the units of the output values and why? Incorrect units can cause severe penalties in "
+            "log score."
+        ),
+        schema_block=schema_block,
+    )
+
+
+def _date_axis(question: MetaculusQuestion, view: EpochDateQuestion) -> _ContinuousAxis:
+    nom_upper, nom_lower = nominal_bounds(view)
+    granularity = view.date_granularity
+    lower_date = format_epoch(nom_lower, granularity)
+    upper_date = format_epoch(nom_upper, granularity)
+    axis_block = "\n".join(
+        [
+            "        ── Dates & Bounds ──",
+            _bullet_lines(
+                'Every value you output is a date in ISO-8601 form: a calendar date "YYYY-MM-DD", which means that '
+                'whole UTC day, or a UTC timestamp "YYYY-MM-DDTHH:MM:SSZ" when the time of day matters.',
+                f"Displayed range: [{lower_date}, {upper_date}]",
+                f"All {EXPECTED_PERCENTILE_COUNT} percentiles you output must be dates. Keep them within a closed "
+                "bound (the outcome cannot fall outside it); an open bound is only the displayed range, so a "
+                "percentile may sit at or beyond it when warranted (see the bound notes below). Dates after an open "
+                'upper bound are how you say "this does not happen within the displayed window".',
+                _scoring_grid_clause(question, view),
+            ),
+        ]
+    )
+    # The example spans the displayed range in the question's own rendering, so the model sees
+    # the exact string form its grid expects (a calendar date on a day/week grid, a timestamp on
+    # a legacy fine grid) rather than an illustrative value from another calendar.
+    example_epochs = np.linspace(nom_lower, nom_upper, EXPECTED_PERCENTILE_COUNT)
+    example_pairs = [
+        f'"{p:g}": "{format_epoch(float(x), granularity)}"'
+        for p, x in zip(STANDARD_PERCENTILES, example_epochs, strict=True)
+    ]
+    example_rows = ",\n            ".join(", ".join(example_pairs[i : i + 5]) for i in range(0, len(example_pairs), 5))
+    schema_block = f"""\
+        Schema (`declared_percentiles` is REQUIRED and MUST contain all {EXPECTED_PERCENTILE_COUNT} standard
+        percentiles — {_STANDARD_PERCENTILES_DECIMAL_CSV}):
+
+        ```json
+        {{
+          "question_type": "date",
+          "declared_percentiles": {{
+            {example_rows}
+          }}
+        }}
+        ```
+
+        Notes:
+        - Values are ISO-8601 strings, non-decreasing across percentiles: a repeated date is
+          allowed where your mass concentrates on one day, a decrease is not. A bare year, a
+          month, or a number is rejected; write the full calendar date (or UTC timestamp)."""
+    return _ContinuousAxis(
+        axis_block=axis_block,
+        status_quo_question=(
+            'If nothing changed between now and resolution, on what date would it resolve?" Derive that date from '
+            'the platform state alone. For a "when will X happen" question, open means X has not happened yet, so '
+            "the status quo is that it does not happen within the displayed window: that region lies above the "
+            "upper bound when it is open, and every date you place earlier is a claim that something changes. For "
+            'a "which date will Y fall on" question, the status-quo date is the one the most recent authoritative '
+            "measurement points to. The one exception is a qualifying event so recent that resolution simply lags: "
+            "treat its date as the anchor."
+        ),
+        # The soft-clock rule is the date question's natural home: a "when will X happen" question
+        # with an announced target date is the announced-but-unbound shape the rule was measured on
+        # (binary forecasts averaged 44% on events that happened 8% of the time), and here the
+        # mass on the target date IS the timing term the rule asks to price separately.
+        reference_class_rules=f"{_COUNT_IN_PERIOD_REFERENCE_CLASS}{_SOFT_CLOCK_RULE}",
+        tail_scenarios=(
+            "            - Coherent pathway for an unusually early date.\n"
+            "            - Coherent pathway for an unusually late date, including not within the displayed window."
+        ),
+        forecastability_bullet=(
+            "Decide how forecastable this date is from current information. An event on a binding clock (a "
+            "statutory deadline, a contracted delivery, a published schedule the actor has a measured record of "
+            "meeting) is largely predictable from that clock and the actor's slip record: anchor tightly on it. An "
+            'event with no clock, a first-ever occurrence, or a "largest move in the window" question is close to '
+            "unforecastable: spread your mass over the eligible dates in proportion to whatever base rate you can "
+            'source, put the "not within the window" mass beyond an open upper bound, and do not expect a date you '
+            "cannot source to a named cause."
+        ),
+        outcome_type_step="",
+        final_check_lead=(
+            "Calendar check: does every date you output fall on a day the resolution criteria allow (a trading "
+            "session, a business day, a scheduled release), and is the UTC day the one you mean?"
+        ),
+        schema_block=schema_block,
+    )
+
+
+def _continuous_prompt(
+    question: MetaculusQuestion,
+    *,
+    view: NumericQuestion,
     research: str,
     lower_bound_message: str,
     upper_bound_message: str,
+    axis: _ContinuousAxis,
 ) -> str:
-    unit_str = question.unit_of_measure or "unknown units, assume unitless (e.g. raw count)"
-    nom_upper, nom_lower = nominal_bounds(question)
+    """The one continuous template; ``numeric_prompt`` and ``date_prompt`` fill its axis slots."""
     # Only surface the anchor guidance when an anchor section is actually in the research:
     # the same cheap substring gate ``_strong_evidence_market_clause`` applies to the market
     # clause, so neither clause spends prompt on a table the forecaster does not have.
     ts_anchor_clause = f"\n        {_ts_anchor_evidence_clause()}" if TS_ANCHOR_SECTION_HEADER in research else ""
+    final_checks_step = "(10)" if axis.outcome_type_step else "(9)"
     return clean_indents(
         f"""
         You are a **senior forecaster** writing a public report for expert peers.
-        You will be scored with Metaculus' log-score, so accuracy **and** calibration
+        {_scoring_sentence(question)} Accuracy **and** calibration
         (especially the width of your prediction interval) are critical; how to set that width
         is step (8) of the template below.
         Use your own expertise and knowledge, not only the provided research — if you know a relevant fact from your
@@ -1141,17 +1514,11 @@ def numeric_prompt(
         {question.resolution_criteria}
         {question.fine_print}
 
-        ── Units & Bounds ──
-        • Base units for output values: {unit_str}
-        • Displayed range (in base units): [{nom_lower}, {nom_upper}]
-        • Note: displayed range is suggestive of units! If needed, you may use it to infer units.
-        • All {
-            EXPECTED_PERCENTILE_COUNT
-        } percentiles you output must be numeric values in the base unit. Keep them within a closed bound (the outcome cannot cross it); an open bound is only the displayed range, so a percentile may sit at or beyond it when warranted (see the bound notes below).
-        • If your reasoning uses billions/millions/thousands, convert to base unit numerically (e.g., 350B → 350000000000). No suffixes or scientific notation, just numbers.
+{axis.axis_block}
 
         ── Scoring Rule ──
-        Metaculus continuous questions use a log density score: score = ln f(x*), where f is your forecasted PDF evaluated at the realized value x*. A uniform 0.01 floor is added to every PDF to avoid -∞; excluding the truth yields ln(0.01) ≈ -4.605, while sharp accuracy is rewarded (e.g., f(x*) = 10 → +2.303). Probability mass below/above the bounds is scored as a binary event;  PDF sharpness is capped (about 0.01 ≤ f ≤ ~35), so spiky tricks don't pay. This is a proper scoring rule—to maximize expected score, report your true uncertainty and resist overconfident, narrow shapes.
+        {_CONTINUOUS_SCORING_RULE}
+        {_multi_resolution_clause(question, _MULTI_RESOLUTION_CONTINUOUS_RULE)}
 
         ── Intelligence Briefing (assistant research) ────────────────────────
         {research}
@@ -1160,6 +1527,7 @@ def numeric_prompt(
 
         {lower_bound_message}
         {upper_bound_message}
+        {_mantic_out_of_range_clause(question, view)}
 
         Reproduce the following analysis template in your answer:
 
@@ -1168,9 +1536,9 @@ def numeric_prompt(
         PHASE 0: PRELIMINARY CHECK
 
         (0) Status-quo derivation (answer this FIRST, before weighing any research or news)
-            - State in your own words: "This question is open and unresolved as of {
-            _today_str()
-        }. If nothing changed between now and resolution, what value would it resolve at?" Derive that value from the platform state and the most recent authoritative measurement alone. Note: an open question generally means the resolution criteria have not yet been satisfied, with one exception — if a qualifying event or measurement is so recent that resolution simply lags, treat that recent value as the anchor and weight your distribution accordingly.
+            - State in your own words: "This question is open and unresolved as of {_today_str()}. {
+            axis.status_quo_question
+        }
             - To move your central estimate off that status-quo value, name the specific POST-OPEN event (or concretely expected in-window event) that changes it. Commit explicitly: either write "no qualifying event has yet occurred inside the window" or name the in-window trigger and its date.
 
         (0a) {_RESOLUTION_METRIC_ECHO_HEADER}
@@ -1186,7 +1554,7 @@ def numeric_prompt(
             - Candidate reference classes and suitability.
             - State the outside view range and how you anchor to it.
             - If the data supports it, perform an explicit quantitative estimate: extrapolate recent trends, compute historical mean and variance, or fit a simple model. A rough calculation from data is more reliable than an intuitive range estimate.
-{_COUNT_IN_PERIOD_REFERENCE_CLASS}
+{axis.reference_class_rules}
 
         (3) Timeframe and dynamics
             - Time to resolution; describe how halving or doubling the timeline might shift percentiles.
@@ -1206,8 +1574,7 @@ def numeric_prompt(
 {_NULL_RESULT_READING}
 
         (6) Tail scenarios
-            - Coherent pathway for unusually low results.
-            - Coherent pathway for unusually high results.
+{axis.tail_scenarios}
 
         (7) Red team and final rationale — integrate outside→inside view
             - Challenge assumptions and data quality.
@@ -1217,14 +1584,13 @@ def numeric_prompt(
             - Question-specific base rate: anchor on the historical frequency, trend, or variance for THIS specific indicator (e.g., "how much has this index moved in prior analogous windows"), not a generic "things are usually stable" or "things are usually volatile" prior.
 
         (8) Forecastability and width
-            - Decide how forecastable this quantity is from current information on this horizon. An administered or slow-moving series (a policy rate, a home-price index, a monthly unemployment print) is largely predictable from its latest value and historical variance: anchor tightly on recent observations. A traded price, a volatile count or a novel metric on a short horizon is close to a random walk: center on the current value, take the width from its realized variability over comparable windows, and do not expect movement you cannot source to a named cause.
+            - {axis.forecastability_bullet}
             - Match your interval width to what your reasoning actually supports, and do not pad or sharpen out of a generic disposition. Log score punishes a narrow interval that misses far more than a wide one that covers, but a wide interval on a predictable quantity also bleeds points.
             - Keep your extreme tails (P1 and P99) wide enough to cover unknown unknowns you can actually name — but not padded out of generic caution.
 
-        (9) Outcome type: decide whether the resolution value is inherently a whole integer and record it in `outcome_type` in the block below (definition in the schema notes).
-
-        (10) Final checks
-            - Units: what are the units of the output values and why? Incorrect units can cause severe penalties in log score.
+{axis.outcome_type_step}
+        {final_checks_step} Final checks
+            - {axis.final_check_lead}
             - Bait-and-switch check: does your reasoning address the EXACT question and resolution criteria, not a related-but-different question?
             - Consistency line: which percentile corresponds to the status quo or trend, and is that sensible?
 
@@ -1232,29 +1598,50 @@ def numeric_prompt(
         This block is the ONLY authoritative source of your forecast — a downstream
         deterministic parser reads it and nothing else. Responses without it are
         discarded.
-        Schema (`declared_percentiles` is REQUIRED and MUST contain all {EXPECTED_PERCENTILE_COUNT} standard
-        percentiles — {_STANDARD_PERCENTILES_DECIMAL_CSV}; `outcome_type` is REQUIRED):
-
-        ```json
-        {{
-          "question_type": "numeric",
-          "declared_percentiles": {{
-            "0.01": 0.5, "0.025": 1.2, "0.05": 10.1, "0.1": 12.3, "0.2": 23.4, "0.4": 34.5, "0.5": 45.6,
-            "0.6": 56.7, "0.8": 67.8, "0.9": 78.9, "0.95": 89.0, "0.975": 123.4, "0.99": 140.2
-          }},
-          "outcome_type": "continuous"
-        }}
-        ```
-
-        Notes:
-        - Values must be strictly increasing across percentiles (e.g. p20 > p10, not
-          equal); floating-point numbers in the base unit; no scientific notation.
-        - `outcome_type`: set to "discrete_integer" if the quantity is inherently a
-          whole number (counts, rankings, number of events, number of countries),
-          "continuous" otherwise (temperatures, percentages, dollar amounts, ratios).
+{axis.schema_block}
 
         The LAST thing you write MUST be this fenced ```json block. Write nothing after it.
-        """  # noqa: S608  # not SQL: the prompt prose "INSIDE VIEW UPDATE (update from your base rate)" trips the heuristic
+        """  # not SQL: the prompt prose "INSIDE VIEW UPDATE (update from your base rate)" trips the heuristic
+    )
+
+
+def numeric_prompt(
+    question: NumericQuestion,
+    research: str,
+    lower_bound_message: str,
+    upper_bound_message: str,
+) -> str:
+    """The forecaster prompt for a numeric (or discrete) question; ``bound_messages`` supplies the two notes."""
+    return _continuous_prompt(
+        question,
+        view=question,
+        research=research,
+        lower_bound_message=lower_bound_message,
+        upper_bound_message=upper_bound_message,
+        axis=_numeric_axis(question),
+    )
+
+
+def date_prompt(
+    question: DateQuestion | EpochDateQuestion,
+    research: str,
+    lower_bound_message: str,
+    upper_bound_message: str,
+) -> str:
+    """The forecaster prompt for a date question: the numeric template on the calendar axis.
+
+    Takes the ``DateQuestion`` or its ``numeric.date_axis`` view interchangeably (the runner holds
+    both) and renders every bound as a date, never an epoch float. The bound messages arrive
+    already date-rendered from ``bound_messages`` on the epoch view.
+    """
+    view = question if isinstance(question, EpochDateQuestion) else as_epoch_question(question)
+    return _continuous_prompt(
+        question,
+        view=view,
+        research=research,
+        lower_bound_message=lower_bound_message,
+        upper_bound_message=upper_bound_message,
+        axis=_date_axis(question, view),
     )
 
 
@@ -1278,11 +1665,11 @@ def stacking_binary_prompt(
     return clean_indents(
         f"""
         You are a senior meta-forecaster specializing in combining predictions from multiple expert models.
-        You will be judged based on the accuracy and calibration of your final forecast using the Metaculus peer score (log score).
+        {_scoring_sentence(question)}
         {aggregation_section}
         Your task is to synthesize multiple expert analyses into a single, well-calibrated probability.
 
-        Your Metaculus question is:
+        Your question is:
         {question.question_text}
 
         Question background:
@@ -1371,8 +1758,7 @@ def stacking_multiple_choice_prompt(
     return clean_indents(
         f"""
         You are a senior meta-forecaster specializing in combining predictions from multiple expert models.
-        Your accuracy and calibration will be scored with Metaculus' log-score, so avoid over-confidence
-        and make sure your probabilities sum to **100%**.
+        {_scoring_sentence(question)} Avoid over-confidence and make sure your probabilities sum to 1.0.
         {aggregation_section}
         ── Question ──────────────────────────────────────────────────────────
         {question.question_text}
@@ -1472,7 +1858,7 @@ def stacking_numeric_prompt(
     return clean_indents(
         f"""
         You are a senior meta-forecaster specializing in combining predictions from multiple expert models.
-        You will be scored with Metaculus' log-score, so accuracy **and** calibration
+        {_scoring_sentence(question)} Accuracy **and** calibration
         (especially the width of your 90/10 interval) are critical.
         {aggregation_section}
         ── Question ──────────────────────────────────────────────────────────
@@ -1495,7 +1881,7 @@ def stacking_numeric_prompt(
         • If your reasoning uses B/M/k, convert to base unit numerically (e.g., 350B → 350000000000). No suffixes.
 
         ── Scoring Rule ──
-        Metaculus continuous questions use a log density score: score = ln f(x*), where f is your forecasted PDF evaluated at the realized value x*. A uniform 0.01 floor is added to every PDF to avoid -∞; excluding the truth yields ln(0.01) ≈ -4.605, while sharp accuracy is rewarded (e.g., f(x*) = 10 → +2.303). Probability mass below/above the bounds is scored as a binary event;  PDF sharpness is capped (about 0.01 ≤ f ≤ ~35), so spiky tricks don't pay. This is a proper scoring rule—to maximize expected score, report your true uncertainty and resist overconfident, narrow shapes.
+        {_CONTINUOUS_SCORING_RULE}
 
         ── Intelligence Briefing ────────────────────────────────
         {research}

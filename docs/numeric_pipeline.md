@@ -127,6 +127,26 @@ withholds the member. The archive audit found exact ties in 2 of 346 declaration
 whole-set collapses, supporting this distinction without adding a separate distinct-value
 requirement.
 
+Wherever the published bins are the outcome space, the spreader keeps a plateau inside the
+bin it names: the plateau's TOTAL spread is capped at one bin width, `grid_bin_width`
+(`numeric/config.py`), so the per-position spread is the smaller of the count-like unit and
+`bin_width / (plateau_size - 1)` (`_spread_cluster_values`, `numeric/cluster_processing.py`).
+The grid points of a discrete question are its bin edges, so a plateau at integer k spread
+past k +- 0.5 handed the mass the forecaster put on k to the neighbouring bins: on the
+three-bin Mantic post 253 a declared 90% on the first bin published 0.558 (Mantic edge-case
+review 2026-09, rank 7; the corpus reproductions are
+`tests/test_numeric_discrete_grid_plateaus.py`). What a plateau pins is an interval
+(`P90 = 0` and `P95 = 1` say `F(0.5)` lies in [0.90, 0.95)), and the published mass is
+that interval's lower edge less the uniform mixture. The predicate is
+`grid_is_outcome_space` (`numeric/config.py`): a natively discrete question
+(`DiscreteQuestion`, which every Metaculus discrete and every Mantic quantitative question
+parses as) or any non-201 grid, the same predicate on which Step 7's discrete snap skips. On
+those shapes the spread is the final word; on the 201-point continuous grid of a
+`NumericQuestion` the unit spread is pre-processing the vote-gated snap can re-concentrate,
+so that grid is byte-identical. The ablation harness rehydrates questions as
+`NumericQuestion`, which diverges from prod only on Mantic 200-bin discrete questions, absent
+from the Metaculus archives it replays.
+
 It also resolves the `zero_point` every CDF for the question is built with
 (`resolve_zero_point` in `numeric/validation.py`): the question's own, or `None` when it
 equals the lower bound, where the geometric axis divides by zero. A non-201 grid is not a
@@ -309,6 +329,17 @@ defend against pathological inputs), but their absence in logs carries no inform
 and they must not be used as model-quality features. Verified 2026-07-15; receipts in
 `scratch/coherence_2026-07-15/synthesis.md`.
 
+The rebuild trigger and the rebuild's own range check carry the same `_MIN_STEP_TOLERANCE`
+(1e-10) as the post-check and the final assertion (`numeric/pchip_cdf.py`). A forecast that
+puts essentially all of its mass beyond an open bound leaves the in-range CDF as the bare
+min-step ramp, whose required range equals its available range to within float epsilon;
+untoleranced, the trigger fired on a step 1e-18 short and the range check then refused a range
+1e-16 short, so the member was dropped on every non-201 grid and the 201-point grid fell
+through to a forecasting-tools fallback that failed on the same input (Mantic edge-case
+review 2026-09, rank 3; `TestAllMassBeyondABoundStillBuilds` in
+`tests/test_numeric_fine_grids.py` pins 15, 201, 451 and 2,001 points, both bounds). With the
+tolerance the rebuild can only be reached by a genuine shortfall, where it raises.
+
 Do NOT generalize that to the MAX-step repair, which is a live path — see the
 nearest-first packing section below. That the 2026-07-15 audit did not see it is an
 artifact of its old DEBUG level, not evidence it never fires.
@@ -335,8 +366,16 @@ concentrated on integer values.
 half-integer interpolation, rebuilds a step CDF, mixes in a uniform component for
 min-step compliance, then runs `safe_cdf_bounds`. It is skipped when the range holds
 more than `DISCRETE_SNAP_MAX_INTEGERS` integers (`constants.py`), when there
-are no integers in bounds, when bounds are non-finite, or when the question is already
-natively discrete (`cdf_size != 201`). Snapping is decided at the ensemble level, after
+are no integers in bounds, when bounds are non-finite, when the question is natively
+discrete (a `DiscreteQuestion`: every Metaculus discrete question and every Mantic
+quantitative question), or when the grid is not the 201-point one the snap's step limits
+belong to. The type is the signal, not `cdf_size`: a 200-bin Mantic discrete question has
+`cdf_size == 201` (thirteen in the Series 1 corpus, steps 1.0, 1.005 and 251.25) and the old
+`cdf_size != 201` guard let them through. A natively discrete grid is already its outcome
+space, so a 0.1-step grid resolves in tenths and an integer vote is simply wrong there, while
+on a 1.0-step integer-centred grid the snap is a no-op (Mantic edge-case review 2026-09,
+rank 14). Metaculus continuous count questions on [0, 10] or [0, 50] at 201 points, the
+snap's designed target, are unaffected. Snapping is decided at the ensemble level, after
 aggregation.
 
 ## Step 8: unit-mismatch guard

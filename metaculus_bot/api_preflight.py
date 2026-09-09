@@ -127,7 +127,12 @@ def _hijack_hint(host: str) -> str:
 
 
 class ApiIdentityError(RuntimeError):
-    """Raised when the host answering a question platform's API base URL doesn't behave like the real API."""
+    """Raised when the host answering a question platform's API base URL doesn't behave like the real API.
+
+    Also the failure class of the Mantic tournament preflight (``mantic.preflight_mantic_tournaments``)
+    when the token cannot be confirmed to hold forecast permission on the configured tournament: the
+    same fail-shut-before-any-spend gate, one exception for the operator to grep.
+    """
 
 
 def _parse_json_object(body: str) -> dict[str, Any] | None:

@@ -1,7 +1,7 @@
 """
 Pydantic schemas for structured forecaster output blocks.
 
-Base-forecaster LLMs (binary / multiple-choice / numeric) are asked to append
+Base-forecaster LLMs (binary / multiple-choice / numeric / date) are asked to append
 a fenced ```json block to their free-text rationale that declares structured
 fields (prior, base rate, hazard, percentiles, scenarios, etc.). A post-hoc
 tool runner extracts these blocks and feeds them to probabilistic tools
@@ -26,6 +26,7 @@ import logging
 import math
 import re
 from collections.abc import Iterator, Mapping
+from datetime import datetime
 from typing import Annotated, Literal, get_args
 
 from pydantic import (
@@ -38,7 +39,14 @@ from pydantic import (
     model_validator,
 )
 
+from metaculus_bot.numeric.date_axis import parse_iso_utc
+
 logger = logging.getLogger(__name__)
+
+# The question types a structured block may declare. ``question_types.QuestionType`` is the
+# same set; it is restated here as the schema's own vocabulary because that leaf is typed on
+# question CLASSES while this module is typed on the block's ``question_type`` string.
+StructuredQuestionType = Literal["binary", "numeric", "multiple_choice", "date"]
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +298,38 @@ class BinaryStructured(BaseModel):
         return _validate_scenario_sum(v)
 
 
+def _check_declared_percentiles[V: (float, datetime)](declared_percentiles: dict[float, V]) -> dict[float, V]:
+    """The percentile-map contract both continuous block types share.
+
+    Keys must include ``_REQUIRED_NUMERIC_PERCENTILES`` and sit in [0, 1]; values must be
+    non-decreasing with the percentile. Non-decreasing rather than strictly increasing because
+    ties are valid concentrated declarations (the cluster spreader separates them downstream).
+    The prompt still requests strict increases; this is the safety net that rejects a DECREASE
+    before the sanitizer orders by percentile level and would force-monotonize it into a
+    distribution nobody declared. Generic over the value type so a date block's datetimes get
+    the identical ordering check as a numeric block's floats.
+    """
+    missing_percentiles = _REQUIRED_NUMERIC_PERCENTILES - declared_percentiles.keys()
+    if missing_percentiles:
+        raise ValueError(
+            f"declared_percentiles must include at least "
+            f"{sorted(_REQUIRED_NUMERIC_PERCENTILES)}, missing {sorted(missing_percentiles)}"
+        )
+    for percentile_level in declared_percentiles:
+        if not (0.0 <= percentile_level <= 1.0):
+            raise ValueError(f"Percentile keys must be in [0, 1], got {percentile_level}")
+    previous_value: V | None = None
+    for percentile_level in sorted(declared_percentiles):
+        current_value = declared_percentiles[percentile_level]
+        if previous_value is not None and current_value < previous_value:
+            raise ValueError(
+                f"declared_percentiles values must be non-decreasing with percentile; "
+                f"got {current_value} at pct {percentile_level} after {previous_value}"
+            )
+        previous_value = current_value
+    return declared_percentiles
+
+
 class NumericStructured(BaseModel):
     """Structured declaration for a numeric question."""
 
@@ -341,29 +381,7 @@ class NumericStructured(BaseModel):
     def _check_percentiles(cls, declared_percentiles: dict[float, float] | None) -> dict[float, float] | None:
         if not declared_percentiles:
             return declared_percentiles
-        missing_percentiles = _REQUIRED_NUMERIC_PERCENTILES - declared_percentiles.keys()
-        if missing_percentiles:
-            raise ValueError(
-                f"NumericStructured.declared_percentiles must include at least "
-                f"{sorted(_REQUIRED_NUMERIC_PERCENTILES)}, missing {sorted(missing_percentiles)}"
-            )
-        for percentile_level in declared_percentiles:
-            if not (0.0 <= percentile_level <= 1.0):
-                raise ValueError(f"Percentile keys must be in [0, 1], got {percentile_level}")
-        # Values are non-decreasing rather than strictly increasing because ties are valid
-        # concentrated declarations. The prompt still requests strict increases; this check
-        # is a safety net that rejects decreases before the sanitizer orders by percentile level.
-        percentile_levels = sorted(declared_percentiles)
-        previous_value: float | None = None
-        for percentile_level in percentile_levels:
-            current_value = declared_percentiles[percentile_level]
-            if previous_value is not None and current_value < previous_value:
-                raise ValueError(
-                    f"declared_percentiles values must be non-decreasing with percentile; "
-                    f"got {current_value} at pct {percentile_level} after {previous_value}"
-                )
-            previous_value = current_value
-        return declared_percentiles
+        return _check_declared_percentiles(declared_percentiles)
 
     @model_validator(mode="after")
     def _require_percentiles(self) -> NumericStructured:
@@ -377,6 +395,52 @@ class NumericStructured(BaseModel):
     @classmethod
     def _check_scenarios_sum(cls, v: list[ScenarioBranch]) -> list[ScenarioBranch]:
         return _validate_scenario_sum(v)
+
+
+class DateStructured(BaseModel):
+    """Structured declaration for a date question: the 13 percentiles as ISO-8601 dates.
+
+    The values are parsed by ``numeric.date_axis.parse_iso_utc`` and nothing else: a calendar
+    date ``YYYY-MM-DD`` means noon UTC of that day (so it lands inside the platform's right-closed
+    day bin), a timestamp is taken as written with a naive time read as UTC, and every other
+    spelling fails. That single parser is what makes this block the TRUNCATION GUARD for dates.
+    The repair rung's fidelity check (``value_extraction._repair_infidelity_reason``) refuses a
+    numeric literal that ``json_repair`` would complete by inventing digits, but it reads only
+    numbers outside string literals, so a rationale cut mid-date (``"0.99": "2027-06-1``) is
+    invisible to it: ``json_repair`` closes the quote and hands back an invented ``"2027-06-1"``.
+    Here that value fails to parse and the whole block fails, which sends the ladder on to the
+    LLM rung rather than publishing a date nobody declared. Non-string values are rejected for
+    the same reason: pydantic would otherwise read a bare ``2027`` as a unix timestamp in 1970.
+
+    No ``outcome_type``: integer snapping on an epoch axis is meaningless, and the date runner
+    never records a discrete vote.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    question_type: Literal["date"]
+    declared_percentiles: dict[float, datetime]
+
+    @field_validator("declared_percentiles", mode="before")
+    @classmethod
+    def _parse_iso_dates(cls, declared: object) -> object:
+        if not isinstance(declared, dict):
+            return declared
+        parsed: dict[object, datetime] = {}
+        for percentile_level, value in declared.items():
+            if not isinstance(value, str):
+                raise ValueError(
+                    f"declared_percentiles[{percentile_level!r}] must be an ISO-8601 date string, got {value!r}"
+                )
+            parsed[percentile_level] = parse_iso_utc(value)
+        return parsed
+
+    @field_validator("declared_percentiles")
+    @classmethod
+    def _check_percentiles(cls, declared_percentiles: dict[float, datetime]) -> dict[float, datetime]:
+        if not declared_percentiles:
+            raise ValueError("DateStructured requires a non-empty declared_percentiles")
+        return _check_declared_percentiles(declared_percentiles)
 
 
 class MultipleChoiceStructured(BaseModel):
@@ -460,7 +524,7 @@ class DiscreteCountStructured(BaseModel):
 
 
 StructuredBlock = Annotated[
-    BinaryStructured | NumericStructured | MultipleChoiceStructured,
+    BinaryStructured | NumericStructured | MultipleChoiceStructured | DateStructured,
     Field(discriminator="question_type"),
 ]
 
@@ -473,6 +537,7 @@ _QUESTION_TYPE_TO_MODEL: dict[str, type[BaseModel]] = {
     "binary": BinaryStructured,
     "numeric": NumericStructured,
     "multiple_choice": MultipleChoiceStructured,
+    "date": DateStructured,
 }
 
 
@@ -617,7 +682,7 @@ def extract_first_balanced_braces(s: str) -> str | None:
 
 def parse_structured_payload(
     raw_json: str,
-    question_type: Literal["binary", "numeric", "multiple_choice"],
+    question_type: StructuredQuestionType,
     *,
     log_failures: bool = True,
 ) -> StructuredBlock | None:
@@ -669,7 +734,7 @@ def parse_structured_payload(
 
 def _decode_structured_payload(
     raw_json: str,
-    question_type: Literal["binary", "numeric", "multiple_choice"],
+    question_type: StructuredQuestionType,
     *,
     log_failures: bool,
 ) -> dict | None:
@@ -770,7 +835,7 @@ def _retry_without_binary_telemetry(
 
 def parse_structured_block(
     rationale_text: str,
-    question_type: Literal["binary", "numeric", "multiple_choice"],
+    question_type: StructuredQuestionType,
 ) -> StructuredBlock | None:
     """
     Extract and validate a structured JSON block from a rationale.

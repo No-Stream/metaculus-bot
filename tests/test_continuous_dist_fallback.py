@@ -42,6 +42,7 @@ def make_dummy_numeric_question():
         lower_bound=0,
         upper_bound=9999,
         page_url="https://example.com/q",
+        api_json={"question": {}},
         zero_point=0,
         id_of_question=123,  # Added for testing purposes
         cdf_size=201,

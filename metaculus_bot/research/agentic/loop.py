@@ -33,6 +33,7 @@ from typing import Any, Literal
 
 from pydantic import ValidationError
 
+from metaculus_bot.numeric.date_axis import format_epoch, to_epoch
 from metaculus_bot.research.agentic.artifact import detachment_lint, render_findings
 from metaculus_bot.research.agentic.dispatch import (
     _absorb_tool_results,
@@ -89,6 +90,7 @@ from metaculus_bot.research.agentic.types import (
 )
 from metaculus_bot.structured_output_schema import (
     BinaryStructured,
+    DateStructured,
     MultipleChoiceStructured,
     NumericStructured,
     extract_json_block,
@@ -432,14 +434,15 @@ def _log_completion(state: _LoopState, log_prefix: str) -> None:
     )
 
 
-_GHOST_QTYPES: tuple[Literal["binary", "multiple_choice", "numeric"], ...] = (
+_GHOST_QTYPES: tuple[Literal["binary", "multiple_choice", "numeric", "date"], ...] = (
     "binary",
     "multiple_choice",
     "numeric",
+    "date",
 )
 
 
-def _declared_qtype(raw_text: str) -> Literal["binary", "multiple_choice", "numeric"] | None:
+def _declared_qtype(raw_text: str) -> Literal["binary", "multiple_choice", "numeric", "date"] | None:
     """Peek the ghost block's self-declared ``question_type`` without parsing it.
 
     The ghost emits exactly one structured block that names its own
@@ -495,6 +498,13 @@ def _summarize_ghost(raw_text: str) -> tuple[str, str, dict[str, Any] | None]:
             median = declared.get(0.5)
             summary = "" if median is None else f"median={median}"
             return "numeric", summary, {"qtype": "numeric", "declared_percentiles": declared, "median": median}
+        if isinstance(block, DateStructured):
+            # Epoch seconds, the axis the date pipeline forecasts on, so the ghost is scored
+            # against a date resolution exactly as a published date CDF is.
+            declared = {float(pct): to_epoch(moment) for pct, moment in block.declared_percentiles.items()}
+            median = declared.get(0.5)
+            summary = "" if median is None else f"median={format_epoch(median, '')}"
+            return "date", summary, {"qtype": "date", "declared_percentiles": declared, "median": median}
     return "unknown", "", None
 
 

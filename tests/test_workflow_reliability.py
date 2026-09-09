@@ -37,6 +37,8 @@ import yaml
 from metaculus_bot.constants import (
     METACULUS_CLOSE_WINDOW_SECONDS,
     PER_QUESTION_WALL_CLOCK_DEADLINE,
+    PUBLISH_RESERVE_SECONDS,
+    TIME_BUDGET_FAST_PATH_THRESHOLD,
     WALL_CLOCK_STACKING_MIN_BUDGET,
 )
 
@@ -269,11 +271,17 @@ class TestScheduledBotCadence:
     Metaculus Cup workflow sat on ``3 0 */2 * *`` (00:03 every second day) until 2026-09-03,
     which could leave a cup question unforecast for most of its window.
 
-    Distinct minutes are the second half. The three workflows sit in SEPARATE concurrency
+    Distinct minutes are the second half. The four workflows sit in SEPARATE concurrency
     groups (``group: ${{ github.workflow }}``), so a shared minute does not queue — it
     starts two or three full bot runs at once, on the same runner pool and against the same
     shared AskNews / Gemini / OpenRouter quotas.
+
+    The Mantic workflow's entries all sit early in the hour, and the pin below derives why.
     """
+
+    mantic_rel_path = ".github/workflows/run_bot_on_mantic.yaml"
+    _MANTIC_WINDOW_SECONDS = 3600
+    _MANTIC_MIN_ENTRIES = 3
 
     @staticmethod
     def _schedule(rel_path: str) -> list[str]:
@@ -329,6 +337,32 @@ class TestScheduledBotCadence:
                     "and one set of shared research quotas, not a queue"
                 )
                 minutes[minute] = rel_path
+
+    def test_every_mantic_entry_fires_early_enough_for_the_full_research_path(self) -> None:
+        """Mantic questions open on the hour with 60-minute windows, so only early entries earn their keep.
+
+        The per-question budget is the close time minus now minus PUBLISH_RESERVE_SECONDS, and a
+        budget under TIME_BUDGET_FAST_PATH_THRESHOLD gets only the degraded research path, so an
+        entry later than the derived minute buys a worse forecast and the last quarter-hour (under
+        TIME_BUDGET_MIN_VIABLE_S) buys nothing. GitHub delivers about 22% of this repository's
+        scheduled firings (7 to 23 of 72 a day, measured 2026-08-27 to 2026-09-07), which is why
+        there are several early entries rather than one; the durable fix is an external dispatcher
+        (docs/operations.md "Scheduling reliability"). Two crons at :17/:47 would have forfeited
+        roughly half of all one-hour questions and given the :47 pickup only the fast path.
+        """
+        minutes = sorted(int(cron.split()[0]) for cron in self.scheduled[self.mantic_rel_path])
+        last_full_path_minute = (
+            self._MANTIC_WINDOW_SECONDS - PUBLISH_RESERVE_SECONDS - TIME_BUDGET_FAST_PATH_THRESHOLD
+        ) // 60
+        assert len(minutes) >= self._MANTIC_MIN_ENTRIES, (
+            f"{self.mantic_rel_path} has {len(minutes)} cron entry(ies); under GitHub's measured ~22% delivery a "
+            f"60-minute Mantic window needs at least {self._MANTIC_MIN_ENTRIES} early chances"
+        )
+        assert max(minutes) <= last_full_path_minute, (
+            f"{self.mantic_rel_path} fires at {minutes}, but a pickup after :{last_full_path_minute} of a "
+            "60-minute Mantic window falls under the fast-path threshold and gets only the degraded research "
+            "path; later entries buy little and the last quarter-hour buys nothing"
+        )
 
 
 class TestFetchDiagnosticCannotSpend:

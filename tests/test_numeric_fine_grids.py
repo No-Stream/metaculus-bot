@@ -32,7 +32,7 @@ Mantic forked with identical constants.
 from __future__ import annotations
 
 import logging
-from typing import NamedTuple
+from typing import ClassVar, NamedTuple
 
 import numpy as np
 import pytest
@@ -42,6 +42,7 @@ from scipy.stats import norm
 
 from metaculus_bot.constants import NUM_MIN_PROB_STEP
 from metaculus_bot.numeric.config import (
+    EXPECTED_PERCENTILE_COUNT,
     MAX_CDF_PROB_STEP,
     PCHIP_CDF_POINTS,
     STANDARD_PERCENTILES,
@@ -334,3 +335,65 @@ class TestLogScaledFineGridKeepsTheGeometricAxis:
             assert_server_accepts_cdf(probs, cdf_size=self._CDF_SIZE, open_lower=open_bounds, open_upper=open_bounds)
             median = float(np.interp(0.5, probs, geometric))
             assert 800.0 <= median <= 1250.0, f"median {median} is not where the forecasters put it"
+
+
+class TestAllMassBeyondABoundStillBuilds:
+    """A declaration that puts essentially all of its mass beyond an open bound builds and publishes.
+
+    Mantic scores an out-of-range resolution against the mass the CDF leaves beyond the bound
+    (``50 * ln(tail / 0.05)``), so a forecaster that follows the bound instruction and places all
+    thirteen percentiles past a ceiling it believes is too low is stating the highest-scoring shape
+    the platform has (+148.8 baseline points for a 0.98 tail). The in-range CDF is then exactly the
+    min-step ramp, whose required range equals its available range to within float epsilon. The
+    untoleranced rebuild trigger fired on that epsilon (a step 1e-18 short) and the untoleranced
+    range check inside the rebuild then refused a range 1e-16 short, so every non-201 grid raised
+    and dropped the member, and the 201-point grid fell through to the forecasting-tools builder,
+    which failed on the same input. Because the trigger is a property of the question, agreeing
+    forecasters failed together and the question published nothing (Mantic edge-case review,
+    2026-09, rank 3). The trigger and the range check now share the tolerance the post-check and
+    final assertion always had.
+
+    The range is the live Preseason 2 bitcoin question's; the 15-point grid is the coarse extreme,
+    2,001 the largest grid Mantic issues, and 201 the grid whose failure took the fallback route.
+    """
+
+    _LOWER, _UPPER = 54_950.0, 99_950.0
+    _SPAN = _UPPER - _LOWER
+    _ABOVE_CEILING = tuple(np.linspace(_UPPER + 0.01 * _SPAN, _UPPER + _SPAN, EXPECTED_PERCENTILE_COUNT))
+    _BELOW_FLOOR = tuple(np.linspace(_LOWER - _SPAN, _LOWER - 0.01 * _SPAN, EXPECTED_PERCENTILE_COUNT))
+    # Every declared percentile sits beyond the bound, so the mass beyond it is at least 1 - P1
+    # less the uniform mixture the min-step forces into the interior.
+    _MIN_OUT_OF_RANGE_MASS = 0.97
+
+    _SHAPES: ClassVar[list] = [
+        pytest.param(_ABOVE_CEILING, True, True, id="above-ceiling-open-floor"),
+        pytest.param(_ABOVE_CEILING, False, True, id="above-ceiling-closed-floor"),
+        pytest.param(_BELOW_FLOOR, True, True, id="below-floor-open-ceiling"),
+        pytest.param(_BELOW_FLOOR, True, False, id="below-floor-closed-ceiling"),
+    ]
+
+    @pytest.mark.parametrize("cdf_size", [15, PCHIP_CDF_POINTS, 451, 2001])
+    @pytest.mark.parametrize(("values", "open_lower", "open_upper"), _SHAPES)
+    def test_member_builds_and_the_server_accepts_it(
+        self, cdf_size: int, values: tuple[float, ...], open_lower: bool, open_upper: bool, caplog
+    ) -> None:
+        question = _question(
+            cdf_size, self._LOWER, self._UPPER, open_lower=open_lower, open_upper=open_upper, zero_point=None
+        )
+        declaration = [Percentile(percentile=p, value=v) for p, v in zip(STANDARD_PERCENTILES, values, strict=True)]
+
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.numeric"):
+            member = _build_member(declaration, question, "member")
+
+        # Built by the PCHIP path on the question's own grid, not rescued by the forecasting-tools
+        # fallback: ``_pchip_cdf_values`` is the marker the pipeline itself keys on.
+        assert hasattr(member, "_pchip_cdf_values")
+        probs = _probs(member)
+        assert_server_accepts_cdf(probs, cdf_size=cdf_size, open_lower=open_lower, open_upper=open_upper)
+        beyond_the_bound = float(probs[0]) if values is self._BELOW_FLOOR else float(1.0 - probs[-1])
+        assert beyond_the_bound >= self._MIN_OUT_OF_RANGE_MASS, f"only {beyond_the_bound:.4f} left beyond the bound"
+        messages = [record.getMessage() for record in caplog.records]
+        assert not any("PCHIP minimum step enforcement required" in m for m in messages), (
+            "the epsilon ramp is not a repair"
+        )
+        assert not any("PCHIP_FALLBACK" in m or "fallback" in m.lower() for m in messages), messages

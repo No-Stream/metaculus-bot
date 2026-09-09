@@ -43,7 +43,9 @@ telemetry supersedes the deleted shadow-divergence comparison): watch for
 Callers keep their post-processing contracts: binary output is the RAW
 pre-clamp decimal; MC output is a ``McForecast`` pairing the
 pre-``clamp_and_renormalize_mc`` option list with the probabilities as declared;
-numeric output feeds ``sanitize_percentiles`` unchanged.
+numeric output feeds ``sanitize_percentiles`` unchanged; date output is the same
+percentile list with EPOCH-SECOND values, so it feeds the numeric pipeline through
+``numeric.date_axis.as_epoch_question``.
 """
 
 from __future__ import annotations
@@ -68,14 +70,17 @@ from metaculus_bot.mc_processing import (
     accumulate_declared_option_probs,
     build_mc_prediction,
     clamp_and_renormalize_probs,
+    fold_option_label,
 )
 from metaculus_bot.numeric.config import STANDARD_PERCENTILES
+from metaculus_bot.numeric.date_axis import to_epoch
 from metaculus_bot.question_types import QuestionType
 from metaculus_bot.simple_types import OptionProbability
 from metaculus_bot.structured_output_schema import (
     _MAX_STRUCTURED_BLOCK_BYTES,
     _MC_OPTION_PROB_SUM_TOLERANCE,
     BinaryStructured,
+    DateStructured,
     MultipleChoiceStructured,
     NumericStructured,
     StructuredBlock,
@@ -83,7 +88,7 @@ from metaculus_bot.structured_output_schema import (
     iter_balanced_braces,
     parse_structured_payload,
 )
-from metaculus_bot.structured_parse import parse_structured
+from metaculus_bot.structured_parse import IsoDatePercentile, parse_structured
 
 logger = logging.getLogger(__name__)
 
@@ -495,6 +500,70 @@ async def extract_numeric(
 
 
 # ---------------------------------------------------------------------------
+# Date
+# ---------------------------------------------------------------------------
+
+
+def _date_from_block(block: StructuredBlock) -> list[Percentile]:
+    """The date block's ISO dates as epoch-second ``Percentile``s, ready for the numeric pipeline."""
+    if not isinstance(block, DateStructured):
+        raise ValueError(f"expected date block, got {type(block).__name__}")
+    return [
+        Percentile(percentile=float(pct), value=to_epoch(moment))
+        for pct, moment in sorted(block.declared_percentiles.items())
+    ]
+
+
+def _epoch_percentiles(dates: Sequence[IsoDatePercentile]) -> list[Percentile]:
+    return [Percentile(percentile=float(item.percentile), value=to_epoch(item.value)) for item in dates]
+
+
+# On the epoch axis a date forecast IS a numeric forecast, so the fidelity contract is the
+# numeric one verbatim: every ``STANDARD_PERCENTILES`` entry present, values finite and
+# non-decreasing by label. What differs is upstream of it, in ``DateStructured``: the repair
+# rung's ``_repair_infidelity_reason`` cannot see a truncated date (it inspects numeric
+# literals outside string literals, and a date is a string), so the block schema's strict ISO
+# parse is what refuses the ``json_repair``-completed ``"2027-06-1"`` a cut-off rationale leaves.
+_validate_date = _validate_numeric
+
+
+async def extract_date(
+    text: str,
+    parser_llm: GeneralLlm,
+    *,
+    prompt_notes: str = "",
+    question_id: int | None = None,
+    model_name: str = "",
+) -> ExtractionOutcome[list[Percentile]]:
+    """Extract a date question's ``STANDARD_PERCENTILES`` set as EPOCH SECONDS (UTC floats).
+
+    Mirrors ``extract_numeric``: the caller hands ``outcome.value`` to the same guarded numeric
+    distribution build, on the question's ``numeric.date_axis.as_epoch_question`` view. Every
+    rung converts through one parser (``numeric.date_axis.parse_iso_utc``): the block rung via
+    ``DateStructured``, the LLM salvage rung via ``IsoDatePercentile``, so a date-only value lands
+    at noon UTC inside its day bin on both paths and a naive timestamp is never read as host
+    time. ``prompt_notes`` should be the date sibling of ``build_parse_notes`` so the rung-3
+    parser keeps the ISO format and open-bound instructions.
+    """
+
+    async def _llm() -> list[Percentile]:
+        dates: list[IsoDatePercentile] = await parse_structured(
+            text, list[IsoDatePercentile], parser_llm, prompt_notes=prompt_notes
+        )
+        return _epoch_percentiles(dates)
+
+    return await _run_ladder(
+        text=text,
+        qtype="date",
+        convert_block=_date_from_block,
+        validate=_validate_date,
+        llm_extract=_llm,
+        question_id=question_id,
+        model_name=model_name,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Multiple choice
 # ---------------------------------------------------------------------------
 
@@ -528,8 +597,9 @@ def _make_mc_from_block(options: list[str]) -> Callable[[StructuredBlock], McFor
     def _mc_from_block(block: StructuredBlock) -> McForecast:
         if not isinstance(block, MultipleChoiceStructured):
             raise ValueError(f"expected multiple_choice block, got {type(block).__name__}")
-        # Match each block key to a canonical option by case/whitespace-insensitive
-        # comparison. We deliberately do NOT route through build_mc_prediction here:
+        # Match each block key to a canonical option through ``fold_option_label`` (case,
+        # whitespace, Unicode compatibility forms and curly-quote/dash glyphs all fold, on
+        # BOTH sides). We deliberately do NOT route through build_mc_prediction here:
         # its _normalize_name strips a leading "Option " token, which would mangle
         # options literally named "Option A"/"Option B". The block already declares
         # exact per-option probabilities, so we map straight onto the canonical
@@ -538,10 +608,10 @@ def _make_mc_from_block(options: list[str]) -> Callable[[StructuredBlock], McFor
         # the PredictedOptionList so ft 0.2.92's clamp-and-renormalize validator
         # (which raises on any >0.05 move) is a no-op; the caller still applies
         # clamp_and_renormalize_mc idempotently.
-        canonical_by_norm = {opt.strip().lower(): opt for opt in options}
+        canonical_by_norm = {fold_option_label(opt): opt for opt in options}
         matched: dict[str, float] = {}
         for key, prob in block.option_probs.items():
-            canonical = canonical_by_norm.get(key.strip().lower())
+            canonical = canonical_by_norm.get(fold_option_label(key))
             if canonical is None:
                 raise ValueError(f"block option {key!r} does not match any question option {options}")
             matched[canonical] = matched.get(canonical, 0.0) + float(prob)
@@ -634,6 +704,7 @@ __all__ = [
     "McForecast",
     "Rung",
     "extract_binary",
+    "extract_date",
     "extract_mc",
     "extract_numeric",
 ]

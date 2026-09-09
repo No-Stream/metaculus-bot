@@ -312,6 +312,9 @@ def make_mock_binary_question(qid: int = 1001) -> MagicMock:
     q.page_url = f"https://example.com/q/{qid}"
     q.open_time = _OPEN
     q.scheduled_resolution_time = _RESOLVE
+    # Real MetaculusQuestion objects always carry api_json; the prompts read
+    # api_json["question"] for the Mantic multi_resolution and grid clauses.
+    q.api_json = {"question": {}}
     return q
 
 
@@ -327,6 +330,9 @@ def make_mock_mc_question(qid: int = 1002, options: list[str] | None = None) -> 
     q.page_url = f"https://example.com/q/{qid}"
     q.open_time = _OPEN
     q.scheduled_resolution_time = _RESOLVE
+    # Real MetaculusQuestion objects always carry api_json; the prompts read
+    # api_json["question"] for the Mantic multi_resolution and grid clauses.
+    q.api_json = {"question": {}}
     return q
 
 
@@ -383,6 +389,9 @@ def make_mock_numeric_question(
     q.cdf_size = cdf_size
     q.nominal_lower_bound = nominal_lower_bound
     q.nominal_upper_bound = nominal_upper_bound
+    # No platform-specific flags: the prompts read Mantic's ``multi_resolution`` / ``precision``
+    # off ``api_json["question"]``, and a MagicMock attribute chain is truthy.
+    q.api_json = {"question": {}}
     if with_open_resolve_times:
         q.open_time = datetime.now() - timedelta(days=30)
         q.scheduled_resolution_time = datetime.now() + timedelta(days=365)
@@ -510,4 +519,7 @@ def mock_binary_question() -> MagicMock:
     question.id_of_question = 456
     question.open_time = datetime.now() - timedelta(days=30)
     question.scheduled_resolution_time = datetime.now() + timedelta(days=365)
+    # Real MetaculusQuestion objects always carry api_json; the prompts read
+    # api_json["question"] for the Mantic multi_resolution and grid clauses.
+    question.api_json = {"question": {}}
     return question

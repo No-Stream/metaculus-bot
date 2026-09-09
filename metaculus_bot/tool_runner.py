@@ -79,7 +79,7 @@ from metaculus_bot.probabilistic_tools import (
     satopaa_extremize,
     stated_base_rate_consistency,
 )
-from metaculus_bot.question_types import question_type_of
+from metaculus_bot.question_types import QuestionType, question_type_of
 from metaculus_bot.structured_output_schema import (
     BinaryStructured,
     MultipleChoiceStructured,
@@ -116,7 +116,7 @@ _P10_P90_Z_GAP: float = 2.5631
 _SPREAD_ANOMALY_RATIO_THRESHOLD: float = 0.10
 
 
-def _feature_enabled(question_type: Literal["binary", "numeric", "multiple_choice"] | None = None) -> bool:
+def _feature_enabled(question_type: QuestionType | None = None) -> bool:
     """Return True iff global PROBABILISTIC_TOOLS_ENABLED is set AND
     question_type (when given) appears in the PROBABILISTIC_TOOLS_TYPES allow-list.
 

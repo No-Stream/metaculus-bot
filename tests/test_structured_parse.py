@@ -13,6 +13,8 @@ Covers:
 
 from __future__ import annotations
 
+import time
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -22,6 +24,8 @@ from forecasting_tools.data_models.numeric_report import Percentile
 from metaculus_bot import structured_parse as sp
 from metaculus_bot.simple_types import OptionProbability
 from metaculus_bot.structured_parse import (
+    DatePercentileListWrapper,
+    IsoDatePercentile,
     OptionProbabilityListWrapper,
     PercentileListWrapper,
     parse_structured,
@@ -229,3 +233,66 @@ class TestWrapperHelpers:
         )
         assert len(w.options) == 1
         assert w.options[0].option_name == "A"
+
+
+class TestDatePercentileWrapper:
+    """The date salvage rung reads ``value`` through the repo's one date parser, never pydantic's.
+
+    forecasting-tools' own date template lets pydantic coerce the value (a date-only string lands
+    at midnight naive, a bare integer becomes a 1970 unix timestamp) and then calls ``.timestamp()``
+    on the naive result, which is host-local time. ``IsoDatePercentile`` routes the raw string
+    through ``numeric.date_axis.parse_iso_utc`` instead.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_naive_date_only_value_parses_to_noon_utc_under_a_non_utc_host_tz(
+        self, parser_llm, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        canned = (
+            '{"percentiles": ['
+            '{"percentile": 0.1, "value": "2026-09-16"},'
+            '{"percentile": 0.5, "value": "2026-09-17T09:30:00"},'
+            '{"percentile": 0.9, "value": "2026-09-18T00:00:00Z"}'
+            "]}"
+        )
+        constrained = _patch_build_constrained_llm(canned)
+        monkeypatch.setenv("TZ", "America/Los_Angeles")
+        time.tzset()
+        try:
+            with patch.object(sp, "_build_constrained_llm", return_value=constrained):
+                result = await parse_structured("txt", list[IsoDatePercentile], parser_llm)
+        finally:
+            monkeypatch.delenv("TZ")
+            time.tzset()
+
+        assert [type(item) for item in result] == [IsoDatePercentile] * 3
+        assert result[0].value == datetime(2026, 9, 16, 12, tzinfo=UTC)
+        assert result[1].value == datetime(2026, 9, 17, 9, 30, tzinfo=UTC)
+        assert result[2].value == datetime(2026, 9, 18, tzinfo=UTC)
+        # The epoch the numeric pipeline will run on is the UTC one, whatever the host clock says.
+        assert result[0].value.timestamp() == datetime(2026, 9, 16, 12, tzinfo=UTC).timestamp()
+
+    @pytest.mark.asyncio
+    async def test_a_bare_number_or_truncated_date_fails_the_constrained_path(self, parser_llm) -> None:
+        """pydantic would read ``2027`` as a unix timestamp; the wrapper refuses, so the constrained
+        path fails and the ``structure_output`` fallback (typed on the same model) gets its turn."""
+        for bad in (
+            '{"percentiles": [{"percentile": 0.5, "value": 2027}]}',
+            '{"percentiles": [{"percentile": 0.5, "value": "2027-06-1"}]}',
+        ):
+            constrained = _patch_build_constrained_llm(bad)
+            fallback = AsyncMock(return_value=[])
+            with (
+                patch.object(sp, "_build_constrained_llm", return_value=constrained),
+                patch.object(sp, "structure_output", new=fallback),
+            ):
+                await parse_structured("t", list[IsoDatePercentile], parser_llm)
+            fallback.assert_awaited_once()
+            assert fallback.await_args is not None
+            assert fallback.await_args.kwargs["output_type"] == list[IsoDatePercentile]
+
+    def test_wrapper_shape_and_dispatch(self) -> None:
+        w = DatePercentileListWrapper.model_validate({"percentiles": [{"percentile": 0.5, "value": "2026-09-16"}]})
+        assert w.percentiles[0].value == datetime(2026, 9, 16, 12, tzinfo=UTC)
+        assert sp._get_wrapper_type(list[IsoDatePercentile]) is DatePercentileListWrapper
+        assert sp._get_wrapper_type(list[Percentile]) is PercentileListWrapper

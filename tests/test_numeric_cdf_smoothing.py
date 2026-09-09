@@ -48,6 +48,7 @@ def _make_question(open_upper=False, open_lower=False, lower=0.0, upper=100.0):
         upper_bound=upper,
         lower_bound=lower,
         zero_point=None,
+        cdf_size=201,
         id_of_question=999,
         question_text="Test numeric question",
         background_info="",
@@ -55,6 +56,7 @@ def _make_question(open_upper=False, open_lower=False, lower=0.0, upper=100.0):
         fine_print="",
         unit_of_measure="units",
         page_url="https://example.com/q/999",
+        api_json={"question": {}},
         open_time=_stub_open_time(),
         scheduled_resolution_time=_stub_resolve_time(),
     )

@@ -24,6 +24,7 @@ from forecasting_tools import (
     ReasonedPrediction,
 )
 from forecasting_tools.data_models.data_organizer import PredictionTypes
+from forecasting_tools.data_models.questions import DateQuestion
 
 from metaculus_bot import calibration, stacking
 from metaculus_bot.aggregation_strategies import (
@@ -35,7 +36,13 @@ from metaculus_bot.aggregation_strategies import (
 from metaculus_bot.constants import STACKER_FALLBACK_SOFT_DEADLINE, STACKER_SOFT_DEADLINE
 from metaculus_bot.exceptions import UnitMismatchError
 from metaculus_bot.llm_configs import STACKER_FALLBACK_LLM
-from metaculus_bot.member_forecast import MEMBER_FORECAST_ROLE_STACKER, format_member_forecast_marker, percentile_pairs
+from metaculus_bot.member_forecast import (
+    MEMBER_FORECAST_ROLE_STACKER,
+    format_member_forecast_marker,
+    out_of_range_mass,
+    percentile_pairs,
+)
+from metaculus_bot.numeric.date_axis import numeric_qtype, numeric_view
 from metaculus_bot.numeric.diagnostics import log_final_prediction, log_open_bound_piling_diagnostics
 from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
 from metaculus_bot.numeric.utils import bound_messages
@@ -83,11 +90,12 @@ class AggregationPipeline:
     counters: AggregationCounters = field(default_factory=AggregationCounters)
 
     def get_threshold_for_question(self, question: MetaculusQuestion) -> float:
+        """The spread threshold for the question's type; a date question's spread is numeric (range-normalised)."""
         if isinstance(question, BinaryQuestion):
             return self.stacking_spread_thresholds["binary"]
         if isinstance(question, MultipleChoiceQuestion):
             return self.stacking_spread_thresholds["mc"]
-        if isinstance(question, NumericQuestion):
+        if isinstance(question, (NumericQuestion, DateQuestion)):
             return self.stacking_spread_thresholds["numeric"]
         raise ValueError(f"No spread threshold for question type: {type(question).__name__}")
 
@@ -158,9 +166,13 @@ class AggregationPipeline:
             self.meta_reasoning[qid] = meta_text
             logger.info(f"Stacked multiple choice prediction for {page_url}: {pol}")
             return pol
-        if isinstance(question, NumericQuestion):
+        if isinstance(question, (NumericQuestion, DateQuestion)):
+            # A date question stacks on its epoch-seconds view. Reachable only with
+            # NUMERIC_STACKING_ENABLED on (stacking_route gates dates on the numeric flag,
+            # off in prod); the stacker's numeric prompt and extraction are float-based, so a
+            # date stack that fails to parse degrades to MEDIAN through the ladder above.
             return await self._run_stacking_numeric(
-                question,
+                numeric_view(question),
                 research,
                 base_predictions,
                 stacker_llm=stacker_llm,
@@ -183,7 +195,12 @@ class AggregationPipeline:
         aggregated_tool_output: str | None,
         stacker_wall_timeout: float,
     ) -> PredictionTypes:
-        """Stack a numeric question: percentiles -> sanitize -> unit guard -> PCHIP CDF."""
+        """Stack a numeric question: percentiles -> sanitize -> PCHIP CDF -> unit guard.
+
+        The CDF is built before the unit-mismatch guard so the stacker's MEMBER_FORECAST line
+        can carry the built CDF's out-of-range mass; the guard still withholds the same
+        distributions, and a withheld stacker still leaves its line.
+        """
         upper_msg, lower_msg = bound_messages(question)
         perc_list, meta_text = await stacking.run_stacking_numeric(
             stacker_llm,
@@ -199,14 +216,16 @@ class AggregationPipeline:
         self.meta_reasoning[qid] = meta_text
 
         percentile_list, zero_point = sanitize_percentiles(list(perc_list), question, model_name=stacker_llm.model)
+        prediction = build_numeric_distribution(percentile_list, question, zero_point, model_name=stacker_llm.model)
         logger.info(
             format_member_forecast_marker(
                 question_id=qid,
                 model=stacker_llm.model,
                 role=MEMBER_FORECAST_ROLE_STACKER,
-                qtype="numeric",
+                qtype=numeric_qtype(question),
                 raw=percentile_pairs(perc_list),
                 published=percentile_pairs(percentile_list),
+                out_of_range=out_of_range_mass(prediction),
             )
         )
 
@@ -219,7 +238,6 @@ class AggregationPipeline:
                 f"Unit mismatch likely; {reason}. Values: {[float(p.value) for p in percentile_list]}"
             )
 
-        prediction = build_numeric_distribution(percentile_list, question, zero_point, model_name=stacker_llm.model)
         log_open_bound_piling_diagnostics(prediction, question, stacker_llm.model, percentile_list)
         log_final_prediction(prediction, question)
         logger.info(f"Stacked numeric prediction for {page_url}")
@@ -530,9 +548,11 @@ class AggregationPipeline:
         if isinstance(first, (int, float)):
             values = [float(p) for p in predictions if isinstance(p, (int, float))]
             return combine_binary_predictions(values, strategy)  # type: ignore[return-value]
-        if isinstance(first, NumericDistribution) and isinstance(question, NumericQuestion):
+        if isinstance(first, NumericDistribution) and isinstance(question, (NumericQuestion, DateQuestion)):
             numeric_preds = [p for p in predictions if isinstance(p, NumericDistribution)]
-            return combine_numeric_predictions(numeric_preds, question, strategy)  # type: ignore[return-value]
+            # A date question's members live on the epoch-seconds axis; the combiner reads the
+            # bounds and grid off the same view, so the ensemble CDF carries is_date too.
+            return combine_numeric_predictions(numeric_preds, numeric_view(question), strategy)  # type: ignore[return-value]
         if isinstance(first, PredictedOptionList):
             mc_preds = [p for p in predictions if isinstance(p, PredictedOptionList)]
             return combine_multiple_choice_predictions(mc_preds, strategy)  # type: ignore[return-value]

@@ -78,21 +78,94 @@ for new questions. Details and receipts: `docs/operations.md` "Fall 2026 season"
    warning for this state; the way to notice is a supply-probe row showing cup questions with no bot
    forecasts.
 
-### Mantic Crucible: Phase 1 shipped 2026-09-08, what is deferred (added 2026-09-08)
+### Mantic Crucible: Phases 1 and 2 shipped 2026-09-08, what is deferred to Wave C (added 2026-09-08)
 
 Mantic runs a bot-only forecasting competition (Crucible, competitions.mantic.com) on a fork of
 the Metaculus platform and pays $3 per forecast. `--mode mantic` and `run_bot_on_mantic.yaml`
-(crons :17/:47) forecast it on the operator's personal keys only; the design and the three API
-differences are in `docs/operations.md` "Mantic" and the plan in
-`scratch_docs_and_planning/mantic_integration_plan_2026-09-08.md`. Operator step remaining:
+(three crons at :05/:15/:25) forecast it on the operator's personal keys only; the design and the three
+API differences are in `docs/operations.md` "Mantic" and the plans in
+`scratch_docs_and_planning/mantic_integration_plan_2026-09-08.md` (Phase 1, the platform seam)
+and `mantic_phase2_plan_2026-09-08.md` (Phase 2: first-class date questions, the
+Mantic-optimized prompt and numeric fixes, and the robustness rules from the readiness review
+in `mantic_research_2026-09-08/`). Operator step remaining:
 `gh secret set MANTIC_TOKEN --repo No-Stream/metaculus-bot < ~/.keys/MANTIC_TOKEN`, then merge;
-the schedule is live once the file is on `main`. Deferred, each with its trigger:
+the schedule is live once the file is on `main`.
 
-- **Multi-resolution prompt clause: deferred.** The preseason bitcoin question is scored against
-  eleven daily prices and averaged, and its question text already explains that format, so the
-  forecasters see it. Add a prompt clause only if the published distribution proves measurably
-  too narrow once that question resolves (2026-09-20); the `MANTIC_QUESTION` marker logs
-  `multi_resolution` per question so the cohort is recoverable.
+**Wave C, before Series 2, with live data** (from the Phase 2 plan; each item's receipt is in
+the research dossier):
+
+- **Per-bin PMF elicitation for enumerable grids** (about 31 bins or fewer). Forecasters would
+  emit a probability per bin, as they do for multiple choice, the CDF built from the PMF and
+  aggregation left in CDF space. Motivation: impossible bins (weekends on a trading-day date
+  question) cost 14.4 baseline points with zero information under percentile-to-PCHIP, and
+  Series 2 makes coarse grids the default. Needs its own design and e2e.
+- **Supply probe Mantic mode** (free, unauthenticated). Page the tournament for closed and
+  resolved posts, count how many carry a forecast from the bot's user, report the miss rate
+  per release hour. This is the instrument for the cadence decision below; today Mantic
+  forfeits leave no trace at all.
+- **External dispatcher: OPEN operator decision** (review item 2). GitHub delivered about 22%
+  of this repo's scheduled firings from 2026-08-27 to 2026-09-07 (7 to 23 of 72 a day). The
+  Mantic workflow runs three crons at :05/:15/:25, not six: a pickup after about :30 of a
+  60-minute window falls under the 1815 s fast-path threshold and the last quarter-hour under
+  the 300 s viability floor, so later entries buy little or nothing. The durable fix is an
+  always-on cron or a free Cloudflare Worker cron trigger calling GitHub's workflow-dispatch
+  API at :01 (dispatch events are not subject to schedule dropping); a self-hosted runner does
+  not help because the drops are scheduler-side, and running the bot on a box directly loses
+  the artifact pipeline. Detail: `docs/operations.md` "Scheduling reliability".
+- **Mechanical 5% out-of-range tail floor: HELD** pending the new `oor_low` / `oor_high`
+  telemetry on the per-member and aggregate numeric markers. Moving each open side from 1% to
+  5% breaks even at a 5% escape rate; Mantic measured 15% on discrete and 51% on date questions,
+  so the floor is probably right, but it would override an honest forecaster and would be inert
+  if the models already place percentiles beyond the bound. Decide on the first live runs' oor
+  fields.
+- **Fast-path alertability in mantic mode** (item 13). The `time_budget_fast_path` counter is
+  alertable and would fire routinely under 60-minute windows; decide once the Series 2 window
+  length is known.
+- **Median versus mean aggregation under the baseline formula** (item 18). Replay the archived
+  per-member CDFs under Mantic's baseline score; about +5 points per question if the mechanism
+  transfers. A re-measurement of a recorded decision, not a re-litigation.
+- **Starved outer tail** (item 19) stays a documented watch item, not bundled with the
+  min-step tolerance fix.
+- **Log-scaled discrete grids are untested.** No `zero_point` (log-scaled) discrete question
+  exists in the Mantic corpus, so the plateau cap's use of the linear mean bin width on such a
+  grid has no live or recorded case behind it; check the first one that appears.
+- **After 2026-09-20 12:00 UTC:** read question 651's resolution string and reported baseline
+  score to close the on-edge bin-mapping question, and read one resolved Series 2 question's
+  score to learn the continuous coefficient Mantic actually uses.
+
+**Accepted with no change (do not re-raise):** loosening the binary 0.98 clamp (at most +2.7
+points, and Series 1 had zero binary questions); the multiple-choice 0.01 floor
+(forecasting-tools' own); never withdrawing a forecast (a withdrawn forecast scores 0 instead of
+the 25th-percentile fallback); the early-close `min()` (0 of 520 Series 1 questions closed
+early); publish thread-pool sizing; clock and timezone handling; upcoming, group, conditional
+and notebook posts (Mantic produces none); 400/404/405/429 publish handling; resolution-time
+bin aggregation (no adjacent-bin hedging); the 70-minute step cap; the high-cardinality
+multiple-choice ceiling; Mantic comment backfill.
+
+- **Multi-resolution prompt clause: SHIPPED in Phase 2**, gated on the question's own
+  `multi_resolution: true` flag and type-aware (mixture percentiles for continuous and date
+  questions, expected share per option for multiple choice, expected fraction of Yes for
+  binary); priced at 38.7 points on the live post 650. It lives in the base prompts only. The
+  three stacking prompts do not carry it, or any other base-prompt rule, by the standing rule
+  in `docs/prompts.md`; stacking is off in production and the stacker rewrites the forecasts it
+  is given rather than reasoning about the platform. The consequence is deliberate but worth
+  naming: a stacker on a multi-resolution question never learns it, so revisit before
+  re-enabling numeric stacking.
+- **Prompt notes recorded by the Phase 2 build, not changed.** `_HISTORY_DISCHARGED_RULE` was
+  NOT added to the date prompt, pending the operator's say (the date prompt does carry
+  `_SOFT_CLOCK_RULE`, since announced target dates in "when will X" questions are the
+  announced-but-unbound shape it was measured on). `_METACULUS_SCORING_SENTENCE` names the spot
+  peer score, which is exact for the bot tournaments; the Metaculus Cup is coverage-scaled peer
+  scoring, so on the cup the sentence is one word off.
+- **Numeric notes recorded by the Phase 2 build, not changed.** After the 1e-10 min-step
+  tolerance in `numeric/pchip_cdf.py`, the `_rebuild_with_min_steps` success branch is
+  unreachable on any real input (the server-formula min step times N is always about 0.01 and
+  the caps always leave 0.998); it stays under the fallback-code standing rule and is a
+  dead-code cleanup candidate. The discrete-grid plateau cap applies only on the discrete build
+  path (`cdf_size != 201`); capping on every grid so Metaculus count questions on 201-point
+  grids get sharper is a one-token key change plus a golden re-pin, recorded as a candidate. The
+  "Cluster spread applied ... delta_used=" log line in `numeric/bounds_clamping.py` still reports
+  the pre-cap parameter; its meaning was left alone under the marker rule.
 - **Free Series 1 corpus as a calibration and backtest resource.** 520 resolved Series 1 questions
   expose every competitor's full CDF unauthenticated, at
   `aggregations.recency_weighted.score_data.disagreement_forecasts` on
@@ -110,23 +183,19 @@ the schedule is live once the file is on `main`. Deferred, each with its trigger
   posts in the 650s the next Metaculus key above them is 14333, about 13,700 Mantic posts away.
   Namespace the grouping key or the filenames before the Mantic counter gets near that, and not
   before, because that is mechanism for a collision this deployment does not produce.
-- **Date questions: Phase 2.** The preseason's fourth question is a date question (twelve daily
-  bins) that the bot's type guard skips. Support means a date runner in `forecaster_runners.py`
-  (percentiles as ISO dates, parsed to epoch seconds, the numeric pipeline on the epoch axis with
-  the question's `cdf_size`, comment rendering as dates) and admitting `DateQuestion` in the type
-  guard; aggregation is unchanged in CDF space. Planned as a second section of the Mantic plan
-  after Phase 1 is green and reviewed.
-- **Series 2 cadence unknown.** Series 1 windows were exactly one hour, opened on the hour, up to
-  three questions an hour. The :17/:47 crons dodge the top-of-hour GitHub Actions congestion and
-  leave about 43 minutes if that cadence returns; move to three entries per hour if it does.
-- **Prompts still name Metaculus and the peer score (review finding, 2026-09-08).** Every
-  forecasting prompt tells the model it is a Metaculus question judged by the Metaculus peer
-  score (`prompts.py`, the binary, numeric and multiple-choice templates), and on Mantic both are
-  false: the preseason `score_type` is `spot_baseline_tournament`, and baseline scoring has no
-  differentiate-from-the-field incentive. Platform-neutral wording ("a proper log score", "Your
-  forecasting question is:") is the fix and needs no per-platform branch, but a base-prompt edit
-  is a config-era boundary and goes through the prompt-rule process (presence and absence pins
-  under `tests/prompts/`), so the timing is the operator's call.
+- **Date questions: SHIPPED in Phase 2.** The question stays a `DateQuestion` end to end and
+  the numeric math runs on its epoch-seconds view (`numeric/date_axis.py`); the date runner,
+  prompt, structured schema and extraction are in `docs/architecture.md` "The date path". Out of
+  scope and asserted at the code's own seams: backtest, ablation and performance_analysis for
+  date questions, and Mantic residual analysis.
+- **Series 2 cadence: three early crons, dispatcher decision open (Wave C above).** Series 1
+  windows were exactly one hour, opened on the hour, up to three questions an hour; two crons at
+  :17/:47 under a 22% delivery rate would have forfeited roughly half of them, and the :47 pickup
+  would have had only the fast path.
+- **Prompts naming Metaculus and the peer score: SHIPPED in Phase 2** as platform-aware named
+  constants (`_METACULUS_SCORING_SENTENCE`, `_MANTIC_SCORING_SENTENCE`) read off the question's
+  `page_url` host, with the Metaculus-only scoring facts deleted; see `docs/operations.md`
+  "Mantic-optimized forecasting".
 - **`research/resolution_source.py` split (review finding, 2026-09-08).** The module is about
   3,500 lines carrying the fetch ladder, URL selection, the network-safety checks, the per-rung
   drivers and marker logging; the Mantic branch only reworded two docstrings in it. It has

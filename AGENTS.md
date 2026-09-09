@@ -64,8 +64,11 @@ Paid or externally visible — ask before each:
   publish to the platform they forecast (Metaculus, or competitions.mantic.com for
   `run_bot_on_mantic.yaml`). `test_bot_basic.yaml` (one numeric question, ~$2.60) and
   `test_bot.yaml` are `workflow_dispatch`-only. The four `run_bot_on_*.yaml` prod workflows are
-  additionally on `schedule:` crons (`run_bot_on_mantic.yaml`, :17/:47, holds no Metaculus
-  secret and is auto-enabled once its file lands on `main`). Never dispatch one, and never edit
+  additionally on `schedule:` crons (`run_bot_on_mantic.yaml`, :05/:15/:25, all in the first
+  half hour because a later pickup of a 60-minute Mantic window gets only the fast path; GitHub
+  delivers about 22% of this repo's scheduled firings, see `docs/operations.md` "Scheduling
+  reliability"; the file holds no Metaculus secret and is auto-enabled once it lands on
+  `main`). Never dispatch one, and never edit
   a `schedule:` block or a research/model flag in a way that adds runs or raises per-run cost,
   without the operator's say-so. `gh` needs
   `--repo No-Stream/metaculus-bot` here: `origin` is the fork, `upstream` is the Metaculus
@@ -170,6 +173,7 @@ Inside `metaculus_bot/`:
 |---|---|
 | Per-question orchestration | `forecaster.py` (`_research_and_make_predictions`), `cli.py` |
 | Mantic platform client (Crucible, a Metaculus fork) | `mantic.py` |
+| Which platform a question is on, read off `page_url` | `question_platform.py` (tokens `PLATFORM_METACULUS` / `PLATFORM_MANTIC` in `constants.py`) |
 | Close-derived time budget | `time_budget.py` |
 | Research fan-out and providers | `research/` (`orchestrator.py`, `providers.py`, one module per provider) |
 | Outbound fetch transports (never hand-rolled) | `research/http_fetch.py`, `impersonated_fetch.py` (the `curl_cffi` TLS-impersonating retry), `rendered_fetch.py` (headless Chromium), `url_context_reader.py` (the paid Gemini read), `robots_policy.py` |
@@ -181,6 +185,7 @@ Inside `metaculus_bot/`:
 | Per-type forecaster runners | `forecaster_runners.py` |
 | Value extraction ladder | `value_extraction.py`, `structured_parse.py`, `structured_output_schema.py` |
 | Numeric percentiles → CDF | `numeric/` |
+| Date question as a numeric question on the epoch-seconds axis | `numeric/date_axis.py` |
 | MC clamp / renormalize | `mc_processing.py` |
 | Aggregation routing and stacking | `stacking_route.py`, `aggregation_pipeline.py`, `stacking.py`, `spread_metrics.py` |
 | Publish hardening and close gate | `publish_hardening.py`, `publish_gate.py` |

@@ -14,10 +14,11 @@ import logging
 from typing import get_args, get_origin
 
 from forecasting_tools import GeneralLlm, structure_output
-from forecasting_tools.data_models.numeric_report import Percentile
-from pydantic import BaseModel
+from forecasting_tools.data_models.numeric_report import DatePercentile, Percentile
+from pydantic import BaseModel, field_validator
 
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
+from metaculus_bot.numeric.date_axis import parse_iso_utc
 from metaculus_bot.simple_types import OptionProbability
 
 logger = logging.getLogger(__name__)
@@ -27,10 +28,37 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+class IsoDatePercentile(DatePercentile):
+    """forecasting-tools' ``DatePercentile`` whose ``value`` is read by the repo's one date parser.
+
+    The framework's own date template parses a ``value`` with pydantic's datetime coercion, which
+    leaves a date-only string at midnight naive and a bare integer as a unix timestamp, and then
+    calls ``.timestamp()`` on the naive result, which is host-local time (an 8-hour error on a
+    Pacific laptop; correct on a UTC runner by accident). Routing the raw string through
+    ``numeric.date_axis.parse_iso_utc`` instead gives the LLM salvage rung the same semantics as
+    the block rung: strict ISO-8601, a naive time read as UTC, a date-only value at noon UTC so it
+    lands inside its day bin, and a loud failure on anything else. The parser LLM's constrained
+    schema still asks for a date-time string, since that is what ``DatePercentile`` declares.
+    """
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def _parse_iso_utc(cls, value: object) -> object:
+        if isinstance(value, str):
+            return parse_iso_utc(value)
+        raise ValueError(f"DatePercentile.value must be an ISO-8601 date string, got {value!r}")
+
+
 class PercentileListWrapper(BaseModel):
     """Wrapper for list[Percentile] to satisfy json_schema response_format."""
 
     percentiles: list[Percentile]
+
+
+class DatePercentileListWrapper(BaseModel):
+    """Wrapper for list[IsoDatePercentile] to satisfy json_schema response_format."""
+
+    percentiles: list[IsoDatePercentile]
 
 
 class OptionProbabilityListWrapper(BaseModel):
@@ -53,6 +81,8 @@ def _get_wrapper_type(output_type: type) -> type[BaseModel] | None:
             item_type = args[0]
             if item_type is Percentile:
                 return PercentileListWrapper
+            if item_type is IsoDatePercentile:
+                return DatePercentileListWrapper
             if item_type is OptionProbability:
                 return OptionProbabilityListWrapper
     return None
@@ -140,7 +170,7 @@ async def parse_structured[T](
         if wrapper_type is not None:
             wrapper_instance = wrapper_type.model_validate_json(raw_response)
             # Unwrap to the list contents
-            if wrapper_type is PercentileListWrapper:
+            if wrapper_type in (PercentileListWrapper, DatePercentileListWrapper):
                 return wrapper_instance.percentiles  # type: ignore[return-value]
             if wrapper_type is OptionProbabilityListWrapper:
                 return wrapper_instance.options  # type: ignore[return-value]

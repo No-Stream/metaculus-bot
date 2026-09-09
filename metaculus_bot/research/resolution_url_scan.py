@@ -27,7 +27,7 @@ _MARKDOWN_ESCAPED_CHARS = r"_&.\-#()"
 _MARKDOWN_ESCAPE_RE = re.compile(rf"\\([{_MARKDOWN_ESCAPED_CHARS}])")
 
 # A URL body is a run of atoms; both URL regexes below are built from these, so
-# they agree about where a URL ends. Three atom kinds, tried in this order:
+# they agree about where a URL ends. Four atom kinds, tried in this order:
 #   1. A markdown escape — exactly the set `strip_markdown_escapes` removes, so
 #      the matcher and the unescaper can never disagree about what is an escape.
 #      An escaped paren must NOT end the URL: Metaculus renders
@@ -38,17 +38,28 @@ _MARKDOWN_ESCAPE_RE = re.compile(rf"\\([{_MARKDOWN_ESCAPED_CHARS}])")
 #   2. A balanced `(…)` pair — Wikipedia/Ballotpedia style `…_(rocket)`,
 #      `…_(August_18_Republican_primary)`. That closing paren is part of the URL,
 #      and dropping it 404s the same way (the second archived instance).
-#   3. Any other character except whitespace, the common closers, and a LONE
-#      `)` — a `)` that closes nothing opened inside the URL is prose
-#      punctuation (`(see https://example.com/x)`), so it ends the match.
-# `_URL_ATOM` adds a fourth, lowest-priority alternative for a lone `(`, so an
-# unbalanced open paren doesn't truncate a bare URL that never had a closing one.
-# The markdown-link form uses `_BALANCED_URL_ATOM` instead — see below.
+#   3. A balanced `[…]` pair — the Rails-style query grammar Mantic writers cite
+#      for "the count this API returns" questions:
+#      `documents.json?conditions[agencies][]=nuclear-regulatory-commission`.
+#      Cut at the first bracket, the Federal Register query answers 200 with the
+#      UNFILTERED count (10000 against a correct 125; six such URLs in the
+#      2026-09-08 corpus of 556 Mantic posts), served as grading evidence.
+#   4. Any other character except whitespace, the common closers, a backtick
+#      (writers fence an API URL in backticks and the fenced form 404s), and a
+#      LONE closer — a `)` or `]` that closes nothing opened inside the URL is
+#      prose punctuation (`(see https://example.com/x)`), so it ends the match.
+# `_URL_ATOM` adds a fifth, lowest-priority alternative for a lone `(` or `[`, so
+# an unbalanced opener doesn't truncate a bare URL that never had a closing one.
+# The markdown-link form uses `_BALANCED_URL_ATOM` instead — see below. Both pair
+# atoms exclude every opener and closer from their body, which is what keeps the
+# star over the alternation linear: an opener starts a pair or is the lone
+# literal, never both.
 _ESCAPE_ATOM = rf"\\[{_MARKDOWN_ESCAPED_CHARS}]"
-_PLAIN_URL_CHAR = r"[^\s()\\<>\"'\]]"
+_PLAIN_URL_CHAR = r"[^\s()\[\]`\\<>\"']"
 _BALANCED_PARENS = rf"\((?:{_ESCAPE_ATOM}|{_PLAIN_URL_CHAR})*\)"
-_BALANCED_URL_ATOM = rf"(?:{_ESCAPE_ATOM}|{_BALANCED_PARENS}|{_PLAIN_URL_CHAR})"
-_URL_ATOM = rf"(?:{_BALANCED_URL_ATOM}|\()"
+_BALANCED_BRACKETS = rf"\[(?:{_ESCAPE_ATOM}|{_PLAIN_URL_CHAR})*\]"
+_BALANCED_URL_ATOM = rf"(?:{_ESCAPE_ATOM}|{_BALANCED_PARENS}|{_BALANCED_BRACKETS}|{_PLAIN_URL_CHAR})"
+_URL_ATOM = rf"(?:{_BALANCED_URL_ATOM}|[(\[])"
 
 # Markdown link: [label](https://...) — capture only the URL. The atoms stop at
 # a lone `)`, so the link's own closing paren is the one `\)` consumes while an
@@ -64,8 +75,10 @@ _BARE_URL_RE = re.compile(rf"https?://{_URL_ATOM}*")
 
 # Trailing punctuation to strip from an extracted URL. `)` is NOT here: whether a
 # trailing paren belongs to the URL depends on balance, handled separately by
-# `_trim_trailing_delimiters`.
-_TRAILING_PUNCT = ".,;:]}>\"'"
+# `_trim_trailing_delimiters`. `]` is not here either: the atoms above admit a `]`
+# only as the closer of a pair opened inside the URL (a Rails array param ends in
+# `[]`), so a trailing one is always the URL's own.
+_TRAILING_PUNCT = ".,;:}>\"'"
 
 
 def strip_markdown_escapes(url: str) -> str:
@@ -109,7 +122,9 @@ def extract_source_urls(text: str) -> list[str]:
 
     Handles markdown links ``[label](https://…)`` and bare URLs, including parens
     that belong to the URL — escaped (``…/Nuri_\(rocket\)``) or balanced
-    (``…/Nuri_(rocket)``). Applies backslash-unescape, then strips trailing
+    (``…/Nuri_(rocket)``) — and balanced brackets in a query
+    (``documents.json?conditions[agencies][]=…``); a backtick fence ends a URL.
+    Applies backslash-unescape, then strips trailing
     punctuation, then dedupes preserving order (case-insensitive scheme+host;
     exact path and query — query params stay in the
     key because we may need them, e.g. for FRED graph_id; fragments are

@@ -7,6 +7,15 @@ empty history. ``tests/test_mantic_client.py`` parses it post by post and ``test
 serves it from a fake transport under a full run; before this module each declared its own copy of
 the fixture path and the four post ids, which is how two files come to disagree about one payload.
 
+``tests/data/mantic_series1_date_post_500_2026_09_08.json`` is the second date fixture: post 500 from
+the unauthenticated 2026-09-08 pull of every public Mantic date post, a RESOLVED Series 1 question in
+the modal legacy shape the preseason fixture lacks (200 uniform bins whose edges fall at arbitrary
+times of day, ``date_granularity`` empty, closed lower bound, OPEN upper bound, resolved
+``above_upper_bound`` like half of all Series 1 date questions). Trimmed once: the ten competitor CDFs
+under ``aggregations.recency_weighted.score_data.disagreement_forecasts`` are dropped (56 KB nothing
+here reads); everything else, including the community's last CDF, is the wire payload verbatim. It
+carries no ``my_forecasts`` block because the pull was unauthenticated.
+
 Not named ``test_*`` on purpose: pytest imports it without collecting it, and consumers bind what
 they need by import. Nothing here opens a socket.
 
@@ -26,12 +35,14 @@ from pathlib import Path
 from typing import Any
 
 PRESEASON_FIXTURE_PATH = Path(__file__).parent / "data" / "mantic_preseason2_posts_2026_09_08.json"
+LEGACY_DATE_FIXTURE_PATH = Path(__file__).parent / "data" / "mantic_series1_date_post_500_2026_09_08.json"
 
 BINARY_POST_ID = 648
 MULTIPLE_CHOICE_POST_ID = 649
 DISCRETE_POST_ID = 650
 DATE_POST_ID = 651
 PRESEASON_POST_IDS = (BINARY_POST_ID, MULTIPLE_CHOICE_POST_ID, DISCRETE_POST_ID, DATE_POST_ID)
+LEGACY_DATE_POST_ID = 500
 
 # Shaped like a platform user id; the real bot account's id is not in the fixture and nothing reads it.
 _FAKE_BOT_USER_ID = 9001
@@ -44,6 +55,18 @@ def load_preseason_posts() -> list[dict[str, Any]]:
     with PRESEASON_FIXTURE_PATH.open() as f:
         payload = json.load(f)
     return copy.deepcopy(payload["results"])
+
+
+def load_preseason_post(post_id: int) -> dict[str, Any]:
+    """One of the probe's four posts by id."""
+    return next(post for post in load_preseason_posts() if post["id"] == post_id)
+
+
+def load_legacy_date_post() -> dict[str, Any]:
+    """Post 500, the legacy 200-bin closed-lower / open-upper date question, freshly parsed."""
+    with LEGACY_DATE_FIXTURE_PATH.open() as f:
+        payload = json.load(f)
+    return copy.deepcopy(payload["results"][0])
 
 
 def with_prior_forecast(post: dict[str, Any], forecast_values: Sequence[float]) -> dict[str, Any]:

@@ -15,6 +15,7 @@ from metaculus_bot.numeric.config import (
     PCHIP_CDF_POINTS,
     grid_step_constraints,
 )
+from metaculus_bot.numeric.date_axis import EpochDateQuestion
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid, safe_cdf_bounds
 
 logger = logging.getLogger(__name__)
@@ -223,7 +224,12 @@ def create_pchip_numeric_distribution(
     question: NumericQuestion,
     zero_point: float | None,
 ) -> NumericDistribution:
-    """Create a custom NumericDistribution that uses PCHIP CDF."""
+    """Create a custom NumericDistribution that uses PCHIP CDF.
+
+    ``is_date`` is set from the question: on the epoch adapter of a date question it is what
+    makes forecasting-tools' ``make_readable_prediction`` render the published comment's values
+    as UTC dates instead of epoch floats. Nothing else reads it.
+    """
 
     class PchipNumericDistribution(NumericDistribution):
         def __init__(self, pchip_cdf_values, *args, **kwargs):
@@ -264,6 +270,7 @@ def create_pchip_numeric_distribution(
         lower_bound=question.lower_bound,
         zero_point=zero_point,
         cdf_size=getattr(question, "cdf_size", None),
+        is_date=isinstance(question, EpochDateQuestion),
         # Our CDF is already the final, min/max-step- and bound-enforced submission,
         # exposed via the get_cdf() override above. strict_validation=False stops the
         # 0.2.92 validators from (a) rejecting our beyond-open-bound percentile
@@ -353,6 +360,7 @@ def create_fallback_numeric_distribution(
         lower_bound=question.lower_bound,
         zero_point=zero_point,
         cdf_size=getattr(question, "cdf_size", None),
+        is_date=isinstance(question, EpochDateQuestion),
         # strict_validation=False: preserve the beyond-range declared percentiles
         # verbatim (no _check_too_far_from_bounds rejection, no
         # _check_and_update_repeating_values mutation). standardize_cdf=False: keep

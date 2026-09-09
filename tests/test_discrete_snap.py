@@ -14,7 +14,7 @@ from typing import ClassVar
 import numpy as np
 import pytest
 from forecasting_tools.data_models.numeric_report import NumericDistribution, Percentile
-from forecasting_tools.data_models.questions import NumericQuestion
+from forecasting_tools.data_models.questions import DiscreteQuestion, NumericQuestion
 
 from metaculus_bot.backtest.scoring import numeric_log_score
 from metaculus_bot.constants import DISCRETE_SNAP_MAX_INTEGERS, NUM_MAX_STEP, NUM_MIN_PROB_STEP
@@ -257,7 +257,7 @@ class TestEdgeCases:
         assert result is None
 
     def test_already_discrete_question_skipped(self):
-        """Question with cdf_size != 201 (already discrete) → skip."""
+        """A non-201 grid skips: the snap's step limits are the 201-grid constants."""
         question = _make_question(lower_bound=-0.5, upper_bound=7.5, cdf_size=9)
         dist = NumericDistribution(
             declared_percentiles=[Percentile(value=2.0, percentile=0.25), Percentile(value=5.0, percentile=0.75)],
@@ -698,3 +698,102 @@ class TestSnapCdfGoldenOutputs:
 
         assert result is not None
         np.testing.assert_allclose(result, self.GOLDEN[name], rtol=0, atol=1e-12)
+
+
+# =============================================================================
+# Natively discrete questions are never snapped, whatever their grid
+# =============================================================================
+
+
+class TestNativelyDiscreteQuestionsAreNeverSnapped:
+    """The skip is keyed on the question TYPE, not on ``cdf_size == 201``.
+
+    A natively discrete question's bins are its outcome space: a 0.1-step grid resolves in
+    tenths, so an integer vote is simply wrong there, and on a 1.0-step integer-centred grid
+    the snap is a no-op. ``cdf_size`` cannot carry that: a 200-bin Mantic discrete question
+    has ``cdf_size == 201`` (thirteen in the Series 1 corpus, with steps 1.0, 1.005 and
+    251.25), so the old ``cdf_size != 201`` guard let them through and only the 200-integer
+    cap kept the snap off them (Mantic edge-case review, 2026-09, rank 14). Every Mantic
+    quantitative question and every Metaculus discrete question parses as
+    ``DiscreteQuestion``; Metaculus continuous count questions stay ``NumericQuestion`` and
+    keep the snap they were built for.
+    """
+
+    @staticmethod
+    def _discrete_question(lower_bound: float, upper_bound: float, cdf_size: int) -> DiscreteQuestion:
+        return DiscreteQuestion(
+            id_of_question=999,
+            id_of_post=999,
+            page_url="https://competitions.mantic.com/questions/999",
+            question_text="Discrete corpus question",
+            background_info="",
+            resolution_criteria="",
+            fine_print="",
+            published_time=None,
+            close_time=None,
+            lower_bound=lower_bound,
+            upper_bound=upper_bound,
+            open_lower_bound=False,
+            open_upper_bound=False,
+            unit_of_measure="",
+            zero_point=None,
+            cdf_size=cdf_size,
+        )
+
+    @staticmethod
+    def _smooth_distribution(question: NumericQuestion) -> NumericDistribution:
+        from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
+
+        x = np.linspace(question.lower_bound, question.upper_bound, question.cdf_size)
+        centre, spread = (
+            (question.lower_bound + question.upper_bound) / 2,
+            (question.upper_bound - question.lower_bound) / 8,
+        )
+        cdf = 1.0 / (1.0 + np.exp(-(x - centre) / spread))
+        cdf[0], cdf[-1] = 0.0, 1.0
+        return create_pchip_numeric_distribution(
+            pchip_cdf=cdf.tolist(),
+            percentile_list=[
+                Percentile(value=question.lower_bound + 1, percentile=0.25),
+                Percentile(value=question.upper_bound - 1, percentile=0.75),
+            ],
+            question=question,
+            zero_point=None,
+        )
+
+    @pytest.mark.parametrize(
+        ("lower_bound", "upper_bound", "cdf_size"),
+        [
+            pytest.param(-0.5, 199.5, 201, id="step-1.0-integer-centred-200-bins"),
+            pytest.param(-0.5, 200.5, 201, id="step-1.005-corpus-shape"),
+            pytest.param(-0.05, 20.05, 202, id="step-0.1-series-2-shape"),
+            pytest.param(0.0, 20.0, 201, id="step-0.1-hunter-scenario"),
+        ],
+    )
+    def test_discrete_question_is_skipped_on_every_grid(
+        self, lower_bound: float, upper_bound: float, cdf_size: int, caplog
+    ) -> None:
+        question = self._discrete_question(lower_bound, upper_bound, cdf_size)
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.numeric.discrete_snap"):
+            result = snap_distribution_to_integers(self._smooth_distribution(question), question)
+
+        assert result is None
+        skip_lines = [r.getMessage() for r in caplog.records if "Discrete snap skipped" in r.getMessage()]
+        assert len(skip_lines) == 1
+        assert "already its outcome space" in skip_lines[0]
+        assert "type=DiscreteQuestion" in skip_lines[0]
+        assert f"cdf_size={cdf_size}" in skip_lines[0]
+
+    def test_continuous_fractional_step_grid_still_snaps(self) -> None:
+        """The designed target: a Metaculus continuous count question, [0, 10] at 201 points (step 0.05)."""
+        question = _make_question(lower_bound=0.0, upper_bound=10.0)
+        result = snap_distribution_to_integers(self._smooth_distribution(question), question)
+        assert result is not None
+        assert len(result.get_cdf()) == 201
+
+    def test_non_201_grid_is_skipped_with_the_same_reason(self, caplog) -> None:
+        question = _make_question(lower_bound=-0.5, upper_bound=7.5, cdf_size=9)
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.numeric.discrete_snap"):
+            result = snap_distribution_to_integers(self._smooth_distribution(question), question)
+        assert result is None
+        assert any("grid_step=1" in r.getMessage() for r in caplog.records)

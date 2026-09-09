@@ -20,6 +20,7 @@ from metaculus_bot.mc_processing import (
     accumulate_declared_option_probs,
     build_mc_prediction,
     clamp_and_renormalize_probs,
+    fold_option_label,
 )
 from metaculus_bot.simple_types import OptionProbability
 from metaculus_bot.value_extraction import extract_mc
@@ -175,3 +176,65 @@ class TestAccumulateDeclaredOptionProbs:
 
         assert [o.option_name for o in pol.predicted_options] == [name for name, _ in pairs]
         assert [o.probability for o in pol.predicted_options] == clamp_and_renormalize_probs([p for _, p in pairs])
+
+
+class TestOptionLabelFolding:
+    """Typographic glyphs fold before a label is matched, on BOTH sides (edge review item 15).
+
+    On Mantic's 2026-09-08 corpus a model retyping a ballot label it read in prose came back with a
+    curly apostrophe or an en dash on about 6% of MC questions, failed the exact-string match and
+    dropped the member. NFKC alone folds no-break spaces and fullwidth punctuation but leaves curly
+    quotes and dashes alone, hence the explicit translation.
+    """
+
+    # The real post 649 label, as the API sent it, and the retyped forms a model emits.
+    _CANONICAL = "Leave the target range unchanged at 3.50-3.75%"
+    _RETYPED = (
+        "Leave the target range unchanged at 3.50\u20133.75%",  # en dash
+        "Leave the target range unchanged at 3.50\u20143.75%",  # em dash
+        "Leave\u00a0the target range unchanged at 3.50-3.75%",  # no-break space
+        "  leave the target  range unchanged at 3.50-3.75%  ",  # case, padding, doubled space
+    )
+
+    @pytest.mark.parametrize("retyped", _RETYPED)
+    def test_retyped_glyphs_fold_onto_the_canonical_label(self, retyped: str) -> None:
+        assert fold_option_label(retyped) == fold_option_label(self._CANONICAL)
+
+    def test_curly_quotes_fold_onto_straight_ones(self) -> None:
+        assert fold_option_label("\u201cOther\u201d") == fold_option_label('"Other"')
+        assert fold_option_label("Biden\u2019s pick") == fold_option_label("Biden's pick")
+
+    def test_a_label_that_already_carries_a_glyph_still_matches_itself(self) -> None:
+        """Both sides fold, so a canonical option written with an en dash matches both its own
+        spelling and the straight-hyphen retyping."""
+        options = ["3.50\u20133.75%", "Other"]
+        pol = build_mc_prediction(_raw([("3.50\u20133.75%", 0.7), ("Other", 0.3)]), options)
+        assert [o.option_name for o in pol.predicted_options] == options
+        pol = build_mc_prediction(_raw([("3.50-3.75%", 0.7), ("Other", 0.3)]), options)
+        assert [o.option_name for o in pol.predicted_options] == options
+
+    def test_the_loose_parser_match_folds_too(self) -> None:
+        pairs = accumulate_declared_option_probs(
+            _raw([("Option Leave the target range unchanged at 3.50\u20133.75%", 0.9), ("Other", 0.1)]),
+            [self._CANONICAL, "Other"],
+        )
+        assert pairs == [(self._CANONICAL, pytest.approx(0.9)), ("Other", pytest.approx(0.1))]
+
+    def test_distinct_labels_stay_distinct(self) -> None:
+        assert fold_option_label("3.50-3.75%") != fold_option_label("3.25-3.50%")
+
+    @pytest.mark.asyncio
+    async def test_a_curly_dash_block_key_reaches_the_block_rung(self) -> None:
+        """End to end: the structured block's canonical map folds the same way, so the member is
+        read on rung 1 instead of dropping to the paid salvage rung."""
+        options = [self._CANONICAL, "Raise", "Lower"]
+        block = (
+            '{"question_type": "multiple_choice", "option_probs": '
+            '{"Leave the target range unchanged at 3.50\u20133.75%": 0.7, "Raise": 0.1, "Lower": 0.2}}'
+        )
+        with patch("metaculus_bot.value_extraction.parse_structured", new=AsyncMock()) as llm:
+            outcome = await extract_mc(f"reasoning\n\n```json\n{block}\n```\n", options, MagicMock())
+        assert outcome.rung == "block"
+        probs = {o.option_name: o.probability for o in outcome.value.option_list.predicted_options}
+        assert probs[self._CANONICAL] == pytest.approx(0.7, abs=0.02)
+        llm.assert_not_awaited()

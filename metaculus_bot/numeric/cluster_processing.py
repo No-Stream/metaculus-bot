@@ -17,6 +17,8 @@ from metaculus_bot.numeric.config import (
     COUNT_LIKE_THRESHOLD,
     MIN_BOUNDARY_DISTANCE,
     STRICT_ORDERING_EPSILON,
+    grid_bin_width,
+    grid_is_outcome_space,
 )
 
 logger = logging.getLogger(__name__)
@@ -90,8 +92,20 @@ def _spread_cluster_values(
     Bound-clamped, then shifted up if it would collide with the preceding value, then
     compressed if it would overrun the following one. The compression is what keeps the
     spread from reordering the set when the next declared value sits close by.
+
+    Where the published bins are the outcome space (``grid_is_outcome_space``: a natively
+    discrete question or a non-201 grid, the shapes the vote-gated discrete snap never
+    reshapes afterwards) the WHOLE plateau stays inside one bin: its total spread is capped at
+    the grid's bin width. The grid points are the bin edges, so a plateau at integer k that
+    spilled past k +- 0.5 handed the mass the forecaster put on k to the neighbouring bins. On
+    the 3-bin Mantic post 253 a declared 90% on the first bin published 0.558 under the
+    uncapped count-like unit spread (Mantic edge-case review, 2026-09). The 201-point
+    continuous grid is untouched: there the unit spread is pre-processing the snap can undo.
     """
     size = end - start + 1
+    if grid_is_outcome_space(question):
+        bin_width = grid_bin_width(question.lower_bound, question.upper_bound, question.cdf_size)
+        spread_delta = min(spread_delta, bin_width / (size - 1))
 
     center = float(np.mean(values[start : end + 1]))
 

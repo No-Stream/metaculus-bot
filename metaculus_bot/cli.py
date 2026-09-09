@@ -50,7 +50,12 @@ from metaculus_bot.llm_configs import (
     STACKER_LLM,
     SUMMARIZER_LLM,
 )
-from metaculus_bot.mantic import build_mantic_client
+from metaculus_bot.mantic import (
+    build_mantic_client,
+    get_post_drop_count,
+    preflight_mantic_tournaments,
+    reset_post_drop_count,
+)
 from metaculus_bot.publish_hardening import apply_publish_hardening
 from metaculus_bot.research.persistence import PLATFORM_MANTIC, PLATFORM_METACULUS, ResearchPersistenceWriter
 
@@ -117,6 +122,11 @@ def _configure_process(run_mode: RunMode) -> None:
     # metaculus_bot/fetch_hardening.py for rationale (a single transient
     # 403/429/5xx would otherwise kill the whole run).
     apply_fetch_hardening()
+
+    # The Mantic parse-drop counter is process-global (the client has no link back to the
+    # bot) and is read into the exit arithmetic at the end of the run. Reset at startup,
+    # not in forecast_questions: the fetch it counts happens before those resets run.
+    reset_post_drop_count()
 
     # One-shot, unauthenticated identity check before any mode sends its token.
     # See metaculus_bot/api_preflight.py (DNS-parking incident): aborts non-zero
@@ -281,7 +291,6 @@ def _question_source(
     (``_tournament_source``); the parser refuses that filter for ``test_questions``.
     """
     if run_mode == "tournament":
-        check_tournament_dates(logging.getLogger(__name__))  # Warn/error if tournament dates are stale
         # to not risk explosive spend, we won't update preds
         template_bot.skip_previously_forecasted_questions = True
         return _tournament_source(template_bot, TOURNAMENT_ID, only_posts)
@@ -296,12 +305,7 @@ def _question_source(
         return _tournament_source(template_bot, METACULUS_CUP_ID, only_posts)
     if run_mode == "mantic":
         # Mantic's competitions platform, through the ManticClient main injects; same
-        # shape as the bot tournament, over the Mantic slug and its own end date.
-        check_tournament_dates(
-            logging.getLogger(__name__),
-            tournament_id=MANTIC_TOURNAMENT_ID,
-            end_date_str=MANTIC_TOURNAMENT_END_DATE,
-        )
+        # shape as the bot tournament, over the Mantic slug.
         # to not risk explosive spend, we won't update preds
         template_bot.skip_previously_forecasted_questions = True
         return _tournament_source(template_bot, MANTIC_TOURNAMENT_ID, only_posts)
@@ -373,6 +377,29 @@ def _run_forecasts(
     return asyncio.run(_forecast_with_callback_drain(source))
 
 
+def _check_tournament_dates(run_mode: RunMode) -> bool:
+    """Run the mode's stale-slug check at startup; True only when the MANTIC slug is past its end date.
+
+    ``check_tournament_dates`` (constants.py) warns from a slug's end date and raises at the hard
+    stop two weeks later, for the Metaculus bot tournament and for Mantic alike. In between, the
+    Metaculus tournament stays advisory: its questions are open for weeks and a fortnight of
+    warnings costs nothing. On Mantic that fortnight is a silent forfeit. A zero-question run is
+    green, Series 2 opens under a slug that does not exist yet, and every hourly run would keep
+    fetching the ended preseason and exit 0, about seventy questions at Series 1's rate (edge
+    review item 5). So in mantic mode the verdict is held and reddens the run after publishing,
+    the same shape as the fall-cup reminder; the shared hard stop is untouched. The cup and
+    minibench slugs carry no end date and are not checked.
+    """
+    if run_mode == "tournament":
+        check_tournament_dates(logger)
+        return False
+    if run_mode == "mantic":
+        return check_tournament_dates(
+            logger, tournament_id=MANTIC_TOURNAMENT_ID, end_date_str=MANTIC_TOURNAMENT_END_DATE
+        )
+    return False
+
+
 def main() -> None:
     """Command-line entry-point for running the TemplateForecaster.
 
@@ -387,11 +414,11 @@ def main() -> None:
     # Fall-cup configuration reminder (constants.py): logs its ERROR here, at startup,
     # so the operator sees it before the run's noise; the non-zero exit it demands
     # happens in _report_degradation_and_exit AFTER forecasting/publishing complete,
-    # same shape as the credit-floor path. Checked in every run mode on purpose — the
-    # tournament crons stop reaching this from 2026-09-20 (check_tournament_dates
-    # raises), but the cup/minibench crons and manual runs keep reddening until the
-    # operator flips FALL_CUP_CONFIGURED.
+    # same shape as the credit-floor path. Checked in every run mode on purpose, so the
+    # cup/minibench crons and manual runs keep reddening until the operator flips
+    # FALL_CUP_CONFIGURED. The stale-slug check has the same shape in mantic mode.
     fall_cup_reminder = check_fall_cup_reminder(logger)
+    mantic_tournament_stale = _check_tournament_dates(run_mode)
 
     # Wire research persistence if enabled (production GHA runs set this env var)
     research_writer = None
@@ -421,6 +448,11 @@ def main() -> None:
     # preflight have both passed before the Mantic token is even read. None leaves
     # the framework on its default Metaculus client.
     metaculus_client = build_mantic_client() if run_mode == "mantic" else None
+    if metaculus_client is not None:
+        # One authenticated GET, still before any spend: the token's forecast permission
+        # on the configured tournament (fails shut) and the MANTIC_TOURNAMENTS discovery
+        # line that names a Series 2 slug the constants have not been re-pointed at.
+        preflight_mantic_tournaments(metaculus_client, MANTIC_TOURNAMENT_ID)
     template_bot = TemplateForecaster(
         research_reports_per_question=1,
         predictions_per_research_report=1,  # Ignored when 'forecasters' present
@@ -485,6 +517,7 @@ def main() -> None:
         report_summary_error=report_summary_error,
         donated_below_floor=donated_below_floor,
         fall_cup_reminder=fall_cup_reminder,
+        mantic_tournament_stale=mantic_tournament_stale,
     )
 
 
@@ -494,6 +527,7 @@ def _report_degradation_and_exit(
     report_summary_error: Exception | None,
     donated_below_floor: bool,
     fall_cup_reminder: bool,
+    mantic_tournament_stale: bool,
 ) -> None:
     """Emit the one-line degradation breakdown and decide the process exit status.
 
@@ -535,7 +569,11 @@ def _report_degradation_and_exit(
     donated_404 = get_donated_404_fallback_count()
     credit_fallback = get_credit_key_fallback_count()
     suppressed_credit_fallback = 0 if alerts_active else credit_fallback
-    alertable = bot_alertable + generic_fallback - suppressed_credit_fallback
+    # Mantic posts the client could not parse (mantic.py): the framework's per-post loop
+    # swallows the error as a warning, so this process-global counter is the only thing
+    # that turns a forfeited post into a red run.
+    mantic_post_drops = get_post_drop_count()
+    alertable = bot_alertable + generic_fallback - suppressed_credit_fallback + mantic_post_drops
 
     suppression_note = (
         ""
@@ -548,6 +586,10 @@ def _report_degradation_and_exit(
     # probe rather than "no run this shape ever needed one".
     probed_donated_key_state = get_probed_donated_key_state()
     donated_key_note = "" if probed_donated_key_state is None else f", donated_key={probed_donated_key_state.value}"
+    # Rendered only when a post was dropped, so the term that explains a non-zero
+    # ``alertable`` sits on the line exactly when it applies (an optional trailing group
+    # in the registry's run_alertable_summary regex).
+    mantic_drops_note = "" if mantic_post_drops == 0 else f", mantic_post_drops={mantic_post_drops}"
     # One breakdown, EVERY path — degraded, suppressed-green, crashed, and fully
     # clean. The green paths need it as much as the red one: when every donated-key
     # call fell back and the credit subset cancels the whole generic total,
@@ -582,13 +624,14 @@ def _report_degradation_and_exit(
         and generic_fallback <= 0
         and not (donated_below_floor and alerts_active)
         and not fall_cup_reminder
+        and not mantic_tournament_stale
         and not has_deprecation_alerts()
     )
     completion_phrase = "Run completed clean with" if run_clean else "Run completed with"
     breakdown = (
         f"{completion_phrase} {alertable} alertable degradation event(s) "
         f"(bot={bot_alertable}, personal_key_fallback={generic_fallback} of which "
-        f"donated_404={donated_404}, credit={credit_fallback}{suppression_note}{donated_key_note});"
+        f"donated_404={donated_404}, credit={credit_fallback}{suppression_note}{donated_key_note}{mantic_drops_note});"
     )
     if report_summary_error is not None:
         # Emit-then-raise, never swallow: the breakdown line above is the record
@@ -632,6 +675,19 @@ def _report_degradation_and_exit(
     # path above — the run completed and published normally, and this non-zero exit is
     # purely the reminder-to-configure signal, retired by flipping FALL_CUP_CONFIGURED.
     if fall_cup_reminder:
+        sys.exit(1)
+
+    # Stale Mantic slug (the WARNING from check_tournament_dates was logged at startup).
+    # Same shape again: the run completed and published, and the red exit is the
+    # re-point-the-constants signal, because a zero-question run is otherwise green while
+    # a Series 2 slug goes unforecast (see _check_tournament_dates).
+    if mantic_tournament_stale:
+        logger.error(
+            "Mantic tournament %s is past MANTIC_TOURNAMENT_END_DATE (%s); re-point MANTIC_TOURNAMENT_ID and "
+            "MANTIC_TOURNAMENT_END_DATE in constants.py. Exiting non-zero so CI marks this run red.",
+            MANTIC_TOURNAMENT_ID,
+            MANTIC_TOURNAMENT_END_DATE,
+        )
         sys.exit(1)
 
     # Post-submission deprecation tripwire. Runs LAST so submission has fully

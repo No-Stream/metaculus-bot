@@ -69,6 +69,7 @@ def _make_question(**overrides):
         "fine_print": "",
         "unit_of_measure": "units",
         "page_url": "https://example/q/4242",
+        "api_json": {"question": {}},
         "cdf_size": 201,
         "open_time": _stub_open_time(),
         "scheduled_resolution_time": _stub_resolve_time(),
@@ -337,6 +338,7 @@ async def test_binary_parse_additional_instructions_capture():
     bot = TemplateForecaster(llms={"default": "m", "parser": "p", "researcher": "r", "summarizer": "s"})
     q = MagicMock(spec=BinaryQuestion)
     q.page_url = "http://ex"
+    q.api_json = {"question": {}}
     q.question_text = "?"
     q.background_info = ""
     q.resolution_criteria = ""

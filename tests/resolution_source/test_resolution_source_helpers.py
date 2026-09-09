@@ -199,6 +199,88 @@ class TestUrlParensBelongToTheUrl:
         assert time.monotonic() - start < 1.0
 
 
+class TestUrlBracketsBelongToTheUrl:
+    """Brackets inside a cited API query, the Mantic readiness review's item 4 (2026-09-08).
+
+    Mantic question writers resolve a question to "the count this API query returns" and cite
+    the query, and Rails-style query grammars put the filter keys in brackets. The old URL class
+    allowed `[` and excluded `]` with no balanced-bracket atom, so the match stopped at the first
+    bracket. Six of the 556 public Mantic posts lost a URL that way, and the truncated Federal
+    Register query is the worst kind of failure: it answers HTTP 200 with the UNFILTERED count
+    (`{"description":"All Documents","count":10000}` against a correct 125), which the
+    resolution-source fetcher then serves as the grading evidence for a question whose upper
+    bound is 75. Same edit: writers fence an API URL in backticks (ten URLs on nine posts) and the
+    fenced form 404s where the clean form is 200, so a backtick ends a URL.
+    """
+
+    # Post 434's "Source Hierarchy" paragraph verbatim: the JSON API query sits inside prose parens AND has brackets.
+    POST_434_SOURCE_HIERARCHY = (
+        "**Source Hierarchy**: The human-readable web interface at federalregister.gov is the primary "
+        "authority. If its reported count differs from the Federal Register JSON API, the human-readable "
+        "page count prevails. If the web interface is unavailable at 12:00 UTC on 2026-08-15, the JSON API "
+        "(https://www.federalregister.gov/api/v1/documents.json?conditions[agencies][]=nuclear-regulatory-commission"
+        "&conditions[publication_date][gte]=2026-06-08&conditions[publication_date][lte]=2026-08-12) will be "
+        "used. If both are unavailable, the observation will be delayed up to 48 hours until 12:00 UTC on "
+        "2026-08-17. If both remain unavailable, the NRC ADAMS system (https://adams.nrc.gov/wba/) is the "
+        "tertiary source."
+    )
+    POST_434_JSON_API_URL = (
+        "https://www.federalregister.gov/api/v1/documents.json?conditions[agencies][]=nuclear-regulatory-commission"
+        "&conditions[publication_date][gte]=2026-06-08&conditions[publication_date][lte]=2026-08-12"
+    )
+    # Post 598's query line verbatim: backtick-fenced, bracketed date range; the old extractor cut it at the `[`.
+    POST_598_QUERY_LINE = (
+        "The API query to be used is: `https://api.fda.gov/drug/enforcement.json?search=classification:"
+        "%22Class+I%22+AND+report_date:[20260706+TO+20260811]&limit=1`"
+    )
+    POST_598_QUERY_URL = (
+        "https://api.fda.gov/drug/enforcement.json?search=classification:%22Class+I%22+AND+report_date:"
+        "[20260706+TO+20260811]&limit=1"
+    )
+
+    def test_post_434_json_api_query_survives_whole_inside_prose_parens(self):
+        assert extract_source_urls(self.POST_434_SOURCE_HIERARCHY) == [
+            self.POST_434_JSON_API_URL,
+            "https://adams.nrc.gov/wba/",
+        ]
+
+    def test_post_598_backticked_bracketed_query_survives_whole_without_the_backtick(self):
+        assert extract_source_urls(self.POST_598_QUERY_LINE) == [self.POST_598_QUERY_URL]
+
+    def test_a_backtick_fenced_url_loses_the_fence(self):
+        assert extract_source_urls("Query `https://api.example.com/v1/items?limit=1` at noon.") == [
+            "https://api.example.com/v1/items?limit=1"
+        ]
+
+    def test_markdown_link_keeps_the_bracketed_query(self):
+        assert extract_source_urls(f"[the query]({self.POST_434_JSON_API_URL})") == [self.POST_434_JSON_API_URL]
+
+    def test_a_url_inside_prose_brackets_drops_the_prose_bracket(self):
+        # The `]` closes the prose `[`, not anything inside the URL, so it is a delimiter.
+        assert extract_source_urls("Source [https://example.com/x] as cited.") == ["https://example.com/x"]
+        assert extract_source_urls("see https://example.com/x] and more") == ["https://example.com/x"]
+
+    def test_prose_brackets_around_a_url_that_has_its_own_brackets(self):
+        # Both rules at once: the inner pair stays, the outer prose bracket goes.
+        assert extract_source_urls("[https://example.com/q?a[b]=1]") == ["https://example.com/q?a[b]=1"]
+
+    def test_an_empty_bracket_pair_at_the_end_of_the_url_is_kept(self):
+        # Rails array params end in `[]`; the old `_TRAILING_PUNCT` stripped the closer.
+        assert extract_source_urls("Count https://example.com/q?ids[] daily.") == ["https://example.com/q?ids[]"]
+
+    def test_an_unbalanced_open_bracket_does_not_truncate_a_bare_url(self):
+        # Mirrors the lone-`(` rule: no closer exists anywhere, so `[` cannot be a delimiter.
+        assert extract_source_urls("https://example.com/a[b then prose") == ["https://example.com/a[b"]
+
+    def test_a_long_bracket_run_matches_in_linear_time(self):
+        # Same shape as the paren pin: a `[` starts a balanced group or is a literal, and the
+        # group's body excludes brackets, so the two branches never match the same text.
+        text = "https://example.com/" + "[a" * 400 + " and prose"
+        start = time.monotonic()
+        extract_source_urls(text)
+        assert time.monotonic() - start < 1.0
+
+
 class TestSkipPredicates:
     def test_is_metaculus_self_ref(self):
         assert is_metaculus_self_ref("https://metaculus.com/q/12345") is True

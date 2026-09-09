@@ -18,12 +18,15 @@ forecast is only meaningful against the real template).
 """
 
 from forecasting_tools import BinaryQuestion, MultipleChoiceQuestion, NumericQuestion
+from forecasting_tools.data_models.questions import DateQuestion
 
+from metaculus_bot.numeric.date_axis import as_epoch_question, format_epoch
 from metaculus_bot.numeric.utils import bound_messages, nominal_bounds
 from metaculus_bot.prompts import (
     MARKET_SNAPSHOT_SECTION_HEADER,
     _forecasting_window_str,
     binary_prompt,
+    date_prompt,
     multiple_choice_prompt,
     numeric_prompt,
 )
@@ -240,9 +243,9 @@ complete the forecast yourself using the panel's template above, applying
 your findings. Output only the template's STRUCTURED FORECAST block.
 """
 
-# Question types the dry-run scaffold has a template for. Others (e.g. date
-# questions) are skipped by the caller before prompts are built.
-SupportedQuestion = BinaryQuestion | MultipleChoiceQuestion | NumericQuestion
+# Every question type the bot forecasts has a template here; a date question's brief renders
+# its bounds as dates through the epoch adapter, never as epoch floats.
+SupportedQuestion = BinaryQuestion | MultipleChoiceQuestion | NumericQuestion | DateQuestion
 
 # Fills the template builders' research slot. Everything else in the skeleton
 # (units, bounds, options, resolution criteria) is the question's REAL values.
@@ -278,10 +281,20 @@ def _question_header(question: SupportedQuestion) -> str:
     if isinstance(question, MultipleChoiceQuestion):
         options = ", ".join(question.options)
         return f"{question.question_text}\n\nType: multiple choice\nOptions: {options}"
-    nom_upper, nom_lower = nominal_bounds(question)
-    unit = question.unit_of_measure or "unspecified (assume unitless)"
     lower_kind = "open" if question.open_lower_bound else "closed"
     upper_kind = "open" if question.open_upper_bound else "closed"
+    if isinstance(question, DateQuestion):
+        view = as_epoch_question(question)
+        nom_upper, nom_lower = nominal_bounds(view)
+        return (
+            f"{question.question_text}\n\n"
+            f"Type: date (UTC)\n"
+            f"Displayed range: [{format_epoch(nom_lower, view.date_granularity)}, "
+            f"{format_epoch(nom_upper, view.date_granularity)}] "
+            f"(lower bound {lower_kind}, upper bound {upper_kind})"
+        )
+    nom_upper, nom_lower = nominal_bounds(question)
+    unit = question.unit_of_measure or "unspecified (assume unitless)"
     return (
         f"{question.question_text}\n\n"
         f"Type: numeric\n"
@@ -301,6 +314,10 @@ def _template_skeleton(question: SupportedQuestion) -> str:
         return binary_prompt(question, _TEMPLATE_RESEARCH_PLACEHOLDER)
     if isinstance(question, MultipleChoiceQuestion):
         return multiple_choice_prompt(question, _TEMPLATE_RESEARCH_PLACEHOLDER)
+    if isinstance(question, DateQuestion):
+        view = as_epoch_question(question)
+        upper_bound_message, lower_bound_message = bound_messages(view)
+        return date_prompt(view, _TEMPLATE_RESEARCH_PLACEHOLDER, lower_bound_message, upper_bound_message)
     upper_bound_message, lower_bound_message = bound_messages(question)
     return numeric_prompt(question, _TEMPLATE_RESEARCH_PLACEHOLDER, lower_bound_message, upper_bound_message)
 

@@ -281,8 +281,10 @@ def _question_type_label(
     question: MetaculusQuestion,
 ) -> Literal["binary", "numeric", "multiple_choice"]:
     qtype = question_type_of(question)
-    if qtype is None:
-        raise ValueError(f"Unsupported question type: {type(question).__name__}")
+    # Date questions are forecast live but stay out of the ablation harness (see the
+    # exclusion note at backtest/question_prep.py's datetime assert).
+    if qtype is None or qtype == "date":
+        raise ValueError(f"Unsupported question type for ablation: {type(question).__name__}")
     return qtype
 
 

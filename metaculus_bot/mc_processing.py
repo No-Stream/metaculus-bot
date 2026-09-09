@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import unicodedata
 from collections.abc import Sequence
 
 from forecasting_tools import PredictedOptionList
@@ -70,7 +71,12 @@ def clamp_and_renormalize_probs(
     not reachable by relaxing our floor: ft clamps to its OWN hard-coded 0.01 regardless of
     what we send, so a lower floor here changes nothing about its move (measured — for
     n=200 ft accepts a top option up to ~0.06 and no floor choice lifts that). Metaculus MC
-    ballots are far below this cardinality in practice; see
+    ballots are far below this cardinality in practice, but Mantic (Crucible) runs ballots of
+    up to 50 options, where the floor binds on about 41% of real option probabilities. Loosening
+    it for Mantic was priced and REFUSED (2026-09-08): the floor is forecasting-tools' own, so a
+    lower value here changes nothing, and routing around its validator would be a parallel
+    publish path for a measured cost of 0.70 baseline points per ballot (6.64 at worst, on a
+    50-option question) on the 5% of the pool that is MC. Do not re-derive this; see
     tests/test_ft_pin_mc_high_cardinality.py for the pinned shapes.
 
     The naive clamp-then-divide can push a clamped option back out of bounds: when a
@@ -140,19 +146,57 @@ def _repair_bound_violations(probs: list[float], floor: float, ceiling: float) -
     return probs
 
 
+# Typographic glyphs folded onto their ASCII forms before an option label is compared. NFKC
+# already folds no-break spaces and fullwidth punctuation, but it leaves curly quotes and the
+# en/em dashes alone, and those are exactly what a model emits when it retypes a ballot label
+# it read in prose: on Mantic's 2026-09-08 corpus, labels such as ``Leave the target range
+# unchanged at 3.50-3.75%`` came back with a curly apostrophe or an en dash on about 6% of MC
+# questions, failed the exact-string match, and dropped the member. Both sides of every match
+# go through ``fold_option_label``, so a label that already carries one of these glyphs keeps
+# matching its own retyped form.
+_TYPOGRAPHIC_FOLD = str.maketrans(
+    {
+        "\u2018": "'",  # left single quotation mark
+        "\u2019": "'",  # right single quotation mark
+        "\u201a": "'",  # single low-9 quotation mark
+        "\u201b": "'",  # single high-reversed-9 quotation mark
+        "\u201c": '"',  # left double quotation mark
+        "\u201d": '"',  # right double quotation mark
+        "\u201e": '"',  # double low-9 quotation mark
+        "\u201f": '"',  # double high-reversed-9 quotation mark
+        "\u2010": "-",  # hyphen
+        "\u2011": "-",  # non-breaking hyphen
+        "\u2012": "-",  # figure dash
+        "\u2013": "-",  # en dash
+        "\u2014": "-",  # em dash
+        "\u2015": "-",  # horizontal bar
+        "\u2212": "-",  # minus sign
+    }
+)
+
+
+def fold_option_label(name: str) -> str:
+    """The comparison form of an option label: NFKC, typographic glyphs folded, trimmed, lowercased.
+
+    The one folding both matchers share: ``_normalize_name`` below (the loose parser-output
+    match, which additionally strips a leading "Option " token) and the structured block's
+    canonical map in ``value_extraction`` (which must not strip that token, because an option
+    may literally be named "Option A"). Whitespace runs collapse to one space so a label
+    wrapped across a line still matches.
+    """
+    folded = unicodedata.normalize("NFKC", name).translate(_TYPOGRAPHIC_FOLD)
+    return " ".join(folded.split()).lower()
+
+
 def _normalize_name(name: str) -> str:
-    # Trim common prefixes like "Option X:" while preserving canonical names when matching
-    stripped = name.strip()
-    # Remove leading "Option" labels if present
-    lowered = stripped.lower()
-    if lowered.startswith(("option ", "option:")):
-        # drop leading token up to colon/space
-        parts = stripped.split(":", 1)
+    """``fold_option_label`` plus the loose-parser allowance for a leading "Option X:" label."""
+    folded = fold_option_label(name)
+    if folded.startswith(("option ", "option:")):
+        parts = folded.split(":", 1)
         if len(parts) == 2:
-            return parts[1].strip().lower()
-        # fallback: remove first word
-        return " ".join(stripped.split(" ")[1:]).strip().lower()
-    return stripped.lower()
+            return parts[1].strip()
+        return " ".join(folded.split(" ")[1:]).strip()
+    return folded
 
 
 def accumulate_declared_option_probs(
@@ -221,4 +265,9 @@ def build_mc_prediction(
     )
 
 
-__all__ = ["accumulate_declared_option_probs", "build_mc_prediction", "clamp_and_renormalize_probs"]
+__all__ = [
+    "accumulate_declared_option_probs",
+    "build_mc_prediction",
+    "clamp_and_renormalize_probs",
+    "fold_option_label",
+]

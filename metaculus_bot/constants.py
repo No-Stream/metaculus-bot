@@ -66,6 +66,12 @@ MANTIC_SITE_URL: str = f"https://{MANTIC_HOST}"
 MANTIC_API_BASE_URL: str = f"{MANTIC_SITE_URL}/api"
 MANTIC_TOURNAMENT_ID: str = "preseason-2"
 MANTIC_TOURNAMENT_END_DATE: str = "2026-09-20"  # forecasting_end_date on project 4 (API-verified 2026-09-08)
+# The tournament fetch asks the framework for this many questions so it walks offsets until an EMPTY
+# page instead of trusting Mantic's ``next`` link, which is advertised past the last page (probed
+# 2026-09-08: offset 600 of the 520-post Series 1 still carried one). A ceiling, not an expectation:
+# the fetch passes error_if_question_target_missed=False. Five pages; the most Mantic has ever held
+# open at once is three questions, and the Series 2 rules allow batch releases.
+MANTIC_FETCH_QUESTION_CEILING: int = 500
 
 # The question platforms the bot publishes to, whose own pages are self-references for research.
 # One tuple because the two sets are the same two hosts today; if they ever diverge, split the
@@ -77,6 +83,13 @@ MANTIC_TOURNAMENT_END_DATE: str = "2026-09-20"  # forecasting_end_date on projec
 # blog, which publish forecasts and are a legitimate outside source.
 METACULUS_HOST: str = "metaculus.com"
 QUESTION_PLATFORM_HOSTS: tuple[str, ...] = (METACULUS_HOST, MANTIC_HOST)
+
+# The ``platform`` vocabulary: which question platform a question's ids and page_url belong to.
+# Data-contract tokens (the research archive keys off the exact spelling); add, never re-spell.
+# ``question_platform.question_platform`` reads one off a question's ``page_url`` host, and the
+# research persistence writer stamps one on every archived record.
+PLATFORM_METACULUS: str = "metaculus"
+PLATFORM_MANTIC: str = "mantic"
 
 
 def gemini_use_donated_openrouter_key() -> bool:
@@ -138,16 +151,19 @@ def check_tournament_dates(
     *,
     tournament_id: str | None = None,
     end_date_str: str | None = None,
-) -> None:
-    """Check if tournament dates are stale and warn/error accordingly.
+) -> bool:
+    """Check if tournament dates are stale and warn/error accordingly; True when past the end date.
 
-    - Warns if current date is past the tournament's end date
+    - Warns, and returns True, if the current date is past the tournament's end date
     - Raises TournamentExpiredError if past end date + TOURNAMENT_HARD_STOP_WEEKS
 
     Defaults to the Metaculus bot tournament (``TOURNAMENT_ID`` / ``TOURNAMENT_END_DATE``);
     the Mantic mode passes ``MANTIC_TOURNAMENT_ID`` / ``MANTIC_TOURNAMENT_END_DATE``. The
     defaults resolve at CALL time (None sentinels), so a module-level patch of the constants
-    is honored. Call this at bot startup to catch stale tournament IDs.
+    is honored. Call this at bot startup to catch stale tournament IDs. The verdict is what lets
+    a caller make staleness alertable rather than advisory: cli reddens a Mantic run on it, while
+    the Metaculus modes keep the warning only (their questions stay open for weeks, so a fortnight
+    of warnings costs nothing; on Mantic the same fortnight forfeits every Series 2 question).
     """
     log = logger or logging.getLogger(__name__)
     tournament_id = TOURNAMENT_ID if tournament_id is None else tournament_id
@@ -161,7 +177,7 @@ def check_tournament_dates(
         end_date = _as_utc(datetime.strptime(end_date_str, "%Y-%m-%d"))  # noqa: DTZ007  # stamped UTC by _as_utc
     except ValueError:
         log.warning(f"Invalid tournament end date format for '{tournament_id}': {end_date_str}")
-        return
+        return False
 
     today = _as_utc(datetime.now(UTC))
     hard_stop_date = end_date + timedelta(weeks=TOURNAMENT_HARD_STOP_WEEKS)
@@ -180,6 +196,8 @@ def check_tournament_dates(
             f"({days_past} days ago). Update constants.py for the new season! "
             f"Bot will error out in {days_until_error} days."
         )
+        return True
+    return False
 
 
 # --- Cup-season configuration reminder (dated, DISCHARGED for fall 2026, re-armable) ---

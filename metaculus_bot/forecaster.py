@@ -59,8 +59,14 @@ from metaculus_bot.drop_telemetry import (
     emit_drop_telemetry,
 )
 from metaculus_bot.extreme_call import format_extreme_call_markers
-from metaculus_bot.forecaster_runners import run_binary_forecast, run_mc_forecast, run_numeric_forecast
+from metaculus_bot.forecaster_runners import (
+    run_binary_forecast,
+    run_date_forecast,
+    run_mc_forecast,
+    run_numeric_forecast,
+)
 from metaculus_bot.llm_setup import prepare_llm_config
+from metaculus_bot.member_forecast import format_numeric_aggregate_marker, out_of_range_mass
 from metaculus_bot.numeric.pchip_processing import log_pchip_summary, reset_pchip_stats
 from metaculus_bot.performance_analysis.parsing import extract_model_display_name_from_reasoning
 from metaculus_bot.publish_gate import (
@@ -69,6 +75,7 @@ from metaculus_bot.publish_gate import (
     reset_publish_skipped_closed,
 )
 from metaculus_bot.publish_hardening import publish_attempt_failures, reset_publish_attempt_failures
+from metaculus_bot.question_types import question_type_of
 from metaculus_bot.research.orchestrator import ResearchOrchestrator
 from metaculus_bot.research.providers import (
     ResearchCallable,
@@ -324,17 +331,17 @@ class TemplateForecaster(CompactLoggingForecastBot):
         questions: Sequence[MetaculusQuestion],
         return_exceptions: bool = False,
     ) -> list[ForecastReport] | list[ForecastReport | BaseException]:
-        # Unsupported-type guard. 0.2.92's ApiFilter default and tournament fetch
-        # can now return ConditionalQuestion (a new type) alongside DateQuestion —
-        # neither of which this bot forecasts (_make_prediction has no runner for
-        # them). Drop them up front with a loud WARNING instead of letting them
-        # reach the fan-out and surface as per-question exceptions. This is the
+        # Unsupported-type guard. 0.2.92's ApiFilter default and tournament fetch can
+        # return ConditionalQuestion, which this bot does not forecast (_make_prediction
+        # has no runner for it). Drop it up front with a loud WARNING instead of letting
+        # it reach the fan-out and surface as a per-question exception. This is the
         # single chokepoint every entry path funnels through: both
         # forecast_on_tournament and forecast_question call forecast_questions, so
         # filtering here covers the tournament path and the test/URL path without a
-        # separate filter in cli.py. DiscreteQuestion subclasses NumericQuestion and
-        # is intentionally kept.
-        supported_types = (BinaryQuestion, MultipleChoiceQuestion, NumericQuestion)
+        # separate filter in cli.py. DiscreteQuestion subclasses NumericQuestion and is
+        # intentionally kept; DateQuestion is forecast through the numeric pipeline on
+        # its epoch-seconds view (run_date_forecast).
+        supported_types = (BinaryQuestion, MultipleChoiceQuestion, NumericQuestion, DateQuestion)
         supported_questions = [q for q in questions if isinstance(q, supported_types)]
         if len(supported_questions) != len(questions):
             dropped_type_names = sorted({type(q).__name__ for q in questions if not isinstance(q, supported_types)})
@@ -367,10 +374,16 @@ class TemplateForecaster(CompactLoggingForecastBot):
             ),
         )
 
-        # Enforce max questions per run safety cap
+        # Enforce max questions per run safety cap. WARNING, naming the posts left behind:
+        # on a tournament whose questions all open together (Mantic releases a whole hour's
+        # batch at once) the cap forfeits real questions, and a forfeit at INFO is invisible.
         if self.max_questions_per_run is not None and len(questions) > self.max_questions_per_run:
-            logger.info(
-                f"Limiting to the {self.max_questions_per_run} soonest-closing questions out of {len(questions)}"
+            dropped = list(questions)[self.max_questions_per_run :]
+            logger.warning(
+                "Limiting to the %d soonest-closing questions out of %d; dropped posts: %s",
+                self.max_questions_per_run,
+                len(questions),
+                ",".join(str(q.id_of_post) for q in dropped),
             )
             questions = list(questions)[: self.max_questions_per_run]
 
@@ -787,8 +800,9 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # The cast narrows PredictionTypes to the float a binary question's members carry
         # by construction: this is the same isinstance predicate _make_prediction dispatches
         # on, so the questions that reach here are exactly the ones routed to
-        # run_binary_forecast, which returns ReasonedPrediction[float] (a conditional or
-        # date question raises NotImplementedError there and never yields a prediction). An
+        # run_binary_forecast, which returns ReasonedPrediction[float] (a conditional
+        # question raises NotImplementedError there and never yields a prediction; numeric
+        # and date members are NumericDistributions and never enter this branch). An
         # isinstance filter over the values would silently drop a member instead.
         if isinstance(question, BinaryQuestion):
             for marker in format_extreme_call_markers(
@@ -961,7 +975,9 @@ class TemplateForecaster(CompactLoggingForecastBot):
             forecast_function = lambda q, r, llm: self._run_forecast_on_multiple_choice(q, r, llm, chart_b64)  # noqa: E731
         elif isinstance(question, NumericQuestion):
             forecast_function = lambda q, r, llm: self._run_forecast_on_numeric(q, r, llm, chart_b64)  # noqa: E731
-        elif isinstance(question, (DateQuestion, ConditionalQuestion)):
+        elif isinstance(question, DateQuestion):
+            forecast_function = lambda q, r, llm: self._run_forecast_on_date(q, r, llm, chart_b64)  # noqa: E731
+        elif isinstance(question, ConditionalQuestion):
             # forecast_questions filters these out up front; this is the
             # defense-in-depth backstop for any path that reaches _make_prediction
             # directly with an unsupported type.
@@ -1007,15 +1023,30 @@ class TemplateForecaster(CompactLoggingForecastBot):
     ) -> PredictionTypes:
         if self.aggregation_strategy in (AggregationStrategy.STACKING, AggregationStrategy.CONDITIONAL_STACKING):
             if reasoned_predictions is None and research is None:
-                return self._pipeline.base_combine(predictions, question)
-            return await self._pipeline.stack_predictions(
-                predictions,
-                question,
-                research=research,
-                reasoned_predictions=reasoned_predictions,
-                aggregated_tool_output=aggregated_tool_output,
+                aggregated = self._pipeline.base_combine(predictions, question)
+            else:
+                aggregated = await self._pipeline.stack_predictions(
+                    predictions,
+                    question,
+                    research=research,
+                    reasoned_predictions=reasoned_predictions,
+                    aggregated_tool_output=aggregated_tool_output,
+                )
+        else:
+            aggregated = self._pipeline.simple_combine(predictions, question)
+        # The one seam every aggregation path (stacked, base-combine, median fallback, single
+        # survivor, simple) returns through, so the PUBLISHED distribution's tails are logged once.
+        if isinstance(aggregated, NumericDistribution):
+            cdf = aggregated.get_cdf()
+            logger.info(
+                format_numeric_aggregate_marker(
+                    question_id=question.id_of_question,
+                    qtype=question_type_of(question) or "numeric",
+                    cdf_size=len(cdf),
+                    out_of_range=out_of_range_mass(aggregated),
+                )
             )
-        return self._pipeline.simple_combine(predictions, question)
+        return aggregated
 
     def _pull_research_chart(self, qid: int | None) -> str | None:
         """Pop the time-series-anchor chart image for this qid from the provider's
@@ -1055,3 +1086,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
         if qid is not None and discrete_vote is not None:
             self._pipeline.discrete_integer_votes[qid].append(discrete_vote)
         return prediction
+
+    async def _run_forecast_on_date(  # pyright: ignore[reportIncompatibleMethodOverride]  # extra params: ensemble fan-out passes a specific LLM + optional chart per call
+        self, question: DateQuestion, research: str, llm_to_use: GeneralLlm, chart_b64: str | None = None
+    ) -> ReasonedPrediction[NumericDistribution]:
+        # No discrete-integer vote: integer snapping on an epoch-seconds axis is meaningless.
+        return await run_date_forecast(
+            question, research, llm_to_use, self.get_llm("parser", "llm"), chart_b64=chart_b64
+        )

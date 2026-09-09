@@ -30,6 +30,7 @@ def _make_question(open_upper=False, open_lower=False, lower=0.0, upper=100.0) -
             open_lower_bound=open_lower,
             upper_bound=upper,
             lower_bound=lower,
+            cdf_size=201,
             id_of_question=999,
         ),
     )
@@ -320,3 +321,62 @@ class TestApplyClusterSpreadingGoldenOutputs:
         result, _ = apply_cluster_spreading(values, question, value_eps=1e-6, spread_delta=1.0, range_size=100.0)
 
         assert result is values
+
+
+class TestDiscreteGridPlateauCap:
+    """On a discrete grid a plateau's whole spread stays inside the bin it names.
+
+    The bin width is ``(upper - lower) / (cdf_size - 1)`` and the plateau is centred on the
+    declared value, so its values span at most ``value +- width / 2``, which on an
+    integer-centred grid is exactly the bin. The 201-point continuous grid is exempt: the
+    golden pins above run at ``cdf_size=201`` and are unchanged.
+    """
+
+    def _discrete_question(self, cdf_size: int, lower: float, upper: float) -> NumericQuestion:
+        return cast(
+            NumericQuestion,
+            SimpleNamespace(
+                open_upper_bound=False,
+                open_lower_bound=False,
+                upper_bound=upper,
+                lower_bound=lower,
+                cdf_size=cdf_size,
+                id_of_question=253,
+            ),
+        )
+
+    def test_three_bin_plateau_spans_at_most_one_bin(self):
+        # Mantic post 253: bins centred on 0, 1, 2; P1..P90 = 0, P95 = P97.5 = 1, P99 = 2.
+        values = [0.0] * 10 + [1.0, 1.0, 2.0]
+        question = self._discrete_question(4, -0.5, 2.5)
+
+        result, clusters_applied = apply_cluster_spreading(
+            values, question, value_eps=1e-9, spread_delta=1.0, range_size=3.0
+        )
+
+        assert clusters_applied == 2
+        assert all(-0.5 <= v <= 0.5 for v in result[:10]), result[:10]
+        assert all(0.5 <= v <= 1.5 + 1e-9 for v in result[10:12]), result[10:12]
+        assert all(a < b for a, b in pairwise(result[:10]))
+
+    def test_per_position_spread_is_the_bin_width_over_the_plateau_length(self):
+        values = [10.0, 20.0, 20.0, 20.0, 30.0]
+        question = self._discrete_question(41, 0.0, 100.0)  # bin width 2.5
+
+        result, _ = apply_cluster_spreading(values, question, value_eps=1e-6, spread_delta=1.0, range_size=100.0)
+
+        # Uncapped this is [19, 20, 21] (the "mid_cluster" golden); the 2.5-wide bin only tightens
+        # a plateau whose full spread would exceed it, and 2 * 1.0 = 2.0 fits, so it is unchanged.
+        assert result == pytest.approx([10.0, 19.0, 20.0, 21.0, 30.0])
+
+        question = self._discrete_question(201, 0.0, 100.0)  # bin width 0.5 but the 201 grid is exempt
+        result, _ = apply_cluster_spreading(
+            [10.0, 20.0, 20.0, 20.0, 30.0], question, value_eps=1e-6, spread_delta=1.0, range_size=100.0
+        )
+        assert result == pytest.approx([10.0, 19.0, 20.0, 21.0, 30.0])
+
+        question = self._discrete_question(101, 0.0, 100.0)  # bin width 1.0 caps the 2.0 spread
+        result, _ = apply_cluster_spreading(
+            [10.0, 20.0, 20.0, 20.0, 30.0], question, value_eps=1e-6, spread_delta=1.0, range_size=100.0
+        )
+        assert result == pytest.approx([10.0, 19.5, 20.0, 20.5, 30.0])

@@ -8,15 +8,28 @@ from itertools import pairwise
 from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
 
-from metaculus_bot.numeric.config import BOUNDARY_SAFETY_MARGIN, MIN_BOUNDARY_DISTANCE
+from metaculus_bot.numeric.config import BOUNDARY_SAFETY_MARGIN, MIN_BOUNDARY_DISTANCE, PCHIP_CDF_POINTS
 
 logger = logging.getLogger(__name__)
 
 
 def calculate_bounds_buffer(question: NumericQuestion) -> float:
-    """Calculate buffer for bounds clamping based on question range."""
+    """How far outside a CLOSED bound a declared value may sit and still be clamped in.
+
+    The larger of the range-based tolerance (1% of the range, a flat 1.0 once the range exceeds
+    100) and one grid bin, ``(upper - lower) / (cdf_size - 1)``. A value within one bin of the
+    edge is indistinguishable from the edge once the CDF is bucketed, so it is clamped instead
+    of dropping the forecaster, while a value several bins out still reads as a scale error and
+    raises. The bin floor is what a date question needs: its axis is epoch seconds, where the
+    flat 1.0 is a ONE-SECOND tolerance, and a date named one day outside a closed bound (the
+    natural granularity of a date answer) used to drop the member.
+    """
     range_size = question.upper_bound - question.lower_bound
-    return 1.0 if range_size > 100 else range_size * BOUNDARY_SAFETY_MARGIN
+    range_buffer = 1.0 if range_size > 100 else range_size * BOUNDARY_SAFETY_MARGIN
+    # A None cdf_size means the standard grid, the same reading build_numeric_distribution makes.
+    cdf_size = question.cdf_size if question.cdf_size is not None else PCHIP_CDF_POINTS
+    bin_width = range_size / (cdf_size - 1)
+    return max(range_buffer, bin_width)
 
 
 def clamp_values_to_bounds(
@@ -25,7 +38,7 @@ def clamp_values_to_bounds(
     question: NumericQuestion,
     buffer: float,
 ) -> tuple[list[float], bool]:
-    """Clamp values to bounds if they violate by small amounts."""
+    """Clamp values to bounds if they violate by at most ``buffer`` (``calculate_bounds_buffer``)."""
     corrections_made = False
 
     for i in range(len(modified_values)):
@@ -36,8 +49,13 @@ def clamp_values_to_bounds(
             if question.lower_bound - modified_values[i] <= buffer:
                 modified_values[i] = question.lower_bound + buffer
                 corrections_made = True
-                logger.debug(
-                    f"Clamped lower: percentile {percentile_list[i].percentile} value {original_value} -> {modified_values[i]}"
+                logger.info(
+                    "Clamped lower for Q %s: percentile %s value %s -> %s (tolerance %s)",
+                    getattr(question, "id_of_question", None),
+                    percentile_list[i].percentile,
+                    original_value,
+                    modified_values[i],
+                    buffer,
                 )
             else:
                 raise ValueError(
@@ -49,8 +67,13 @@ def clamp_values_to_bounds(
             if modified_values[i] - question.upper_bound <= buffer:
                 modified_values[i] = question.upper_bound - buffer
                 corrections_made = True
-                logger.debug(
-                    f"Clamped upper: percentile {percentile_list[i].percentile} value {original_value} -> {modified_values[i]}"
+                logger.info(
+                    "Clamped upper for Q %s: percentile %s value %s -> %s (tolerance %s)",
+                    getattr(question, "id_of_question", None),
+                    percentile_list[i].percentile,
+                    original_value,
+                    modified_values[i],
+                    buffer,
                 )
             else:
                 raise ValueError(

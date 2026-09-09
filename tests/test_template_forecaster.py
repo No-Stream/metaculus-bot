@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -10,6 +10,7 @@ from forecasting_tools.data_models.forecast_report import ResearchWithPrediction
 from forecasting_tools.data_models.multiple_choice_report import PredictedOption
 from forecasting_tools.data_models.numeric_report import Percentile as FTPercentile
 from forecasting_tools.data_models.questions import ConditionalQuestion, DateQuestion
+from forecasting_tools.forecast_bots.forecast_bot import ForecastBot
 from forecasting_tools.helpers.metaculus_client import MetaculusClient
 
 from main import TemplateForecaster
@@ -42,6 +43,7 @@ _ASYNCIO_SLEEP = asyncio.sleep
 def mock_metaculus_question():
     question = MagicMock(spec=MetaculusQuestion)
     question.page_url = "http://example.com/question"
+    question.api_json = {"question": {}}
     question.question_text = "Test Question"
     question.background_info = "Background info"
     question.resolution_criteria = "Resolution criteria"
@@ -751,25 +753,37 @@ class TestMetaculusClientSeam:
 
 
 class TestUnsupportedQuestionTypes:
-    """The type guard at the top of ``forecast_questions`` DROPS date and conditional questions
-    with one WARNING rather than raising; every entry path (tournament fetch, URL list) funnels
-    through it. Mantic's preseason has a date question, so the docs lean on this being a skip."""
+    """The type guard at the top of ``forecast_questions`` DROPS conditional questions with one
+    WARNING rather than raising; every entry path (tournament fetch, URL list) funnels through
+    it. Date questions pass it since 2026-09-08 (Mantic's pool is 41% date questions)."""
 
-    async def test_date_and_conditional_questions_are_skipped_with_a_warning(self, mock_general_llm, caplog):
+    async def test_conditional_questions_are_skipped_with_a_warning(self, mock_general_llm, caplog):
         bot = _bot_with_one_forecaster(mock_general_llm)
         with caplog.at_level(logging.WARNING, logger="metaculus_bot.forecaster"):
-            # Real (unvalidated) instances, not spec'd mocks: the guard names the dropped TYPES.
-            reports = await bot.forecast_questions(
-                [DateQuestion.model_construct(), ConditionalQuestion.model_construct()]
-            )
+            # A real (unvalidated) instance, not a spec'd mock: the guard names the dropped TYPE.
+            reports = await bot.forecast_questions([ConditionalQuestion.model_construct()])
         assert reports == []
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         assert any(
-            "Skipping 2 unsupported question(s)" in message
-            and "DateQuestion" in message
-            and "ConditionalQuestion" in message
-            for message in warnings
+            "Skipping 1 unsupported question(s)" in message and "ConditionalQuestion" in message for message in warnings
         ), warnings
+
+    async def test_a_date_question_passes_the_guard(self, mock_general_llm, caplog, monkeypatch):
+        forwarded: list[list[MetaculusQuestion]] = []
+
+        async def capture(self, questions, return_exceptions=False):
+            forwarded.append(list(questions))
+            return []
+
+        monkeypatch.setattr(ForecastBot, "forecast_questions", capture)
+        date_question = MagicMock(spec=DateQuestion)
+        date_question.already_forecasted = False
+        date_question.close_time = datetime.now(UTC) + timedelta(days=1)
+        bot = _bot_with_one_forecaster(mock_general_llm)
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.forecaster"):
+            await bot.forecast_questions([cast(MetaculusQuestion, date_question)])
+        assert forwarded == [[date_question]]
+        assert not [r for r in caplog.records if "unsupported" in r.getMessage()]
 
 
 class TestResearchChartSideChannel:

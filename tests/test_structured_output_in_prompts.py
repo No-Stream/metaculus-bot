@@ -35,6 +35,8 @@ def _make_binary_q() -> BinaryQuestion:
     q.fine_print = ""
     q.open_time = _OPEN
     q.scheduled_resolution_time = _RESOLVE
+    q.page_url = "https://www.metaculus.com/questions/1/"
+    q.api_json = {"question": {}}
     return q
 
 
@@ -47,6 +49,8 @@ def _make_mc_q() -> MultipleChoiceQuestion:
     q.fine_print = ""
     q.open_time = _OPEN
     q.scheduled_resolution_time = _RESOLVE
+    q.page_url = "https://www.metaculus.com/questions/2/"
+    q.api_json = {"question": {}}
     return q
 
 

@@ -28,6 +28,7 @@ from forecasting_tools.data_models.questions import NumericQuestion
 from pydantic import BaseModel
 
 from metaculus_bot.constants import DISCRETE_SNAP_MAX_INTEGERS, DISCRETE_SNAP_UNIFORM_MIX, NUM_MIN_PROB_STEP
+from metaculus_bot.numeric.config import grid_bin_width, grid_is_outcome_space
 from metaculus_bot.numeric.pchip_cdf import safe_cdf_bounds
 from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
 
@@ -208,6 +209,17 @@ def snap_distribution_to_integers(
 
     Returns a new distribution with the snapped CDF, or None if snapping
     should be skipped.
+
+    A natively discrete question is skipped whatever its grid: its bins ARE its outcome
+    space, so a 0.1-step grid resolves in tenths and an integer vote is simply wrong there,
+    while on a 1.0-step integer-centred grid the snap is a no-op. ``cdf_size`` is not the
+    signal for that (a 200-bin Mantic discrete question has ``cdf_size == 201``); the
+    question type is (``grid_is_outcome_space``, shared with the cluster spreader's plateau
+    cap). A non-201 grid is skipped by the same predicate because the snap's step limits are
+    the 201-grid constants. There is no grid-alignment guard because none is needed: the step
+    for integer k lands in the bin containing k, and ``resolution_to_bucket_index`` scores a
+    resolution of k in that same bin on ANY grid, so the snap and the scorer agree by
+    construction; the skip is semantic, not geometric.
     """
     if not (np.isfinite(question.lower_bound) and np.isfinite(question.upper_bound)):
         logger.warning(
@@ -215,8 +227,13 @@ def snap_distribution_to_integers(
         )
         return None
 
-    if question.cdf_size is not None and question.cdf_size != 201:
-        logger.info("Discrete snap skipped: question already labeled discrete (cdf_size=%d)", question.cdf_size)
+    if grid_is_outcome_space(question):
+        logger.info(
+            "Discrete snap skipped: the question's grid is already its outcome space | type=%s | cdf_size=%d | grid_step=%.6g",
+            type(question).__name__,
+            question.cdf_size,
+            grid_bin_width(question.lower_bound, question.upper_bound, question.cdf_size),
+        )
         return None
 
     if not hasattr(distribution, "_pchip_cdf_values"):

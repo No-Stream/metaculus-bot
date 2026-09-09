@@ -17,15 +17,33 @@ overrides none of ``_get_questions_from_api``, ``_post_question_prediction`` or
    ``zero_point``) are identical.
 3. The framework hardcodes ``https://www.metaculus.com/questions/{post_id}`` as ``page_url``.
 
+Three robustness rules from the 2026-09-08 readiness review sit beside them:
+
+- The tournament fetch asks for a CEILING of questions (``MANTIC_FETCH_QUESTION_CEILING``) rather
+  than the framework's default single page of 100, because Mantic's paginator advertises a ``next``
+  link past the last page (offset 600 of a 520-post tournament still carries one), so only walking
+  offsets until an empty page can prove there is nothing more.
+- A post the framework cannot parse used to be forfeited silently: ``_get_questions_from_api`` logs
+  one warning per failed post and continues, nothing counts it, and after the 90-day log expiry it
+  is gone. The parse override now counts the drop (``get_post_drop_count``, read into cli's
+  alertable arithmetic so the run reddens) and emits one ``MANTIC_POST_DROPPED`` line before
+  re-raising. Fail-fast is kept: nothing here swallows the error.
+- :func:`preflight_mantic_tournaments` makes ONE authenticated GET of the tournament list before
+  any spend and does two things with it: refuses to run unless the token's ``user_permission`` on
+  the configured tournament allows forecasting (a view-only token reads fine and would fail only at
+  the publish POST, after the ensemble had been paid for, every hour), and logs
+  ``MANTIC_TOURNAMENTS`` naming every ongoing bots-only tournament, at WARNING when one is not the
+  configured slug, so a Series 2 slug is named in the log the run it appears.
+
 Every parsed question emits one ``MANTIC_QUESTION`` line so the fields Mantic added and the framework
 does not model (``multi_resolution``, ``date_granularity``, ``precision``), plus the type as it
-arrived on the wire, outlive the 90-day GitHub Actions log expiry for residual analysis. The spec
-lives in ``scripts/telemetry/markers.py``; the verbatim example lines in
+arrived on the wire, outlive the 90-day GitHub Actions log expiry for residual analysis. The specs
+live in ``scripts/telemetry/markers.py``; the verbatim example lines in
 ``tests/test_telemetry_markers.py``.
 
 Conditional posts are not modelled: Mantic publishes none, and the bot's type guard drops
-``ConditionalQuestion`` anyway, so one reaching this client surfaces as the framework's per-post
-"Error processing post" warning rather than as a forecast.
+``ConditionalQuestion`` anyway, so one reaching this client is counted and logged as a dropped post
+and surfaces as the framework's per-post "Error processing post" warning rather than as a forecast.
 """
 
 from __future__ import annotations
@@ -34,10 +52,17 @@ import asyncio
 import logging
 import os
 
+import requests
 from forecasting_tools.data_models.questions import DateQuestion, MetaculusQuestion, NumericQuestion
 from forecasting_tools.helpers.metaculus_client import ApiFilter, GroupQuestionMode, MetaculusClient
 
-from metaculus_bot.constants import MANTIC_API_BASE_URL, MANTIC_SITE_URL, MANTIC_TOKEN_ENV
+from metaculus_bot.api_preflight import ApiIdentityError
+from metaculus_bot.constants import (
+    MANTIC_API_BASE_URL,
+    MANTIC_FETCH_QUESTION_CEILING,
+    MANTIC_SITE_URL,
+    MANTIC_TOKEN_ENV,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +70,22 @@ _QUANTITATIVE_WIRE_TYPE = "quantitative"
 _DISCRETE_TYPE = "discrete"
 # The registry's None sentinel (scripts/telemetry/markers._NONE_SENTINELS): harvests as None.
 _ABSENT = "n/a"
+# The Metaculus backend's ObjectPermission roles that may forecast (projects/permissions.py); viewer and null only read.
+_FORECASTING_PERMISSIONS: frozenset[str] = frozenset({"forecaster", "curator", "admin", "creator"})
+_BOTS_ONLY_LEADERBOARD = "bots_only"
+_BODY_PREVIEW_CHARS = 200
+
+_post_drop_count = 0
+
+
+def get_post_drop_count() -> int:
+    """Posts this process failed to parse into questions: the ``MANTIC_POST_DROPPED`` count."""
+    return _post_drop_count
+
+
+def reset_post_drop_count() -> None:
+    global _post_drop_count  # noqa: PLW0603  # module-global run counter is the design (AGENTS.md)
+    _post_drop_count = 0
 
 
 class ManticClient(MetaculusClient):
@@ -66,19 +107,55 @@ class ManticClient(MetaculusClient):
             allowed_types=[],
             group_question_mode=group_question_mode,
         )
-        questions = asyncio.run(self.get_questions_matching_filter(api_filter))
+        # The ceiling makes the framework walk offsets until an EMPTY page; short of it is the normal result.
+        questions = asyncio.run(
+            self.get_questions_matching_filter(
+                api_filter,
+                num_questions=MANTIC_FETCH_QUESTION_CEILING,
+                error_if_question_target_missed=False,
+            )
+        )
         logger.info("Retrieved %d questions from Mantic tournament %s", len(questions), tournament_id)
         return questions
 
     def _post_json_to_questions_while_handling_groups(
         self, post_json_from_api: dict, group_question_mode: GroupQuestionMode
     ) -> list[MetaculusQuestion]:
-        post_json, wire_types = _normalize_quantitative_types(post_json_from_api)
-        questions = super()._post_json_to_questions_while_handling_groups(post_json, group_question_mode)
-        for question in questions:
-            question.page_url = f"{MANTIC_SITE_URL}/questions/{question.id_of_post}/"
-            _log_mantic_question(question, wire_type=wire_types[question.api_json["question"]["id"]])
+        try:
+            post_json, wire_types = _normalize_quantitative_types(post_json_from_api)
+            questions = super()._post_json_to_questions_while_handling_groups(post_json, group_question_mode)
+            for question in questions:
+                question.page_url = f"{MANTIC_SITE_URL}/questions/{question.id_of_post}/"
+                _log_mantic_question(question, wire_type=wire_types.get(question.id_of_question))
+        except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except  # counted and logged, then re-raised into the framework's per-post loop
+            _count_dropped_post(post_json_from_api, exc)
+            raise
         return questions
+
+    def list_tournaments(self) -> list[dict]:
+        """One authenticated GET of ``/projects/tournaments/``; ``ApiIdentityError`` on anything but a 200 list.
+
+        Authenticated on purpose: the platform's token authentication answers 401 to a revoked or
+        mistyped token here, which the unauthenticated identity preflight cannot see, and
+        ``user_permission`` in the payload is the caller's own. Not retried, like the identity
+        preflight: a transient failure stops the run before any spend and the next cron retries.
+        """
+        url = f"{self.base_url}/projects/tournaments/"
+        response = requests.get(url, headers=self._get_auth_headers()["headers"], timeout=self.timeout)
+        body_preview = response.text[:_BODY_PREVIEW_CHARS]
+        if response.status_code != 200:
+            raise ApiIdentityError(
+                f"Mantic tournament list GET {url!r} answered status={response.status_code} "
+                f"(first {_BODY_PREVIEW_CHARS} chars: {body_preview!r}); the token's forecast permission cannot "
+                "be confirmed, so the run stops before any spend. A 401 means MANTIC_TOKEN is not accepted."
+            )
+        tournaments = response.json()
+        if not isinstance(tournaments, list):
+            raise ApiIdentityError(
+                f"Mantic tournament list GET {url!r} answered 200 but not with a JSON list "
+                f"(first {_BODY_PREVIEW_CHARS} chars: {body_preview!r}); stopping before any spend."
+            )
+        return tournaments
 
 
 def build_mantic_client() -> ManticClient:
@@ -91,13 +168,15 @@ def build_mantic_client() -> ManticClient:
     return ManticClient(token=token)
 
 
-def _normalize_quantitative_types(post_json: dict) -> tuple[dict, dict[int, str]]:
+def _normalize_quantitative_types(post_json: dict) -> tuple[dict, dict[int | None, str | None]]:
     """Return a copy of the post with ``quantitative`` question types rewritten to ``discrete``.
 
     Also returns each question's type as it arrived on the wire, keyed by question id, for the
     marker. Only the dicts that get rewritten are copied, so the caller's post JSON is left as it
     was. Mirrors the framework's dispatch: a ``group_of_questions`` post carries its questions
-    under the group, anything else under ``question``.
+    under the group, anything else under ``question``; a post with neither key passes through
+    untouched for the framework's own parser to reject. The telemetry-only reads (``id``, ``type``)
+    use ``.get``, so the marker can never be what drops a question.
     """
     post = dict(post_json)
     if "group_of_questions" in post:
@@ -105,23 +184,94 @@ def _normalize_quantitative_types(post_json: dict) -> tuple[dict, dict[int, str]
         question_jsons: list[dict] = group["questions"]
         group["questions"] = [_as_discrete_if_quantitative(question) for question in question_jsons]
         post["group_of_questions"] = group
-    else:
+    elif "question" in post:
         question_jsons = [post["question"]]
         post["question"] = _as_discrete_if_quantitative(post["question"])
-    return post, {question["id"]: question["type"] for question in question_jsons}
+    else:
+        question_jsons = []
+    return post, {question.get("id"): question.get("type") for question in question_jsons}
 
 
 def _as_discrete_if_quantitative(question_json: dict) -> dict:
-    if question_json["type"] != _QUANTITATIVE_WIRE_TYPE:
+    if question_json.get("type") != _QUANTITATIVE_WIRE_TYPE:
         return question_json
     return {**question_json, "type": _DISCRETE_TYPE}
 
 
-def _log_mantic_question(question: MetaculusQuestion, *, wire_type: str) -> None:
+def _count_dropped_post(post_json: dict, exc: BaseException) -> None:
+    """Bump the process counter and emit ``MANTIC_POST_DROPPED`` for a post that failed to parse.
+
+    The framework's ``_get_questions_from_api`` catches the re-raised error per post, logs one
+    warning and continues, which forfeited the post silently on every run. The counter reaches
+    cli's alertable arithmetic so the run reddens; the marker outlives the log expiry. Every read
+    here is ``.get``: telemetry about a broken post must not raise on the same broken post.
+    """
+    global _post_drop_count  # noqa: PLW0603  # module-global run counter is the design (AGENTS.md)
+    _post_drop_count += 1
+    question_json = post_json.get("question") or {}
+    logger.error(
+        "MANTIC_POST_DROPPED: post=%s type=%s error=%s",
+        _render(post_json.get("id")),
+        _render(question_json.get("type")),
+        type(exc).__name__,
+    )
+
+
+def preflight_mantic_tournaments(client: ManticClient, tournament_id: str) -> None:
+    """One authenticated GET of the tournament list, two checks, before any spend.
+
+    Series 2 discovery first: ``MANTIC_TOURNAMENTS`` names every ongoing tournament, the configured
+    slug, and the ongoing bots-only tournaments that are NOT the configured one, at WARNING when
+    that last set is non-empty. A zero-question run is green, so without this line a Series 2 slug
+    could open and every hourly run would keep fetching the ended preseason silently.
+
+    Then the permission check, which fails shut: ``ApiIdentityError`` unless ``tournament_id`` is
+    on the list with a ``user_permission`` that allows forecasting. A token that authenticates but
+    may only view reads the tournament fine and fails only at the publish POST, after the whole
+    ensemble has been paid for, on every cron until somebody reads the red runs.
+    """
+    tournaments = client.list_tournaments()
+    by_slug = {tournament.get("slug"): tournament for tournament in tournaments}
+    ongoing = sorted(slug for slug, tournament in by_slug.items() if slug and tournament.get("is_ongoing") is True)
+    new = [
+        slug
+        for slug in ongoing
+        if slug != tournament_id and by_slug[slug].get("bot_leaderboard_status") == _BOTS_ONLY_LEADERBOARD
+    ]
+    logger.log(
+        logging.WARNING if new else logging.INFO,
+        "MANTIC_TOURNAMENTS: ongoing=%s configured=%s new=%s",
+        _slugs_csv(ongoing),
+        tournament_id,
+        _slugs_csv(new),
+    )
+
+    configured = by_slug.get(tournament_id)
+    if configured is None:
+        raise ApiIdentityError(
+            f"Mantic tournament {tournament_id!r} is not on {client.base_url}/projects/tournaments/ "
+            f"(slugs there: {_slugs_csv(sorted(slug for slug in by_slug if slug))}); re-point MANTIC_TOURNAMENT_ID "
+            "in constants.py. Stopping before any spend."
+        )
+    permission = configured.get("user_permission")
+    if permission not in _FORECASTING_PERMISSIONS:
+        raise ApiIdentityError(
+            f"MANTIC_TOKEN holds user_permission={permission!r} on tournament {tournament_id!r}, which does not "
+            f"allow forecasting (one of {sorted(_FORECASTING_PERMISSIONS)} does). Every question would be researched "
+            "and forecast and then fail at the publish POST, so the run stops before any spend."
+        )
+
+
+def _slugs_csv(slugs: list[str]) -> str:
+    """Comma-joined slugs for the ``MANTIC_TOURNAMENTS`` marker; ``none`` for an empty list."""
+    return ",".join(slugs) or "none"
+
+
+def _log_mantic_question(question: MetaculusQuestion, *, wire_type: str | None) -> None:
     """Emit the MANTIC_QUESTION marker for one parsed question.
 
-    The three Mantic-only fields are read with ``.get`` so a post that lacks one still parses and
-    renders ``n/a``: telemetry must never turn into a dropped question.
+    The three Mantic-only fields and the wire type are read with ``.get`` so a post that lacks one
+    still parses and renders ``n/a``: telemetry must never turn into a dropped question.
     """
     question_json: dict = question.api_json["question"]
     cdf_size = question.cdf_size if isinstance(question, (NumericQuestion, DateQuestion)) else None
@@ -129,7 +279,7 @@ def _log_mantic_question(question: MetaculusQuestion, *, wire_type: str) -> None
         "MANTIC_QUESTION: post=%s question=%s type=%s cdf_size=%s multi_resolution=%s date_granularity=%s precision=%s",
         question.id_of_post,
         question.id_of_question,
-        wire_type,
+        _render(wire_type),
         _render(cdf_size),
         _render(question_json.get("multi_resolution")),
         _render(question_json.get("date_granularity")),

@@ -35,8 +35,10 @@ import pytest
 import requests
 from forecasting_tools.data_models.binary_report import BinaryReport
 from forecasting_tools.data_models.data_organizer import DataOrganizer
+from forecasting_tools.data_models.numeric_report import NumericReport
 from forecasting_tools.data_models.questions import (
     BinaryQuestion,
+    DateQuestion,
     MultipleChoiceQuestion,
     NumericQuestion,
 )
@@ -170,13 +172,28 @@ class TestPublishDoesNotBlockTheEventLoop:
         assert BinaryReport.__dict__[publish_hardening._PUBLISH_METHOD] is first
 
     def test_every_published_report_type_is_offloaded(self) -> None:
-        # All three question types the bot forecasts publish through their own report
-        # class, so missing one silently leaves that type blocking the loop.
+        # The three question types with their own report class publish through it, so
+        # missing one silently leaves that type blocking the loop.
         for question_type in (BinaryQuestion, NumericQuestion, MultipleChoiceQuestion):
             report_type = DataOrganizer.get_report_type_for_question_type(question_type)
             assert report_type in publish_hardening._PATCHED_REPORT_TYPES, (
                 f"{report_type.__name__} publishes but is not in _PATCHED_REPORT_TYPES"
             )
+
+    def test_the_date_report_inherits_the_patched_numeric_publish(self, pristine_report_publish: None) -> None:
+        # DateReport (and DiscreteReport) define no publish of their own: they resolve
+        # NumericReport's through the MRO, so patching NumericReport covers them and adding
+        # them to _PATCHED_REPORT_TYPES would trip the patcher's AttributeError instead.
+        date_report_type = DataOrganizer.get_report_type_for_question_type(DateQuestion)
+        assert publish_hardening._PUBLISH_METHOD not in date_report_type.__dict__
+        assert date_report_type not in publish_hardening._PATCHED_REPORT_TYPES
+        assert NumericReport in publish_hardening._PATCHED_REPORT_TYPES
+
+        publish_hardening.apply_report_publish_offload()
+
+        resolved = getattr(date_report_type, publish_hardening._PUBLISH_METHOD)
+        assert resolved is getattr(NumericReport, publish_hardening._PUBLISH_METHOD)
+        assert getattr(resolved, publish_hardening._REPORT_SENTINEL, False) is True
 
     def test_each_report_type_defines_its_own_publish(self) -> None:
         # The offload marker is per-function rather than per-class precisely because

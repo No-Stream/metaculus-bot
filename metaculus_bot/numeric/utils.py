@@ -19,6 +19,7 @@ from forecasting_tools.data_models.questions import NumericQuestion
 from metaculus_bot.constants import NUM_RAMP_K_FACTOR
 from metaculus_bot.mc_processing import clamp_and_renormalize_probs
 from metaculus_bot.numeric.config import PCHIP_CDF_POINTS, grid_step_constraints
+from metaculus_bot.numeric.date_axis import EpochDateQuestion, format_epoch
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid, safe_cdf_bounds
 from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
 from metaculus_bot.numeric.validation import resolve_zero_point
@@ -235,7 +236,10 @@ def nominal_bounds(question: NumericQuestion) -> tuple[float, float]:
 
     The half-step branch requires ``cdf_size > 1`` — the API derives cdf_size as
     ``inbound_outcome_count + 1`` so real questions are always >= 2, but a degenerate
-    stub would otherwise divide by zero.
+    stub would otherwise divide by zero. It is never entered for a date question: the
+    epoch adapter (``date_axis.as_epoch_question``) always carries the nominal bounds the
+    API declared, because Mantic labels a date bin by its LEFT edge and the centre-aligned
+    derivation below would shift both displayed dates by half a day.
     """
     nominal_upper = getattr(question, "nominal_upper_bound", None)
     nominal_lower = getattr(question, "nominal_lower_bound", None)
@@ -259,9 +263,15 @@ def bound_messages(question: NumericQuestion) -> tuple[str, str]:
     """Return upper & lower bound helper messages for numeric prompts.
 
     For discrete questions, if nominal bounds are missing, derive them using half-step logic.
+    On the epoch adapter of a date question the bounds read as dates, not epoch floats.
     """
 
-    upper_bound_number, lower_bound_number = nominal_bounds(question)
+    upper_bound_value, lower_bound_value = nominal_bounds(question)
+    upper_bound_number: str | float = upper_bound_value
+    lower_bound_number: str | float = lower_bound_value
+    if isinstance(question, EpochDateQuestion):
+        upper_bound_number = format_epoch(upper_bound_value, question.date_granularity)
+        lower_bound_number = format_epoch(lower_bound_value, question.date_granularity)
 
     if question.open_upper_bound:
         upper_bound_message = (

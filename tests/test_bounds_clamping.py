@@ -20,7 +20,7 @@ from metaculus_bot.numeric.bounds_clamping import (
 )
 
 
-def _make_question(open_upper=False, open_lower=False, lower=0.0, upper=100.0) -> NumericQuestion:
+def _make_question(open_upper=False, open_lower=False, lower=0.0, upper=100.0, cdf_size=201) -> NumericQuestion:
     return cast(
         NumericQuestion,
         SimpleNamespace(
@@ -28,6 +28,7 @@ def _make_question(open_upper=False, open_lower=False, lower=0.0, upper=100.0) -
             open_lower_bound=open_lower,
             upper_bound=upper,
             lower_bound=lower,
+            cdf_size=cdf_size,
             id_of_question=999,
             page_url="https://example.com/q/999",
         ),
@@ -49,6 +50,20 @@ class TestBoundsClamping:
         buffer = calculate_bounds_buffer(question)
         expected = 50.0 * 0.01  # Should be 1% of range
         assert buffer == expected
+
+    def test_calculate_bounds_buffer_is_at_least_one_grid_bin(self):
+        """A coarse grid widens the tolerance to one bin: a value inside one bin of a closed edge
+        is indistinguishable from the edge once bucketed, so it clamps instead of dropping the
+        forecaster. Twelve one-day bins on an epoch-seconds axis is the case that motivated it,
+        where the flat 1.0 was a one-second tolerance."""
+        day = 86_400.0
+        question = _make_question(lower=0.0, upper=12 * day, cdf_size=13)
+        assert calculate_bounds_buffer(question) == day
+        # A 201-point grid over a range of 1000 has 5-wide bins, so the tolerance is one bin, not 1.0.
+        assert calculate_bounds_buffer(_make_question(lower=0.0, upper=1000.0)) == 5.0
+        # Whenever the range-based tolerance is the larger, nothing changes.
+        assert calculate_bounds_buffer(_make_question(lower=0.0, upper=200.0)) == 1.0
+        assert calculate_bounds_buffer(_make_question(lower=0.0, upper=50.0)) == 0.5
 
     def test_clamp_values_to_bounds_no_violations(self):
         """Test clamping when no values violate bounds."""

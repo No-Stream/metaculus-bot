@@ -901,7 +901,18 @@ warnings retain their text and use that module's logger. Requests, host limits,
 timeouts, cancellation, and registered result markers remain in `resolution_source`.
 
 It deterministically extracts URLs from resolution criteria + fine print (markdown
-links and bare URLs, order-preserving dedup, Metaculus markdown-escapes undone),
+links and bare URLs, order-preserving dedup, Metaculus markdown-escapes undone;
+`research/resolution_url_scan.py`). A URL body is a run of atoms: a markdown escape, a
+balanced `(...)` pair, a balanced `[...]` pair, or any plain character, so a Wikipedia-style
+`_(rocket)` path and a Rails-style API query such as
+`documents.json?conditions[agencies][]=nuclear-regulatory-commission` both survive whole while a
+lone closer from the surrounding prose still ends the match. The bracket atom came from the
+Mantic readiness review (2026-09-08): question writers there resolve a question to "the count
+this API query returns" and cite the query, the old class cut it at the first bracket, and the
+truncated Federal Register query answers HTTP 200 with the UNFILTERED count (10000 against a
+correct 125), which this provider would then have served as the grading evidence. Six of 556
+public Mantic posts carried such a URL. A backtick ends a URL for the same reason: ten cited
+API URLs were fenced in backticks and the fenced form 404s. It then
 skip-filters URLs that add nothing or belong to another provider (self-references
 to either question platform's own site, metaculus.com or `competitions.mantic.com`,
 refused on every run mode since the host list `QUESTION_PLATFORM_HOSTS` is module-level;

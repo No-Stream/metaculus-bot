@@ -25,15 +25,19 @@ Three files form the startup chain:
   mode-specific forecast loop. Before any fetch it runs the API identity preflight
   (`api_preflight.verify_api_identity`, against the Metaculus API by default and the
   Mantic API in `--mode mantic`; it raises `ApiIdentityError` when the host does not
-  answer like the platform), and in mantic mode the personal-keys-only assertion and
-  the swap to the Mantic platform client (`metaculus_bot/mantic.py`); see
+  answer like the platform), and in mantic mode the personal-keys-only assertion, the
+  swap to the Mantic platform client (`metaculus_bot/mantic.py`) and one authenticated
+  GET of the tournament list that fails shut unless the token may forecast the configured
+  tournament and logs the `MANTIC_TOURNAMENTS` discovery line; see
   `docs/operations.md` "Mantic". It also wires credit telemetry and decides the process exit code:
   the run exits non-zero when any degradation counter fired (`alertable_count` on
   `TemplateForecaster` sums them: dropped forecasters, questions that failed to
   publish, stacker fallbacks, research-provider and summarizer failures, gap-fill
-  v2 errors, and prediction-market degradation) or the donated OpenRouter key
-  dropped below the $100 early-warning floor (`OPENROUTER_CREDIT_FLOOR_USD`, sized
-  so the reminder to ask Metaculus for a top-up arrives with runway left).
+  v2 errors, and prediction-market degradation), when the Mantic client dropped a post it
+  could not parse (`mantic.get_post_drop_count`), when the Mantic slug is past its end date
+  (`_check_tournament_dates`; advisory for the Metaculus tournament), or the donated
+  OpenRouter key dropped below the $100 early-warning floor (`OPENROUTER_CREDIT_FLOOR_USD`,
+  sized so the reminder to ask Metaculus for a top-up arrives with runway left).
   Credit-caused alerts are live again as of 2026-09-03 and are suppressed only
   inside a dated window — see "The credit-alert suppression window" in
   `docs/operations.md`. See `main` in `cli.py`.
@@ -151,10 +155,26 @@ orchestrator's `pop_provider_diagnostics`, which `_research_and_make_predictions
 Each forecaster LLM runs through `_forecaster_with_soft_deadline` (`forecaster.py`),
 which caps a single model at `FORECASTER_SOFT_DEADLINE` so one stuck
 model can't hold the whole question. `_make_prediction` dispatches to the
-type-specific runner (`forecaster_runners.py`) for binary, multiple-choice, or numeric
-questions. The N coroutines are gathered under the shared wall-clock budget by
+type-specific runner (`forecaster_runners.py`) for binary, multiple-choice, numeric or
+date questions. The N coroutines are gathered under the shared wall-clock budget by
 `_gather_predictions_with_wall_clock` (`forecaster.py`), which cancels any
 forecaster still pending at the deadline and counts the drop.
+
+**The date path.** A `DateQuestion` stays a `DateQuestion` end to end, so the framework builds
+a `DateReport`, telemetry says `qtype=date` and persistence sees a date, while the numeric math
+runs on an adapter: `numeric/date_axis.py` (`as_epoch_question`, `numeric_view`) views the
+question as a `NumericQuestion` on the epoch-seconds axis, which is exactly how
+forecasting-tools and the Metaculus backend represent a date question (`.timestamp()` on the
+bounds, the same CDF validation rules). `_run_forecast_on_date` (`forecaster.py`) calls
+`run_date_forecast` (`forecaster_runners.py`), a thin wrapper of the numeric runner: the
+`date_prompt` (`prompts.py`) asks for ISO dates and names the bin granularity, `DateStructured`
+(`structured_output_schema.py`) carries the declared percentiles as datetimes, the extraction
+ladder converts them to epoch seconds (`parse_iso_utc`: UTC always, a date-only value is noon
+UTC of that day so it lands inside that day's right-closed bin), and the same guarded PCHIP
+build, CDF-space aggregation (`numeric_view` at every routing site) and publish path follow
+with `is_date` set so the comment renders dates through the framework formatter. Nominal bounds
+are read from the API's `scaling` block and never derived for a date question. Detail:
+[numeric_pipeline.md](numeric_pipeline.md) and `docs/operations.md` "Date questions".
 
 The ensemble is a handful of forecaster LLMs, one per vendor. The exact roster
 rotates often, so **read `metaculus_bot/llm_configs.py` for the current list** rather
@@ -276,7 +296,9 @@ What the bot takes from the framework, and the one place it overrides it:
 
 - `GeneralLlm` for model interfaces (a wrapper around litellm).
 - `MetaculusApi` for platform integration.
-- Question types: `BinaryQuestion`, `NumericQuestion`, `MultipleChoiceQuestion`.
+- Question types: `BinaryQuestion`, `NumericQuestion`, `MultipleChoiceQuestion`, `DateQuestion`
+  (forecast on its epoch-seconds view, `numeric/date_axis.py`; `ConditionalQuestion` stays
+  unsupported).
 - Prediction types: `ReasonedPrediction`, `BinaryPrediction`, and friends.
 - Research helpers: `AskNewsSearcher`, `SmartSearcher`.
 - Numeric: `NumericDistribution`, `Percentile`. We subclass `NumericDistribution` as
@@ -334,6 +356,7 @@ Whichever applies, keep the `# noqa: PLC0415`, state the reason inline, and neve
 | Startup / CLI | `main.py`, `metaculus_bot/cli.py` |
 | API identity preflight | `metaculus_bot/api_preflight.py` (`verify_api_identity`, its Metaculus wrapper, `ApiIdentityError`) |
 | Mantic platform client (Crucible, a Metaculus fork) | `metaculus_bot/mantic.py` |
+| Which platform a question is on | `metaculus_bot/question_platform.py` (`question_platform(question)` reads the `page_url` host; the `PLATFORM_METACULUS` / `PLATFORM_MANTIC` tokens live in `constants.py` and `research/persistence.py` re-exports them). The prompts read it for the platform-aware scoring sentence and the Mantic out-of-range base rate |
 | Publish hardening and close gate | `metaculus_bot/publish_hardening.py` (the forced POST timeout is scoped to `QUESTION_PLATFORM_HOSTS` from `constants.py`, so it covers both platforms), `publish_gate.py` |
 | Per-question orchestration | `metaculus_bot/forecaster.py` |
 | Post-fan-out aggregation routing | `metaculus_bot/stacking_route.py` |
@@ -347,6 +370,7 @@ Whichever applies, keep the `# noqa: PLC0415`, state the reason inline, and neve
 | Forecaster runners | `metaculus_bot/forecaster_runners.py` |
 | Value extraction | `metaculus_bot/value_extraction.py` |
 | Numeric CDF | `metaculus_bot/numeric/` |
+| Date question as a numeric question on the epoch-seconds axis | `metaculus_bot/numeric/date_axis.py` (`EpochDateQuestion`, `as_epoch_question`, `numeric_view`, `parse_iso_utc`, `format_epoch`) |
 | Aggregation + stacking | `metaculus_bot/aggregation_pipeline.py`, `stacking.py` |
 | Model roster (source of truth) | `metaculus_bot/llm_configs.py` |
 | Prompts | `metaculus_bot/prompts.py` |

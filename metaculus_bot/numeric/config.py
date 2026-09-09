@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import math
 
+from forecasting_tools.data_models.questions import DiscreteQuestion, NumericQuestion
+
 from metaculus_bot.constants import NUM_MAX_STEP
 
 # --- Percentile Processing Constants ---
@@ -83,6 +85,40 @@ def grid_step_constraints(num_points: int) -> tuple[float, float]:
     min_step = round(0.01 / inbound, 9)
     max_step = min(1.0, math.floor(0.2 * 200.0 / inbound * 1e9) / 1e9)
     return min_step, max_step
+
+
+def grid_bin_width(lower_bound: float, upper_bound: float, num_points: int) -> float:
+    """Width of one bin of a ``num_points``-point linear CDF grid over ``[lower, upper]``.
+
+    ``(upper - lower) / (num_points - 1)``: the platform derives a discrete question's
+    ``range_min`` / ``range_max`` as the nominal bounds pushed out by half a step, so on an
+    integer-count question this is exactly 1.0 and each bin is centred on its integer. It is
+    the grid step the cluster spreader keeps a plateau inside of (``cluster_processing``) and
+    the one the discrete-snap skip reports (``discrete_snap``). Linear only: on a ``zero_point``
+    grid the bins are geometric and this is the mean width.
+    """
+    return (upper_bound - lower_bound) / (num_points - 1)
+
+
+def grid_is_outcome_space(question: NumericQuestion) -> bool:
+    """True when the question's published bins are its outcome space and nothing downstream reshapes them.
+
+    Two shapes qualify: a natively discrete question (``DiscreteQuestion``: every Metaculus
+    discrete question and every Mantic quantitative question, whose wire type the Mantic
+    client rewrites to ``discrete``) and any non-201 grid. On both, the vote-gated discrete
+    snap never runs (``discrete_snap`` skips on exactly this predicate), so what the
+    sanitizer's cluster spreader publishes is the final word and a plateau is kept inside
+    its bin (``cluster_processing``). On the 201-point continuous grid of a
+    ``NumericQuestion`` the count-like unit spread is a pre-processing step the snap can
+    re-concentrate afterwards, so that grid stays byte-identical. ``cdf_size`` alone cannot
+    carry the distinction: a 200-bin Mantic discrete question has ``cdf_size == 201``.
+
+    The ablation harness rehydrates archived questions as plain ``NumericQuestion`` with the
+    recorded ``cdf_size``, so its replay of a 200-bin discrete question would take the
+    continuous branch here. That divergence bites only on Mantic 200-bin discrete questions,
+    which do not exist in the Metaculus archives the harness replays.
+    """
+    return isinstance(question, DiscreteQuestion) or question.cdf_size != PCHIP_CDF_POINTS
 
 
 # Higher = more aggressive smoothing

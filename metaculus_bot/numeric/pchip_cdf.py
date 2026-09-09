@@ -29,6 +29,13 @@ _MASS_TOLERANCE: float = 1e-15
 # accumulated float drift. Deliberately far looser than _MASS_TOLERANCE (a ~200-ring walk
 # can drift a few times 1e-15) and far below the min-step, so nothing meaningful is lost.
 _UNPLACED_MASS_TOLERANCE: float = 1e-9
+# How far below ``min_step`` an adjacent step may sit before it counts as a violation. One
+# tolerance for the rebuild trigger, the rebuild's range check, its post-check and the final
+# assertion: when only the last two carried it, a 1e-18 step deficit tripped the trigger and
+# the range check then refused a range 1e-16 short, dropping a forecast that put almost all
+# of its mass beyond an open bound (Mantic edge-case review, 2026-09). The server rounds the
+# PMF to 9 decimals, so a deficit this small is invisible to it.
+_MIN_STEP_TOLERANCE: float = 1e-10
 
 
 @dataclass(frozen=True)
@@ -501,7 +508,8 @@ def _rebuild_with_min_steps(
     coarse grid whose available range is exactly saturated by the min-step.
 
     Raises:
-        ValueError: the CDF range cannot hold one ``min_step`` per bin.
+        ValueError: the CDF range cannot hold one ``min_step`` per bin (beyond
+            ``_MIN_STEP_TOLERANCE``; a float-epsilon shortfall rebuilds).
         RuntimeError: the rebuild itself failed to satisfy the min-step.
     """
     steps = np.diff(cdf_y)
@@ -526,7 +534,7 @@ def _rebuild_with_min_steps(
     available_range = end_val - start_val
     required_range = (len(cdf_y) - 1) * min_step
 
-    if required_range > available_range:
+    if required_range > available_range + _MIN_STEP_TOLERANCE:
         raise ValueError(
             f"Cannot satisfy minimum step requirement: need {required_range:.6f} "
             f"but only have {available_range:.6f} available in CDF range"
@@ -549,7 +557,7 @@ def _rebuild_with_min_steps(
         for i in range(1, len(new_cdf)):
             new_cdf[i] = new_cdf[i - 1] + (available_range / (len(new_cdf) - 1))
 
-    if np.any(np.diff(new_cdf) < min_step - 1e-10):
+    if np.any(np.diff(new_cdf) < min_step - _MIN_STEP_TOLERANCE):
         raise RuntimeError("Internal error: Step size enforcement failed")
 
     new_steps = np.diff(new_cdf)
@@ -572,8 +580,8 @@ def _assert_pchip_constraints(
     open_upper_bound: bool,
 ) -> None:
     """Fail loudly rather than submit a CDF the Metaculus validators would reject."""
-    if np.any(np.diff(cdf_y) < min_step - 1e-10):
-        problematic_indices = np.where(np.diff(cdf_y) < min_step - 1e-10)[0]
+    if np.any(np.diff(cdf_y) < min_step - _MIN_STEP_TOLERANCE):
+        problematic_indices = np.where(np.diff(cdf_y) < min_step - _MIN_STEP_TOLERANCE)[0]
         raise RuntimeError(
             f"Failed to enforce minimum step size at indices: {problematic_indices}, "
             f"values: {np.diff(cdf_y)[problematic_indices]}"
@@ -661,7 +669,7 @@ def generate_pchip_cdf(
         model_name=model_name,
     )
 
-    aggressive_enforcement_used = bool(np.any(np.diff(cdf_y) < min_step))
+    aggressive_enforcement_used = bool(np.any(np.diff(cdf_y) < min_step - _MIN_STEP_TOLERANCE))
     if aggressive_enforcement_used:
         cdf_y = _rebuild_with_min_steps(
             cdf_y,

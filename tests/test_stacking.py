@@ -735,6 +735,7 @@ class TestStackingMethods:
             numeric_question.open_lower_bound = False
             numeric_question.unit_of_measure = "units"
             numeric_question.zero_point = None
+            numeric_question.cdf_size = 201
             result = await bot._pipeline.run_stacking(numeric_question, "research", reasoned_preds)
             mock_binary.assert_not_called()
             mock_mc.assert_not_called()
@@ -766,10 +767,11 @@ class TestStackingMethods:
             ),
         )
 
-        # Create unsupported question type
-        from forecasting_tools.data_models.questions import DateQuestion
+        # A conditional question is the one framework type the bot never stacks (date
+        # questions stack through the numeric path since 2026-09).
+        from forecasting_tools.data_models.questions import ConditionalQuestion
 
-        unsupported_question = Mock(spec=DateQuestion)
+        unsupported_question = Mock(spec=ConditionalQuestion)
         unsupported_question.id_of_question = 104
         unsupported_question.page_url = "https://example.com/q/104"
         reasoned_preds: ReasonedPredictionList = [ReasonedPrediction(prediction_value=0.6, reasoning="test")]

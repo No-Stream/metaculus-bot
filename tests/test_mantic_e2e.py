@@ -16,10 +16,11 @@ values are deterministic. Research is stubbed at ``run_research``, so no provide
 
 What the run proves, per assertion group below: the four preseason questions are fetched through the
 Mantic client with no ``forecast_type`` parameter (the difference that made the framework's default
-fetch return zero quantitative questions); the binary, multiple-choice and 450-bin discrete
-questions are forecast while the date question is dropped with a warning; every prediction and
-comment POST goes to the Mantic API with the payload shape that platform validates, including a
-451-point CDF the server's own rules accept; and nothing in the run contacts metaculus.com.
+fetch return zero quantitative questions); all four are forecast, the 12-bin day-granularity date
+question included (on its epoch-seconds view, published as a 13-value CDF whose mass lands in the
+calendar day's bin, with the comment rendering dates); every prediction and comment POST goes to
+the Mantic API with the payload shape that platform validates, including a 451-point CDF the
+server's own rules accept; and nothing in the run contacts metaculus.com.
 
 A second run, over the same posts with the bot's own forecast already standing on one of them, proves
 the already-forecast skip that the first run cannot: the workflow fires hourly, so once it has run
@@ -40,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -54,7 +56,7 @@ from forecasting_tools import GeneralLlm
 from forecasting_tools.data_models.binary_report import BinaryReport
 from forecasting_tools.data_models.forecast_report import ForecastReport
 from forecasting_tools.data_models.multiple_choice_report import MultipleChoiceReport
-from forecasting_tools.data_models.numeric_report import DiscreteReport
+from forecasting_tools.data_models.numeric_report import DateReport, DiscreteReport
 from forecasting_tools.data_models.questions import MetaculusQuestion
 from forecasting_tools.helpers import metaculus_client as ft_client
 from forecasting_tools.helpers.metaculus_client import MetaculusClient
@@ -92,9 +94,9 @@ pytestmark = pytest.mark.e2e
 _FAKE_TOKEN = "m" * 40
 _EXPECTED_AUTH = f"Token {_FAKE_TOKEN}"
 
-# The second run: the bot's forecast already stands on the binary question, leaving two fresh supported ones.
+# The second run: the bot's forecast already stands on the binary question, leaving three fresh ones.
 _PRIOR_FORECAST_POST_ID = BINARY_POST_ID
-_STILL_FRESH_POST_IDS = frozenset({MULTIPLE_CHOICE_POST_ID, DISCRETE_POST_ID})
+_STILL_FRESH_POST_IDS = frozenset({MULTIPLE_CHOICE_POST_ID, DISCRETE_POST_ID, DATE_POST_ID})
 
 # Derived from the base URL, so the routing paths and the asserted prefixes cannot disagree.
 _POSTS_URL = f"{MANTIC_API_BASE_URL}/posts/"
@@ -131,9 +133,15 @@ _BITCOIN_MEMBER_NORMALS: tuple[tuple[float, float], ...] = (
     (77_300.0, 5_800.0),
 )
 _BITCOIN_MEDIAN_RANGE = (77_000.0, 79_000.0)
+# Every forecaster is certain the largest move lands on 2026-09-16 and spreads its percentiles
+# inside that UTC day, each over a slightly different window of hours. On the platform's grid that
+# day is bin 8, ``cdf[9] - cdf[8]`` over (2026-09-16T00:00Z, 2026-09-17T00:00Z].
+_DATE_CERTAIN_DAY = datetime(2026, 9, 16, tzinfo=UTC)
+_DATE_MEMBER_HOUR_WINDOWS: tuple[tuple[int, int], ...] = ((2, 22), (3, 21), (1, 23))
+_DATE_CERTAIN_BIN = 8
 
 _FORECASTS_PER_QUESTION = 3
-_FORECAST_QUESTION_COUNT = 3
+_FORECAST_QUESTION_COUNT = 4
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +217,26 @@ def _numeric_reasoning(mean: float, sd: float) -> str:
     )
 
 
+def _date_reasoning(start_hour: int, end_hour: int) -> str:
+    """A forecaster certain of 2026-09-16, its 13 percentiles spread over that day's given hours.
+
+    The block is the ``DateStructured`` shape: ISO-8601 strings keyed by percentile, no
+    ``outcome_type``. Timestamps rather than bare dates so the three members differ.
+    """
+    start = _DATE_CERTAIN_DAY + timedelta(hours=start_hour)
+    span = timedelta(hours=end_hour - start_hour)
+    count = len(STANDARD_PERCENTILES)
+    percentiles = {
+        _percentile_key(p): _iso(start + span * index / (count - 1)) for index, p in enumerate(STANDARD_PERCENTILES)
+    }
+    payload = {"question_type": "date", "declared_percentiles": percentiles}
+    return (
+        "## Analysis\n\nRealised volatility clusters around the CPI print and the FOMC decision; the "
+        "session after the FOMC statement is the modal largest move.\n\n"
+        f"{_structured_block(payload)}"
+    )
+
+
 def _canned_responses(posts: list[dict[str, Any]]) -> dict[str, list[str]]:
     """One rationale per forecaster per question, keyed by the question title the prompt carries."""
     questions = {post["id"]: post["question"] for post in posts}
@@ -217,6 +245,7 @@ def _canned_responses(posts: list[dict[str, Any]]) -> dict[str, list[str]]:
         questions[BINARY_POST_ID]["title"]: [_binary_reasoning(prob) for prob in _BINARY_MEMBER_PROBS],
         questions[MULTIPLE_CHOICE_POST_ID]["title"]: [_mc_reasoning(mc_options, probs) for probs in _MC_MEMBER_PROBS],
         questions[DISCRETE_POST_ID]["title"]: [_numeric_reasoning(mean, sd) for mean, sd in _BITCOIN_MEMBER_NORMALS],
+        questions[DATE_POST_ID]["title"]: [_date_reasoning(start, end) for start, end in _DATE_MEMBER_HOUR_WINDOWS],
     }
 
 
@@ -289,10 +318,19 @@ def _json_response(request: requests.PreparedRequest, status: int, payload: Any)
 
 
 def _visible_posts(posts: list[dict[str, Any]], query: dict[str, list[str]]) -> list[dict[str, Any]]:
+    """The page of ``posts`` a real list endpoint would answer: type-filtered, then ``offset``/``limit``-sliced.
+
+    The Mantic client walks offsets until an EMPTY page (its ceiling makes the framework keep
+    paging, since Mantic's ``next`` link is unreliable), so the fake must run out of posts the
+    way the platform does or the framework reads the same four posts twice and refuses them as
+    duplicates.
+    """
     requested_types = query.get("forecast_type")
-    if not requested_types:
-        return posts
-    return [post for post in posts if _MANTIC_FILTER_TYPE[post["question"]["type"]] in requested_types]
+    if requested_types:
+        posts = [post for post in posts if _MANTIC_FILTER_TYPE[post["question"]["type"]] in requested_types]
+    offset = int(query.get("offset", ["0"])[0])
+    limit = int(query.get("limit", [str(len(posts))])[0])
+    return posts[offset : offset + limit]
 
 
 def _install_fake_transport(mp: pytest.MonkeyPatch, posts: list[dict[str, Any]]) -> list[_RecordedRequest]:
@@ -416,7 +454,10 @@ class _ManticRun:
         return {r.body["on_post"] for r in self.comment_posts()}
 
     def mantic_question_marker_lines(self) -> list[str]:
-        return [line for line in self.log_text.splitlines() if line.startswith("MANTIC_QUESTION:")]
+        return self.marker_lines("MANTIC_QUESTION:")
+
+    def marker_lines(self, prefix: str) -> list[str]:
+        return [line for line in self.log_text.splitlines() if line.startswith(prefix)]
 
     def forecast_payload(self, question_id: int) -> dict[str, Any]:
         payloads = [r.body[0] for r in self.forecast_posts() if r.body[0]["question"] == question_id]
@@ -521,10 +562,17 @@ def mantic_posts_transport(monkeypatch: pytest.MonkeyPatch) -> list[_RecordedReq
 
 
 class TestTheFetchGoesThroughTheManticClient:
-    def test_one_posts_get_against_the_mantic_api(self, mantic_run: _ManticRun) -> None:
+    def test_the_fetch_walks_pages_until_an_empty_one(self, mantic_run: _ManticRun) -> None:
+        """Two question-list GETs: the first page carries all four posts, the second is empty and
+        stops the walk. The client asks for a ceiling rather than trusting Mantic's ``next`` link."""
         gets = mantic_run.posts_requests()
-        assert len(gets) == 1, f"expected a single question-list GET, got {[r.url for r in gets]}"
-        assert gets[0].url.startswith(_POSTS_URL)
+        assert len(gets) == 2, f"expected a full page then an empty one, got {[r.url for r in gets]}"
+        for recorded in gets:
+            assert recorded.url.startswith(_POSTS_URL)
+        first_offset = int(gets[0].query["offset"][0])
+        second_offset = int(gets[1].query["offset"][0])
+        assert first_offset == 0
+        assert second_offset == int(gets[0].query["limit"][0])
 
     def test_the_get_asks_for_the_open_questions_of_the_preseason_tournament(self, mantic_run: _ManticRun) -> None:
         query = mantic_run.posts_requests()[0].query
@@ -544,7 +592,7 @@ class TestTheFetchGoesThroughTheManticClient:
 
     def test_all_four_preseason_questions_were_parsed(self, mantic_run: _ManticRun) -> None:
         """One MANTIC_QUESTION marker per parsed question, so this counts what the client returned
-        rather than what survived the bot's own type guard."""
+        rather than what the bot went on to forecast."""
         marker_lines = mantic_run.mantic_question_marker_lines()
         assert len(marker_lines) == len(mantic_run.posts)
         for post_id in (BINARY_POST_ID, MULTIPLE_CHOICE_POST_ID, DISCRETE_POST_ID, DATE_POST_ID):
@@ -552,26 +600,30 @@ class TestTheFetchGoesThroughTheManticClient:
 
 
 class TestTypeRouting:
-    def test_three_questions_produced_reports_one_per_supported_type(self, mantic_run: _ManticRun) -> None:
+    def test_four_questions_produced_reports_one_per_type(self, mantic_run: _ManticRun) -> None:
         assert not [r for r in mantic_run.reports if isinstance(r, BaseException)], mantic_run.reports
         assert len(mantic_run.reports) == _FORECAST_QUESTION_COUNT
         assert isinstance(mantic_run.report_for(BINARY_POST_ID), BinaryReport)
         assert isinstance(mantic_run.report_for(MULTIPLE_CHOICE_POST_ID), MultipleChoiceReport)
         assert isinstance(mantic_run.report_for(DISCRETE_POST_ID), DiscreteReport)
+        assert isinstance(mantic_run.report_for(DATE_POST_ID), DateReport)
 
-    def test_the_date_question_is_dropped_with_a_warning(self, mantic_run: _ManticRun) -> None:
+    def test_no_question_was_dropped_as_unsupported(self, mantic_run: _ManticRun) -> None:
+        """Until 2026-09-08 the date question was dropped here with a WARNING; Mantic's pool is 41%
+        date questions, so the guard now admits it and only a conditional question would trip it."""
         warnings = [
             record.getMessage()
             for record in mantic_run.records
             if record.levelno >= logging.WARNING and "unsupported" in record.getMessage()
         ]
-        assert len(warnings) == 1, warnings
-        assert "DateQuestion" in warnings[0]
-        assert "Skipping 1 unsupported question(s)" in warnings[0]
+        assert warnings == []
 
-    def test_the_date_question_is_never_posted(self, mantic_run: _ManticRun) -> None:
-        assert DATE_POST_ID not in mantic_run.posted_question_ids()
-        assert DATE_POST_ID not in mantic_run.commented_post_ids()
+    def test_the_date_report_is_published_off_the_epoch_axis(self, mantic_run: _ManticRun) -> None:
+        report = mantic_run.report_for(DATE_POST_ID)
+        assert isinstance(report, DateReport)
+        assert report.prediction.is_date is True
+        assert report.prediction.lower_bound == report.question.lower_bound.timestamp()
+        assert report.prediction.upper_bound == report.question.upper_bound.timestamp()
 
 
 class TestThePreviouslyForecastQuestionIsSkipped:
@@ -674,7 +726,51 @@ class TestPublishedPayloads:
         low, high = _BITCOIN_MEDIAN_RANGE
         assert low <= median_value <= high, f"published median {median_value} outside {_BITCOIN_MEDIAN_RANGE}"
 
-    @pytest.mark.parametrize("post_id", [BINARY_POST_ID, MULTIPLE_CHOICE_POST_ID, DISCRETE_POST_ID])
+    def test_date_payload_is_a_13_point_cdf_the_server_accepts(self, mantic_run: _ManticRun) -> None:
+        """Both of post 651's bounds are closed, so the CDF is pinned to exactly 0.0 and 1.0 at its
+        ends, and its 12 bins must each clear the server's ``0.01 / 12`` minimum step."""
+        question_json = next(post["question"] for post in mantic_run.posts if post["id"] == DATE_POST_ID)
+        scaling = question_json["scaling"]
+        cdf_size = scaling["inbound_outcome_count"] + 1
+        assert cdf_size == 13
+        cdf = mantic_run.forecast_payload(DATE_POST_ID)["continuous_cdf"]
+
+        assert len(cdf) == cdf_size
+        probs = np.asarray(cdf, dtype=float)
+        assert probs[0] == 0.0
+        assert probs[-1] == 1.0
+        assert np.all(np.diff(probs) >= 0.0), "the CDF must be non-decreasing"
+        assert_server_accepts_cdf(
+            probs,
+            cdf_size=cdf_size,
+            open_lower=scaling["open_lower_bound"],
+            open_upper=scaling["open_upper_bound"],
+        )
+
+    def test_a_forecaster_certain_of_september_16_puts_the_mass_in_bin_8(self, mantic_run: _ManticRun) -> None:
+        """The oracle for the bin convention: calendar day D = range_min + k days is bin k, whose mass
+        is ``cdf[k + 1] - cdf[k]`` over ``(edge_k, edge_{k+1}]``, and 2026-09-16 is k = 8. Every member
+        put its whole day inside that bin, so the published median must too."""
+        question_json = next(post["question"] for post in mantic_run.posts if post["id"] == DATE_POST_ID)
+        edges = question_json["scaling"]["continuous_range"]
+        assert edges[_DATE_CERTAIN_BIN] == _iso(_DATE_CERTAIN_DAY)
+        assert edges[_DATE_CERTAIN_BIN + 1] == _iso(_DATE_CERTAIN_DAY + timedelta(days=1))
+
+        probs = np.asarray(mantic_run.forecast_payload(DATE_POST_ID)["continuous_cdf"], dtype=float)
+        bin_masses = np.diff(probs)
+        assert int(np.argmax(bin_masses)) == _DATE_CERTAIN_BIN
+        assert bin_masses[_DATE_CERTAIN_BIN] > 0.9
+        # The other eleven bins hold only the server's minimum step each.
+        others = np.delete(bin_masses, _DATE_CERTAIN_BIN)
+        assert np.all(others < 0.01)
+
+    def test_the_date_comment_renders_dates_not_epoch_seconds(self, mantic_run: _ManticRun) -> None:
+        text: str = mantic_run.comment_payload(DATE_POST_ID)["text"]
+        assert "2026-09-16" in text
+        # An epoch second in 2026 is a ten-digit number starting 17; none may reach the reader.
+        assert re.search(r"\b17\d{8}(?:\.\d+)?\b", text) is None, text[:2000]
+
+    @pytest.mark.parametrize("post_id", [BINARY_POST_ID, MULTIPLE_CHOICE_POST_ID, DISCRETE_POST_ID, DATE_POST_ID])
     def test_each_comment_targets_its_own_post(self, mantic_run: _ManticRun, post_id: int) -> None:
         payload = mantic_run.comment_payload(post_id)
         assert payload["on_post"] == post_id
@@ -682,6 +778,42 @@ class TestPublishedPayloads:
         assert payload["text"].lstrip().startswith("# SUMMARY")
         assert payload["is_private"] is True
         assert payload["included_forecast"] is True
+
+
+class TestDateTelemetry:
+    """The date question is counted as its own type in the run log, on the epoch axis."""
+
+    def test_each_member_leaves_a_member_forecast_line_with_qtype_date(self, mantic_run: _ManticRun) -> None:
+        lines = [line for line in mantic_run.marker_lines("MEMBER_FORECAST:") if f"question={DATE_POST_ID} " in line]
+        assert len(lines) == _FORECASTS_PER_QUESTION
+        for line in lines:
+            assert " role=member qtype=date " in line
+            # Both bounds closed: no mass outside the range, and the fields close the line.
+            assert line.endswith(" oor_low=0.000000 oor_high=0.000000")
+            published = json.loads(line.split(" published=", 1)[1].split(" ", 1)[0])
+            assert len(published) == len(STANDARD_PERCENTILES)
+            # The values are epoch seconds inside 2026-09-16 UTC.
+            day_start = _DATE_CERTAIN_DAY.timestamp()
+            assert all(day_start < value < day_start + 86_400 for _, value in published)
+
+    def test_the_aggregate_marker_names_the_date_grid(self, mantic_run: _ManticRun) -> None:
+        lines = [line for line in mantic_run.marker_lines("NUMERIC_AGGREGATE:") if f"question={DATE_POST_ID} " in line]
+        assert lines == [
+            f"NUMERIC_AGGREGATE: question={DATE_POST_ID} qtype=date cdf_size=13 oor_low=0.000000 oor_high=0.000000"
+        ]
+
+    def test_the_discrete_question_has_its_aggregate_marker_too(self, mantic_run: _ManticRun) -> None:
+        lines = [
+            line for line in mantic_run.marker_lines("NUMERIC_AGGREGATE:") if f"question={DISCRETE_POST_ID} " in line
+        ]
+        assert len(lines) == 1
+        assert " qtype=numeric cdf_size=451 " in lines[0]
+
+    def test_the_mantic_question_marker_still_names_the_date_question(self, mantic_run: _ManticRun) -> None:
+        (line,) = [line for line in mantic_run.mantic_question_marker_lines() if f"post={DATE_POST_ID} " in line]
+        assert "type=date" in line
+        assert "cdf_size=13" in line
+        assert "date_granularity=day" in line
 
 
 class TestNothingReachesMetaculus:
@@ -695,7 +827,7 @@ class TestNothingReachesMetaculus:
             assert "metaculus.com" not in recorded.url, recorded.url
 
     def test_the_reports_carry_mantic_page_urls(self, mantic_run: _ManticRun) -> None:
-        for post_id in (BINARY_POST_ID, MULTIPLE_CHOICE_POST_ID, DISCRETE_POST_ID):
+        for post_id in (BINARY_POST_ID, MULTIPLE_CHOICE_POST_ID, DISCRETE_POST_ID, DATE_POST_ID):
             page_url = mantic_run.report_for(post_id).question.page_url
             assert page_url is not None
             assert page_url.startswith(f"{MANTIC_SITE_URL}/questions/"), page_url
@@ -722,7 +854,7 @@ class TestTheEnsembleFannedOut:
 
     def test_no_parser_or_stacker_call_was_needed(self, mantic_run: _ManticRun) -> None:
         """Every value came off the structured block (extraction rung 1) and every spread sat below
-        its stacking threshold, so the nine forecaster calls were the only LLM calls."""
+        its stacking threshold, so the twelve forecaster calls were the only LLM calls."""
         assert mantic_run.llm_calls.unexpected_prompts == []
 
 
