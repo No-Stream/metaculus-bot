@@ -1446,7 +1446,8 @@ def _date_axis(question: EpochDateQuestion) -> _ContinuousAxis:
         reference_class_rules=f"{_COUNT_IN_PERIOD_REFERENCE_CLASS}{_SOFT_CLOCK_RULE}",
         tail_scenarios=(
             "            - Coherent pathway for an unusually early date.\n"
-            "            - Coherent pathway for an unusually late date, including not within the displayed window."
+            "            - Coherent pathway for an unusually late date, including, where the upper bound is open, a "
+            "date beyond the displayed window."
         ),
         forecastability_bullet=(
             "Decide how forecastable this date is from current information. An event on a binding clock (a "
@@ -1454,8 +1455,8 @@ def _date_axis(question: EpochDateQuestion) -> _ContinuousAxis:
             "meeting) is largely predictable from that clock and the actor's slip record: anchor tightly on it. An "
             'event with no clock, a first-ever occurrence, or a "largest move in the window" question is close to '
             "unforecastable: spread your mass over the eligible dates in proportion to whatever base rate you can "
-            'source, put the "not within the window" mass beyond an open upper bound, and do not expect a date you '
-            "cannot source to a named cause."
+            'source, put any "not within the window" mass beyond the upper bound where the question leaves it open, '
+            "and do not expect a date you cannot source to a named cause."
         ),
     )
 

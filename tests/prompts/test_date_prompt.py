@@ -112,10 +112,13 @@ class TestDateSpecificBlocks:
     def test_tails_forecastability_and_final_check_are_date_worded(self) -> None:
         flat = _flat(_date_prompt_text())
         assert "coherent pathway for an unusually early date" in flat
-        assert "coherent pathway for an unusually late date, including not within the displayed window" in flat
+        assert (
+            "coherent pathway for an unusually late date, including, where the upper bound is open, a date beyond the displayed window"
+            in flat
+        )
         assert "decide how forecastable this date is from current information" in flat
         assert "an event on a binding clock" in flat
-        assert 'put the "not within the window" mass beyond an open upper bound' in flat
+        assert 'put any "not within the window" mass beyond the upper bound where the question leaves it open' in flat
         assert "calendar check: does every date you output fall on a day the resolution criteria allow" in flat
         assert "unusually low results" not in flat
         assert "center on the current value" not in flat

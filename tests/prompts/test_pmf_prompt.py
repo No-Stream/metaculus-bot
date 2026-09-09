@@ -512,7 +512,10 @@ class TestSharedRulesReachThePerBinPrompt:
     def test_the_date_kind_slots_and_the_soft_clock_rule_reach_a_date_grid(self) -> None:
         flat = _flat(_pmf_prompt_text(_mantic_date_q()))
         assert "on what date would it resolve?" in flat
-        assert "coherent pathway for an unusually late date, including not within the displayed window" in flat
+        assert (
+            "coherent pathway for an unusually late date, including, where the upper bound is open, a date beyond the displayed window"
+            in flat
+        )
         assert "decide how forecastable this date is from current information" in flat
         assert flat.count(_flat(_SOFT_CLOCK_RULE)) == 1
         assert "measured record of meeting" not in _flat(_pmf_prompt_text())

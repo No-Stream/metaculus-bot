@@ -76,10 +76,16 @@ the destination doc, then `make all`. Prose goes to the topical doc that already
 or to a registry-style doc when the comments are receipts on a table of values. **Operator: run this
 as the first CR after the Mantic merge lands; this entry is the reminder.**
 
-### Two prompt and comment candidates left open by the 2026-09-09 readiness review (added 2026-09-09, operator decision)
+### Two prompt and comment candidates from the 2026-09-09 readiness review: wording SHIPPED, comment table DEFERRED (added 2026-09-09, decided 2026-09-09)
 
 Both were raised by two independent reviewers of the post-651 smoke and refuted by the adversarial
-verifiers as low-risk, so neither shipped without the operator's word.
+verifiers as low-risk, so neither shipped without the operator's word. The operator decided the same
+afternoon: the wording change SHIPPED (the bullets below now read "including, where the upper bound is
+open, a date beyond the displayed window" and "put any 'not within the window' mass beyond the upper
+bound where the question leaves it open", with the three pins moved); the comment table is DEFERRED
+because the comment is private on Mantic, scores nothing, and the per-bin vectors are already in the
+MEMBER_FORECAST lines, so a new Mantic-only renderer branch fails the medicine-versus-disease test
+until Mantic comments go public.
 
 - **Date template wording on closed bounds (Metaculus render, one line each).** The shared date
   template (`_date_axis` in `metaculus_bot/prompts.py`) renders for every date question on both
