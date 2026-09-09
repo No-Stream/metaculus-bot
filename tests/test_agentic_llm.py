@@ -70,13 +70,29 @@ class TestKwargsPassthrough:
         assert kwargs["model"] == "openrouter/openai/gpt-5.6-luna"
         assert kwargs["parallel_tool_calls"] is True
         assert kwargs["reasoning_effort"] == "high"
-        # litellm's OpenrouterConfig doesn't map reasoning_effort; without the
-        # whitelist, litellm.drop_params=True (set globally by forecasting_tools)
-        # silently strips it and drivers run at model-default effort.
+        # Without the whitelist, forecasting_tools' global litellm.drop_params=True silently strips the effort.
         assert kwargs["allowed_openai_params"] == ["reasoning_effort"]
         assert kwargs["temperature"] is None
         assert kwargs["tools"] == tools
+        assert "tool_choice" not in kwargs
         assert kwargs["api_key"] == _PERSONAL
+
+    @pytest.mark.asyncio
+    async def test_tool_choice_is_forwarded_when_given(
+        self, acompletion: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The ghost phase sends the research turns' tools with ``tool_choice="none"`` so the cached
+        prompt prefix (which includes the tool definitions) still matches; both must reach litellm."""
+        _set_keys(monkeypatch, donated=None, personal=_PERSONAL)
+        monkeypatch.setattr(agentic_llm, "should_route_via_donated_key", lambda model: False)
+        call = agentic_llm.build_default_llm_call(_config())
+        tools = [{"type": "function", "function": {"name": "fetch"}}]
+
+        await call(_messages(), tools, tool_choice="none")
+
+        kwargs = _last_kwargs(acompletion)
+        assert kwargs["tools"] == tools
+        assert kwargs["tool_choice"] == "none"
 
     @pytest.mark.asyncio
     async def test_existing_prefix_not_doubled(self, acompletion: AsyncMock, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -139,6 +155,22 @@ class TestKeyRouting:
         assert second.kwargs["api_key"] == _PERSONAL
 
     @pytest.mark.asyncio
+    async def test_fallback_retry_keeps_tools_and_tool_choice(
+        self, acompletion: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _set_keys(monkeypatch, donated=_DONATED, personal=_PERSONAL)
+        monkeypatch.setattr(agentic_llm, "should_route_via_donated_key", lambda model: True)
+        monkeypatch.setattr(agentic_llm, "should_retry_with_general_key", lambda exc: True)
+        acompletion.side_effect = [RuntimeError("401 unauthorized: invalid api key"), {"ok": True}]
+        tools = [{"type": "function", "function": {"name": "fetch"}}]
+
+        await agentic_llm.build_default_llm_call(_config())(_messages(), tools, tool_choice="none")
+
+        for attempt in acompletion.await_args_list:
+            assert attempt.kwargs["tools"] == tools
+            assert attempt.kwargs["tool_choice"] == "none"
+
+    @pytest.mark.asyncio
     async def test_credit_role_metadata_names_the_key_each_attempt_bills(
         self, acompletion: AsyncMock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -192,8 +224,7 @@ class TestKeyRouting:
             await call(_messages(), None)
 
         assert fallback_openrouter.get_generic_key_fallback_count() == 1
-        # A 401 is not a credit shortfall, so the suppression subset stays empty:
-        # generic adds once, at most one subset subtracts (CLAUDE.md invariant).
+        # A 401 is not a credit shortfall, so the credit subset stays empty (generic adds once, one subset at most).
         assert fallback_openrouter.get_credit_key_fallback_count() == 0
         assert any("PAID PERSONAL-KEY FALLBACK" in message for message in caplog.messages)
         assert any("openrouter/openai/gpt-5.6-luna" in message for message in caplog.messages)

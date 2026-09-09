@@ -353,6 +353,25 @@ for evaluating driver quality. The ghost phase runs only when the driver
 concluded explicitly (not when the deadline cut it off) and is bounded by its own
 `asyncio.wait_for` in `loop.py`, so a slow ghost call can't eat into the run.
 
+The ghost request offers the same tool list the last research turn offered and
+forbids tool use with `tool_choice="none"`, instead of sending no tools. OpenAI's
+prompt cache keys on the rendered prefix, and that prefix includes the tool
+definitions ("cache reuse requires the entire rendered prefix to match"; the
+settings that change the prefix are `model`, `tools`, `parallel_tool_calls`,
+`text.format`, `reasoning.effort`, `text.verbosity` and `context_management`, and
+`tool_choice` is not among them; OpenAI's own guidance is "set tool_choice to
+none instead of removing the tool definitions"). Every research turn re-sends the
+whole transcript and bills 87% of its input at the cached-read rate, so a ghost
+sent with `tools=None` was the one call that re-paid full input price on the
+entire history: about 41,000 tokens, $0.09 a question, 29% of the
+`gap_fill_v2_driver` line in the 2026-09-09 cost pass
+(`scratch/cost_pass_2026-09-09/v2_cost_anatomy.md`). The `LlmCall` protocol in
+`agentic/llm.py` carries `tool_choice` for exactly this call; the research turns
+leave it unset. OpenRouter forwards `tool_choice` unchanged and litellm lists it
+among the OpenRouter provider's supported params, so nothing strips it. The
+ghost's output and both of its markers are unchanged; `cached_tokens` on the
+driver's `CREDIT_ROLE_SPEND` row is how the saving shows up on the next run.
+
 `_run_ghost_phase` logs the parsed result twice: a lossy human-readable
 `GHOST_FORECAST` line kept byte-identical for the already-harvested archive, and
 an additive `GHOST_FORECAST_JSON` line carrying the complete forecast (every

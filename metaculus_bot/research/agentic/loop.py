@@ -28,7 +28,7 @@ import copy
 import json
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from typing import Any, Literal, get_args
 
 from pydantic import ValidationError
@@ -55,7 +55,7 @@ from metaculus_bot.research.agentic.gates import (
     _evaluate_conclude_gate,
     _FindingsValidation,
 )
-from metaculus_bot.research.agentic.llm import build_default_llm_call
+from metaculus_bot.research.agentic.llm import LlmCall, build_default_llm_call
 from metaculus_bot.research.agentic.loop_state import (
     _budget_line,
     _extract_tool_calls,
@@ -99,8 +99,6 @@ from metaculus_bot.structured_output_schema import (
 )
 
 logger = logging.getLogger(__name__)
-
-LlmCall = Callable[[list[dict[str, Any]], list[dict[str, Any]] | None], Awaitable[Any]]
 
 _NUDGE = "call conclude or use tools"
 
@@ -509,6 +507,7 @@ async def _run_ghost_phase(
     *,
     state: _LoopState,
     ghost_prompt: str,
+    tools_json: list[dict[str, Any]],
     llm_call: LlmCall,
     log_prefix: str,
 ) -> GhostForecast | None:
@@ -529,7 +528,8 @@ async def _run_ghost_phase(
     """
     state.messages.append({"role": "user", "content": ghost_prompt})
     try:
-        response = await asyncio.wait_for(llm_call(state.messages, None), timeout=60.0)
+        # Same tool list as the last research turn, tools forbidden via tool_choice: the cached prefix keeps matching.
+        response = await asyncio.wait_for(llm_call(state.messages, tools_json, tool_choice="none"), timeout=60.0)
         assistant_message = _parse_response_message(response)
         state.messages.append(assistant_message)
     except TimeoutError:
@@ -565,10 +565,11 @@ async def _run_loop_body(
     now: Callable[[], float],
 ) -> LoopResult:
     tools_by_name = {tool.name: tool for tool in tools}
+    offered_tools: list[dict[str, Any]] = []
 
     while not state.stop_loop and state.telemetry.steps < config.max_steps:
-        tools_json = _tool_schemas(tools, _must_conclude(state, config, now))
-        response = await llm_call(state.messages, tools_json)
+        offered_tools = _tool_schemas(tools, _must_conclude(state, config, now))
+        response = await llm_call(state.messages, offered_tools)
         assistant_message = _parse_response_message(response)
         state.messages.append(assistant_message)
         state.telemetry.steps += 1
@@ -589,7 +590,9 @@ async def _run_loop_body(
     findings_markdown = render_findings(state.findings, state.pending_leads)
     ghost: GhostForecast | None = None
     if ghost_prompt is not None and state.explicit_conclude:
-        ghost = await _run_ghost_phase(state=state, ghost_prompt=ghost_prompt, llm_call=llm_call, log_prefix=log_prefix)
+        ghost = await _run_ghost_phase(
+            state=state, ghost_prompt=ghost_prompt, tools_json=offered_tools, llm_call=llm_call, log_prefix=log_prefix
+        )
 
     _log_completion(state, log_prefix)
     return _freeze_result(state, findings_markdown, ghost)
