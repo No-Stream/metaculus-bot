@@ -176,7 +176,22 @@ half its width, a span ratio of 6e-6 that Step 8 withheld at its 1e-5 threshold,
 drop the outcome-space carve-out exists to remove (codex second-opinion review, 2026-09).
 The shifted plateau may start exactly on the bound: a declared P1 equal to the lower bound
 already does, and it builds the same CDF as one at the `minimum_separation` standoff
-(closed: cdf[0] = 0; open: the structural 0.01). The predicate is
+(closed: cdf[0] = 0; open: the structural 0.01). Three limits keep the translation from
+overreaching (codex re-check, 2026-09). Only a plateau that would cross a bound because of
+the width the spread added is translated: one whose declared value (its centre) lies beyond
+an OPEN bound is a real out-of-range declaration and keeps its symmetric spread, where
+pulling it in had turned ten percentiles declared six hours before a date window's open
+lower bound (a one-bin plateau, 57% of it below the bound) into the structural 1%. Beyond
+a CLOSED bound the plateau is shifted to start at its declared value rather than pulled
+inside, because the
+clamp runs after the spreader and judges the outermost value against its tolerance: a spread
+reaching past the declaration could drop a member whose declared value was within tolerance,
+and one pulled fully inside would hide a scale error from the clamp. And the shift-up against
+the preceding declared value, which runs after the translation, compresses the plateau into
+the gap between that value and the bound instead of pushing it back across (P5 five hours
+before an open upper bound followed by ten percentiles on it had come back 0.8 of a day past
+the bound and published 63% "after the window"). Only a whole-set collapse, which has no
+neighbours, is owed the full 12-step span. The predicate is
 `grid_is_outcome_space` (`numeric/config.py`): a natively discrete question
 (`DiscreteQuestion`, which every Metaculus discrete and every Mantic quantitative question
 parses as) or any non-201 grid, the same predicate on which Step 7's discrete snap skips. On

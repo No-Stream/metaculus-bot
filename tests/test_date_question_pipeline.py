@@ -266,6 +266,76 @@ class TestTheRunner:
             heights, cdf_size=13, open_lower=open_edge == "lower", open_upper=open_edge == "upper"
         )
 
+    def test_a_plateau_on_the_open_upper_bound_behind_a_late_percentile_stays_inside(
+        self, test_llm: GeneralLlm
+    ) -> None:
+        """P5 five hours before the window closes, P10..P99 on the open upper bound itself. The
+        shift-up against P5 ran after the translation and pushed the plateau 0.8 of a day past the
+        bound, and the build invented 63% "after the window" (codex re-check, 2026-09). The
+        plateau compresses between P5 and the bound instead."""
+        epoch = as_epoch_question(make_real_date_question(open_upper_bound=True))
+        day = 86_400.0
+        values = [epoch.lower_bound, epoch.lower_bound + 6 * day, epoch.upper_bound - 0.2 * day] + [
+            epoch.upper_bound
+        ] * 10
+        percentiles = [Percentile(percentile=p, value=v) for p, v in zip(STANDARD_PERCENTILES, values, strict=True)]
+
+        prediction = _build_guarded_numeric_distribution(percentiles, epoch, test_llm)
+
+        heights = _cdf_heights(prediction)
+        mass = np.diff(heights)
+        assert 1.0 - heights[-1] < 0.05, heights[-1]
+        assert mass[11] > 0.9
+        assert_server_accepts_cdf(heights, cdf_size=13, open_lower=False, open_upper=True)
+
+    def test_a_plateau_declared_before_an_open_lower_bound_keeps_its_below_range_mass(
+        self, test_llm: GeneralLlm
+    ) -> None:
+        """P1..P90 six hours before the window opens, on an open lower bound: a real "probably
+        before the window" declaration. The count-like spread caps the plateau at one bin, a
+        full day centred six hours out, so 57% of it lies below the bound. The first translation
+        rule pulled every plateau inside the range and published the structural 1% instead
+        (codex re-check, 2026-09)."""
+        epoch = as_epoch_question(make_real_date_question(open_lower_bound=True))
+        day = 86_400.0
+        values = [epoch.lower_bound - 0.25 * day] * 10 + [
+            epoch.lower_bound + day,
+            epoch.lower_bound + 6 * day,
+            epoch.upper_bound,
+        ]
+        percentiles = [Percentile(percentile=p, value=v) for p, v in zip(STANDARD_PERCENTILES, values, strict=True)]
+
+        prediction = _build_guarded_numeric_distribution(percentiles, epoch, test_llm)
+
+        heights = _cdf_heights(prediction)
+        assert heights[0] == pytest.approx(0.57, abs=0.01), heights[0]
+        assert_server_accepts_cdf(heights, cdf_size=13, open_lower=True, open_upper=False)
+
+    def test_a_plateau_one_day_before_a_closed_lower_bound_is_clamped_in_not_dropped(
+        self, test_llm: GeneralLlm
+    ) -> None:
+        """P1..P90 exactly one day before a CLOSED lower bound, the clamp's tolerance edge on a
+        one-day grid, then three in-range percentiles. The clamp runs after the spreader and
+        judges the outermost value, so a spread that reached even seconds further out than the
+        declared value would raise and drop the member; the plateau starts at the declared value
+        and the clamp folds it onto the bound as it does a lone percentile there."""
+        epoch = as_epoch_question(make_real_date_question())
+        day = 86_400.0
+        values = [epoch.lower_bound - day] * 10 + [
+            epoch.lower_bound + day,
+            epoch.lower_bound + 6 * day,
+            epoch.upper_bound - 0.5 * day,
+        ]
+        percentiles = [Percentile(percentile=p, value=v) for p, v in zip(STANDARD_PERCENTILES, values, strict=True)]
+
+        prediction = _build_guarded_numeric_distribution(percentiles, epoch, test_llm)
+
+        heights = _cdf_heights(prediction)
+        mass = np.diff(heights)
+        assert heights[0] == 0.0
+        assert mass[0] > 0.85, mass[0]
+        assert_server_accepts_cdf(heights, cdf_size=13, open_lower=False, open_upper=False)
+
     def test_the_fallback_distribution_of_a_201_grid_date_question_still_renders_dates(
         self, q500: DateQuestion, monkeypatch: pytest.MonkeyPatch
     ) -> None:

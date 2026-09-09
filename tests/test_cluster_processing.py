@@ -504,3 +504,102 @@ class TestCollapseOnABoundOfAnOutcomeSpaceGrid:
 
         assert result[0] == question.lower_bound
         assert result[1] == pytest.approx(question.lower_bound + spread_delta)
+
+
+class TestPartialPlateauAgainstABoundOfAnOutcomeSpaceGrid:
+    """A partial plateau near a bound: the translation must neither be undone nor overreach.
+
+    Two holes in the first translation rule (codex re-check, 2026-09), on a 13-point [0, 12]
+    grid with a unit count-like spread so one bin is one unit and the 10-value plateau spans
+    one bin. Bug 1: the shift-up against the preceding declared value ran AFTER the
+    translation, so ``[0, 6, 11.8] + [12] * 10`` came back ending at 12.8, past the bound the
+    translation had just respected, and the real build invented 63% above an open upper bound.
+    Bug 2: the translation pulled in EVERY plateau, including one deliberately declared beyond
+    an open bound, so ``[-0.25] * 10`` on an open lower bound became ``[0.0 .. 0.9]`` and 57%
+    of declared below-range mass became the structural 1%.
+    """
+
+    def _question(self, *, open_lower: bool, open_upper: bool) -> NumericQuestion:
+        return cast(
+            NumericQuestion,
+            SimpleNamespace(
+                open_upper_bound=open_upper,
+                open_lower_bound=open_lower,
+                upper_bound=12.0,
+                lower_bound=0.0,
+                cdf_size=13,
+                id_of_question=1,
+            ),
+        )
+
+    def _spread(self, values: list[float], question: NumericQuestion) -> list[float]:
+        result, _ = apply_cluster_spreading(values, question, value_eps=1e-6, spread_delta=1.0, range_size=12.0)
+        return result
+
+    @pytest.mark.parametrize("bound_kind", ["closed", "open"])
+    def test_a_plateau_on_the_upper_bound_compresses_above_its_predecessor_instead_of_crossing(
+        self, bound_kind: str
+    ) -> None:
+        question = self._question(open_lower=False, open_upper=bound_kind == "open")
+
+        result = self._spread([0.0, 6.0, 11.8] + [12.0] * 10, question)
+
+        assert all(a < b for a, b in pairwise(result))
+        assert result[-1] <= question.upper_bound
+        assert result[3] > 11.8
+        assert result[:3] == [0.0, 6.0, 11.8]
+
+    @pytest.mark.parametrize("bound_kind", ["closed", "open"])
+    def test_a_plateau_on_the_lower_bound_compresses_below_its_successor_instead_of_crossing(
+        self, bound_kind: str
+    ) -> None:
+        question = self._question(open_lower=bound_kind == "open", open_upper=False)
+
+        result = self._spread([0.0] * 10 + [0.2, 6.0, 12.0], question)
+
+        assert all(a < b for a, b in pairwise(result))
+        assert question.lower_bound <= result[0]
+        assert result[9] < 0.2
+        assert result[10:] == [0.2, 6.0, 12.0]
+
+    def test_a_plateau_declared_beyond_an_open_lower_bound_keeps_its_symmetric_spread(self) -> None:
+        """Below-range mass on an open bound is a real declaration, not spill from the spread."""
+        question = self._question(open_lower=True, open_upper=True)
+
+        result = self._spread([-0.25] * 10 + [1.0, 6.0, 12.0], question)
+
+        assert sum(result[:10]) / 10 == pytest.approx(-0.25)
+        assert result[0] == pytest.approx(-0.75)
+        assert result[9] == pytest.approx(0.25)
+
+    def test_a_plateau_declared_beyond_an_open_upper_bound_keeps_its_symmetric_spread(self) -> None:
+        question = self._question(open_lower=True, open_upper=True)
+
+        result = self._spread([0.0, 6.0, 11.0] + [12.25] * 10, question)
+
+        assert sum(result[3:]) / 10 == pytest.approx(12.25)
+        assert result[3] == pytest.approx(11.75)
+        assert result[-1] == pytest.approx(12.75)
+
+    @pytest.mark.parametrize(
+        ("values", "expected_plateau_edge"),
+        [
+            ([-0.25] * 10 + [1.0, 6.0, 12.0], (-0.25, 0.75)),
+            ([0.0, 6.0, 11.0] + [12.25] * 10, (11.25, 12.25)),
+        ],
+        ids=["below_closed_lower", "above_closed_upper"],
+    )
+    def test_a_plateau_declared_beyond_a_closed_bound_reaches_no_further_out_than_declared(
+        self, values: list[float], expected_plateau_edge: tuple[float, float]
+    ) -> None:
+        """The clamp runs AFTER the spreader and judges the outermost value against its
+        tolerance, so a spread that widened the violation by half a bin could drop a member
+        whose declared value was within tolerance, and one pulled fully inside would hide a
+        scale error from the clamp. The plateau starts at the declared value instead."""
+        question = self._question(open_lower=False, open_upper=False)
+
+        result = self._spread(list(values), question)
+        plateau = [v for v, declared in zip(result, values, strict=True) if declared == values[len(values) // 2]]
+
+        assert all(a < b for a, b in pairwise(result))
+        assert (min(plateau), max(plateau)) == pytest.approx(expected_plateau_edge)

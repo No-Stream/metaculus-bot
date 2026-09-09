@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from itertools import pairwise
 
 import numpy as np
@@ -37,23 +38,16 @@ def detect_count_like_pattern(values: list[float]) -> bool:
 def is_degenerate_cluster(values: list[float], value_eps: float) -> bool:
     """True when EVERY declared value sits inside ONE ``value_eps`` cluster.
 
-    That is a point mass: the model declared (near-)identical values at all
-    percentiles, so the declaration carries no distribution width at all. It is
-    matched with the same adjacent-gap chaining ``apply_cluster_spreading`` uses
-    to grow a cluster, so the two agree on what "one cluster" means by
-    construction.
+    That is a point mass: the model declared (near-)identical values at all percentiles, so
+    the declaration carries no distribution width. Matched with the same adjacent-gap
+    chaining ``apply_cluster_spreading`` uses to grow a cluster, so the two agree on what
+    "one cluster" means by construction.
 
-    Callers need this separately from the spreader because the whole-set case is
-    the one where spreading would INVENT the width instead of separating
-    genuinely-plateaued neighbours: with no unclustered neighbour to compress
-    against, the spread runs the full ``+-(k-1)/2 * spread_delta``, which on a
-    count-like question is a full unit per position (a 13-percentile point mass
-    on [0, 100] came out 12 units wide). That fabricated span is also exactly
-    what let the point mass PASS ``detect_unit_mismatch``'s span-ratio test,
-    which would otherwise have withheld the degenerate declaration. Where the
-    grid's bins are the outcome space the spreader does spread it, under its
-    one-bin cap, so the width it adds stays inside the bin the forecaster named
-    (``apply_cluster_spreading``).
+    Callers need it separately from the spreader because on the 201-point continuous grid
+    the whole-set case is the one where spreading would INVENT the width (a 13-percentile
+    point mass on [0, 100] came out 12 units wide), and that fabricated span is exactly what
+    let a point mass PASS ``detect_unit_mismatch``. Where the grid's bins are the outcome
+    space the spreader does spread it, under its one-bin cap (``apply_cluster_spreading``).
     """
     if len(values) < 2:
         return False
@@ -95,6 +89,13 @@ def _shifted_inside(new_vals: list[float], low: float, high: float) -> list[floa
     return [v + shift for v in new_vals]
 
 
+def _declared_beyond_an_open_bound(center: float, question: NumericQuestion) -> bool:
+    """True when the plateau's declared value lies strictly outside an OPEN bound: real out-of-range mass."""
+    return (question.open_lower_bound and center < question.lower_bound) or (
+        question.open_upper_bound and center > question.upper_bound
+    )
+
+
 def _spread_cluster_values(
     values: list[float],
     start: int,
@@ -107,39 +108,29 @@ def _spread_cluster_values(
 ) -> list[float]:
     """Replacement values for the cluster ``values[start:end + 1]``, symmetric about its mean.
 
-    Kept in range (how depends on the grid, below), then shifted up if it would collide with
-    the preceding value, then compressed if it would overrun the following one. The
-    compression is what keeps the spread from reordering the set when the next declared value
-    sits close by.
+    Kept in range (below), shifted up if it would collide with the preceding value, then
+    compressed if it would overrun the following one, so the spread never reorders the set.
 
-    Where the published bins are the outcome space (``grid_is_outcome_space``: a natively
-    discrete question or a non-201 grid, the shapes the vote-gated discrete snap never
-    reshapes afterwards) the WHOLE plateau stays inside one bin. Its total spread is capped at
-    the grid's bin width: the grid points are the bin edges, so a plateau at integer k that
-    spilled past k +- 0.5 handed the mass the forecaster put on k to the neighbouring bins (on
-    the 3-bin Mantic post 253 a declared 90% on the first bin published 0.558 under the
-    uncapped count-like unit spread; Mantic edge-case review, 2026-09). And a plateau that
-    would cross a bound is TRANSLATED back inside the range, spacing intact, whichever kind of
-    bound it is: the bound value buckets into the terminal bin, so a plateau ON the bound keeps
-    its full span there. Symmetric about the bound, half of it crossed an OPEN edge (13
-    declarations at the open lower bound of a grid shaped like post 651's published
-    ``cdf[0] == 0.5``, 50% "before the window" invented from a declaration that named
-    nothing before it), and the CLOSED-edge
-    clamp folded it to half its width, a span ``detect_unit_mismatch`` withheld (codex
-    second-opinion review, 2026-09). The plateau may start exactly on the bound: a declared
-    P1 = lower already does, and it builds the same CDF as one at the standoff inside.
-
-    The 201-point continuous grid is untouched: there the unit spread is pre-processing the
-    snap can undo, so it is uncapped and clamped to the ``minimum_separation`` standoff at a
-    CLOSED edge only.
+    Where the published bins are the outcome space (``grid_is_outcome_space``) the WHOLE
+    plateau stays inside one bin: its spread is capped at the bin width, and a plateau that
+    would cross a bound only because of that spread is translated back inside, spacing
+    intact, whichever kind of bound. A plateau centred beyond an OPEN bound is real
+    out-of-range mass and stays symmetric; beyond a CLOSED bound it starts at its declared
+    value, since the clamp runs after this and judges the outermost value; and the shift-up
+    compresses a translated plateau into the gap below the bound rather than pushing it back
+    across. The 201-point grid is untouched: uncapped, clamped at a CLOSED edge only.
+    Receipts: ``docs/numeric_pipeline.md`` Step 3.
     """
     size = end - start + 1
     center = float(np.mean(values[start : end + 1]))
+    ceiling = math.inf
 
     if grid_is_outcome_space(question):
         bin_width = grid_bin_width(question.lower_bound, question.upper_bound, question.cdf_size)
         new_vals = _symmetric_plateau(center, size, min(spread_delta, bin_width / (size - 1)))
-        new_vals = _shifted_inside(new_vals, question.lower_bound, question.upper_bound)
+        if not _declared_beyond_an_open_bound(center, question):
+            ceiling = max(question.upper_bound, center)
+            new_vals = _shifted_inside(new_vals, min(question.lower_bound, center), ceiling)
     else:
         new_vals = _symmetric_plateau(center, size, spread_delta)
         tiny = minimum_separation(range_size)
@@ -152,6 +143,8 @@ def _spread_cluster_values(
     if start - 1 >= 0 and new_vals[0] <= values[start - 1]:
         shift = (values[start - 1] + max(STRICT_ORDERING_EPSILON, value_eps)) - new_vals[0]
         new_vals = [v + shift for v in new_vals]
+        if new_vals[-1] > ceiling:
+            new_vals = np.linspace(new_vals[0], ceiling, size).tolist()
 
     # If a next value exists and the last new exceeds it, compress into the available gap
     if end + 1 < len(values) and new_vals[-1] >= values[end + 1]:
@@ -173,25 +166,16 @@ def apply_cluster_spreading(
 ) -> tuple[list[float], int]:
     """Spread epsilon-clustered values apart so the set can carry a CDF.
 
-    Separates genuinely-plateaued neighbours (a count-like question where a model
-    declares P20 = P40 = P50 = 1) from each other; it does NOT invent a
-    distribution where the model declared none. On the 201-point continuous grid
-    a whole-set collapse — every value inside one epsilon cluster — is left ALONE
-    and reported as 0 clusters applied: downstream jitter / strict-ordering give
-    it the minimum separation the CDF format needs, and ``detect_unit_mismatch``
-    then sees the honest (essentially zero) span and withholds the forecaster.
-    See ``is_degenerate_cluster``.
-
-    Where the published bins are the outcome space (``grid_is_outcome_space``)
-    the whole-set case is spread like any other plateau, under the one-bin cap
-    ``_spread_cluster_values`` applies. "100% on 2026-09-16" is fully expressible
-    on post 651's twelve one-day bins, and the date prompt invites that shape, so
-    the member publishes with its mass in that day instead of being withheld as a
-    unit mismatch; the width the spread adds stays inside the bin the forecaster
-    named, and a collapse ON a bound is shifted into the terminal bin rather than
-    spilling past an open edge or being folded at a closed one. A genuine scale
-    error on such a grid sits several bins outside the bounds and still raises in
-    ``clamp_values_to_bounds``.
+    Separates genuinely-plateaued neighbours (a count-like question where a model declares
+    P20 = P40 = P50 = 1); it does NOT invent a distribution where the model declared none.
+    On the 201-point continuous grid a whole-set collapse (``is_degenerate_cluster``) is
+    left ALONE and reported as 0 clusters applied: the jitter / strict-ordering passes give
+    it the format minimum and ``detect_unit_mismatch`` then sees the honest (zero) span and
+    withholds the forecaster. Where the published bins are the outcome space
+    (``grid_is_outcome_space``) the whole-set case is spread like any other plateau under
+    the one-bin cap: "100% on 2026-09-16" is fully expressible on post 651's twelve one-day
+    bins, so the member publishes with its mass in that day, and a collapse ON a bound is
+    shifted into the terminal bin. Receipts: ``docs/numeric_pipeline.md`` Step 3.
 
     Mutates and returns ``modified_values``.
     """
