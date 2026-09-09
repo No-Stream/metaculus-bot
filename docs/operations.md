@@ -1343,6 +1343,77 @@ stderr), so per-run spend is durably grep-able:
   (`constants.py`, $100). That level is an early warning, not an empty tank. Read
   it as "ask Metaculus for a top-up", not "the key is dry".
 
+### Which field the spend delta reads, and the personal key's settlement lag
+
+Verified against live `/auth/key` pulls on 2026-07-17: `usage` counts only spend
+billed as native OpenRouter credits. Spend routed through a BYOK provider
+integration (the donated Metaculus key routes nearly everything that way) lands
+in `byok_usage` instead, so `usage` can sit frozen while real money burns; it sat
+at $4.16 across a $3.34 donated-key run that day. `limit_remaining` is
+`limit - usage - byok_usage` when the key sets `include_byok_in_limit`, which
+makes it the only field that reliably tracks total spend on a limit-bearing key.
+So per-run spend comes from the `limit_remaining` delta when the key reports one,
+and from the `usage` delta otherwise. The personal key is the "otherwise": it
+reports a null `limit_remaining`, and its spend does land in `usage`.
+
+**The personal key's per-run delta is a lower bound, and the cause is settlement
+lag.** The BYOK paragraph above is the wrong explanation for it and misled two
+separate investigations. On the personal key `usage` genuinely does climb
+($154.58 to $160.24 over 2026-07-20 to 2026-07-27), so nothing is hiding in
+`byok_usage`. What happens is that OpenRouter has not booked the run's spend by
+the time the end snapshot fires, seconds after the last call. Measured over
+`backtests/telemetry_archive/credit_balance.jsonl`, 178 paired personal-key runs:
+the within-run deltas summed to $3.31 against $5.66 of true lifetime-usage growth
+(58% captured), and 160 of the 178 runs reported exactly $0.00. The missing $2.35
+is fully accounted for by the gap between each run's `phase=end` usage and the
+next run's `phase=start` usage, since $3.31 + $2.35 = $5.66 to the cent. The
+money is late, not lost.
+
+The tightest version of that evidence restricts to runs that demonstrably spent.
+Of the 25 paired runs carrying at least one `extraction_rung` record (a forecast
+provably happened, and `gemini-3.1-pro-preview`, the slot pinned to the personal
+key, produced one in all 25), 7 reported exactly $0.00: a 28% false-zero rate on
+runs that cannot have been free. `scripts/reconcile_credit_spend.py` recovers a
+real figure for all 7, $0.10 to $0.32 each, which is the direct demonstration
+that the zeros are lag rather than absence.
+
+There is deliberately no wait-and-re-read in the telemetry. The earliest
+confirmed settlement in the archive is 153 s after the end snapshot and the
+median is about 25 minutes, so any delay short enough to sit in `cli.main`'s
+`finally`, where telemetry must never stall a run, is below anything the data can
+show would work: an unverifiable guess that also slows every run. Instead the
+marker states its own provenance (`source=usage_delta_unsettled`) and the sibling
+`CREDIT_SPEND_UNSETTLED` warning says the figure is a floor, so a `0.00` can
+never be misread as "this run was free". The settled per-run number is recovered
+after the fact by `scripts/reconcile_credit_spend.py`, which differences each
+run's start usage against its successor's, the only place the lag is observable.
+
+A BYOK route on the personal key is a separate blind spot that adds to the lag,
+not the same one. Those calls (the OpenAI slugs, per "Per-role spend" below)
+never reach `usage` at all, so no balance field of either key ever sees them and
+they are visible only on the `CREDIT_ROLE_SPEND` ledger.
+
+Two smaller caveats on any of these numbers: an out-of-band top-up mid-run skews
+the remaining-based delta (rare, and per-run spend is indicative anyway), and
+OpenRouter caches the balance values briefly, so exact figures are not something
+to build on.
+
+Balance fetching itself can never fail a run. Any error is logged as a WARNING
+and read as "unknown", and unknown never trips the floor. The catch in
+`_fetch_snapshot` is deliberately total rather than a curated tuple: `cli.main`
+calls `log_end_and_check_floor` from a `finally`, so an escape there replaces
+whatever the run was already raising and takes the whole end-of-run diagnostic
+surface with it (report summary, alertable arithmetic, deprecation tripwire, all
+downstream). A narrow tuple already missed three real shapes: `FileNotFoundError`
+from a stale `SSL_CERT_FILE`, `httpx.InvalidURL`, which is not an
+`httpx.HTTPError` subclass, and the `RuntimeError` this repo's own autouse
+network guard raises. The snapshot's field reads sit inside the same `try` for a
+related reason: `fetch_auth_key` returns `payload.get("data", payload)`, so a 200
+whose body carries a non-mapping `data` (`{"data": null}`, `{"data": [...]}`)
+yields a non-dict and `data.get(...)` raises `AttributeError`. Keeping those
+calls under the `try` degrades that malformed-but-200 case to a WARNING and
+`None` like any other fetch failure.
+
 ### Per-role spend (`CREDIT_ROLE_SPEND`)
 
 The per-key deltas above say what a run cost; the role lines say which part of
@@ -1423,9 +1494,21 @@ How the number is produced, because it decides how to read it:
   per role is `cached_tokens / prompt_tokens`; the gap-fill v2 driver should sit
   near 0.8 once the ghost call reuses the cache (`docs/agentic_gap_fill.md` "The
   ghost forecast"), and a forecaster slot near 0.
-- `role=untagged` means a completion nobody stamped: forecasting-tools' own
-  helpers, or a builder call site that forgot its `role=`. `key=unknown` is the
-  same for the key.
+- `role=untagged` means a completion nobody stamped: one of forecasting-tools'
+  own helpers (`SmartSearcher`), an ablation or benchmark harness, or a builder
+  call site that forgot its `role=`. It is visible on purpose rather than folded
+  into another row. `key=unknown` is the same thing for the key.
+- The two `metadata=` field names (`role`, `key_alias`) and the four key-alias
+  values (`donated`, `personal`, `direct`, `unknown`) are separate vocabularies:
+  the first pair names FIELDS, the second names KEYS. `donated` and `personal`
+  are the `KEY_SPECS` aliases verbatim, so `CREDIT_ROLE_SPEND key=` joins onto
+  `CREDIT_SPEND key=` and `CREDIT_BALANCE key=` without translation. `direct` is
+  a non-OpenRouter slug, a `perplexity/` or `exa/` model billed to its own
+  provider key: outside this ledger's remit, but still counted rather than
+  dropped.
+- Dollar figures on these lines render at four decimals, not the balance lines'
+  two, because a per-role figure is a fraction of a cent per call: the parser
+  costs about $0.0005 a question.
 - Not on OpenRouter, so never in this ledger: Gemini grounded search and gap-fill
   v2's `read_document` (google-genai on the personal Google AI Studio key), the
   AskNews subscription, Exa. The ledger is therefore an OpenRouter-only figure,
@@ -1441,7 +1524,22 @@ How the number is produced, because it decides how to read it:
   bound"; without it, the ledger covers every completion of the run. That warning
   is harvested in its own right, as `litellm_callback_drain_timeout.jsonl` (one
   row per affected run, carrying the bound it used), so the caveat is answerable
-  offline instead of only from a live log.
+  offline instead of only from a live log. It carries its own marker prefix rather
+  than `CREDIT_ROLE_SPEND` on purpose: the ledger's harvester spec expects
+  `role=` / `key=` / `usd=` / `calls=` fields, so prose under that prefix would
+  pollute every grep of a run log without ever parsing as a row. Since 2026-09-04
+  the prefix has its own spec (`scripts/telemetry/markers.py`,
+  `litellm_callback_drain_timeout`), which reads the `within <n>s` clause of the
+  message; the rest of that sentence is free to reword, that clause is a data
+  contract.
+- The 10s bound is reachable two ways, not one. A wedged worker is the obvious
+  one (a worker loop that dies on any non-`CancelledError` leaves `queue.join()`
+  outstanding forever). The other is a single callback slower than 10s, which
+  litellm itself still considers healthy: it allows each queued coroutine 20s
+  (`LOGGING_WORKER_MAX_TIME_PER_COROUTINE`), twice this window. It is left at
+  10.0 deliberately. Both callbacks the bot registers are in-memory arithmetic,
+  so raising the bound would be an unverified retune whose only effect is a longer
+  pointless wait on a dead worker.
 
 Harvested as `credit_role_spend.jsonl` in the telemetry archive.
 `uv run python scripts/reconcile_credit_spend.py --roles` (free, offline) prints
@@ -1533,7 +1631,12 @@ Text alone cannot tell a genuinely **drained** key from one Metaculus
 **revoked** or **re-capped to zero** (all three produce that same 403), and the
 operator wants opposite CI colors for them. So on the first spend-cap failure of
 a run, `credit_telemetry.classify_donated_key_state` reads the free, read-only
-`/auth/key` endpoint once (verdict cached for the process) and classifies:
+`/auth/key` endpoint once (verdict cached for the process) and classifies. It
+goes through the same `check_openrouter_credits.fetch_auth_key` as the start and
+end balance telemetry, so "how much is left on the donated key" has one endpoint
+and one parser rather than two. With no donated key configured it returns before
+any network call at all, which also keeps the probe silent in tests that do not
+stub it. The classification:
 
 | `/auth/key` says | State | Alerting |
 | --- | --- | --- |
@@ -1543,10 +1646,33 @@ a run, `credit_telemetry.classify_donated_key_state` reads the free, read-only
 | 200, money remaining | `funded` | **red**: the failure was not about credit |
 | probe failed, or no donated key configured | `unknown` | **red**: fail safe |
 
+"Nothing remaining" is `limit_remaining <= 0` rather than `== 0`, because
+OpenRouter clamps that field at 0 even when the true arithmetic is negative (live:
+`limit=850`, `usage=4.39`, `byok_usage=846.42`, reported as 0.00). An uncapped key,
+which reports no `limit` or no `limit_remaining` at all, classifies as `unknown`:
+it has no cap to exceed, so a spend-cap failure on one is unexplained rather than
+expected.
+
 Only `drained` is ever subtracted from `alertable`, and only inside a suppression
 window (none is open since 2026-09-03). A probe that errors or times out classifies
 as `unknown` and stays red, so a broken probe can never silently turn a red run
 green.
+
+The verdict is cached once per process behind a `threading.Lock`, and both halves
+of that matter. Without caching, a run that lost every donated-key call would fire
+one HTTP request per failure, and caching failures counts as much as caching
+verdicts, since a dead endpoint would otherwise cost one timeout per failed call.
+The lock is `threading` rather than `asyncio` because every production caller
+arrives on an `asyncio.to_thread` worker (`fallback_openrouter.record_donated_key_fallback`),
+so the contention is between real OS threads. The one-verdict half is the more
+important one: without the lock each caller keeps its own probe result, so an
+intermittently failing `/auth/key` splits a single drained-key incident into some
+suppressed and some alertable events, and `cli.py` then exits red on the very
+condition the suppression window exists for. The `DONATED_KEY_STATE` line is
+logged inside the lock too, so it appears exactly once per run; N copies of one
+verdict would read as N separate probes to whoever greps the run log. A run that
+never needed to probe leaves the cache at `None`, which the CLI renders
+differently from any verdict.
 
 The probe is what the *ambiguous* spend-cap 403 needs, so it is the only path that
 pays for one. A documented 402 or plain insufficient-credit response says the
@@ -1557,7 +1683,11 @@ behavior. Read the table above as the verdict on a spend-cap 403 specifically, n
 on every credit failure (`test_documented_402_needs_no_probe` in
 `tests/test_fallback_openrouter.py` pins the carve-out).
 
-`DONATED_KEY_PROBE_TIMEOUT_S` bounds the probe, but read what shape of promise
+`DONATED_KEY_PROBE_TIMEOUT_S` is 5.0 s, shorter than the shared `fetch_auth_key`
+default (`AUTH_KEY_REQUEST_TIMEOUT_S`) by design: this probe can fire mid-run, so
+it must not be able to stall a forecast, while the shared default is fine for the
+CLI and the start/end telemetry, which both run outside the forecasting window.
+It bounds the probe, but read what shape of promise
 that is: httpx applies a bare float **per network operation** (connect, read,
 write and pool each get the full budget independently), so it is not a cap on
 elapsed time. A server trickling bytes slower than the read timeout resets the
