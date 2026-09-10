@@ -30,7 +30,6 @@ from playwright.async_api import Browser, WebSocketRoute
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from metaculus_bot.research import rendered_fetch, resolution_source
-from metaculus_bot.research.agentic import tools as agentic_tools
 from metaculus_bot.research.derived_api import DerivedEndpoint, derived_api_lead, largest_json
 from metaculus_bot.research.fetch_ladder import guard, rungs
 from metaculus_bot.research.fetch_ladder.context import LadderContext
@@ -476,31 +475,6 @@ class TestTheRenderMemos:
             is True
         )
 
-    async def test_a_v2_render_to_nothing_does_not_suppress_tier_1s_richer_attempt(self, monkeypatch):
-        """Through the two real callers, not the memo functions: gap-fill v2's ``fetch`` reads an
-        empty DOM and memoises under its own scope; the Tier-1 rung on the same URL must still
-        launch — its classification can rescue the page on chart data or the harvested feed alone —
-        and only then memoise under ITS scope."""
-        chromium = install_fake_playwright(monkeypatch, FakePage([], html=_EMPTY_DOM))
-
-        v2_result = await agentic_tools._try_rendered_fetch(_PAGE_URL)
-
-        assert v2_result is not None
-        assert v2_result.status == "error"
-        assert v2_result.method == "rendered"
-        assert rendered_fetch.rendered_to_nothing(_PAGE_URL, memo_scope=_V2_SCOPE) is True
-        assert rendered_fetch.rendered_to_nothing(_PAGE_URL, memo_scope=_TIER1_SCOPE) is False
-        assert len(chromium.launch_args) == 1
-
-        direct = FetchResult(url=_PAGE_URL, status="js_wall", text="", http_status=200, content_type="text/html")
-        ctx = LadderContext()
-        tier1_result = await rungs._rendered_rung(_PAGE_URL, direct, {}, ctx)
-
-        assert len(chromium.launch_args) == 2
-        assert tier1_result is None
-        assert rendered_fetch.rendered_to_nothing(_PAGE_URL, memo_scope=_TIER1_SCOPE) is True
-        assert [attempt.skipped_reason for attempt in ctx.rungs] == [""]
-
 
 class TestTheBrowserTransportSecurityAndCapacity:
     """The browser transport owns its request guard, teardown drain, and launch cap.
@@ -560,7 +534,10 @@ class TestTheBrowserTransportSecurityAndCapacity:
     async def test_the_render_uses_the_shared_playwright_setup_contract(self, monkeypatch: pytest.MonkeyPatch) -> None:
         semaphore_entries: list[str] = []
 
-        class RecordingSemaphore:
+        class RecordingSemaphore(asyncio.Semaphore):
+            def __init__(self) -> None:
+                super().__init__(1)
+
             async def __aenter__(self) -> None:
                 semaphore_entries.append("entered")
 

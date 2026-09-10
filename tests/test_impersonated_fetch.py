@@ -49,7 +49,6 @@ from curl_cffi.requests import exceptions as curl_exceptions
 
 from metaculus_bot.constants import IMPERSONATE_BROWSER_TARGET, RESOLUTION_SOURCE_MIN_HOP_TIMEOUT_S
 from metaculus_bot.research import impersonated_fetch, rendered_fetch, resolution_fetch_result
-from metaculus_bot.research.agentic import fetch_outcomes
 from metaculus_bot.research.fetch_ladder import classify, guard
 from metaculus_bot.research.http_fetch import MAX_REDIRECTS
 from metaculus_bot.research.impersonated_fetch import (
@@ -1504,9 +1503,10 @@ class TestDeclaredPdf:
         read as a document by one path and escalated as unknown by the other."""
         assert impersonated_fetch.PDF_CONTENT_TYPES is resolution_fetch_result.PDF_CONTENT_TYPES
         assert classify.PDF_CONTENT_TYPES is resolution_fetch_result.PDF_CONTENT_TYPES
-        assert fetch_outcomes.PDF_CONTENT_TYPES is resolution_fetch_result.PDF_CONTENT_TYPES
         for content_type in ("application/pdf", "application/x-pdf; charset=binary", "text/html", ""):
-            assert fetch_outcomes._content_type_is_pdf(content_type) is declared_pdf(content_type)
+            assert any(token in content_type for token in resolution_fetch_result.PDF_CONTENT_TYPES) is declared_pdf(
+                content_type
+            )
 
 
 class TestEgressGuard:

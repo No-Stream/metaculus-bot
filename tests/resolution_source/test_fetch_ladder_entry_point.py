@@ -48,7 +48,7 @@ class TestFetchUrlBindsThePolicy:
     async def test_the_walls_on_the_policy_are_the_walls_the_rungs_read(self):
         """The wall pair is the knob the entry point exists for, so it has to reach a rung.
 
-        Read through the per-hop ``ClientTimeout``, which ``_fetch_one_hop`` clamps to the
+        Read through the per-hop ``ClientTimeout``, which ``fetch_ladder.direct_fetch._fetch_one_hop`` clamps to the
         remaining budget: a policy whose whole wall is already spent leaves the floor, where the
         45 s preset leaves the full per-hop timeout.
         """

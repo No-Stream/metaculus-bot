@@ -17,8 +17,6 @@ from urllib.parse import urlsplit
 import aiohttp
 import pytest
 from google.genai import types as genai_types
-from playwright.async_api import Error as _PlaywrightError
-from playwright.async_api import TimeoutError as _PlaywrightTimeoutError
 from pypdf import PdfWriter
 
 from metaculus_bot.constants import (
@@ -70,11 +68,16 @@ from metaculus_bot.research.impersonated_fetch import (
     impersonation_refused,
     reset_impersonation_memo,
 )
-from metaculus_bot.research.resolution_fetch_result import FetchResult, FetchStatus, FetchStatusReason
+from metaculus_bot.research.resolution_fetch_result import (
+    _NON_OK_FETCH_STATUS,
+    FetchResult,
+    FetchStatus,
+    FetchStatusReason,
+)
 from metaculus_bot.research.robots_policy import robots_txt_url
 from metaculus_bot.research.wayback import wayback_snapshot_url
 from scripts.telemetry.markers import MARKER_SPECS, qid_from_ref
-from tests.playwright_fakes import FakeBrowser, FakeChromium, FakePage, FakePlaywrightManager, install_fake_playwright
+from tests.playwright_fakes import FakeChromium, FakePage, FakePlaywrightManager, install_fake_playwright
 from tests.resolution_source_fakes import _escape_config, _fake_render, _impersonated, fake_impersonated_fetch
 from tests.test_document_text import build_text_pdf
 
@@ -130,9 +133,9 @@ def _scanned_pdf() -> bytes:
 
 
 def _serve_pdf(monkeypatch: pytest.MonkeyPatch, body: bytes, *, content_type: str = "application/pdf") -> AsyncMock:
-    """Wire the plain rung to answer one request with ``body`` under ``content_type``.
+    """Wire the shared direct rung to answer one request with ``body`` under ``content_type``.
 
-    Patches ``_read_response_body`` rather than teaching the fake response object to stream,
+    Patches ``classify.read_body_capped`` rather than teaching the fake response object to stream,
     because the cap that read runs under is the thing the PDF rung changes and each test wants
     to state the body it is classifying, not the transport. Returns that spy, which is how a
     test counts requests: one request has to serve both a paginated fetch and a later digest.
@@ -179,7 +182,7 @@ def _direct(
 def _serve_direct(monkeypatch: pytest.MonkeyPatch, answer: FetchResult | dict[str, FetchResult]) -> list[str]:
     """Answer the shared ladder's DIRECT fetch with ``answer``, leaving every rung's gate live.
 
-    The seam ``tools._fetch_plain`` used to be. It is also the one every rung's own request goes
+    The shared direct-fetch seam is also the one every rung's own request goes
     through — the archive snapshot, a remembered feed, the robots pre-check — so a dict keys those
     apart by URL and anything unlisted comes back ``not_found`` rather than reaching the network.
     Returns the list of URLs it was asked for, in order, which is how a test counts requests.
@@ -215,8 +218,8 @@ def _serve_direct(monkeypatch: pytest.MonkeyPatch, answer: FetchResult | dict[st
 def _serve_rendered(monkeypatch: pytest.MonkeyPatch, rescue: FetchResult | None) -> list[str]:
     """Answer the shared ladder's BROWSER rung with ``rescue``, or None to decline.
 
-    The seam ``tools._try_rendered_fetch`` used to be, one layer in: the dispatcher's decision to
-    reach the browser at all stays live, which is what the escalation tests are about. Returns the
+    The dispatcher's decision to reach the browser at all stays live, which is what the escalation
+    tests are about. Returns the
     URLs the rung was invoked on.
     """
     rendered_on: list[str] = []
@@ -234,9 +237,8 @@ def _serve_rendered(monkeypatch: pytest.MonkeyPatch, rescue: FetchResult | None)
 async def _fetch_direct_only(url: str) -> fetch_outcomes.PlainFetchResult:
     """One DIRECT fetch through the shared ladder, as this ladder's own result.
 
-    What ``tools._fetch_plain`` was: the redirect loop, the classification and the local document
-    read, with no escalation rung (``GAP_FILL_DIRECT_POLICY``). Tests that pin the direct
-    classification drive this.
+    The redirect loop, classification and local document read with no escalation rung
+    (``GAP_FILL_DIRECT_POLICY``). Tests that pin the direct classification drive this.
     """
     return await agentic_tools._fetch_via_ladder(url, query="", pol=GAP_FILL_DIRECT_POLICY, ctx=None)
 
@@ -609,7 +611,7 @@ async def test_search_news_missing_creds(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 @pytest.mark.asyncio
-async def test_fetch_plain_success_path_reuses_fetch_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_fetch_direct_success_path_reuses_fetch_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
     session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/html"}))
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True))
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
@@ -723,7 +725,7 @@ async def test_fetch_pagination_second_call_uses_cache(monkeypatch: pytest.Monke
 
 
 @pytest.mark.asyncio
-async def test_fetch_plain_textual_branch_strips_allowlisted_markup(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_fetch_direct_textual_branch_strips_allowlisted_markup(monkeypatch: pytest.MonkeyPatch) -> None:
     """The raw-text branch runs the same allow-listed tag strip as the Tier-1 CSV path:
     a poll-tracker CSV's styled per-row anchors are markup the driver's result budget
     should not buy, and inequality signs in data cells must survive untouched."""
@@ -749,7 +751,7 @@ async def test_fetch_plain_textual_branch_strips_allowlisted_markup(monkeypatch:
 def test_extract_links_caps_at_twenty_five() -> None:
     html = "".join(f'<a href="/{index}">link{index}</a>' for index in range(30))
 
-    links = agentic_tools._extract_links_from_html(html, "https://example.com/root")
+    links = fetch_outcomes._extract_links_from_html(html, "https://example.com/root")
 
     assert len(links) == 25
     assert links[0] == "https://example.com/0"
@@ -757,7 +759,7 @@ def test_extract_links_caps_at_twenty_five() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fetch_plain_follows_redirect_to_public_url(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_fetch_direct_follows_redirect_to_public_url(monkeypatch: pytest.MonkeyPatch) -> None:
     session = _FakeSession(
         _FakeResponse(status=302, headers={"Location": "https://example.com/final"}),
         _FakeResponse(status=200, headers={"Content-Type": "text/html"}),
@@ -784,7 +786,7 @@ async def test_fetch_plain_follows_redirect_to_public_url(monkeypatch: pytest.Mo
 
 
 @pytest.mark.asyncio
-async def test_fetch_plain_blocks_redirect_to_non_public_target(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_fetch_direct_blocks_redirect_to_non_public_target(monkeypatch: pytest.MonkeyPatch) -> None:
     session = _FakeSession(
         _FakeResponse(status=302, headers={"Location": "http://169.254.169.254/latest/meta-data/"}),
     )
@@ -804,8 +806,8 @@ async def test_fetch_plain_blocks_redirect_to_non_public_target(monkeypatch: pyt
 
 
 @pytest.mark.asyncio
-async def test_fetch_plain_caps_redirect_chain(monkeypatch: pytest.MonkeyPatch) -> None:
-    hops = agentic_tools.MAX_REDIRECTS + 2
+async def test_fetch_direct_caps_redirect_chain(monkeypatch: pytest.MonkeyPatch) -> None:
+    hops = http_fetch.MAX_REDIRECTS + 2
     session = _FakeSession(
         *[_FakeResponse(status=302, headers={"Location": f"https://example.com/hop{i}"}) for i in range(hops)]
     )
@@ -816,11 +818,11 @@ async def test_fetch_plain_caps_redirect_chain(monkeypatch: pytest.MonkeyPatch) 
 
     assert result.status == "error"
     assert result.text == "Redirect limit exceeded."
-    assert len(session.calls) == agentic_tools.MAX_REDIRECTS + 1
+    assert len(session.calls) == http_fetch.MAX_REDIRECTS + 1
 
 
 @pytest.mark.asyncio
-async def test_fetch_plain_redirect_without_location_is_malformed(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_fetch_direct_redirect_without_location_is_malformed(monkeypatch: pytest.MonkeyPatch) -> None:
     session = _FakeSession(_FakeResponse(status=302, headers={}))
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True))
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
@@ -842,7 +844,7 @@ async def test_fetch_plain_redirect_without_location_is_malformed(monkeypatch: p
     ],
 )
 @pytest.mark.asyncio
-async def test_fetch_plain_blocks_metaculus_without_network(url: str, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_fetch_direct_blocks_metaculus_without_network(url: str, monkeypatch: pytest.MonkeyPatch) -> None:
     # is_public_http_url is stubbed True so the platform URL clears the SSRF gate
     # (as it would in prod — both sites are public); the real is_metaculus_self_ref
     # then blocks it. _get_session raises if reached, proving no HTTP is attempted.
@@ -880,7 +882,7 @@ def test_fetch_description_redirects_data_endpoints_to_the_briefing() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fetch_plain_blocks_redirect_to_metaculus(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_fetch_direct_blocks_redirect_to_metaculus(monkeypatch: pytest.MonkeyPatch) -> None:
     session = _FakeSession(
         _FakeResponse(status=302, headers={"Location": "https://www.metaculus.com/questions/12345/"}),
     )
@@ -963,83 +965,6 @@ async def test_same_host_plain_and_rendered_fetches_serialize(monkeypatch: pytes
 
 
 @pytest.mark.asyncio
-async def test_rendered_fetch_drains_routes_and_guard_tolerates_teardown_race(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """2026-07-25 teardown fix. Three things must hold together:
-    1. the SSRF route guard still ABORTS a disallowed URL and CONTINUES an
-       allowed one on a live page (the guard is the SSRF boundary — never weaken);
-    2. a route callback racing context teardown (continue_/abort raising a
-       closed-target Playwright error) is swallowed, not re-raised as an
-       unhandled event-listener error (the log storm);
-    3. teardown drains handlers via unroute_all(behavior="ignoreErrors") before
-       closing, and context/browser are still closed.
-    """
-
-    # A closed-target error is a subclass of Playwright's public Error (exactly
-    # like the real TargetClosedError) — built locally so the test doesn't lean
-    # on the private import path the storm's traceback came from.
-    class _RacingClosedError(_PlaywrightError):
-        pass
-
-    async def _is_public(url: str) -> bool:
-        return "evil" not in url
-
-    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", _is_public)
-    monkeypatch.setattr(
-        "metaculus_bot.research.fetch_ladder.classify._extract_main_text", MagicMock(return_value="body text " * 60)
-    )
-    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
-
-    class FakeRoute:
-        def __init__(self, *, raise_on_action: bool = False) -> None:
-            self.aborted: str | None = None
-            self.continued = False
-            self._raise = raise_on_action
-
-        async def continue_(self) -> None:
-            if self._raise:
-                raise _RacingClosedError("Route.continue: Target page, context or browser has been closed")
-            self.continued = True
-
-        async def abort(self, code: str | None = None) -> None:
-            if self._raise:
-                raise _RacingClosedError("Route.abort: Target page, context or browser has been closed")
-            self.aborted = code
-
-    page = FakePage(html="<html><body><p>rendered body</p></body></html>")
-    install_fake_playwright(monkeypatch, page, pinned=("example.com", "93.184.216.34"))
-
-    result = await agentic_tools._try_rendered_fetch("https://example.com/page")
-    assert result is not None
-    assert result.method == "rendered"
-
-    # Teardown drained the handlers before close (Playwright's remedy for the storm).
-    assert page.unroute_behavior == "ignoreErrors"
-    assert page.teardown == ["unroute_all", "context.close", "browser.close"]
-
-    guard = page.route_handler
-
-    # SSRF guard intact: disallowed URL is aborted, allowed URL is continued.
-    disallowed = FakeRoute()
-    await guard(disallowed, SimpleNamespace(url="http://evil.internal/imds"))
-    assert disallowed.aborted == "blockedbyclient"
-    assert disallowed.continued is False
-
-    allowed = FakeRoute()
-    await guard(allowed, SimpleNamespace(url="https://example.com/subresource"))
-    assert allowed.continued is True
-    assert allowed.aborted is None
-
-    # Teardown race: continue_/abort raising a closed-target error must be
-    # swallowed, not re-raised (no unhandled event-listener storm).
-    racing_allowed = FakeRoute(raise_on_action=True)
-    await guard(racing_allowed, SimpleNamespace(url="https://example.com/late"))
-    racing_blocked = FakeRoute(raise_on_action=True)
-    await guard(racing_blocked, SimpleNamespace(url="http://evil.internal/late"))
-
-
-@pytest.mark.asyncio
 async def test_fetch_ssrf_reject_returns_blocked(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=False))
 
@@ -1069,7 +994,7 @@ async def test_fetch_playwright_missing_degrades_to_plain(monkeypatch: pytest.Mo
 
 @pytest.mark.parametrize("extracted", [None, "", "   \n  \t "])
 @pytest.mark.asyncio
-async def test_fetch_plain_empty_extraction_returns_empty_status(
+async def test_fetch_direct_empty_extraction_returns_empty_status(
     extracted: str | None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A 200-OK HTML page that extracts to nothing (or only whitespace) must
@@ -1092,7 +1017,7 @@ async def test_fetch_plain_empty_extraction_returns_empty_status(
 
 
 @pytest.mark.asyncio
-async def test_fetch_plain_thin_extraction_is_ok_not_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_fetch_direct_thin_extraction_is_ok_not_empty(monkeypatch: pytest.MonkeyPatch) -> None:
     """A short-but-real extraction is genuinely read content: status stays "ok"
     (fetched-tierable) even though it's below the escalation floor. Thin != empty
     — demoting real short sources would harm legitimate official statements."""
@@ -1114,7 +1039,7 @@ async def test_fetch_plain_thin_extraction_is_ok_not_empty(monkeypatch: pytest.M
 
 
 @pytest.mark.asyncio
-async def test_fetch_plain_honors_declared_charset_on_textual_body(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_fetch_direct_honors_declared_charset_on_textual_body(monkeypatch: pytest.MonkeyPatch) -> None:
     """A windows-1252 CSV with its charset declared decodes faithfully. The old
     forced-UTF-8 read turned every high byte into U+FFFD and shipped the
     mojibake to the driver as status="ok"."""
@@ -1132,7 +1057,7 @@ async def test_fetch_plain_honors_declared_charset_on_textual_body(monkeypatch: 
 
 
 @pytest.mark.asyncio
-async def test_fetch_plain_refuses_an_undecodable_textual_body(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_fetch_direct_refuses_an_undecodable_textual_body(monkeypatch: pytest.MonkeyPatch) -> None:
     """A BOM-less UTF-16 body with no declared charset decodes to NUL-interleaved
     garbage — a failed decode, not text we read. It must report "empty" (never
     "ok") and escalate, so the rendered rung's browser sniffing gets a try."""
@@ -1149,7 +1074,7 @@ async def test_fetch_plain_refuses_an_undecodable_textual_body(monkeypatch: pyte
     assert "could not decode" in result.text
 
 
-class TestFetchPlainTerminalStatuses:
+class TestFetchDirectTerminalStatuses:
     """Behavior pins for the non-content exit paths of the plain rung.
 
     Each branch here decides whether the ladder escalates, retries, or hands the
@@ -1159,7 +1084,9 @@ class TestFetchPlainTerminalStatuses:
     """
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("status", sorted(fetch_outcomes._RETRYABLE_FETCH_BLOCK_STATUSES))
+    @pytest.mark.parametrize(
+        "status", sorted(status for status, verdict in _NON_OK_FETCH_STATUS.items() if verdict == "blocked")
+    )
     async def test_anti_bot_status_is_blocked(self, status: int, monkeypatch: pytest.MonkeyPatch) -> None:
         session = _FakeSession(_FakeResponse(status=status, headers={"Content-Type": "text/html"}))
         monkeypatch.setattr(
@@ -1281,7 +1208,7 @@ class TestFetchPlainTerminalStatuses:
 
 
 @pytest.mark.asyncio
-async def test_fetch_plain_redirect_to_empty_page_returns_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_fetch_direct_redirect_to_empty_page_returns_empty(monkeypatch: pytest.MonkeyPatch) -> None:
     """A redirect chain that terminates on a 200-OK empty page is still empty —
     the final hop, not the redirect, decides the outcome."""
     session = _FakeSession(
@@ -1509,7 +1436,7 @@ class TestThrottleInterstitialIsNotASuccess:
         """Under the char cap but with no throttle phrase: real content, cached as before.
 
         The size half of the rule is what keeps this safe — a one-line official statement is
-        the shape ``_plain_html_outcome`` deliberately keeps as "ok", and demoting it would
+        the shared HTML classifier deliberately keeps as "ok", and demoting it would
         cost more than the throttle it is trying to catch.
         """
         body = "The Ministry confirmed the vote will be held on 12 October 2026."
@@ -1611,172 +1538,6 @@ class TestMatchedThrottlePhrase:
         assert throttle.matched_throttle_phrase(body) is None
 
 
-@pytest.mark.asyncio
-async def test_try_rendered_fetch_uses_playwright_objects(monkeypatch: pytest.MonkeyPatch) -> None:
-    semaphore_entries: list[str] = []
-
-    class RecordingSemaphore:
-        async def __aenter__(self) -> None:
-            semaphore_entries.append("entered")
-
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
-    page = FakePage(html='<html><body><a href="/next">Next</a><p>Rendered body</p></body></html>')
-    chromium = install_fake_playwright(monkeypatch, page, pinned=("example.com", "93.184.216.34"))
-    # Patch our own fresh global semaphore (bound in THIS test's loop) rather than
-    # leaning on the autouse fixture + import order — asyncio.Semaphore binds to the
-    # running loop on first await, so a stale cross-file binding would raise here.
-    monkeypatch.setattr(rendered_fetch, "_RENDERED_FETCH_GLOBAL_SEMAPHORE", asyncio.Semaphore(2))
-    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._sem_for_host", lambda *_: RecordingSemaphore())
-    monkeypatch.setattr(
-        "metaculus_bot.research.fetch_ladder.classify._extract_main_text", MagicMock(return_value="Rendered body")
-    )
-    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
-
-    outcome = await agentic_tools._try_rendered_fetch("https://example.com/page")
-
-    assert outcome is not None
-    assert outcome.method == "rendered"
-    assert outcome.links == ["https://example.com/next"]
-    assert semaphore_entries == ["entered"]
-    assert page.route_patterns == ["**/*"]
-    (call,) = page.goto_calls
-    assert call["url"] == "https://example.com/page"
-    assert call["wait_until"] == "domcontentloaded"
-    # The settle is taken OUT of the goto budget, so the rung's 35 s ceiling is
-    # unchanged rather than lengthened by the wait that replaced networkidle.
-    assert call["timeout"] == rendered_fetch.RENDER_TIMEOUT_MS - rendered_fetch.RENDER_SETTLE_MS
-    assert page.context_kwargs["user_agent"]
-    assert "Accept-Language" in page.context_kwargs["extra_http_headers"]
-    assert chromium.headless == [True]
-
-
-@pytest.mark.asyncio
-async def test_rendered_fetch_launches_bounded_by_global_semaphore(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Fix 1: concurrent headless-Chromium launches must never exceed the
-    module-global cap, even across questions (the semaphore is per-process).
-
-    Fires more concurrent _try_rendered_fetch calls than the cap and gates each fake launch on a
-    barrier so we can measure the true concurrent-launch peak. The peak must equal the cap
-    (proving contention was actually reached) and never exceed it. The per-host gate never
-    serializes the renders because ``_sem_for_host`` is stubbed to hand back a FRESH
-    ``asyncio.Semaphore(1)`` on every call, so the five URLs deliberately share ONE host and
-    differ only by path: the renders share one ``FakePage`` whose ``url`` every goto overwrites,
-    and the transport reads that URL back for its landing-host check on either side of the DOM
-    read, so a sibling's goto landing between those reads must be on the same host or the check
-    would refuse it as a stranger, a spurious failure that looks like a transport bug."""
-    cap = 2
-    monkeypatch.setattr(rendered_fetch, "_RENDERED_FETCH_GLOBAL_SEMAPHORE", asyncio.Semaphore(cap))
-
-    live = 0
-    peak = 0
-    hold = asyncio.Event()
-    at_cap = asyncio.Event()
-
-    class _BarrierChromium(FakeChromium):
-        async def launch(self, *, headless: bool, args: list[str] | None = None) -> FakeBrowser:
-            nonlocal live, peak
-            live += 1
-            peak = max(peak, live)
-            if live >= cap:
-                at_cap.set()
-            try:
-                await hold.wait()
-            finally:
-                live -= 1
-            return await super().launch(headless=headless, args=args)
-
-    page = FakePage(html="<html><body><p>rendered body</p></body></html>")
-    install_fake_playwright(monkeypatch, page, chromium=_BarrierChromium(page))
-    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._sem_for_host", lambda *_: asyncio.Semaphore(1))
-    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True))
-    monkeypatch.setattr(
-        "metaculus_bot.research.fetch_ladder.classify._extract_main_text", MagicMock(return_value="rendered body")
-    )
-    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
-
-    tasks = [
-        asyncio.create_task(agentic_tools._try_rendered_fetch(f"https://host.example.com/page{index}"))
-        for index in range(cap + 3)
-    ]
-
-    # Let the first wave saturate the semaphore, then confirm it plateaued at
-    # the cap while the launches are still parked on the barrier.
-    await asyncio.wait_for(at_cap.wait(), timeout=1.0)
-    for _ in range(5):
-        await asyncio.sleep(0)
-    assert live == cap
-    assert peak == cap
-
-    hold.set()
-    results = await asyncio.gather(*tasks)
-
-    assert all(result is not None and result.method == "rendered" for result in results)
-    assert peak == cap
-
-
-@pytest.mark.asyncio
-async def test_rendered_fetch_route_guard_blocks_private_redirect_target(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The per-hop route guard must abort requests to non-public hosts.
-
-    Simulates a page whose client-side redirect targets a private host: the
-    guard registered via context.route re-runs is_public_http_url per request,
-    aborts the private hop, and no below-bound content reaches the outcome.
-    """
-    aborted: list[tuple[str, str]] = []
-    continued: list[str] = []
-
-    class FakeRoute:
-        def __init__(self, url: str) -> None:
-            self.request = SimpleNamespace(url=url)
-
-        async def continue_(self) -> None:
-            continued.append(self.request.url)
-
-        async def abort(self, error_code: str) -> None:
-            aborted.append((self.request.url, error_code))
-
-    class _RedirectingPage(FakePage):
-        async def goto(self, url: str, *, wait_until: str, timeout: int) -> Any:  # noqa: ASYNC109  # mirrors Playwright API
-            # Drive the guard the way Chromium would: the public main-frame
-            # request continues; the page's client-side redirect to the
-            # private host is aborted.
-            guard = self.route_handler
-            main_route = FakeRoute(url)
-            await guard(main_route, main_route.request)
-            private_route = FakeRoute("http://169.254.169.254/latest/meta-data/")
-            await guard(private_route, private_route.request)
-            return await super().goto(url, wait_until=wait_until, timeout=timeout)
-
-    async def fake_is_public(url: str) -> bool:
-        await asyncio.sleep(0)
-        return "169.254.169.254" not in url
-
-    install_fake_playwright(
-        monkeypatch,
-        _RedirectingPage(html="<html><body><p>public content only</p></body></html>"),
-        pinned=("example.com", "93.184.216.34"),
-    )
-    # Self-sufficient global semaphore bound in this test's loop (see the sibling
-    # rendered-fetch test) — avoids a cross-file stale-loop-binding RuntimeError.
-    monkeypatch.setattr(rendered_fetch, "_RENDERED_FETCH_GLOBAL_SEMAPHORE", asyncio.Semaphore(2))
-    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._sem_for_host", lambda *_: asyncio.Semaphore(1))
-    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", fake_is_public)
-    monkeypatch.setattr(
-        "metaculus_bot.research.fetch_ladder.classify._extract_main_text", MagicMock(return_value="public content only")
-    )
-    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
-
-    outcome = await agentic_tools._try_rendered_fetch("https://example.com/page")
-
-    assert outcome is not None
-    assert continued == ["https://example.com/page"]
-    assert aborted == [("http://169.254.169.254/latest/meta-data/", "blockedbyclient")]
-    assert "169.254.169.254" not in outcome.text
-    assert outcome.text == "public content only"
-
-
 def _addrinfo(ip: str) -> list[tuple[Any, ...]]:
     """A minimal getaddrinfo return; only sockaddr[0] (the IP string) is read."""
     return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 0))]
@@ -1875,41 +1636,6 @@ async def test_resolve_pinned_host_dns_failure_fails_closed(monkeypatch: pytest.
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
     assert await rendered_fetch.resolve_pinned_host("https://nxdomain.example.com/page") is None
-
-
-@pytest.mark.asyncio
-async def test_rendered_fetch_skips_launch_when_host_not_pinnable(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Vetting fails (disallowed / unresolvable host) → Chromium is NOT launched
-    and the rung returns the graceful-failure ``None`` the ladder degrades on."""
-    chromium = install_fake_playwright(monkeypatch, FakePage(), pinned=None)
-    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._sem_for_host", lambda *_: asyncio.Semaphore(1))
-
-    outcome = await agentic_tools._try_rendered_fetch("https://rebind.example.com/page")
-
-    assert outcome is None
-    assert chromium.launch_args == [], "Chromium must not launch for a non-pinnable host"
-
-
-@pytest.mark.asyncio
-async def test_rendered_fetch_launches_with_host_resolver_pin(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Vetting succeeds → Chromium launches with a ``--host-resolver-rules=MAP``
-    arg pinning the main-frame host to exactly the vetted public IP."""
-    chromium = install_fake_playwright(
-        monkeypatch,
-        FakePage(html="<html><body><p>Rendered body</p></body></html>"),
-        pinned=("example.com", "93.184.216.34"),
-    )
-    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._sem_for_host", lambda *_: asyncio.Semaphore(1))
-    monkeypatch.setattr(
-        "metaculus_bot.research.fetch_ladder.classify._extract_main_text", MagicMock(return_value="Rendered body")
-    )
-    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
-
-    outcome = await agentic_tools._try_rendered_fetch("https://example.com/page")
-
-    assert outcome is not None
-    assert outcome.method == "rendered"
-    assert chromium.launch_args == [["--host-resolver-rules=MAP example.com 93.184.216.34"]]
 
 
 @pytest.fixture
@@ -2543,13 +2269,13 @@ class TestLocalPdfRung:
         """
         truncated = extract_pdf_text(_long_pdf(), max_pages=1, max_seconds=5.0)
         assert truncated.truncated_by == "pages", "the fixture has to be a genuinely partial read"
-        monkeypatch.setattr(local_document, "extract_pdf_text", MagicMock(return_value=truncated))
+        _serve_pdf(monkeypatch, _long_pdf())
+        monkeypatch.setattr(classify, "extract_pdf_text", MagicMock(return_value=truncated))
 
-        result = await local_document.pdf_fetch_result(
-            _long_pdf(), url="https://example.gov/report.pdf", content_type="application/pdf"
-        )
+        result = await _fetch_direct_only("https://example.gov/report.pdf")
 
         note = "[Partial document read: 2 pages; stopped at the 1-page read cap]"
+        assert result.method == local_document.PDF_LOCAL_METHOD
         assert result.text.startswith(note)
         assert "unemployment rate" in result.text, "the disclosure leads the text, it does not replace it"
         # The other writer of that text into the run cache — a later read_document digests it flat.
@@ -2560,7 +2286,7 @@ class TestLocalPdfRung:
         assert not local_document.held_pdf(whole).text.startswith("[Partial")
 
     @pytest.mark.asyncio
-    async def test_the_pypdf_gate_is_shared_with_the_tier_1_rung(self) -> None:
+    async def test_the_pypdf_gate_is_shared_with_the_tier_1_rung(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """One process-wide parse gate, not one per rung.
 
         pypdf is pure Python, so the two rungs' parses contend for the same GIL (6 concurrent
@@ -2569,15 +2295,12 @@ class TestLocalPdfRung:
         concurrency ate rather than document size. A gate private to this module would bound
         neither.
         """
+        _serve_pdf(monkeypatch, _long_pdf())
         gate = http_fetch.pdf_parse_semaphore()
         await gate.acquire()
         await gate.acquire()
 
-        parse = asyncio.create_task(
-            local_document.pdf_fetch_result(
-                _long_pdf(), url="https://example.gov/queued.pdf", content_type="application/pdf"
-            )
-        )
+        parse = asyncio.create_task(_fetch_direct_only("https://example.gov/queued.pdf"))
         for _ in range(3):
             await asyncio.sleep(0)
         assert not parse.done(), "both slots are held, so the v2 parse must be queued behind them"
@@ -2974,165 +2697,6 @@ class TestUrlContextSizeGate:
         assert digest.passages == DOCUMENT_DIGEST_TOP_K
 
 
-class TestRenderedRungSalvagesATimedOutNavigation:
-    """The wait-condition fix (2026-09-03), measured on the 47-URL replay.
-
-    ``page.goto(wait_until="networkidle")`` never returns on a page carrying a long-poll widget
-    or an analytics beacon, and its TimeoutError used to discard the rung: 4 of the replay's 10
-    render rescues came from pages whose DOM was complete anyway (both ballotpedia questions,
-    both fts.unocha.org summaries). The rung now waits for DOM-ready plus a fixed settle and
-    salvages ``page.content()`` when the navigation itself fails.
-    """
-
-    @staticmethod
-    def _wire_playwright(monkeypatch: pytest.MonkeyPatch, page: FakePage) -> None:
-        install_fake_playwright(monkeypatch, page, pinned=("example.com", "93.184.216.34"))
-        monkeypatch.setattr(rendered_fetch, "_RENDERED_FETCH_GLOBAL_SEMAPHORE", asyncio.Semaphore(2))
-        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
-
-    @pytest.mark.asyncio
-    async def test_a_goto_timeout_still_returns_the_rendered_dom(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        page = FakePage(
-            goto_raises=_PlaywrightTimeoutError("Timeout 33000ms exceeded."),
-            html="<html><body><p>The tracker reports 41 cases this week.</p></body></html>",
-        )
-        self._wire_playwright(monkeypatch, page)
-        monkeypatch.setattr(
-            "metaculus_bot.research.fetch_ladder.classify._extract_main_text",
-            MagicMock(return_value="The tracker reports 41 cases this week."),
-        )
-
-        result = await agentic_tools._try_rendered_fetch("https://ballotpedia.org/race")
-
-        assert result is not None, "a timed-out goto with a complete DOM is a rescue, not a dead rung"
-        assert result.status == "ok"
-        assert result.method == "rendered"
-        assert result.text == "The tracker reports 41 cases this week."
-        assert page.settles == [rendered_fetch.RENDER_SETTLE_MS]
-
-    @pytest.mark.asyncio
-    async def test_a_navigation_error_with_no_dom_reads_as_rendered_nothing(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A genuine navigation failure salvages an empty about:blank, which is the same
-        "rendered read nothing" outcome the rung produced before, so the ladder falls through
-        exactly as it did."""
-
-        self._wire_playwright(
-            monkeypatch,
-            FakePage(
-                goto_raises=_PlaywrightError("net::ERR_NAME_NOT_RESOLVED"),
-                html="<html><head></head><body></body></html>",
-            ),
-        )
-        monkeypatch.setattr(
-            "metaculus_bot.research.fetch_ladder.classify._extract_main_text", MagicMock(return_value=None)
-        )
-
-        result = await agentic_tools._try_rendered_fetch("https://example.com/gone")
-
-        assert result is not None
-        assert result.status == "error"
-        assert result.method == "rendered"
-        assert result.text == ""
-
-
-class TestRenderedRungTimeoutAtTheV2Wrapper:
-    """P3-1's transport bound RAISES ``TimeoutError`` rather than declining with ``None``, so the
-    Tier-1 rung can record its own reason. This wrapper's callers only know ``None``, so it folds
-    the timeout back into that signal. The memo for a cut-off render is the transport's own —
-    written only when a browser actually ran, pinned in ``tests/test_rendered_fetch.py`` — so this
-    wrapper writes neither memo on a timeout. The ceilings it already ran under are unchanged: the
-    ``fetch`` tool's ``timeout_s`` and ``_LOCAL_DOCUMENT_BUDGET_S`` on the document ladder.
-    """
-
-    @pytest.mark.asyncio
-    async def test_a_transport_timeout_declines_without_memoising_the_url_itself(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        url = "https://example.com/keeps-navigating"
-
-        async def _timed_out(target: str, **kwargs: object) -> None:
-            del target, kwargs
-            await asyncio.sleep(0)
-            raise TimeoutError("rendered fetch DOM read exceeded 5000ms")
-
-        monkeypatch.setattr(agentic_tools, "render_page", _timed_out)
-
-        result = await agentic_tools._try_rendered_fetch(url)
-
-        assert result is None
-        assert rendered_fetch.rendered_to_nothing(url, memo_scope="gap_fill_v2") is False
-
-    @pytest.mark.asyncio
-    async def test_a_dom_over_the_ceiling_declines_without_memoising_the_url(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The transport's other non-``None`` decline. The page rendered, so it is not "rendered
-        to nothing" and must not be memoised as such; this wrapper folds it into ``None`` like the
-        timeout, because its callers know no other signal."""
-        url = "https://example.com/five-megabyte-dashboard"
-
-        async def _too_large(target: str, **kwargs: object) -> None:
-            del kwargs
-            await asyncio.sleep(0)
-            raise rendered_fetch.RenderDomOverCeiling(f"the rendered DOM of {target} is over the ceiling")
-
-        monkeypatch.setattr(agentic_tools, "render_page", _too_large)
-
-        result = await agentic_tools._try_rendered_fetch(url)
-
-        assert result is None
-        assert rendered_fetch.rendered_to_nothing(url, memo_scope="gap_fill_v2") is False
-
-    @pytest.mark.asyncio
-    async def test_an_off_host_landing_declines_without_memoising_the_url(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The transport's third non-``None`` decline: Chromium's main frame landed off the pinned
-        host, so the DOM was refused unread on the pre-read check, or discarded unpublished when
-        the navigation committed during the read itself. This wrapper folds it into ``None`` like
-        the other two, because its callers know no other signal, and nothing from that render
-        reaches the driver. Not memoised: the page rendered, on a host that was not the one asked
-        for."""
-        url = "https://example.com/redirects-inward"
-
-        async def _off_host(target: str, **kwargs: object) -> None:
-            del kwargs
-            await asyncio.sleep(0)
-            raise rendered_fetch.RenderOffHost(
-                requested_url=target, final_url="http://169.254.169.254/latest/meta-data/", pinned_host="example.com"
-            )
-
-        monkeypatch.setattr(agentic_tools, "render_page", _off_host)
-
-        result = await agentic_tools._try_rendered_fetch(url)
-
-        assert result is None
-        assert rendered_fetch.rendered_to_nothing(url, memo_scope="gap_fill_v2") is False
-
-    @pytest.mark.asyncio
-    async def test_through_the_transport_an_off_host_landing_is_never_read(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """End to end through the fake browser: the landing is checked before ``page.content()``,
-        so no DOM from the other host exists for this ladder to extract, memoise or publish."""
-        page = FakePage(html="<html><body><p>internal status page</p></body></html>", land_on="http://10.0.0.8/status")
-        install_fake_playwright(monkeypatch, page, pinned=("example.com", "93.184.216.34"))
-        monkeypatch.setattr(rendered_fetch, "_RENDERED_FETCH_GLOBAL_SEMAPHORE", asyncio.Semaphore(2))
-        monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._sem_for_host", lambda *_: asyncio.Semaphore(1))
-        extract = MagicMock(return_value="internal status page")
-        monkeypatch.setattr("metaculus_bot.research.fetch_ladder.classify._extract_main_text", extract)
-
-        result = await agentic_tools._try_rendered_fetch("https://example.com/page")
-
-        assert result is None
-        assert page.content_reads == 0
-        extract.assert_not_called()
-        assert rendered_fetch.rendered_to_nothing("https://example.com/page", memo_scope="gap_fill_v2") is False
-        assert page.teardown == ["unroute_all", "context.close", "browser.close"]
-
-
 class TestGapFillV2RendersThePlainRungsFinalUrl:
     """The browser is handed the direct fetch's POST-REDIRECT URL, ``direct.url``, never the URL
     the driver asked for. That is load-bearing since the transport pins Chromium's DNS to the host
@@ -3182,29 +2746,6 @@ class TestGapFillV2RendersThePlainRungsFinalUrl:
 
         assert [call["url"] for call in renders] == [self._FINAL]
         assert held.has_text
-
-    @pytest.mark.asyncio
-    async def test_links_resolve_against_the_documents_landing_url(self, monkeypatch: pytest.MonkeyPatch):
-        """A same-host client-side redirect (``/senate`` to ``/senate/2026/``) moves the document's
-        base; a relative ``href`` resolved against the requested URL would send the driver's next
-        fetch to a 404. The memo key, ``url``, stays the requested URL."""
-        page = FakePage(
-            html='<html><body><a href="methodology.html">Method</a><p>Rendered body</p></body></html>',
-            land_on="https://example.com/senate/2026/",
-        )
-        install_fake_playwright(monkeypatch, page)
-        monkeypatch.setattr(rendered_fetch, "_RENDERED_FETCH_GLOBAL_SEMAPHORE", asyncio.Semaphore(2))
-        monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._sem_for_host", lambda *_: asyncio.Semaphore(1))
-        monkeypatch.setattr(
-            "metaculus_bot.research.fetch_ladder.classify._extract_main_text", MagicMock(return_value="Rendered body")
-        )
-        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
-
-        result = await agentic_tools._try_rendered_fetch("https://example.com/senate")
-
-        assert result is not None
-        assert result.links == ["https://example.com/senate/2026/methodology.html"]
-        assert result.url == "https://example.com/senate"
 
     @pytest.mark.asyncio
     async def test_through_fetch_a_scripted_302_decides_the_render_target(self, monkeypatch: pytest.MonkeyPatch):
@@ -3898,7 +3439,7 @@ class TestGapFillV2ImpersonatedRetry:
 class TestPlainHtmlExtractionPolicy:
     """Item A: the loop's HTML path now runs Tier 1's free extraction steps.
 
-    `_plain_html_outcome` routes an HTML body through `classify._extract_page_text`
+    The shared HTML classifier routes an HTML body through `classify._extract_page_text`
     (the ARIA-table rewrite plus the two-pass default/precision policy) and prepends the inline
     chart-data read, and follows a `<meta http-equiv=refresh>` stub as a hop. Ported from the
     resolution-source fetcher, where 33 of 80 rendered reads served under 500 chars because the
