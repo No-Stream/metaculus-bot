@@ -9,8 +9,9 @@ resolved.
 
 The same per-forecaster outputs feed BOTH stacker arms (tools-on, tools-off)
 in the downstream A/B benchmark, so we run forecasters once per question per
-backtest and cache aggressively. Errors are recorded in the payload, never
-re-raised — a single forecaster crash shouldn't poison the batch.
+backtest and cache aggressively. An expected call failure is recorded in the
+forecaster's payload rather than raised, so one bad provider cannot poison the
+batch; a bug is left to propagate.
 
 Design choices:
 
@@ -628,9 +629,9 @@ async def _run_one_forecaster(
 ) -> tuple[str, dict[str, Any]]:
     """Run one forecaster on one question; return (model_slug_filename, payload).
 
-    Errors are captured in the payload's ``errors`` list with
-    ``prediction_value=None``. The payload is always written to cache before
-    returning so we have a record even on failure.
+    An expected call or serialization failure is captured in the payload's ``errors``
+    list with ``prediction_value=None``, and the payload is written to cache before
+    returning so a failure leaves a record too. A bug propagates and caches nothing.
 
     On ``litellm.RateLimitError`` (or any 429-shaped exception), the call is
     retried up to ``max_retries`` times. The sleep duration honors
@@ -734,9 +735,9 @@ async def run_forecasters_for_question(
       :func:`patched_window_for_question` so prompt-injected dates are anchored
       to the question's mid-window.
 
-    Per-forecaster errors are caught, recorded in the payload's ``errors``
-    list, and persisted to cache with ``prediction_value=None``. The batch
-    continues regardless.
+    An expected per-forecaster failure is recorded in that payload's ``errors`` list
+    and persisted to cache with ``prediction_value=None``, and the other forecasters
+    continue. A bug propagates out of this function instead.
     """
     if forecaster_llms is None:
         forecaster_llms = build_free_forecaster_llms()
