@@ -1,39 +1,29 @@
 """Per-arm stacker runner for the probabilistic-tools ablation benchmark.
 
-Reads cached forecaster rationales, runs the tool-runner (per-rationale
-"Computed quantities" + cross-model aggregation), then invokes
-``stacking.run_stacking_*``. Two arms differ only by the
-``PROBABILISTIC_TOOLS_ENABLED`` env-var state at the moment we call the
-tool-runner functions:
+Reads the canonical ``(qid, model_slug)`` forecaster cache entries written by
+``metaculus_bot.ablation.forecasters``, runs the tool-runner (per-rationale "Computed quantities"
+plus cross-model aggregation), then dispatches to ``metaculus_bot.stacking.run_stacking_*``. The
+two arms differ only by the ``PROBABILISTIC_TOOLS_ENABLED`` env-var state when the tool-runner
+functions are called: ARM_STACK leaves it unset so both runners early-return ``""``; ARM_STACK_AUG
+sets it to ``"1"`` so both produce real markdown for the stacker prompt. Results are cached per
+``(qid, arm)``; on primary-stacker failure the runner falls back to a secondary stacker LLM, and
+when both fail it caches a ``success=False`` payload so the batch wrapper continues.
 
-* ARM_STACK — flag explicitly unset; both ``run_tools_for_forecaster`` and
-  ``build_cross_model_aggregation`` early-return ``""``.
-* ARM_STACK_AUG — flag set to ``"1"``; both runners produce real markdown that
-  gets piped into the stacker prompt.
+Stacker choice. The default primary is ``openrouter/anthropic/claude-opus-4.5`` rather than prod's
+opus-4.8 (``STACKER_LLM`` in ``llm_configs.py`` since 2026-07-20, when fable-5 left both roles),
+because a gpt-5.5 primary 404ed ("no endpoints available", a data-policy guardrail) on every
+request from the operator's local donated key while the GitHub-secret key worked; Anthropic models
+clear it. The ``gpt-5.6-sol`` fallback matches prod ``STACKER_FALLBACK_LLM`` (the 2026-07-09
+gpt-5.6 migration) and sits on a different provider so an Anthropic stall cannot take both
+attempts down. Both go through ``build_llm_with_openrouter_fallback`` so the Metaculus-donated
+OpenRouter key absorbs cost ahead of the operator's paid key; that wrapper handles the
+donated-to-paid fallback on credit/auth/data-policy errors itself, so the outer
+primary-to-fallback chain in ``run_stacker_for_arm`` is a defense-in-depth backstop, not the
+cost control.
 
-Caches per ``(qid, arm)``. On primary-stacker failure, falls back to a
-secondary stacker LLM. On both-fail, caches a ``success=False`` payload
-and returns; the batch wrapper continues.
-
-Reads canonical (qid, model_slug) cache entries written by
-``metaculus_bot.ablation.forecasters`` and dispatches to
-``metaculus_bot.stacking.run_stacking_*``.
-
-Default stacker is ``openrouter/anthropic/claude-opus-4.5`` (with a
-``gpt-5.6-sol`` fallback) routed through ``build_llm_with_openrouter_fallback``
-so the Metaculus-donated OpenRouter key absorbs cost ahead of the operator's
-paid key. The wrapper handles donated→paid fallback on
-credit/auth/allowed-providers errors internally, so the outer primary→fallback
-chain in ``run_stacker_for_arm`` is a defense-in-depth backstop rather than a
-primary cost-control mechanism.
-
-Cost note (rough order of magnitude — for the operator's mental model only):
-
-* A frontier stacker with ``reasoning={"effort": "high"}`` runs ~$0.05-0.10 per call.
-* 20-question intermediate sweep (40 stacker calls) ≈ $2-4 if everything pays.
-* 60-question medium sweep (120 stacker calls) ≈ $6-12 worst case.
-* In practice the donated key absorbs almost everything, so the actual
-  paid spend is usually a small fraction of the worst-case figure.
+Cost, order of magnitude: a frontier stacker at ``reasoning={"effort": "high"}`` runs about
+$0.05-0.10 per call, so a 20-question sweep (40 calls) is $2-4 and a 60-question sweep (120
+calls) $6-12 worst case; the donated key usually absorbs almost all of it.
 """
 
 from __future__ import annotations
@@ -85,32 +75,15 @@ ARM_PDF_MIN2 = "pdf_min2"  # pdf arm with min_forecasters=2 (proper aggregation)
 ARM_MEDIAN = "median"  # deterministic median over base predictions, no LLM (see metaculus_bot.ablation.run_simple_agg)
 ARM_MEAN = "mean"  # deterministic mean over base predictions, no LLM (see metaculus_bot.ablation.run_simple_agg)
 
-# Default stacker intentionally uses claude-opus-4.5 as primary for local
-# donated-key compatibility (see the History note below), independent of the
-# current prod ``STACKER_LLM`` primary (claude-opus-4.8 in ``llm_configs.py``
-# since 2026-07-20, when fable-5 was pulled from both roles).
-# gpt-5.6-sol as fallback matches prod STACKER_FALLBACK_LLM (different provider
-# so an Anthropic stall doesn't take both attempts down). Both are routed through
-# ``build_llm_with_openrouter_fallback`` for the donated→paid key fallback the
-# wrapper provides on credit/auth/data-policy errors.
-#
-# History note: a previous iteration tried gpt-5.5 as primary, but the
-# operator's local-`.env` donated key returns 404 "no endpoints available"
-# (data-policy guardrail) on every gpt-5.5 request. Production with a
-# different `OAI_ANTH_OPENROUTER_KEY` GitHub-secret value works, but local
-# couldn't. claude-opus-4.5 sidesteps the issue entirely.
+# Not prod's opus-4.8: a gpt-5.5 primary 404ed on the operator's local donated key; see the module docstring.
 DEFAULT_STACKER_MODEL = "openrouter/anthropic/claude-opus-4.5"
-# Matches prod STACKER_FALLBACK_LLM post the 2026-07-09 gpt-5.6 migration.
+# Matches prod STACKER_FALLBACK_LLM (2026-07-09 gpt-5.6 migration); a different provider than the primary on purpose.
 DEFAULT_STACKER_FALLBACK_MODEL = "openrouter/openai/gpt-5.6-sol"
 DEFAULT_PARSER_MODEL = "openrouter/openai/gpt-oss-120b:free"
 
-# Prod-ish ablation stacker. Mirrors the prod-ish forecaster posture (opus-4.8 at
-# medium reasoning effort, no sampling params): ``temperature=None`` keeps litellm
-# from injecting a temperature, and top_p / max_tokens are deliberately unset.
-# Selected by --lineup prod in the --plain-llm path (a plain GeneralLlm, no
-# donated-key wrapper). Does NOT replace DEFAULT_STACKER_MODEL, which mirrors prod
-# / free-tier compatibility.
+# The --lineup prod stacker, a plain GeneralLlm with no donated-key wrapper; its posture mirrors the prod forecasters.
 PROD_STACKER_MODEL = "openrouter/anthropic/claude-opus-4.8"
+# Medium effort, no sampling params: ``temperature=None`` stops litellm injecting one, top_p and max_tokens stay unset.
 _PROD_STACKER_KWARGS: dict[str, Any] = {
     "reasoning": {"effort": "medium"},
     "temperature": None,
@@ -119,13 +92,7 @@ _PROD_STACKER_KWARGS: dict[str, Any] = {
     "allowed_tries": 1,
 }
 
-# Reasoning config shared by both stacker LLMs. Anthropic models use
-# ``reasoning={"max_tokens": ...}`` (explicit thinking budget — see production
-# STACKER_LLM at llm_configs.py:122). OpenAI models use ``reasoning={"effort":
-# ...}``. We construct each LLM with its own kwargs so the per-provider
-# parameter differences are explicit. Sampling params follow the repo-wide
-# convention: ``temperature=None`` keeps litellm from injecting a temperature,
-# top_p is unset — reasoning models defer to provider defaults.
+# Anthropic takes an explicit thinking budget (``reasoning.max_tokens``, as prod ``STACKER_LLM`` in ``llm_configs.py``).
 _OPUS_STACKER_KWARGS: dict[str, Any] = {
     "reasoning": {"max_tokens": 32_000},
     "temperature": None,
@@ -134,6 +101,7 @@ _OPUS_STACKER_KWARGS: dict[str, Any] = {
     "timeout": 480,
     "allowed_tries": 1,
 }
+# OpenAI takes ``reasoning.effort`` instead; sampling params follow the repo convention (temperature=None, no top_p).
 _OPENAI_STACKER_KWARGS: dict[str, Any] = {
     "reasoning": {"effort": "high"},
     "temperature": None,
@@ -167,10 +135,7 @@ def _build_default_fallback_stacker_llm() -> GeneralLlm:
     return build_llm_with_openrouter_fallback(model=DEFAULT_STACKER_FALLBACK_MODEL, **_OPENAI_STACKER_KWARGS)
 
 
-# Re-exported so existing imports of ``probabilistic_tools_enabled`` and
-# ``FEATURE_FLAG_ENV`` from this module continue to work. The canonical
-# definition lives in ``metaculus_bot.ablation.env`` to keep
-# ``forecasters.py`` and this module from importing each other.
+# Re-exports the flag helpers that moved to ``ablation.env`` (breaking a forecasters/run_stacker import cycle).
 __all__ = [
     "ABLATION_MIN_FORECASTERS",
     "ARM_MEAN",
@@ -190,28 +155,13 @@ __all__ = [
     "run_stacker_for_arm",
 ]
 
-# Minimum forecasters required to run the stacker for an ablation arm. Tracks
-# the production ``MIN_FORECASTERS_TO_PUBLISH`` (lowered 3 → 2 on 2026-07-20
-# with the drop to a 3-member roster; historical eras replayed here ran at 3).
-# We hold at 2 regardless of the current prod value because the alternative is
-# dropping the question for both arms, which defeats the paired-comparison
-# design when one arm could still produce a valid stacker output.
+# Held at 2 whatever prod's MIN_FORECASTERS_TO_PUBLISH is (3 -> 2 on 2026-07-20): a stricter floor drops both arms.
 ABLATION_MIN_FORECASTERS = 2
 
-# Approximate per-prompt character ceiling for stacker calls. ~4 chars/token
-# is the standard rule of thumb for English; sized to the smallest window ever
-# used in this slot (gpt-5.5's 128k; Opus 4.5 is 200k and gpt-5.6-sol is 1.05M)
-# with headroom for the model's reasoning + response tokens, so we
-# use 128k - 30k headroom = 98k tokens => ~390k chars as the guard threshold.
-# Going over surfaces as a 400 ``context_length_exceeded`` on the primary,
-# fallback inherits the same prompt and fails too — the question is dropped
-# from both arms. Truncating per-rationale (tail-preserving so the
-# conclusion survives) is far cheaper than losing both arms.
+# 4 chars/token on the slot's smallest window (gpt-5.5, 128k) less 30k reasoning headroom; overruns 400 both stackers.
 APPROX_STACKER_CHAR_LIMIT = 4 * (128_000 - 30_000)
 
-# Sentinel to distinguish "caller didn't pass a value" from "caller explicitly
-# passed None" for the fallback_stacker_llm parameter. When None is passed
-# explicitly (--no-stacker-fallback), we respect it and skip the fallback chain.
+# Tells "not passed" from an explicit None: None means --no-stacker-fallback, which skips the fallback chain.
 _UNSET: object = object()
 
 
@@ -235,20 +185,13 @@ def _truncate_long_rationales(base_texts: list[str], char_limit: int) -> list[st
 # ---------------------------------------------------------------------------
 # Window-patch reentrancy lock
 # ---------------------------------------------------------------------------
-#
-# ``patched_window_for_question`` is a global monkey-patch with a RuntimeError
-# guard against nested entry. When ``run_stacker_batch`` runs concurrent
-# per-question stacker calls, two concurrent enters would collide. Serializing
-# the patched section under a module-level asyncio.Lock keeps each stacker
-# call inside its own patched region while still letting other batch work
-# (cache reads, gathers) overlap across questions. Mirrors the equivalent
-# pattern in ``metaculus_bot.ablation.forecasters``.
+
+# Serializes ``patched_window_for_question``, a global monkey-patch that raises on re-entry, across batch calls.
 _WINDOW_PATCH_LOCK: asyncio.Lock | None = None
 
 
 def _get_window_patch_lock() -> asyncio.Lock:
-    # Deliberate module-global: the lock guards a MODULE-level monkey-patch, so it has
-    # to be module-scoped too, and it must be built lazily inside a running loop.
+    """Return the module-wide lock, built lazily so it binds to the running event loop."""
     global _WINDOW_PATCH_LOCK  # noqa: PLW0603  # deliberate module-global: lazily-built lock for a module-level monkey-patch
     if _WINDOW_PATCH_LOCK is None:
         _WINDOW_PATCH_LOCK = asyncio.Lock()
@@ -347,23 +290,14 @@ async def _dispatch_stacker(
             aggregated_tool_output=aggregated_tool_output,
         )
     if isinstance(question, NumericQuestion):
-        # Kept function-scoped for call-time lookup: tests patch
-        # ``metaculus_bot.numeric.pipeline.sanitize_percentiles`` on its SOURCE module and
-        # assert this dispatcher routes through it (test_ablation_run_stacker_dispatch.py,
-        # the "stacker numeric output goes through sanitize" case). A module-level from-import
-        # would bind the unpatched function at import time and the spy would never fire.
+        # Function-scoped so the sanitize_percentiles spy in test_ablation_run_stacker_dispatch.py fires at call time.
         from metaculus_bot.numeric.pipeline import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # late import: tests patch numeric.pipeline.sanitize_percentiles at source
             build_numeric_distribution,
             sanitize_percentiles,
         )
 
         upper_msg, lower_msg = bound_messages(question)
-        # Production at main.py:436-468: ``run_stacking_numeric`` returns
-        # ``tuple[list[Percentile], str]``, then the percentile list is piped
-        # through sanitize → unit-mismatch guard → build_numeric_distribution
-        # to produce the final NumericDistribution. Mirror that here so the
-        # ablation cache's full-CDF serializer (which requires NumericDistribution)
-        # gets the right input shape.
+        # Prod mirror (main.py:436-468): sanitize, unit-mismatch guard, then the NumericDistribution the cache needs.
         perc_list, meta_text = await stacking.run_stacking_numeric(
             stacker_llm,
             parser_llm,
@@ -504,7 +438,8 @@ def _build_stacker_inputs(
     Three steps, in order. Per-forecaster tool augmentation:
     ``run_tools_for_forecaster`` checks the env flag internally and returns "" when
     off, so on arm A this produces no augmentations and each rationale passes through
-    unchanged; base texts are stripped of the leading ``Model: <name>`` tag, mirroring
+    unchanged (the ``## Computed quantities`` append mirrors production at ``main.py:1131``);
+    base texts are stripped of the leading ``Model: <name>`` tag, mirroring
     ``AggregationPipeline.run_stacking``. Then the once-per-question
     cross-model aggregation, which receives the *raw* (with-Model-tag) rationales for
     parsing — the structured-block extractors don't depend on the tag, and production
@@ -516,8 +451,7 @@ def _build_stacker_inputs(
     deserialized_values: list[Any] = []
     for slug, payload in surviving.items():
         raw_rationale = payload["reasoning"]
-        # Forecaster payload schema is fixed (forecasters.run_forecasters_batch);
-        # ``model`` is always present. Direct subscript surfaces drift.
+        # forecasters.run_forecasters_batch fixes the payload schema; a direct ``payload["model"]`` surfaces drift.
         computed_md = tool_runner.run_tools_for_forecaster(
             question=question,
             rationale=raw_rationale,
@@ -601,9 +535,7 @@ async def _stack_with_fallback(
     async with _get_window_patch_lock():
         with patched_window_for_question(question):
             try:
-                # Soft deadline mirrors production at main.py:1243: a stuck stacker can
-                # hold a question for the entire litellm timeout(480) when
-                # allowed_tries=1, blocking every other question waiting on the lock.
+                # Prod mirror (main.py:1243): a stuck stacker would otherwise hold the lock for litellm's whole 480 s.
                 result = await asyncio.wait_for(
                     _dispatch_stacker(
                         question=question,
@@ -624,8 +556,7 @@ async def _stack_with_fallback(
             if fallback_stacker_llm is None:
                 return None, None, errors
             try:
-                # Tighter deadline on fallback mirrors production main.py:1271 — by the
-                # time we're falling back, we're already late on the critical path.
+                # Tighter deadline mirrors main.py:1271: a fallback is already late on the critical path.
                 result = await asyncio.wait_for(
                     _dispatch_stacker(
                         question=question,
@@ -730,40 +661,18 @@ async def run_stacker_for_arm(
     stacker_slug: str | None = None,
     force: bool = False,
 ) -> dict:
-    """Run the stacker for one arm of one question. Cached per ``(qid, arm, stacker_slug)``.
+    """Run the stacker for one arm of one question, cached per ``(qid, arm, stacker_slug)``.
 
-    ``stacker_slug`` keys the on-disk cache filename to the active stacker so a
-    stacker swap (e.g. opus-4.5 free-tier vs opus-4.8 prod) never overwrites
-    another stacker's results. The caller derives it via
-    ``model_slug_to_filename(<stacker model>)``; ``None`` preserves the legacy
-    ``arm_<arm>.json`` filename (used by the tests, which pass plain mocks). These
-    are always LLM-stacker arms (stack / stack_aug), so the slug — when supplied —
-    applies to every read/write here, including the median-fallback payload, which
-    is still this stacker arm's cell.
+    ``stacker_slug`` keys the cache filename to the active stacker so a swap (opus-4.5 free-tier
+    versus opus-4.8 prod) never overwrites another stacker's results; callers derive it with
+    ``model_slug_to_filename(<stacker model>)``, and ``None`` keeps the legacy ``arm_<arm>.json``
+    name the tests rely on. The slug applies to every read and write here, the median-fallback
+    payload included, since that is still this stacker arm's cell.
 
-    Steps:
-    1. Cache check (``read_stacker_output(qid, arm, stacker_slug)``). On hit and not ``force``, return as-is.
-    2. Filter to surviving forecasters (``prediction_value`` set, no errors). Need
-       >= ``ABLATION_MIN_FORECASTERS`` (2) to proceed; below that, cache an
-       error payload and return.
-    3. Set ``PROBABILISTIC_TOOLS_ENABLED=1`` for arm B; explicitly unset for arm A.
-    4. Per surviving forecaster: append ``\\n\\n## Computed quantities\\n<md>``
-       to its rationale only when ``run_tools_for_forecaster`` returns non-empty
-       (matches production at ``main.py:1131``).
-    5. Call ``build_cross_model_aggregation`` once per question over all
-       surviving rationales + deserialized prediction values.
-    6. Inside ``patched_window_for_question(question)`` (serialized via a
-       module-level asyncio.Lock so concurrent stacker batch calls don't
-       collide on the global monkey-patch) and the env context manager,
-       dispatch to the right ``run_stacking_*``. On primary failure, try
-       the fallback LLM. On both fail, cache an error payload.
-    7. Cache the success or error payload, return it.
-
-    Note on the min-forecasters threshold: production enforces 3, but the
-    ablation relaxes to 2 because the comparison is paired across arms — an
-    insufficient-forecaster question fails for both arms, so the relaxation
-    only opens a window where both arms might produce a valid stacker output
-    that wouldn't have been compared otherwise.
+    Fewer than ``ABLATION_MIN_FORECASTERS`` surviving forecasters caches an error payload and
+    returns. With ``fallback_stacker_llm=None`` (``--no-stacker-fallback``) a primary failure is
+    cached and then raised so the run aborts; resume with ``--qids <remaining>``. Otherwise both
+    stackers failing degrades to the MEDIAN of the surviving forecasters.
     """
     qid = question.id_of_question
     assert qid is not None, "run_stacker_for_arm requires question.id_of_question"
@@ -771,8 +680,7 @@ async def run_stacker_for_arm(
     if not force:
         cached = cache.read_stacker_output(qid=qid, arm=arm, stacker_slug=stacker_slug)
         if cached is not None:
-            # Yield once so flake8-async (ASYNC910) sees a guaranteed checkpoint
-            # on this early-return branch. The return path is otherwise sync.
+            # A guaranteed checkpoint on this otherwise-sync early return, for flake8-async ASYNC910.
             await asyncio.sleep(0)
             return cached
 
@@ -789,15 +697,10 @@ async def run_stacker_for_arm(
         await asyncio.sleep(0)
         return payload
 
-    # Provide defaults for any LLMs the caller didn't pass. Tests always pass
-    # all three; production callers may rely on the defaults below. The
-    # default stacker LLMs go through ``build_llm_with_openrouter_fallback``
-    # so the Metaculus-donated key absorbs cost ahead of the operator's paid
-    # key; see module docstring for cost expectations.
+    # Defaults for any LLM the caller omitted (tests pass all three); the stacker defaults ride the donated-key wrapper.
     if stacker_llm is None:
         stacker_llm = _build_default_stacker_llm()
-    # _UNSET means "caller didn't specify" → build default. Explicit None means
-    # "no fallback" (--no-stacker-fallback) → leave as None.
+    # _UNSET means "not specified", so build the default; an explicit None (--no-stacker-fallback) stays None.
     if fallback_stacker_llm is _UNSET:
         fallback_stacker_llm = _build_default_fallback_stacker_llm()
     if parser_llm is None:
@@ -818,8 +721,7 @@ async def run_stacker_for_arm(
             research_blob=research_blob,
             base_texts=base_texts,
             stacker_llm=stacker_llm,
-            # ``_UNSET`` was replaced by a real GeneralLlm above; only an explicit None
-            # survives, and that means "no fallback chain" (--no-stacker-fallback).
+            # Only an explicit None survives the default fill above, and it means no fallback chain.
             fallback_stacker_llm=cast("GeneralLlm | None", fallback_stacker_llm),
             parser_llm=parser_llm,
             # Production passes ``aggregated_tool_output or None``; mirror that.
@@ -840,12 +742,7 @@ async def run_stacker_for_arm(
     )
 
     if result is None and fallback_stacker_llm is None:
-        # --no-stacker-fallback mode: primary failed, no fallback chain available.
-        # Write the failure payload to cache so the per-question state is preserved
-        # for resume, then RAISE so the orchestrator aborts the run. This is true
-        # fail-fast: a borked-key scenario aborts at qid #1 instead of silently
-        # failing all 88. Resume after manual fix via ``--qids <remaining>`` —
-        # the cache layer auto-skips qids whose arm payload already exists.
+        # Fail fast: a borked key aborts at qid #1 instead of failing all 88; the cached failure survives for resume.
         cell.write_error(reason="stacker_failed_no_fallback", model_used=stacker_model_used, errors=errors_list)
         raise RuntimeError(
             f"Stacker failed for qid={qid} arm={arm} with --no-stacker-fallback set. "

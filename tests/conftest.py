@@ -14,6 +14,9 @@ from forecasting_tools import BinaryQuestion, GeneralLlm, MultipleChoiceQuestion
 # checkout is fine. See `_block_native_egress` for why the guard needs this class specifically.
 from playwright._impl._browser_type import BrowserType as PlaywrightBrowserType
 
+from metaculus_bot.publish_gate import reset_publish_skipped_closed
+from metaculus_bot.publish_hardening import reset_publish_attempt_failures
+from metaculus_bot.research.degradation_views import reset_run_degradation_counters
 from scripts import gha_artifacts
 
 _OPEN = datetime(2026, 1, 1)
@@ -446,6 +449,28 @@ def _clear_gemini_client_cache():
     gsp._cached_client_for_key.cache_clear()
     yield
     gsp._cached_client_for_key.cache_clear()
+
+
+def _zero_alertable_counters() -> None:
+    """Zero every module-global counter ``alertable_count`` sums, as run start does."""
+    reset_run_degradation_counters()
+    reset_publish_attempt_failures()
+    reset_publish_skipped_closed()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_alertable_counters() -> Iterator[None]:
+    """Give every test the fresh-run counters ``forecast_questions`` grants a real run.
+
+    The prediction-market, provider-health, publish-hardening and close-gate counters are
+    module state (each soft-fails with no handle back to the bot), so a degradation one test
+    records reddens a later test's fresh-bot ``alertable_count == 0`` whenever collection puts
+    the two in that order. Two files leaked that way:
+    ``tests/cli/test_cli_provider_degradation.py`` and ``tests/test_provider_flag_and_logging.py``.
+    """
+    _zero_alertable_counters()
+    yield
+    _zero_alertable_counters()
 
 
 @pytest.fixture

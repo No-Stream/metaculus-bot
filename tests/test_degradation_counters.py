@@ -147,6 +147,23 @@ def test_alertable_count_zero_by_default(mock_general_llm):
     assert _bot(mock_general_llm).alertable_count == 0
 
 
+def test_a_leaked_observation_stays_inside_its_own_test(mock_general_llm):
+    """First half of an ORDERED PAIR with the test below, which must stay next to it.
+
+    This one deliberately leaves a degradation in the module-global observation store; the
+    next asserts it is gone. Together they pin conftest's ``_isolate_alertable_counters``,
+    whose absence surfaces only as some unrelated file's fresh-bot ``alertable_count == 0``
+    failing in some collection orders.
+    """
+    observe_venue("kalshi", fields=frozenset())
+    assert _bot(mock_general_llm).alertable_count == 1
+
+
+def test_the_following_test_sees_zeroed_counters(mock_general_llm):
+    """Second half of the pair above: that test's leaked observation must not be visible here."""
+    assert _bot(mock_general_llm).alertable_count == 0
+
+
 @pytest.mark.asyncio
 async def test_run_summary_lines_name_what_they_count(mock_general_llm, caplog):
     """The two end-of-run summary lines are what a future debugger reads first, so

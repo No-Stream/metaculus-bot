@@ -44,7 +44,6 @@ from metaculus_bot.constants import (
     TIME_BUDGET_MIN_VIABLE_S,
     WALL_CLOCK_STACKING_MIN_BUDGET,
 )
-from metaculus_bot.publish_gate import reset_publish_skipped_closed
 from metaculus_bot.research.orchestrator import ResearchOrchestrator
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail, record_provider_detail
 from metaculus_bot.research.provider_fanout import await_providers_within_deadline
@@ -61,17 +60,6 @@ from metaculus_bot.time_budget import (
 )
 from tests.conftest import gather_predictions_stub
 from tests.pipeline_test_helpers import make_e2e_bot, make_real_binary_question
-
-
-@pytest.fixture(autouse=True)
-def _isolate_publish_gate_counter():
-    """The pipeline tests here drive the REAL publish gate, whose skip counter is a module
-    global (prod resets it at run start). Without an after-each reset, a skip recorded in
-    this file leaks into any later-collected suite's fresh-bot ``alertable_count == 0``
-    assertion — observed as an order-dependent failure in test_degradation_counters."""
-    reset_publish_skipped_closed()
-    yield
-    reset_publish_skipped_closed()
 
 
 def _question(close_in: timedelta | None) -> BinaryQuestion:
