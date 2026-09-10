@@ -2381,7 +2381,8 @@ the telemetry markers:
   channel. Note that a lost catalogue pull bumps BOTH this counter and
   `prediction_market_source_losses`, so one outage adds 2 to `alertable_count`;
   that is deliberate over-counting (the two carry different marker fields) and not
-  two separate failures.
+  two separate failures. `prediction_market_source_losses` is alertable by operator
+  decision: any prediction-market source losing a fetch reddens CI.
 
 **One analysis hazard from ranked market retrieval, worth knowing before you diff
 `providers_used` across eras.** The ranker may legitimately return zero rows, in

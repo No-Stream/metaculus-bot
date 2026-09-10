@@ -447,8 +447,7 @@ class TestSignalMarketFieldContract:
             assert rows, f"{venue}: a healthy catalogue must always reach the pool"
             observe_venue(venue, candidates=len(rows), rows=0, fields=_fields_present(rows, venue))
 
-        # Zero RENDERED rows on both, and the signal still reads the real parser state:
-        # these captured payloads populate every declared field, so nothing fires.
+        # Zero rendered rows, yet nothing fires: the payloads populate every declared field.
         assert provider_degradation_findings() == []
 
     def test_presence_on_one_question_of_two_does_not_fire(self) -> None:
@@ -530,9 +529,6 @@ class TestSignalCatalogueEmpty:
         assert provider_degradation_findings() == []
 
 
-# Reset, suppression, and the log line
-
-
 class TestPerRunReset:
     def test_reset_clears_findings(self) -> None:
         """Without a per-run reset the observations leak across runs sharing a
@@ -591,10 +587,7 @@ class TestSuppression:
             log_provider_degradation_summary(DURING_SUPPRESSION)
         messages = [record.getMessage() for record in caplog.records]
 
-        # Visible, not hidden: the marker shows the arithmetic and names the resume
-        # date, and the per-finding line still fires. A run reading alertable=0
-        # alongside real degradation is exactly the shape that most needs a written
-        # record — the drained-donated-key incident is the precedent.
+        # A suppressed finding stays loud; see docs/constants.md "PROVIDER_DEGRADATION_SUPPRESSED_UNTIL".
         marker = next(msg for msg in messages if msg.startswith("PROVIDER_DEGRADATION:"))
         assert "findings=1 alertable=0 suppressed=1" in marker
         assert "manifold:market_field_contract suppressed until 2026-09-10" in marker
@@ -638,8 +631,7 @@ class TestSummaryLine:
         marker = next(msg for msg in caplog.messages if msg.startswith("PROVIDER_DEGRADATION:"))
         assert "findings=0 alertable=0 suppressed=0" in marker
         assert "detail=[]" in marker
-        # A run that recorded nothing must SAY so: this zero-denominator shape is the
-        # "not measured" reading, distinct from the healthy zero the next test pins.
+        # All-zero denominators are the "not measured" reading, not a healthy zero.
         assert "venues_observed=0 catalogues_observed=0 pool_rows=0" in marker
 
     def test_marker_denominators_come_from_the_recorded_observations(self, caplog: pytest.LogCaptureFixture) -> None:

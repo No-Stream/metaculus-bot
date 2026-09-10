@@ -123,32 +123,19 @@ def test_alertable_count_sums_all_degradation_counters(mock_general_llm, monkeyp
     bot._pipeline.counters.stacker_fallback_failed_count = 16
     bot._research_provider_failure_count = 32
     bot._gap_fill_v2_error_count = 64
-    # prediction_market_degraded is read-only — it reads the prediction-market
-    # module's per-run global — so stub the accessor the property imports rather
-    # than bumping the counter 128 times.
+    # A read-only accessor, not a bot attribute; see docs/telemetry_markers.md "DEGRADATION_COUNTERS".
     monkeypatch.setattr(prediction_market, "kalshi_catalogue_fetch_failures", lambda: 128)
-    # Same shape for the source-loss counter (operator decision: any prediction-market
-    # source losing a fetch reddens CI), so a dropped or double-counted ninth term
-    # shows up in the sum.
+    # Read-only too, and alertable by operator decision; see docs/operations.md "Reading run logs".
     monkeypatch.setattr(prediction_market, "prediction_market_source_losses", lambda: 256)
-    # Tenth term: a dead AskNews summarizer silently ships raw ungated articles on
-    # every question.
+    # A dead AskNews summarizer silently ships raw ungated articles on every question.
     bot._summarizer_failure_count = 512
-    # Eleventh term: a provider that populated but degraded — a liquidity field dead
-    # across 100% of a venue's rows, or a venue contributing nothing while its
-    # siblings answered. Same read-only shape as the two above, so stub the accessor
-    # the property imports rather than recording 1024 observations.
+    # Read-only too; a provider that populated but degraded, per docs/telemetry_markers.md "PROVIDER_DEGRADATION".
     monkeypatch.setattr(provider_health, "provider_degradation_count", lambda: 1024)
-    # Twelfth term: a publish POST that exhausted the publish-hardening retry
-    # budget (q45085's 405 shape) — the module global the bot property reads.
+    # The publish-hardening module global, not a bot attribute; see docs/telemetry_markers.md "DEGRADATION_COUNTERS".
     monkeypatch.setattr(publish_hardening, "_PUBLISH_ATTEMPT_FAILURES", 2048)
-    # Thirteenth term: a question whose close time was too near for the full
-    # pipeline, so the optional research stages were dropped (time_budget.py).
+    # A close time too near for the full pipeline, so the optional research stages were dropped.
     bot._time_budget_fast_path_count = 4096
-    # Fourteenth term: budget-driven research degradation OFF the fast path — a
-    # provider cancelled at the research-window deadline or gap-fill cut/skipped
-    # for budget on a question that never fast-pathed (orchestrator-side,
-    # deduplicated per question).
+    # Budget-driven research loss off the fast path; see docs/research.md "Orchestrator implementation notes".
     bot._research.research_budget_cut_count = 8192
 
     assert bot.alertable_count == 16383
@@ -207,9 +194,7 @@ async def test_provider_degradation_rides_the_run_summary(mock_general_llm, capl
     assert "provider_degradation=0" in degradation, degradation
     assert "publish_attempt_failures=0" in degradation, degradation
     assert "publish_skipped_closed=0" in degradation, degradation
-    # The newest key is the tail, and the tail is where the telemetry parser's optional
-    # groups end — appending past it without extending that regex breaks the whole
-    # line's harvest, because the pattern is $-anchored.
+    # The suite pins the tail key order; see docs/telemetry_markers.md "DEGRADATION_COUNTERS".
     assert "time_budget_fast_path=0" in degradation, degradation
     assert degradation.endswith("research_budget_cuts=0"), degradation
     assert any(line.startswith("PROVIDER_DEGRADATION:") for line in caplog.messages), caplog.messages

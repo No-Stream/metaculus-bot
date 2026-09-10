@@ -894,12 +894,33 @@ One deliberate delta from the old spec: a key absent from an era's line is now a
 record rather than explicitly None; read `record.get(key)` and treat both as "this era didn't
 emit it", never as a measured zero.
 
+`tests/test_degradation_counters.py` pins the shape of this line, and three of its pins are worth
+knowing before you edit either side. It drives fourteen of the alertable terms with a distinct power
+of two each, so the resulting sum names exactly which subset was counted and a missing or
+double-counted term is visible rather than merely wrong; `publish_skipped_closed` is the one term
+that sum leaves at zero, and the same file pins its presence on the line separately. Four terms are
+not bot attributes, so the test stubs what the property reads rather than driving the counter: three
+are read-only accessors the bot property imports (`kalshi_catalogue_fetch_failures` and
+`prediction_market_source_losses` on `prediction_market`, `provider_degradation_count` on
+`provider_health`) and the fourth is the `publish_hardening._PUBLISH_ATTEMPT_FAILURES` module global.
+And the suite asserts the line ENDS with the newest counter, `research_budget_cuts`. That last pin
+dates from the `$`-anchored regex, where a key appended past the optional-group tail dropped the whole
+line's harvest; under the generic `kv_pairs` parse the order no longer decides whether a record
+harvests, so what the assertion records now is which counter is newest.
+
 ### PROVIDER_DEGRADATION
 
 Per-run provider-degradation summary (`research/provider_health.py:log_provider_degradation_summary`),
 the positive/negative counterpart to the `provider_degradation` counter on `DEGRADATION_COUNTERS`.
 Aggregates a whole run, so `qid_kind` stays None. Emitted even at `findings=0`, which makes a
 measured zero a recorded fact rather than an absent line.
+
+Two live signals feed `findings`, and both describe a provider that POPULATED but degraded rather
+than one that failed: `market_field_contract` (a declared liquidity field dead across 100% of a
+venue's pool rows) and `catalogue_empty` (a prefetch reported success and handed the local matcher an
+empty catalogue). A third rule, `venue_no_contribution`, was deleted 2026-08-04 with its receipts in
+`research/provider_health.py`'s module docstring, so a venue contributing nothing is now counted only
+when its own prefetch catalogue came back empty.
 
 `detail` is a compact JSON array of findings captured verbatim (it is in `_RAW_FIELDS`): venue and
 field names are delimiter-hostile, and residual analysis `json.loads` it. The trailing suppression
@@ -909,7 +930,9 @@ The observation denominators (`venues_observed` / `catalogues_observed` / `pool_
 2026-08-24) are optional-group wrapped: re-harvesting replays the ~1039 archived lines that
 predate them, and on those a missing group coerces to None, which reads correctly as "not
 recorded", never as a measured zero. They exist because `findings=0` alone is byte-identical
-between a run that evaluated 400 pool rows and one that evaluated nothing.
+between a run that evaluated 400 pool rows and one that evaluated nothing. All three at zero is
+therefore the "nothing was recorded" reading, distinct from the healthy zero of a run that evaluated
+a populated pool, and `tests/test_provider_health.py` pins both shapes.
 
 ### PUBLISH_HARDENING
 
