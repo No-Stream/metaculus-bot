@@ -50,6 +50,7 @@ from metaculus_bot.ablation.claude_cli import (
     _build_argv,
     _extract_inner_result,  # noqa: F401  # re-export: tests/test_ablation_prune.py imports prune._extract_inner_result
     _run_claude_subprocess,
+    excerpt,
 )
 from metaculus_bot.backtest.scoring import GroundTruth
 
@@ -605,7 +606,7 @@ async def _process_batch(
             "Redactor JSON parse failed for qids=%s: %s; raw stdout (first 500 chars): %r",
             qids,
             exc,
-            raw_stdout[:500],
+            excerpt(raw_stdout, limit=500),
         )
         return out
 

@@ -152,6 +152,11 @@ async def _run_claude_subprocess(
     return _extract_inner_result(stdout_text)
 
 
+def excerpt(text: str, *, limit: int) -> str:
+    """The head of ``text`` for a log line or error message; a subagent's blob runs to megabytes."""
+    return text[:limit]
+
+
 def _extract_inner_result(stdout_text: str) -> str:
     """Pull the inner ``result`` field out if Claude emitted a JSON envelope.
 
@@ -176,7 +181,7 @@ def _extract_inner_result(stdout_text: str) -> str:
         # as a misleading downstream parser error.
         logger.warning(
             "claude -p stdout was not parseable JSON; returning raw (first 200 chars: %r)",
-            stripped[:200],  # HARNESS-SCAN-EXEMPT-subsampling  # log-line display truncation
+            excerpt(stripped, limit=200),
         )
         return stripped
     if isinstance(envelope, list):

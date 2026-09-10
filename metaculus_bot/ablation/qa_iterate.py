@@ -36,6 +36,7 @@ from metaculus_bot.ablation.claude_cli import (
     _build_argv,
     _extract_inner_result,  # noqa: F401  # re-export: tests/test_ablation_qa_iterate.py imports qa_iterate._extract_inner_result
     _run_claude_subprocess,
+    excerpt,
 )
 from metaculus_bot.ablation.prune import verbatim_leak_check_passes
 from metaculus_bot.backtest.scoring import GroundTruth
@@ -260,19 +261,19 @@ def _build_re_redactor_prompt(
 def _parse_verifier_response(raw: str, qid: int) -> dict[str, Any]:
     payload = json.loads(raw)
     if not isinstance(payload, dict) or "verdicts" not in payload or not isinstance(payload["verdicts"], list):
-        raise ValueError(f"verifier response missing 'verdicts' list: {raw[:200]!r}")
+        raise ValueError(f"verifier response missing 'verdicts' list: {excerpt(raw, limit=200)!r}")
     for entry in payload["verdicts"]:
         if not isinstance(entry, dict):
             continue
         if entry.get("qid") == qid:
             return cast(dict[str, Any], entry)
-    raise ValueError(f"verifier response has no entry for qid={qid}: {raw[:200]!r}")
+    raise ValueError(f"verifier response has no entry for qid={qid}: {excerpt(raw, limit=200)!r}")
 
 
 def _parse_re_redactor_response(raw: str, qid: int, ground_truth: GroundTruth) -> str:
     payload = json.loads(raw)
     if not isinstance(payload, dict) or "results" not in payload or not isinstance(payload["results"], list):
-        raise ValueError(f"re-redactor response missing 'results' list: {raw[:200]!r}")
+        raise ValueError(f"re-redactor response missing 'results' list: {excerpt(raw, limit=200)!r}")
     for entry in payload["results"]:
         if not isinstance(entry, dict) or entry.get("qid") != qid:
             continue
