@@ -49,6 +49,7 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_HTTP_TIMEOUT,
     RESOLUTION_SOURCE_IMPERSONATE_MIN_BUDGET_S,
     RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
+    RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS,
 )
 from metaculus_bot.research import derived_api, document_cache, fetch_markers, impersonated_fetch
 from metaculus_bot.research.agentic import ladder_adapter, local_document
@@ -896,6 +897,8 @@ _ROBOTS_DISALLOWED_MSG = (
     "look for the same fact on another host."
 )
 
+_PAID_DOCUMENT_READ_CAP_MSG = "Document read not attempted: this question's paid document-read limit is exhausted."
+
 
 async def _fetch_robots_txt(robots_url: str, *, ctx: LadderContext | None = None) -> str | None:
     """Read one robots.txt through the shared ladder's DIRECT fetch; None when we could not.
@@ -932,6 +935,18 @@ async def _url_context_robots_skip(url: str, *, ctx: LadderContext | None = None
     the per-host cache this shares with the Tier-1 reader.
     """
     return await google_extended_blocks_url(url, fetch_text=lambda robots_url: _fetch_robots_txt(robots_url, ctx=ctx))
+
+
+def _take_paid_document_read_attempt(url: str, ctx: LadderContext | None) -> bool:
+    """Claim one paid read from a question context; standalone calls own an independent allowance."""
+    if ctx is None or ctx.shared.take_url_context_attempt():
+        return True
+    logger.info(
+        "agentic read_document: skipping the paid reader for %s — this question's %d paid read(s) are spent",
+        urlparse(url).netloc,
+        RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS,
+    )
+    return False
 
 
 async def _free_route_outcome(url: str, ask: str, held: local_document.HeldDocument) -> ToolOutcome | None:
@@ -991,6 +1006,8 @@ async def read_document(
             status="robots_disallowed",
             method="document",
         )
+    if not _take_paid_document_read_attempt(url, ctx):
+        return _format_fetch_error(_PAID_DOCUMENT_READ_CAP_MSG, method="document")
     try:
         # What the total budget has left (docs/agentic_gap_fill.md, the budget arithmetic).
         text, n_url_success, statuses = await asyncio.wait_for(
