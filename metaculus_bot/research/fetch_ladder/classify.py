@@ -281,6 +281,7 @@ async def _classify_html_body(
     What is load-bearing about the ORDER here — the raw-HTML embed scans, the chart read running
     on every page, and a chart block rescuing a withheld one: docs/architecture.md "The HTML extractor policy, and the one classification path".
     """
+    started = time.monotonic()
     # Raw decoded HTML: trafilatura drops iframes and embed scripts at every setting.
     html_text, undecodable_ratio = decode_text_body(body, content_type)
     charts = extract_datawrapper_charts(html_text)
@@ -303,12 +304,15 @@ async def _classify_html_body(
         links=tuple(links),
         routing_body=_routing_body(body),
     )
+    digest_budget = (
+        float("inf") if remaining_wall_s is None else max(0.0, remaining_wall_s - (time.monotonic() - started))
+    )
     result = await artifact.present_html(
         pol,
         query=query,
         route="direct",
         now=datetime.now(UTC),
-        budget_seconds=max(0.0, remaining_wall_s or 0.0),
+        budget_seconds=digest_budget,
     )
     if result is None:
         raise RuntimeError("fresh HTML artifact was rejected by the policy that classified it")

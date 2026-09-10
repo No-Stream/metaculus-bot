@@ -15,11 +15,9 @@ document we genuinely cannot read (``unreadable_reason``, or an empty
 ``has_text_layer``, which together separate "we could not parse this" from "this is a scan
 with no text layer at all").
 
-``is_pdf_body`` re-implements the ``%PDF-`` half of the private ``_body_is_document`` in
-``research/agentic/fetch_outcomes.py`` rather than importing it: this module is the shared
-foundation the agentic loop calls, so an import in that direction would invert the
-dependency. The one-line magic check is cheaper to duplicate than the inversion is to live
-with, and the two are pinned against each other in ``tests/test_document_text.py``.
+``is_pdf_body`` is the shared ``%PDF-`` magic check used by the fetch ladder's document
+classifier. Keeping the check here leaves the pure text foundation independent of the ladder's
+transport and caller adapters.
 
 Extraction is CPU-bound (pypdf parses and decodes every content stream), so an async
 caller must run ``extract_pdf_text`` in a thread — ``asyncio.to_thread`` — never inline on
@@ -426,19 +424,35 @@ def digest_text(text: str, *, query: str, top_k: int, max_chars: int | None, sou
     way to whoever consumes them, which is what lets one caller serve a PDF and an HTML page
     through one code path.
     """
-    header = f"Document: {source_url}\n{len(text)} chars of text, no page structure"
     passages = select_passages(text, query, top_k=top_k)
-    block = _truncate_digest("\n\n".join([header, _digest_passages(passages, query=query)]), max_chars)
+    block = render_flat_passages(
+        [passage.text for passage in passages],
+        query=query,
+        max_chars=max_chars,
+        source_url=source_url,
+        source_chars=len(text),
+    )
     return DocumentDigest(block=block, passages=len(passages))
 
 
-def render_flat_passages(passages: Sequence[str], *, query: str, max_chars: int | None) -> str:
-    """Render selected page-less passages in the same compact form as a document digest."""
+def render_flat_passages(
+    passages: Sequence[str],
+    *,
+    query: str,
+    max_chars: int | None,
+    source_url: str | None = None,
+    source_chars: int | None = None,
+) -> str:
+    """Render selected page-less passages, optionally with the held-document header."""
+    if (source_url is None) != (source_chars is None):
+        raise ValueError("source_url and source_chars must be provided together")
     cleaned = [passage.strip() for passage in passages if passage.strip()]
     block = _digest_passages(
         [Passage(score=0.0, start=0, end=len(passage), text=passage, page=None) for passage in cleaned],
         query=query,
     )
+    if source_url is not None and source_chars is not None:
+        block = f"Document: {source_url}\n{source_chars} chars of text, no page structure\n\n{block}"
     return _truncate_digest(block, max_chars)
 
 

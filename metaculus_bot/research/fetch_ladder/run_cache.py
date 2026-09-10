@@ -6,6 +6,7 @@ import asyncio
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from datetime import datetime
+from time import monotonic
 from typing import Protocol
 
 from metaculus_bot.research import document_cache, document_text, resolution_presentation
@@ -163,6 +164,7 @@ class HtmlRead:
         budget_seconds: float,
     ) -> FetchResult | None:
         del now
+        started = monotonic()
         prepared = await asyncio.to_thread(self._prepare, policy, route=route)
         if prepared is None or isinstance(prepared, FetchResult):
             return prepared
@@ -172,11 +174,14 @@ class HtmlRead:
             return ordinary
         if len(read.published_text.strip()) <= policy.per_url_max_chars:
             return ordinary
+        digest_budget = budget_seconds - (monotonic() - started)
+        if digest_budget <= 0.0:
+            return ordinary
         digest = policy.digest or bm25_digest
         passages = await digest(
             read.published_text,
             query,
-            budget_seconds=max(0.0, budget_seconds),
+            budget_seconds=digest_budget,
         )
         rendered = await asyncio.to_thread(
             document_text.render_flat_passages, passages.passages, query=query, max_chars=None

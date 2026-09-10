@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
@@ -83,6 +84,76 @@ async def test_long_html_digest_receives_full_text_and_reapplies_leads_and_cap_o
         assert result.fallback_used is False
     assert cached.cache_hit is True
     assert session.requested == [_URL]
+
+
+@pytest.mark.asyncio
+async def test_fresh_html_digest_receives_wall_time_remaining_after_extraction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    full_text = _long_page()
+    budgets: list[float] = []
+
+    def slow_extract(*_args: object, **_kwargs: object) -> PageExtraction:
+        time.sleep(0.01)
+        return PageExtraction(text=full_text)
+
+    async def digest(text: str, query: str, *, budget_seconds: float) -> LadderDigest:
+        del text, query
+        budgets.append(budget_seconds)
+        return LadderDigest(
+            passages=["The tracker reports 917 admissions this week."],
+            passages_returned=1,
+            passages_grounded=1,
+            fallback_used=False,
+            method="llm_extractive",
+        )
+
+    monkeypatch.setattr(classify, "_extract_page_text", slow_extract)
+    monkeypatch.setattr(classify, "render_inline_chart_data", lambda *_args: "")
+    monkeypatch.setattr(classify, "unreadable_data_embed_providers", lambda *_args: [])
+    policy = replace(RESOLUTION_SOURCE_POLICY, digest=digest)
+    classified = await classify._classify_html_body(
+        b"<html><body>page</body></html>",
+        _URL,
+        "text/html",
+        http_status=200,
+        query="weekly admissions",
+        remaining_wall_s=0.2,
+        pol=policy,
+    )
+
+    assert classified.result.status == "success"
+    assert len(budgets) == 1
+    assert 0.0 < budgets[0] < 0.2
+
+
+@pytest.mark.asyncio
+async def test_html_digest_is_skipped_when_presentation_has_used_the_wall(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = AsyncMock(side_effect=AssertionError("an expired HTML budget must not call the digest seat"))
+    artifact = run_cache.HtmlRead(
+        url=_URL,
+        http_status=200,
+        content_type="text/html",
+        extraction=PageExtraction(text=_long_page()),
+        chart_block="",
+        datawrapper_charts=(),
+        unreadable_embeds=(),
+        links=(),
+        routing_body=b"<html>",
+    )
+    result = await artifact.present_html(
+        replace(RESOLUTION_SOURCE_POLICY, digest=digest),
+        query="weekly admissions",
+        route="direct",
+        now=datetime.now(UTC),
+        budget_seconds=0.0,
+    )
+
+    assert result is not None
+    assert result.status == "success"
+    digest.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -273,6 +344,32 @@ async def test_subfloor_flat_no_match_still_falls_through_to_paid_reader_when_op
 
     assert outcome.method == "document"
     assert outcome.content_markdown == "Paid reader answer."
+    digest.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_subfloor_flat_matching_passage_stays_local_even_when_digest_grounding_count_is_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    held = local_document.HeldDocument(text="The tracker reports 917 admissions this week.")
+    digest = AsyncMock(
+        return_value=LadderDigest(
+            passages=["The tracker reports 917 admissions this week."],
+            passages_returned=0,
+            passages_grounded=0,
+            fallback_used=True,
+            method="digest_local",
+        )
+    )
+    monkeypatch.setattr(agentic_tools, "GAP_FILL_DOCUMENT_POLICY", replace(GAP_FILL_DOCUMENT_POLICY, digest=digest))
+    monkeypatch.setattr(agentic_tools, "_acquire_local_document", AsyncMock(return_value=held))
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+
+    outcome = await agentic_tools.read_document(_URL, "weekly admissions")
+
+    assert outcome.method == "digest_local"
+    assert "Document: https://tracker.example.com/digest" in outcome.content_markdown
+    assert "917 admissions" in outcome.content_markdown
     digest.assert_awaited_once()
 
 
