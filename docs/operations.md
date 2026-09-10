@@ -698,7 +698,8 @@ per-question cost is about $3 (the post-650 smoke spent $3.17), all of it on the
 personal keys.
 `--mode mantic` runs the whole per-question pipeline unchanged and swaps only the
 platform client. Everything in this section was verified against the live API on
-2026-09-08.
+2026-09-08, and the post-651 per-bin smoke of 2026-09-09 re-verified the publish path (see
+"Running it" below).
 
 The current target is Preseason 2: slug `preseason-2` (`MANTIC_TOURNAMENT_ID`),
 project id 4, forecasting closes 2026-09-20 12:00 UTC (`MANTIC_TOURNAMENT_END_DATE`),

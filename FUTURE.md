@@ -2525,8 +2525,19 @@ them OUT of feature work, land as their own PRs.
 - **~~Hoist `tests/test_cli.py`'s 17 redundant function-level imports~~ (added 2026-09-09; DONE
   2026-09-09).** The operator reversed the marker rule the same evening (deleting a marker by
   fixing the code it excused is always welcome), `8b77859` hoisted the 17 imports, and the
-  1,927-line file was then split into the `tests/cli/` package (nine themed modules, fixtures in
-  its `conftest.py`, the shared harness in `tests/cli_test_helpers.py`) on the housekeeping branch.
+  1,927-line file was then split into the `tests/cli/` package in `0f4ffa3` (eight themed
+  modules, fixtures in its `conftest.py`, the shared harness in `tests/cli_test_helpers.py`;
+  `tests/test_cli_run_summary.py` joined the package as the ninth module in `9479084`).
+- **Remaining broad excepts in `metaculus_bot/ablation/` (added 2026-09-10).** The 2026-09-09
+  housekeeping pass converted only `ablation/research.py` (its brief named those two sites). Still
+  carrying a blanket `except Exception`: `run_stacker.py` lines 617, 639 and 670 (three
+  `HARNESS-SCAN-EXEMPT-broad-except` markers, each translating a stacker failure into a cached
+  error payload), `forecasters.py` lines 493, 591 and 842 (`# noqa: BLE001`), `prune.py` line 597
+  and `qa_iterate.py` line 497. Each is a per-question or per-arm soft-fail boundary in the paid
+  harness, so convert them in one pass on the shape `research.py` now has (`asyncio.gather` with
+  `return_exceptions=True`, non-`Exception` outcomes re-raised, the rest logged with the traceback
+  and mapped to the failure payload), with the operator's say, since each moves where a paid run
+  stops.
 
 ## Medium-term (requires more exploration)
 
