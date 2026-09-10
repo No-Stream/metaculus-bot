@@ -1856,8 +1856,13 @@ holds the shared per-host politeness semaphore from `http_fetch`. Bodies stream 
 `read_body_capped` under `SEC_EDGAR_MAX_RESPONSE_BYTES` (16 MiB, because a large filer's
 companyfacts is 7.9 MB and Oracle's inline-XBRL 10-K is 6.9 MB, both past the 5 MiB page cap).
 No retries: a 403 is a policy verdict and a 429 is the ceiling itself, and either raises
-`SecEdgarError` with the status and SEC's body snippet. The transport is `http_fetch.build_session`
-with the 20 s `RESOLUTION_SOURCE_HTTP_TIMEOUT`.
+`SecEdgarError` with the status and SEC's body snippet. Redirects are refused rather than
+followed, because every URL the client dials is a documented endpoint or an Archives document and
+a followed hop would escape the spacer, the host gate and the EDGAR host check while still carrying
+the fair-access User-Agent. The transport is `http_fetch.build_session` with the 20 s
+`RESOLUTION_SOURCE_HTTP_TIMEOUT`. One server behaviour the client works around: the full-text
+search drops its `file_date` filter entirely when only one of `startdt` / `enddt` is sent (probed
+2026-09-09), so a one-sided range is completed with 2001-01-01 or today before it travels.
 
 **The operator's one manual step, before it is wired in:** set `SEC_EDGAR_CONTACT_EMAIL` in the
 local `.env` (see `.env.template`) and as a GitHub Actions secret surfaced into every bot

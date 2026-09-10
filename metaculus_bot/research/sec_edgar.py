@@ -29,7 +29,7 @@ import time
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from typing import Any
 from urllib.parse import urlparse
 
@@ -43,7 +43,7 @@ from metaculus_bot.constants import (
     SEC_EDGAR_USER_AGENT_TEMPLATE,
 )
 from metaculus_bot.research.http_fetch import (
-    MAX_REDIRECTS,
+    REDIRECT_STATUSES,
     build_session,
     host_semaphores,
     read_body_capped,
@@ -62,6 +62,9 @@ FULL_TEXT_SEARCH_BASE_URL = "https://efts.sec.gov"
 _ACCEPT_ENCODING = "gzip, deflate"
 
 _FRAME_PERIOD_RE = re.compile(r"CY\d{4}(?:Q[1-4]I?)?\Z")
+
+# EDGAR full-text search indexes filings from 2001 on; the lower bound a one-sided range is completed with.
+FULL_TEXT_SEARCH_EARLIEST_DATE = date(2001, 1, 1)
 
 
 class SecEdgarError(RuntimeError):
@@ -114,7 +117,7 @@ class RequestSpacer:
             now = time.monotonic()
             if now < self._next_start:
                 await asyncio.sleep(self._next_start - now)
-                now = self._next_start
+                now = time.monotonic()
             self._next_start = now + self._min_interval_s
 
 
@@ -160,10 +163,20 @@ async def edgar_session() -> AsyncIterator[aiohttp.ClientSession]:
 async def _get_bytes(
     session: aiohttp.ClientSession, url: str, params: dict[str, str] | None = None
 ) -> tuple[bytes, str, str]:
-    """One spaced, host-gated, byte-capped GET: ``(body, content_type, final_url)``; raises on anything else."""
+    """One spaced, host-gated, byte-capped GET: ``(body, content_type, final_url)``; raises on anything else.
+
+    Redirects are refused rather than followed: every URL here is a documented endpoint or an
+    Archives document, so a 3xx is unexpected, and following it would dial a hop the spacer, the host
+    gate and the EDGAR host check never saw while still carrying the fair-access User-Agent.
+    """
     async with semaphore_for_host(url, host_semaphores()):
         await request_spacer().wait()
-        async with session.get(url, params=params, max_redirects=MAX_REDIRECTS) as resp:
+        async with session.get(url, params=params, allow_redirects=False) as resp:
+            if resp.status in REDIRECT_STATUSES:
+                location = resp.headers.get("Location")
+                raise SecEdgarError(
+                    f"EDGAR redirected {url} to {location!r}; this client dials documented endpoints only"
+                )
             if resp.status != 200:
                 snippet = await read_body_snippet(resp)
                 raise SecEdgarError(f"EDGAR answered HTTP {resp.status} for {url}: {snippet!r}")
@@ -177,7 +190,7 @@ async def _get_json(session: aiohttp.ClientSession, url: str, params: dict[str, 
     body, _content_type, _final_url = await _get_bytes(session, url, params)
     try:
         return json.loads(body)
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise SecEdgarError(f"EDGAR body for {url} is not JSON: {exc}") from exc
 
 
@@ -440,16 +453,20 @@ async def full_text_search(
     *,
     date_from: date | None = None,
     date_to: date | None = None,
-    forms: Sequence[str] = (),
+    forms: str | Sequence[str] = (),
 ) -> SearchResults:
-    """EDGAR full-text search over filings since 2001; ``forms`` filters on the root form type (``10-K``, ``8-K``)."""
+    """EDGAR full-text search over filings since 2001; ``forms`` filters on the root form type (``10-K``, ``8-K``).
+
+    A one-sided date range is completed with the index's earliest date or today, because the server
+    silently drops the whole ``file_date`` filter when either bound is missing (probed 2026-09-09).
+    """
+    if isinstance(forms, str):
+        forms = (forms,)
     params = {"q": query}
     if date_from is not None or date_to is not None:
         params["dateRange"] = "custom"
-    if date_from is not None:
-        params["startdt"] = date_from.isoformat()
-    if date_to is not None:
-        params["enddt"] = date_to.isoformat()
+        params["startdt"] = (date_from or FULL_TEXT_SEARCH_EARLIEST_DATE).isoformat()
+        params["enddt"] = (date_to or datetime.now(tz=UTC).date()).isoformat()
     if forms:
         params["forms"] = ",".join(forms)
     payload = await _get_json(session, f"{FULL_TEXT_SEARCH_BASE_URL}/LATEST/search-index", params)
@@ -471,13 +488,19 @@ class FilingDocument:
     body: bytes
 
 
-def _edgar_hosts() -> frozenset[str]:
-    return frozenset(urlparse(base).netloc for base in (WWW_BASE_URL, DATA_BASE_URL, FULL_TEXT_SEARCH_BASE_URL))
+def _edgar_hostnames() -> frozenset[str]:
+    return frozenset(urlparse(base).hostname or "" for base in (WWW_BASE_URL, DATA_BASE_URL, FULL_TEXT_SEARCH_BASE_URL))
+
+
+def is_edgar_url(url: str) -> bool:
+    """Whether ``url`` is an HTTP(S) URL on one of the EDGAR hosts this client dials; hostnames compare case-insensitively."""
+    parsed = urlparse(url)
+    return parsed.scheme.lower() in ("http", "https") and (parsed.hostname or "") in _edgar_hostnames()
 
 
 async def filing_document(session: aiohttp.ClientSession, url: str) -> FilingDocument:
     """Fetch one document from the EDGAR archive under the byte cap. Only EDGAR hosts: the User-Agent is theirs."""
-    if urlparse(url).netloc not in _edgar_hosts():
+    if not is_edgar_url(url):
         raise ValueError(f"{url} is not on an EDGAR host; this client dials sec.gov only")
     body, content_type, final_url = await _get_bytes(session, url)
     return FilingDocument(url=final_url, content_type=content_type, body=body)
