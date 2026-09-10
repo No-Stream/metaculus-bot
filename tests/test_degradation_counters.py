@@ -110,7 +110,8 @@ def test_forecaster_reads_a_fresh_snapshot_after_counter_updates(mock_general_ll
 
 
 def test_alertable_count_sums_all_degradation_counters(mock_general_llm, monkeypatch):
-    """Property must sum all thirteen degradation counters. Using distinct powers of 2
+    """Property must sum every degradation counter: fourteen of ``alertable_total``'s fifteen
+    terms are driven here (``publish_skipped_closed`` is pinned on the summary line below). Using distinct powers of 2
     makes an off-by-one or missing-counter bug visible: the resulting sum
     uniquely identifies which subset was counted.
     """

@@ -908,6 +908,23 @@ dates from the `$`-anchored regex, where a key appended past the optional-group 
 line's harvest; under the generic `kv_pairs` parse the order no longer decides whether a record
 harvests, so what the assertion records now is which counter is newest.
 
+What the counters mean, moved here from the `format_degradation_summary` docstring.
+`research_budget_cuts` is the off-fast-path complement of `time_budget_fast_path`: a question whose
+window cleared the fast-path threshold but whose research window still cut a provider or a gap-fill
+pass (deduplicated per question, orchestrator-side); without it that band's degradation was
+invisible to the counter contract and the all-clear census. The three publish-side counters mean
+three different things, which is why they are three keys: `questions_failed_to_publish` counts
+questions the min-forecasters floor kept from attempting publication; `publish_attempt_failures`
+counts attempted POSTs that exhausted the publish-hardening retry budget (the q45085 405 shape the
+old counter could not see); `publish_skipped_closed` counts questions whose publish the close-time
+gate skipped before any POST, so latency cost the question. The oldest key's name is misleading but
+stays, because renaming it would silently drop the field from every historical record the parser
+replays. `time_budget_fast_path` is the fourth member of that family and the earliest of them: it
+counts questions whose close time was too near for the full pipeline's worst case, so the optional
+research stages were dropped to protect the prediction POST. The three above fire once a publish
+has already failed or been withheld; this one fires while the question is still savable, which is
+why it is worth alerting on separately.
+
 ### PROVIDER_DEGRADATION
 
 Per-run provider-degradation summary (`research/provider_health.py:log_provider_degradation_summary`),
