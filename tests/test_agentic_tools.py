@@ -60,6 +60,7 @@ from metaculus_bot.research.impersonated_fetch import (
     IMPERSONATE_TRIGGER_STATUSES,
     ImpersonateBodyTooLarge,
     ImpersonateBudgetExhausted,
+    ImpersonateDeclined,
     ImpersonatedResponse,
     ImpersonateHopRefused,
     ImpersonatePinNotHeld,
@@ -69,7 +70,9 @@ from metaculus_bot.research.impersonated_fetch import (
     reset_impersonation_memo,
 )
 from metaculus_bot.research.resolution_fetch_result import FetchResult, FetchStatus, FetchStatusReason
+from metaculus_bot.research.robots_policy import robots_txt_url
 from metaculus_bot.research.wayback import wayback_snapshot_url
+from scripts.telemetry.markers import MARKER_SPECS, qid_from_ref
 from tests.playwright_fakes import FakeBrowser, FakeChromium, FakePage, FakePlaywrightManager, install_fake_playwright
 from tests.resolution_source_fakes import _escape_config, _fake_render, _impersonated, fake_impersonated_fetch
 from tests.test_document_text import build_text_pdf
@@ -4001,6 +4004,77 @@ class TestPlainHtmlExtractionPolicy:
         assert result.url == "https://example.com/real/page"
         assert "Resolving content read from the refresh target." in result.text
         assert session.calls == [("https://example.com/stub", False), ("https://example.com/real/page", False)]
+
+
+class TestTheLoopEmitsTheSharedFetchMarkers:
+    """The per-URL fetch record this loop never had, on the markers the fetcher already emits.
+
+    Both lines are data contracts: the research archive matches them by regex on the exact field
+    order (``scripts/telemetry/markers.py``), so a line the loop emits has to PARSE through the
+    registered spec rather than merely look right.
+    """
+
+    def _arm_a_refused_host(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A 403 the impersonated retry is offered and declines, so both markers have content."""
+        _serve_direct(monkeypatch, _direct("blocked", http_status=403))
+        monkeypatch.setattr(impersonated_fetch, "IMPERSONATE_TRIGGER_STATUSES", frozenset({403}))
+        monkeypatch.setattr(rungs, "fetch_impersonated", AsyncMock(side_effect=ImpersonateDeclined("declined")))
+
+    @pytest.mark.asyncio
+    async def test_a_fetch_emits_one_parseable_fetch_line_naming_this_caller(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        self._arm_a_refused_host(monkeypatch)
+
+        with caplog.at_level("INFO", logger="metaculus_bot.research.agentic.tools"):
+            await agentic_tools.fetch(_URL)
+
+        (fetch_line,) = [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")]
+        spec = next(s for s in MARKER_SPECS if s.name == "resolution_source_fetch")
+        match = spec.regex.search(fetch_line)
+        assert match is not None
+        assert match.group("caller") == "gap_fill_v2"
+        # `question=None`, as this loop's three event markers are: a tool call holds no question id.
+        assert qid_from_ref(match.group("question")) is None
+        assert match.group("status") == "blocked"
+        assert match.group("http") == "403"
+
+    @pytest.mark.asyncio
+    async def test_every_rung_that_fired_emits_one_parseable_escalation_line(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        self._arm_a_refused_host(monkeypatch)
+
+        with caplog.at_level("INFO", logger="metaculus_bot.research.agentic.tools"):
+            await agentic_tools.fetch(_URL)
+
+        spec = next(s for s in MARKER_SPECS if s.name == "resolution_source_escalation")
+        fired = []
+        for line in [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_ESCALATION:")]:
+            match = spec.regex.search(line)
+            assert match is not None, line
+            assert match.group("caller") == "gap_fill_v2"
+            fired.append(match.group("rung"))
+        assert "impersonate" in fired
+
+    @pytest.mark.asyncio
+    async def test_the_robots_pre_check_is_not_recorded_as_a_fetch_the_driver_made(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """It is a gate on the paid rung, not a URL the driver asked for."""
+        robots_url = robots_txt_url(_URL)
+        policy_body = "User-agent: *\nAllow: /"
+        _serve_direct(
+            monkeypatch,
+            {robots_url: _direct("success", url=robots_url, text=policy_body, content_type="text/plain")},
+        )
+
+        with caplog.at_level("INFO", logger="metaculus_bot.research.agentic.tools"):
+            body = await agentic_tools._fetch_robots_txt(robots_url)
+
+        # The verdict with no content floor is the point: a 22-character policy is its own text.
+        assert body == policy_body
+        assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == []
 
 
 class TestGapFillV2WaybackRung:
