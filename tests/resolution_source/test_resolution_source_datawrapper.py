@@ -1012,8 +1012,8 @@ class TestEmbedShellPageStillHops:
             await resolution_source_provider(is_benchmarking=False)(q)
 
         assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
-            f"RESOLUTION_SOURCE_FETCH: question={q.id_of_question} url={PAGE_URL} status=ok http=200 embeds=none",
-            f"RESOLUTION_SOURCE_FETCH: question={q.id_of_question} url={DATASET_URL} status=ok http=200 embeds=none",
+            f"RESOLUTION_SOURCE_FETCH: question={q.id_of_question} url={PAGE_URL} status=ok http=200 embeds=none caller=resolution_source",
+            f"RESOLUTION_SOURCE_FETCH: question={q.id_of_question} url={DATASET_URL} status=ok http=200 embeds=none caller=resolution_source",
         ]
 
 
@@ -1105,9 +1105,9 @@ class TestProviderEndToEnd:
             await resolution_source_provider(is_benchmarking=False)(q)
 
         assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
-            f"RESOLUTION_SOURCE_FETCH: question={q.id_of_question} url={PAGE_URL} status=ok http=200 embeds=none",
+            f"RESOLUTION_SOURCE_FETCH: question={q.id_of_question} url={PAGE_URL} status=ok http=200 embeds=none caller=resolution_source",
             f"RESOLUTION_SOURCE_FETCH: question={q.id_of_question} url={DATASET_URL} "
-            "status=blocked http=403 embeds=none failure_class=http_403 server=apache/2.4.62_(debian)",
+            "status=blocked http=403 embeds=none failure_class=http_403 server=apache/2.4.62_(debian) caller=resolution_source",
         ]
 
     async def test_a_hop_that_never_got_a_response_reports_its_transport_class(self, monkeypatch, caplog):
@@ -1127,9 +1127,9 @@ class TestProviderEndToEnd:
             await resolution_source_provider(is_benchmarking=False)(q)
 
         assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
-            f"RESOLUTION_SOURCE_FETCH: question={q.id_of_question} url={PAGE_URL} status=ok http=200 embeds=none",
+            f"RESOLUTION_SOURCE_FETCH: question={q.id_of_question} url={PAGE_URL} status=ok http=200 embeds=none caller=resolution_source",
             f"RESOLUTION_SOURCE_FETCH: question={q.id_of_question} url={DATASET_URL} "
-            "status=error http=n/a embeds=none failure_class=connection exc=ClientError",
+            "status=error http=n/a embeds=none failure_class=connection exc=ClientError caller=resolution_source",
         ]
 
     async def test_datasets_cannot_evict_cited_page_text(self, monkeypatch):

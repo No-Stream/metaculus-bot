@@ -146,6 +146,9 @@ FetchStatus = Literal[
 # `blocked` because that spelling is the contract; the reason is what keeps the paid rung off the
 # URL (`_url_context_rung_applies`), the way `ssrf_blocked` is kept out of its trigger set, and
 # what separates "the host refused us" from "we refused the host" on the fetch marker.
+#
+# `oversize_document` and `image_needs_reader` are the two bodies a caller declined to READ; only the
+# gap-fill verdict produces them (docs/architecture.md "What a verdict decides").
 FetchStatusReason = Literal[
     "embed_shell",
     "thin_page",
@@ -157,6 +160,8 @@ FetchStatusReason = Literal[
     "parse_contention",
     "not_addressed",
     "metaculus_self_ref",
+    "oversize_document",
+    "image_needs_reader",
 ]
 
 # Why a RUNG ATTEMPT never ran, carried on `RungAttempt.skipped_reason` (empty when the rung
@@ -236,7 +241,9 @@ FetchStatusReason = Literal[
 #   `read_document` of a URL no question cited). The memo doing its job rather than a
 #   failure, the same distinction `rendered_no_text` draws for the browser; folded into the fired
 #   count it would read as a host refusing us twice.
+# `rung_not_enabled` — the caller's policy does not carry this rung (docs/architecture.md, the knob table).
 RungSkipReason = Literal[
+    "rung_not_enabled",
     "wall_budget",
     "wayback_cap",
     "url_context_cap",
@@ -483,6 +490,10 @@ class FetchResult:
     # `precision_fallback_rescues`), so no status or reason token moved.
     chrome_metric_withheld: bool = False
     precision_rescued: bool = False
+    # Empty unless `policy.collect_links`, so an archived record stays byte-identical (see the doc).
+    links: list[str] = field(default_factory=list)
+    # The caller's thin-content signal (`policy.thin_content_escalation_chars`); False for the fetcher.
+    escalate_rendered: bool = False
     # Provenance for Tier-2 dataset results (None on ordinary page fetches).
     chart_id: str | None = None
     chart_title: str | None = None

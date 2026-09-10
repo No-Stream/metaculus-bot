@@ -98,5 +98,5 @@ class TestNetworkFailureClass:
 
         assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
             "RESOLUTION_SOURCE_FETCH: question=999 url=https://host.example.com/report "
-            "status=error http=n/a embeds=none failure_class=malformed_response exc=ClientResponseError"
+            "status=error http=n/a embeds=none failure_class=malformed_response exc=ClientResponseError caller=resolution_source"
         ]

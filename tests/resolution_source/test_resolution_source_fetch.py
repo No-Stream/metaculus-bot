@@ -20,11 +20,11 @@ import aiohttp
 import pytest
 
 from metaculus_bot.research import impersonated_fetch, resolution_chart_data, resolution_presentation, resolution_source
-from metaculus_bot.research.fetch_ladder import classify, direct_fetch, guard, rungs
-from metaculus_bot.research.fetch_ladder.classify import looks_like_js_wall, looks_like_page_chrome
+from metaculus_bot.research.fetch_ladder import classify, direct_fetch, guard, rungs, verdict
 from metaculus_bot.research.fetch_ladder.context import LadderContext
 from metaculus_bot.research.fetch_ladder.ladder import _fetch_one
 from metaculus_bot.research.fetch_ladder.policy import RESOLUTION_SOURCE_POLICY
+from metaculus_bot.research.fetch_ladder.verdict import looks_like_js_wall, looks_like_page_chrome
 from metaculus_bot.research.http_fetch import host_semaphores, pdf_parse_semaphore, semaphore_for_host
 from metaculus_bot.research.impersonated_fetch import IMPERSONATE_TRIGGER_STATUSES
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail
@@ -54,6 +54,7 @@ from tests.resolution_source_fakes import (
     _mid_band_chart_page,
     _mock_question,
     _prose_page,
+    capped_ctx,
     cdc_aria_stat_block_page,
     fake_impersonated_fetch,
 )
@@ -63,11 +64,10 @@ from tests.test_document_text import build_text_pdf
 class TestFetchOne:
     async def test_success_html_extracts_and_truncates(self, article_html, monkeypatch):
         # Tighten the per-URL cap so we can also verify truncation lands.
-        monkeypatch.setattr(resolution_presentation, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", 200)
         session = FakeSession(
             {"https://news.example.com/report": FakeResponse(200, body=article_html, content_type="text/html")}
         )
-        result = await _fetch_one(session, "https://news.example.com/report", {})
+        result = await _fetch_one(session, "https://news.example.com/report", {}, capped_ctx(200))
         assert result.status == "success"
         assert result.http_status == 200
         # Real trafilatura ran on the article — a known substring survives.
@@ -81,22 +81,20 @@ class TestFetchOne:
         # When truncation fires, a marker line naming the cap and URL must
         # appear, and total text length must remain bounded by the cap.
         cap = 200
-        monkeypatch.setattr(resolution_presentation, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", cap)
         session = FakeSession(
             {"https://news.example.com/report": FakeResponse(200, body=article_html, content_type="text/html")}
         )
-        result = await _fetch_one(session, "https://news.example.com/report", {})
+        result = await _fetch_one(session, "https://news.example.com/report", {}, capped_ctx(cap))
         assert result.status == "success"
         assert f"[truncated at {cap} chars — full source at https://news.example.com/report]" in result.text
         assert len(result.text) <= cap
 
     async def test_no_truncation_marker_when_fits_under_cap(self, article_html, monkeypatch):
         # Extraction fits entirely under the cap -> NO marker appended.
-        monkeypatch.setattr(resolution_presentation, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", 100_000)
         session = FakeSession(
             {"https://news.example.com/report": FakeResponse(200, body=article_html, content_type="text/html")}
         )
-        result = await _fetch_one(session, "https://news.example.com/report", {})
+        result = await _fetch_one(session, "https://news.example.com/report", {}, capped_ctx(100_000))
         assert result.status == "success"
         assert "truncated at" not in result.text
 
@@ -148,12 +146,11 @@ class TestFetchOne:
 
     async def test_json_content_type_returns_raw_truncated(self, monkeypatch):
         cap = 200
-        monkeypatch.setattr(classify, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", cap)
         payload = b'{"vulnerabilities":[{"cveID":"CVE-2026-0001","description":"' + b"x" * 500 + b'"}]}'
         session = FakeSession(
             {"https://json.example.com/kev": FakeResponse(200, body=payload, content_type="application/json")}
         )
-        result = await _fetch_one(session, "https://json.example.com/kev", {})
+        result = await _fetch_one(session, "https://json.example.com/kev", {}, capped_ctx(cap))
         assert result.status == "success"
         assert result.content_type is not None
         assert "json" in result.content_type
@@ -338,10 +335,9 @@ class TestEmbedShapedPages:
         # The note is budgeted out of the cap (like the Tier-2 dataset lead), never added
         # on top of it, so the per-URL bound the section budget relies on still holds.
         cap = 500
-        monkeypatch.setattr(resolution_presentation, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", cap)
         session = FakeSession({"https://t.example.com/p": FakeResponse(200, body=tracker_with_infogram_html)})
 
-        result = await _fetch_one(session, "https://t.example.com/p", {})
+        result = await _fetch_one(session, "https://t.example.com/p", {}, capped_ctx(cap))
 
         assert result.status == "success"
         assert len(result.text) <= cap
@@ -358,7 +354,8 @@ class TestEmbedShapedPages:
         prevent. Sizes are derived from the prod constants so the scenario stays a REACHABLE
         one: earlier full-size pages spend most of the total, and the embed page lands last.
         """
-        per_url = resolution_presentation.RESOLUTION_SOURCE_PER_URL_MAX_CHARS
+        per_url = RESOLUTION_SOURCE_POLICY.per_url_max_chars
+        assert per_url is not None
         total = resolution_presentation.RESOLUTION_SOURCE_TOTAL_MAX_CHARS
         leftover = per_url // 2  # what the embed page is left to render in
         spend = total - leftover
@@ -380,7 +377,7 @@ class TestEmbedShapedPages:
             for i, size in enumerate(filler_sizes)
         ]
         embed_text = resolution_presentation._page_text_with_leads(
-            "lorem ipsum " * (per_url // 2), "https://tracker.example.com/senate", ["infogram"]
+            "lorem ipsum " * (per_url // 2), "https://tracker.example.com/senate", ["infogram"], "", cap=per_url
         )
         embed = FetchResult(
             url="https://tracker.example.com/senate",
@@ -466,7 +463,7 @@ class TestEmbedShapedPages:
         that carries the resolving content at exactly 401 chars
         (myfloridaelections.com's election-date table), so the floor has to withhold at
         399 and publish at 401 or it is throwing away terse-but-real data tables."""
-        floor = classify.RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS
+        floor = verdict.RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS
         # Trafilatura keeps the <article> paragraph verbatim, so the extraction length is
         # the paragraph length; "ab " * n is a word-shaped filler it does not collapse.
         above = _prose_page("ab " * ((floor + 40) // 3))
@@ -811,10 +808,9 @@ class TestInlineChartData:
         # Same rule as the embed disclosure: leads come OUT of the per-URL cap, never on
         # top of it, so the aggregate section budget's arithmetic still holds.
         cap = 400
-        monkeypatch.setattr(resolution_presentation, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", cap)
         session = FakeSession({"https://iom.example.com/med": FakeResponse(200, body=_iom_shaped_page())})
 
-        result = await _fetch_one(session, "https://iom.example.com/med", {})
+        result = await _fetch_one(session, "https://iom.example.com/med", {}, capped_ctx(cap))
 
         assert result.status == "success"
         assert len(result.text) <= cap
@@ -846,9 +842,9 @@ class TestResolutionSourceFetchMarker:
         # The 403 carries its failure_class (server absent: the fake response sends no Server
         # header), which is what separates an egress-reputation refusal from a host fault.
         assert lines == [
-            "RESOLUTION_SOURCE_FETCH: question=999 url=https://www.bls.gov/cpi/ status=ok http=200 embeds=none",
+            "RESOLUTION_SOURCE_FETCH: question=999 url=https://www.bls.gov/cpi/ status=ok http=200 embeds=none caller=resolution_source",
             "RESOLUTION_SOURCE_FETCH: question=999 url=https://cbp.gov/data "
-            "status=blocked http=403 embeds=none failure_class=http_403",
+            "status=blocked http=403 embeds=none failure_class=http_403 caller=resolution_source",
         ]
 
     async def test_a_spaced_server_header_stays_one_marker_token(self, monkeypatch, caplog):
@@ -877,7 +873,7 @@ class TestResolutionSourceFetchMarker:
         (line,) = [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")]
         assert line == (
             "RESOLUTION_SOURCE_FETCH: question=999 url=https://cbp.gov/data "
-            "status=blocked http=403 embeds=none failure_class=http_403 server=apache/2.4.62_(debian)"
+            "status=blocked http=403 embeds=none failure_class=http_403 server=apache/2.4.62_(debian) caller=resolution_source"
         )
         spec = next(s for s in MARKER_SPECS if s.name == "resolution_source_fetch")
         match = spec.regex.search(line)
@@ -893,6 +889,7 @@ class TestResolutionSourceFetchMarker:
             "failure_class": "http_403",
             "exc": None,
             "server": "apache/2.4.62_(debian)",
+            "caller": "resolution_source",
         }
 
     async def test_the_marker_names_the_unreadable_embed_providers(
@@ -912,7 +909,7 @@ class TestResolutionSourceFetchMarker:
 
         assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
             "RESOLUTION_SOURCE_FETCH: question=999 url=https://www.racetothewh.com/senate/26 "
-            "status=ok http=200 embeds=infogram"
+            "status=ok http=200 embeds=infogram caller=resolution_source"
         ]
 
     async def test_the_marker_names_which_rule_withheld_the_page(self, infogram_shell_html, monkeypatch, caplog):
@@ -934,9 +931,9 @@ class TestResolutionSourceFetchMarker:
 
         assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
             "RESOLUTION_SOURCE_FETCH: question=999 url=https://tracker.example.com/senate "
-            "status=no_resolving_content http=200 embeds=infogram reason=embed_shell",
+            "status=no_resolving_content http=200 embeds=infogram reason=embed_shell caller=resolution_source",
             "RESOLUTION_SOURCE_FETCH: question=999 url=https://data.example.com/ "
-            "status=no_resolving_content http=200 embeds=none reason=thin_page",
+            "status=no_resolving_content http=200 embeds=none reason=thin_page caller=resolution_source",
         ]
 
     async def test_a_fetch_that_never_got_a_response_reports_http_n_a(self, monkeypatch, caplog):
@@ -952,7 +949,7 @@ class TestResolutionSourceFetchMarker:
         # timeout from a TLS or DNS refusal without re-scraping the run log.
         assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
             "RESOLUTION_SOURCE_FETCH: question=999 url=https://slow.example.com/x "
-            "status=error http=n/a embeds=none failure_class=timeout exc=TimeoutError"
+            "status=error http=n/a embeds=none failure_class=timeout exc=TimeoutError caller=resolution_source"
         ]
 
     async def test_no_fetch_is_logged_twice(self, article_html, monkeypatch, caplog):
@@ -996,7 +993,7 @@ class TestResolutionSourceFetchMarker:
 
         assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
             "RESOLUTION_SOURCE_FETCH: question=999 url=https://cdc.example.com/data/current "
-            "status=ok http=200 embeds=none route=meta_refresh"
+            "status=ok http=200 embeds=none route=meta_refresh caller=resolution_source"
         ]
         escalations = [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_ESCALATION:")]
         assert len(escalations) == 1
@@ -1004,7 +1001,7 @@ class TestResolutionSourceFetchMarker:
         # names — because that is where the ladder engaged and what `from_status` describes.
         assert re.fullmatch(
             r"RESOLUTION_SOURCE_ESCALATION: question=999 url=https://cdc\.example\.com/surveillance "
-            r"from_status=js_wall rung=meta_refresh outcome=success wall_s=\d+\.\d\d",
+            r"from_status=js_wall rung=meta_refresh outcome=success wall_s=\d+\.\d\d caller=resolution_source",
             escalations[0],
         ), escalations[0]
 
@@ -1022,11 +1019,11 @@ class TestResolutionSourceFetchMarker:
 
         assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
             "RESOLUTION_SOURCE_FETCH: question=999 url=https://cdc.example.com/r.pdf "
-            "status=ok http=200 embeds=none route=pdf_local"
+            "status=ok http=200 embeds=none route=pdf_local caller=resolution_source"
         ]
         assert re.fullmatch(
             r"RESOLUTION_SOURCE_ESCALATION: question=999 url=https://cdc\.example\.com/r\.pdf "
-            r"from_status=unsupported_type rung=pdf_local outcome=success wall_s=\d+\.\d\d",
+            r"from_status=unsupported_type rung=pdf_local outcome=success wall_s=\d+\.\d\d caller=resolution_source",
             next(m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_ESCALATION:")),
         )
 
@@ -1048,13 +1045,13 @@ class TestResolutionSourceFetchMarker:
 
         assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
             "RESOLUTION_SOURCE_FETCH: question=999 url=https://cdc.example.com/r.pdf "
-            "status=no_resolving_content http=200 embeds=none reason=no_matching_passage route=pdf_local"
+            "status=no_resolving_content http=200 embeds=none reason=no_matching_passage route=pdf_local caller=resolution_source"
         ]
         # The rung FIRED and the withhold is its outcome, which is the convention that keeps a
         # rung that fires often and rescues nothing distinguishable from one that never fires.
         assert re.fullmatch(
             r"RESOLUTION_SOURCE_ESCALATION: question=999 url=https://cdc\.example\.com/r\.pdf "
-            r"from_status=unsupported_type rung=pdf_local outcome=no_resolving_content wall_s=\d+\.\d\d",
+            r"from_status=unsupported_type rung=pdf_local outcome=no_resolving_content wall_s=\d+\.\d\d caller=resolution_source",
             next(m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_ESCALATION:")),
         )
 
@@ -1075,7 +1072,7 @@ class TestResolutionSourceFetchMarker:
 
         assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
             "RESOLUTION_SOURCE_FETCH: question=999 url=https://cdc.example.com/surveillance "
-            "status=js_wall http=200 embeds=none"
+            "status=js_wall http=200 embeds=none caller=resolution_source"
         ]
         assert not [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_ESCALATION:")]
         counts = pop_provider_detail(q.id_of_question, "resolution_source")["counts"]
@@ -1384,12 +1381,11 @@ class TestTheHopRefusalPolicy:
 
     async def test_the_terminal_site_keeps_its_status_strings(self):
         blocked_both_ways = await guard._vetted_hop_target(
-            self._BOTH, "https://tracker.example.com/p", http_status=302, content_type="", kind="redirect"
+            self._BOTH, "https://tracker.example.com/p", content_type="", kind="redirect"
         )
         self_ref_only = await guard._vetted_hop_target(
             "https://www.metaculus.com/questions/999/",
             "https://tracker.example.com/p",
-            http_status=302,
             content_type="",
             kind="redirect",
         )
@@ -1563,11 +1559,10 @@ class TestLocalPdfReading:
 
     async def test_the_digest_is_bounded_by_the_per_url_cap(self, monkeypatch):
         cap = 300
-        monkeypatch.setattr(classify, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", cap)
         session = self._session(pages=[["Hospitalizations reported: 922 " * 20]])
 
         result = await _fetch_one(
-            session, "https://cdc.example.com/report.pdf", {}, LadderContext(query="hospitalizations")
+            session, "https://cdc.example.com/report.pdf", {}, capped_ctx(cap, query="hospitalizations")
         )
 
         assert result.status == "success"

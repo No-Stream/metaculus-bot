@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
-from metaculus_bot.research import rendered_fetch, resolution_presentation
+from metaculus_bot.research import rendered_fetch
 from metaculus_bot.research.fetch_ladder import guard, rungs
 from metaculus_bot.research.fetch_ladder.context import LadderContext
 from metaculus_bot.research.fetch_ladder.ladder import _fetch_one
@@ -22,6 +22,7 @@ from tests.resolution_source_fakes import (
     _meta_refresh_stub,
     _mock_question,
     _prose_page,
+    capped_ctx,
 )
 
 
@@ -268,12 +269,11 @@ class TestDerivedApiRung:
         assert rendered_fetch.rendered_to_nothing(_URL, memo_scope="resolution_source") is True
 
     async def test_the_per_url_cap_binds_on_a_served_feed(self, monkeypatch):
-        monkeypatch.setattr(resolution_presentation, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", 400)
         big = '{"series":[' + ",".join(f'{{"v":{index}}}' for index in range(500)) + "]}"
         monkeypatch.setattr(rungs, "render_page", _fake_render(self._harvested(body=big), []))
         session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
 
-        result = await _fetch_one(session, _URL, {})
+        result = await _fetch_one(session, _URL, {}, capped_ctx(400))
 
         assert result.status == "success"
         assert len(result.text) <= 400

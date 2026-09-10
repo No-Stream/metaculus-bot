@@ -29,7 +29,7 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
     URL_CONTEXT_SIZE_GATE_TOKENS,
 )
-from metaculus_bot.research import http_fetch, impersonated_fetch, rendered_fetch, robots_policy
+from metaculus_bot.research import document_cache, http_fetch, impersonated_fetch, rendered_fetch, robots_policy
 from metaculus_bot.research import providers as research_providers
 from metaculus_bot.research.agentic import fetch_outcomes, local_document, provenance, tool_backends
 from metaculus_bot.research.agentic import tools as agentic_tools
@@ -37,7 +37,7 @@ from metaculus_bot.research.agentic.loop import _harvest_verification_tiers, _me
 from metaculus_bot.research.agentic.tool_descriptions import FETCH_DESCRIPTION
 from metaculus_bot.research.agentic.types import ToolOutcome
 from metaculus_bot.research.document_text import extract_pdf_text
-from metaculus_bot.research.fetch_ladder import classify
+from metaculus_bot.research.fetch_ladder import verdict
 from metaculus_bot.research.gemini_client_config import gemini_retry_sleep_allowance_s
 from metaculus_bot.research.impersonated_fetch import (
     IMPERSONATE_TRIGGER_STATUSES,
@@ -138,7 +138,7 @@ def _reset_tool_state() -> None:
     # Run-scoped state of the local-document rung: held parses, plus the pypdf parse gate it now
     # shares process-wide with the Tier-1 rung (its own reset helper, since the gate is
     # loop-scoped and one test's held slot must not gate another's).
-    local_document.clear_document_cache()
+    document_cache.clear_document_cache()
     http_fetch.reset_pdf_parse_semaphore()
     agentic_tools._FETCH_TEXT_CACHE.clear()
     agentic_tools._FETCH_LINKS_CACHE.clear()
@@ -2604,11 +2604,11 @@ class TestLocalPdfRung:
         # The autouse fixture calls exactly this, which is what keeps one test's held document
         # out of the next one's ladder.
         pdf = extract_pdf_text(_scanned_pdf(), max_pages=5, max_seconds=5.0)
-        local_document.cache_document("https://example.gov/a.pdf", pdf)
-        assert local_document.cached_document("https://example.gov/a.pdf") is not None
+        document_cache.cache_document("https://example.gov/a.pdf", pdf)
+        assert document_cache.cached_document("https://example.gov/a.pdf") is not None
 
-        local_document.clear_document_cache()
-        assert local_document.cached_document("https://example.gov/a.pdf") is None
+        document_cache.clear_document_cache()
+        assert document_cache.cached_document("https://example.gov/a.pdf") is None
 
 
 class TestReadDocumentAcquiresBeforePaying:
@@ -4021,7 +4021,7 @@ class TestPlainHtmlExtractionPolicy:
         precision fallback), not a single default `_extract_main_text` call."""
         body = b"<html><body><p>page</p></body></html>"
         self._serve_html(monkeypatch, body)
-        spy = MagicMock(return_value=classify._PageExtraction(text="A calibrated extraction of the page body. " * 3))
+        spy = MagicMock(return_value=verdict.PageExtraction(text="A calibrated extraction of the page body. " * 3))
         monkeypatch.setattr("metaculus_bot.research.fetch_ladder.classify._extract_page_text", spy)
 
         result = await agentic_tools._fetch_plain("https://example.com/page")

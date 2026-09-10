@@ -622,6 +622,16 @@ order, each emitted only when present, so an old parser and every archived line 
 line carrying a later field but not an earlier one cannot mis-claim a neighbour's value. `qid_kind`
 is `question_id` (`resolution_source.py` emits `question.id_of_question`).
 
+`caller` (optional, 2026-09-10) names which of the two callers of the shared fetch ladder emitted
+the line: `resolution_source` for the resolution-source fetcher, `gap_fill_v2` for the gap-fill v2
+agentic loop, whose `fetch` and `read_document` tools moved onto the same ladder and gained this
+per-URL record they never had. Last in the keyed tail, after `server`, for the same reason every
+group before it is keyed and tail-positioned: every archived line parses unchanged, and an absent
+value keeps meaning "does not apply" rather than "old record". A `gap_fill_v2` line carries
+`question=None` (the loop's three event markers do the same, because the tool call has no question
+id in hand), so a join to a question goes through the run id. The marker NAME reads as a slight
+misnomer for a loop fetch, and names are contracts here, so the misnomer is the correct price.
+
 ### RESOLUTION_SOURCE_ESCALATION
 
 One line per escalated-URL rung attempt: the direct fetch could not read the page, so the ladder
@@ -656,6 +666,9 @@ parse, and the paid rung opens its attempt only after its `Google-Extended` robo
 (a real request, bounded at `ROBOTS_FETCH_TIMEOUT_S`), so that pre-check is not in its `wall_s`, a
 15-30% under-count against the rung's 15s floor when the pre-check has to fetch. Skipped attempts
 emit no line at all and ride `details["counts"]` instead.
+
+`caller` (optional, 2026-09-10) is the same field the fetch marker carries, with the same two
+values and the same reason for sitting keyed at the tail; see that section.
 
 The token cannot collide with `RESOLUTION_SOURCE_FETCH`: both specs match on their own full marker
 word plus the colon, and neither word is a prefix of the other, so the one-marker-per-line `break`

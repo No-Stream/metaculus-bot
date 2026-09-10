@@ -52,6 +52,7 @@ from metaculus_bot.constants import (
 )
 from metaculus_bot.research import resolution_datawrapper, resolution_presentation
 from metaculus_bot.research.fetch_ladder import classify, context, guard, ladder, policy
+from metaculus_bot.research.fetch_ladder.policy import LADDER_CALLER_RESOLUTION_SOURCE
 from metaculus_bot.research.http_fetch import DatawrapperChartRef, datawrapper_live_data_url, host_semaphores
 from metaculus_bot.research.provider_diagnostics import record_provider_detail
 from metaculus_bot.research.providers import ResearchCallable
@@ -358,7 +359,7 @@ def _log_fetch_outcome_markers(qid: int | None, results: list[FetchResult]) -> N
             f"RESOLUTION_SOURCE_FETCH: question={qid} url={r.url} status={fetch_outcome_token(r)} "
             f"http={r.http_status if r.http_status is not None else 'n/a'} "
             f"embeds={','.join(r.unreadable_embeds) if r.unreadable_embeds else 'none'}"
-            f"{reason}{route}{failure_class}{exc}{server}"
+            f"{reason}{route}{failure_class}{exc}{server} caller={LADDER_CALLER_RESOLUTION_SOURCE}"
         )
         for attempt in r.rung_attempts:
             if attempt.skipped_reason:
@@ -366,7 +367,8 @@ def _log_fetch_outcome_markers(qid: int | None, results: list[FetchResult]) -> N
             logger.info(
                 f"RESOLUTION_SOURCE_ESCALATION: question={qid} url={attempt.url} "
                 f"from_status={attempt.from_status} rung={attempt.rung} outcome={attempt.outcome} "
-                f"wall_s={attempt.wall_s if attempt.wall_s is not None else 0.0:.2f}"
+                f"wall_s={attempt.wall_s if attempt.wall_s is not None else 0.0:.2f} "
+                f"caller={LADDER_CALLER_RESOLUTION_SOURCE}"
             )
 
 
@@ -403,6 +405,8 @@ def _rung_counts(results: list[FetchResult]) -> dict[str, int]:
         # paid rung get starved by the pages before it" is the question. The total stays as it
         # is, since the archive already reads it.
         **{f"{rung}_budget_skips": budget_skips_by_rung[rung] for rung in context._BUDGET_GATED_RUNGS},
+        # Its own count: a rung a caller never runs reads otherwise as one no page ever earned.
+        "rung_not_enabled_skips": skips_by_reason["rung_not_enabled"],
         # Its own count rather than folded into the budget skips: a document left unread
         # because two others were already parsing says the 2-slot gate is the binding
         # constraint, which is a different thing to fix than a question that ran late.

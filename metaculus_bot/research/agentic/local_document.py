@@ -11,8 +11,8 @@ only on a document we genuinely cannot read.
 This module owns the PDF rung and the digest rendering that sit between the ladder spine in
 ``tools.py`` and the pure text machinery in ``research/document_text.py``:
 
-* :func:`pdf_fetch_result` — bytes in, a :class:`PlainFetchResult` out, plus the run-scoped
-  cache entry that keeps a second look at the same URL from re-parsing it.
+* :func:`pdf_fetch_result` — bytes in, a :class:`PlainFetchResult` out, plus the
+  ``document_cache`` entry that keeps a second look at the same URL from re-parsing it.
 * :func:`digest_held` — the passage digest for a document we hold, page-wise for a PDF and
   flat for an HTML page, rendered in one shape either way.
 * :func:`exceeds_url_context_size_gate` — the hard floor on the one paid call in the ladder.
@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections import OrderedDict
 from dataclasses import dataclass
 
 from metaculus_bot.constants import (
@@ -40,15 +39,15 @@ from metaculus_bot.research.agentic.fetch_outcomes import (
     PlainFetchResult,
     _document_needed_result,
 )
+from metaculus_bot.research.document_cache import cache_document
 from metaculus_bot.research.document_text import (
     DocumentDigest,
     PdfText,
     digest_pdf,
     digest_text,
+    disclosed_page_text,
     extract_pdf_text,
     has_text_layer,
-    joined_page_text,
-    truncation_note,
 )
 from metaculus_bot.research.http_fetch import pdf_parse_semaphore
 
@@ -66,13 +65,6 @@ OVERSIZE_DOCUMENT_METHOD = "oversize_document"
 
 # chars / 4, the estimator the season's reader sizing was measured with.
 _CHARS_PER_TOKEN_ESTIMATE = 4
-
-# Extracted documents held for the rest of the run, so ``start_char`` pagination and a later
-# ``read_document`` on the same URL neither refetch nor re-parse. Small on purpose: an entry is
-# per-page text of a document up to DOCUMENT_TEXT_PDF_MAX_BYTES, and only the TEXT is kept —
-# the body itself is dropped as soon as extraction returns.
-_DOCUMENT_CACHE_MAX_ENTRIES = 20
-_DOCUMENT_CACHE: OrderedDict[str, PdfText] = OrderedDict()
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,46 +98,7 @@ def held_pdf(pdf: PdfText) -> HeldDocument:
     A scan comes back with page structure and no text, which is the shape that tells a caller
     the free route is exhausted rather than untried.
     """
-    return HeldDocument(text=_disclosed_page_text(pdf), pdf=pdf)
-
-
-def _disclosed_page_text(pdf: PdfText) -> str:
-    """The read pages as one string, led by a note when they are not the whole document.
-
-    Both writers of a PDF's flat text go through here, because that text is served to the driver
-    with no header of its own — a ``pdf_local`` fetch window, and a later digest of a page we
-    hold as text — and ``fetch``'s own description promises "A PDF is read here, in full text".
-    Extraction stops at DOCUMENT_TEXT_MAX_PAGES or DOCUMENT_TEXT_MAX_SECONDS and says which in
-    ``truncated_by``; without the note the driver pages to the end, sees ``truncated=False``, and
-    can report an absence over pages nobody read. The wording is
-    :func:`document_text.truncation_note`'s, so this and the digest header cannot drift apart.
-    """
-    text = joined_page_text(pdf)[0].strip()
-    note = truncation_note(pdf)
-    if not note:
-        return text
-    return f"[Partial document read: {pdf.page_count} pages{note}]\n\n{text}"
-
-
-def cached_document(url: str) -> PdfText | None:
-    """The parsed document held for ``url`` this run, or None."""
-    pdf = _DOCUMENT_CACHE.get(url)
-    if pdf is not None:
-        _DOCUMENT_CACHE.move_to_end(url)
-    return pdf
-
-
-def cache_document(url: str, pdf: PdfText) -> None:
-    """Hold ``pdf`` for ``url`` for the rest of the run, evicting the least recently used."""
-    _DOCUMENT_CACHE[url] = pdf
-    _DOCUMENT_CACHE.move_to_end(url)
-    while len(_DOCUMENT_CACHE) > _DOCUMENT_CACHE_MAX_ENTRIES:
-        _DOCUMENT_CACHE.popitem(last=False)
-
-
-def clear_document_cache() -> None:
-    """Drop every held document. Run-scoped state, so the suite resets it per test."""
-    _DOCUMENT_CACHE.clear()
+    return HeldDocument(text=disclosed_page_text(pdf), pdf=pdf)
 
 
 async def pdf_fetch_result(body: bytes, *, url: str, content_type: str) -> PlainFetchResult:
@@ -191,7 +144,7 @@ async def pdf_fetch_result(body: bytes, *, url: str, content_type: str) -> Plain
     return PlainFetchResult(
         status="ok",
         method=PDF_LOCAL_METHOD,
-        text=_disclosed_page_text(pdf),
+        text=disclosed_page_text(pdf),
         links=[],
         url=url,
         content_type=content_type or None,

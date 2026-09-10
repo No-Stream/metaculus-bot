@@ -355,22 +355,23 @@ MARKER_SPECS: list[MarkerSpec] = [
     ),
     MarkerSpec(
         "resolution_source_fetch",
-        # Why: reason/route/exc are optional, tail-keyed. Receipt: docs/telemetry_markers.md "RESOLUTION_SOURCE_FETCH".
+        # Why: reason/route/exc/caller are optional, tail-keyed. Receipt: docs/telemetry_markers.md "RESOLUTION_SOURCE_FETCH".
         re.compile(
             r"RESOLUTION_SOURCE_FETCH:\s*question=(?P<question>\S+)\s+url=(?P<url>\S+)"
             r"\s+status=(?P<status>\S+)\s+http=(?P<http>\S+)\s+embeds=(?P<embeds>\S+)"
             r"(?:\s+reason=(?P<reason>\S+))?(?:\s+route=(?P<route>\S+))?"
             r"(?:\s+failure_class=(?P<failure_class>\S+))?(?:\s+exc=(?P<exc>\S+))?(?:\s+server=(?P<server>\S+))?"
+            r"(?:\s+caller=(?P<caller>\S+))?"
         ),
         qid_kind=QID_KIND_QUESTION_ID,  # resolution_source.py emits question.id_of_question
     ),
     MarkerSpec(
         "resolution_source_escalation",
-        # Why: wall_s is that rung's own cost. Receipt: docs/telemetry_markers.md "RESOLUTION_SOURCE_ESCALATION".
+        # Why: wall_s is that rung's own cost, caller is optional and tail-keyed. Receipt: docs/telemetry_markers.md "RESOLUTION_SOURCE_ESCALATION".
         re.compile(
             r"RESOLUTION_SOURCE_ESCALATION:\s*question=(?P<question>\S+)\s+url=(?P<url>\S+)"
             r"\s+from_status=(?P<from_status>\S+)\s+rung=(?P<rung>\S+)\s+outcome=(?P<outcome>\S+)"
-            r"\s+wall_s=(?P<wall_s>\S+)"
+            r"\s+wall_s=(?P<wall_s>\S+)(?:\s+caller=(?P<caller>\S+))?"
         ),
         qid_kind=QID_KIND_QUESTION_ID,  # resolution_source.py emits question.id_of_question
     ),

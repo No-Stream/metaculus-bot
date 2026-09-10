@@ -7,7 +7,6 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from metaculus_bot.research import resolution_presentation
 from metaculus_bot.research.fetch_ladder import rungs
 from metaculus_bot.research.fetch_ladder.context import LadderContext, QuestionRungBudget
 from metaculus_bot.research.fetch_ladder.ladder import _fetch_one
@@ -28,6 +27,7 @@ from tests.resolution_source_fakes import (
     _prose_page,
     _snapshot_url,
     arm_paid_rung,
+    capped_ctx,
     paid_reader,
 )
 from tests.test_document_text import build_text_pdf
@@ -360,13 +360,12 @@ class TestWaybackRung:
         below the age-disclosure lead's own length, the earlier bare-lead return busted the
         per-URL bound `_budgeted_success_sections` relies on. The lead is now truncated to fit."""
         cap = 60
-        monkeypatch.setattr(resolution_presentation, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", cap)
         session = self._session(
             page=FakeResponse(403, body=b"denied", content_type="text/html"),
             captured=self._NOW - timedelta(days=3),
         )
 
-        result = await _fetch_one(session, _URL, {}, self._ctx())
+        result = await _fetch_one(session, _URL, {}, capped_ctx(cap, now=self._NOW))
 
         assert result.status == "success"
         assert result.route == "wayback"

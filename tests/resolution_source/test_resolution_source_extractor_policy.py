@@ -21,11 +21,11 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from metaculus_bot.research.fetch_ladder import classify, guard, rungs
-from metaculus_bot.research.fetch_ladder.classify import content_share, looks_like_page_chrome
+from metaculus_bot.research.fetch_ladder import classify, guard, rungs, verdict
 from metaculus_bot.research.fetch_ladder.context import LadderContext
 from metaculus_bot.research.fetch_ladder.ladder import _fetch_one
 from metaculus_bot.research.fetch_ladder.rungs import _WAYBACK_TRIGGER_STATUSES, _rendered_rung_applies
+from metaculus_bot.research.fetch_ladder.verdict import content_share, looks_like_page_chrome
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail
 from metaculus_bot.research.rendered_fetch import RenderedPage
 from metaculus_bot.research.resolution_source import _rung_counts, resolution_source_provider
@@ -121,7 +121,7 @@ class TestContentShare:
     """The metric, pinned on hand-computable strings."""
 
     def test_a_line_at_the_cutoff_counts_and_one_under_it_does_not(self):
-        cutoff = classify.RESOLUTION_SOURCE_CONTENT_LINE_MIN_CHARS
+        cutoff = verdict.RESOLUTION_SOURCE_CONTENT_LINE_MIN_CHARS
         assert content_share("x" * cutoff) == 1.0
         assert content_share("x" * (cutoff - 1)) == 0.0
 

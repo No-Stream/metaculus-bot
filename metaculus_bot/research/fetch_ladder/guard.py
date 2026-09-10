@@ -277,9 +277,7 @@ async def _landing_refused(landing_url: str, cited_url: str, *, action: str) -> 
     return True
 
 
-async def _vetted_hop_target(
-    target: str, current_url: str, *, http_status: int, content_type: str, kind: str
-) -> FetchResult | str:
+async def _vetted_hop_target(target: str, current_url: str, *, content_type: str, kind: str) -> FetchResult | str:
     """The absolute next URL for a derived hop, or the terminal refusal it earns.
 
     The terminal-result form of :func:`_hop_refusal`, for a URL this module derived from a
@@ -288,6 +286,11 @@ async def _vetted_hop_target(
     strings it produces, ``ssrf_blocked`` and ``blocked``, are telemetry contracts, as is the
     ``metaculus_self_ref`` reason the second carries. ``kind`` is only there to say which hop
     shape a log line came from.
+
+    Neither refusal carries the redirect's own 3xx, which is why this takes no ``http_status`` at
+    all: that field means "a host answered us this", and a refusal WE made must never be handed to
+    a second transport as though a host had refused (``docs/architecture.md``, "What a
+    self-produced refusal carries").
     """
     next_url = urljoin(current_url, target)
     refusal = await _hop_refusal(next_url)
@@ -299,7 +302,7 @@ async def _vetted_hop_target(
             url=next_url,
             status="ssrf_blocked",
             text="",
-            http_status=http_status,
+            http_status=None,
             content_type=content_type or None,
         )
     if refusal == "metaculus_self_ref":
@@ -318,7 +321,7 @@ async def _vetted_hop_target(
             status="blocked",
             status_reason="metaculus_self_ref",
             text="",
-            http_status=http_status,
+            http_status=None,
             content_type=content_type or None,
         )
     return next_url

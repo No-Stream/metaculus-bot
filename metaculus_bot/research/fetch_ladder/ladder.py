@@ -17,7 +17,7 @@ from typing import Any
 from metaculus_bot.research.fetch_ladder import context, direct_fetch, guard, rungs
 from metaculus_bot.research.fetch_ladder.policy import LadderPolicy
 from metaculus_bot.research.http_fetch import host_semaphores
-from metaculus_bot.research.resolution_fetch_result import FetchResult, FetchStatus
+from metaculus_bot.research.resolution_fetch_result import FetchResult, FetchRoute, FetchStatus
 
 
 async def _run_rung(
@@ -41,6 +41,83 @@ async def _run_rung(
     return result
 
 
+def _rung_declined_by_policy(ctx: context.LadderContext, rung: FetchRoute, direct: FetchResult, url: str) -> bool:
+    """True once a rung this caller does not carry has recorded its skip (``rungs_enabled``)."""
+    if rung in ctx.policy.rungs_enabled:
+        return False
+    ctx.skip_rung(rung, direct.status, url, "rung_not_enabled")
+    return True
+
+
+async def _escalate_via_browser(
+    session: Any, url: str, direct: FetchResult, *, host_sems: dict[str, asyncio.Semaphore], ctx: context.LadderContext
+) -> FetchResult | None:
+    """One question's derived-feed-then-browser escalation on this host, under one gate.
+
+    Why the gate is held across the PAIR, and why the fast-path decline sits here rather than
+    inside the rung: ``docs/architecture.md`` "Why the rungs sit in this order".
+    """
+    async with ctx.shared.browser_escalation_gate(url):
+        if not _rung_declined_by_policy(ctx, "derived_api", direct, url):
+            derived = await _run_rung(
+                ctx, direct.status, rungs._derived_api_rung(session, url, direct, host_sems=host_sems, ctx=ctx)
+            )
+            if derived is not None:
+                return derived
+        if ctx.fast_path:
+            context._skip_for_fast_path(ctx, "rendered", direct, url)
+            return None
+        if _rung_declined_by_policy(ctx, "rendered", direct, url):
+            return None
+        return await _run_rung(ctx, direct.status, rungs._rendered_rung(url, direct, host_sems, ctx))
+
+
+async def _escalate_thin_success(
+    url: str, direct: FetchResult, *, host_sems: dict[str, asyncio.Semaphore], ctx: context.LadderContext
+) -> FetchResult:
+    """The browser, on a success this caller's verdict judged too thin to be the page.
+
+    Only a caller with a thin-content floor reaches this branch (``escalate_rendered``, which the
+    fetcher's verdict never sets), and only the browser is tried: the archive and the paid reader
+    answer a page we could not read AT ALL, and this one we did. A render that declines or reads
+    nothing leaves the thin text standing, which is the whole point of escalating on a success.
+    """
+    if ctx.fast_path:
+        context._skip_for_fast_path(ctx, "rendered", direct, url)
+        return direct
+    if _rung_declined_by_policy(ctx, "rendered", direct, url):
+        return direct
+    async with ctx.shared.browser_escalation_gate(url):
+        rendered = await _run_rung(ctx, direct.status, rungs._rendered_rung(url, direct, host_sems, ctx))
+    return rendered if rendered is not None else direct
+
+
+async def _escalate_offsite(
+    session: Any, url: str, direct: FetchResult, *, host_sems: dict[str, asyncio.Semaphore], ctx: context.LadderContext
+) -> FetchResult:
+    """The two rungs whose product is not the live host's bytes: the archive, then the paid read.
+
+    Reached only for the statuses the browser rungs do not claim (``_wayback_rung_applies``). The
+    archive's ``stale_data`` withhold is kept as the FALLBACK rather than returned early, so the
+    paid rung below is still reachable for that page; the paid rung is asked about the DIRECT
+    outcome for the same reason (``docs/architecture.md``, "Why the rungs sit in this order").
+    """
+    wayback = None
+    if not _rung_declined_by_policy(ctx, "wayback", direct, url):
+        wayback = await _run_rung(
+            ctx, direct.status, rungs._wayback_rung(session, url, direct, host_sems=host_sems, ctx=ctx)
+        )
+        if wayback is not None and wayback.status == "success":
+            return wayback
+    if not _rung_declined_by_policy(ctx, "url_context", direct, url):
+        read = await _run_rung(
+            ctx, direct.status, rungs._url_context_rung(session, url, direct, host_sems=host_sems, ctx=ctx)
+        )
+        if read is not None:
+            return read
+    return wayback if wayback is not None else direct
+
+
 async def _escalate_unresolved(
     session: Any, url: str, direct: FetchResult, *, host_sems: dict[str, asyncio.Semaphore], ctx: context.LadderContext
 ) -> FetchResult:
@@ -49,46 +126,27 @@ async def _escalate_unresolved(
     Returns the FIRST rung's rescue, or ``direct`` unchanged when every rung declines or fails; a
     rung that fired and produced nothing still leaves its attempt on the context, and each rung is
     closed the moment its result is known (:func:`_run_rung`) so its attempt carries its own wall
-    and outcome rather than the ladder's. The Wayback withhold as fallback, the archive-readable
-    convention behind an attempt with no rescue, and which rungs use ``session`` at all:
-    ``docs/architecture.md`` "What the dispatcher returns, and what it carries forward".
+    and outcome rather than the ladder's. A rung the caller's policy does not carry records a
+    ``rung_not_enabled`` skip and is not reached. The Wayback withhold as fallback, the
+    archive-readable convention behind an attempt with no rescue, and which rungs use ``session``
+    at all: ``docs/architecture.md`` "What the dispatcher returns, and what it carries forward".
     """
     if direct.status == "success":
-        return direct
+        if not direct.escalate_rendered:
+            return direct
+        return await _escalate_thin_success(url, direct, host_sems=host_sems, ctx=ctx)
     # First because it is free and its triggers are disjoint from the browser's (see the doc).
-    impersonated = await _run_rung(
-        ctx, direct.status, rungs._impersonate_rung(url, direct, host_sems=host_sems, ctx=ctx)
-    )
-    if impersonated is not None:
-        return impersonated
+    if not _rung_declined_by_policy(ctx, "impersonate", direct, url):
+        impersonated = await _run_rung(
+            ctx, direct.status, rungs._impersonate_rung(url, direct, host_sems=host_sems, ctx=ctx)
+        )
+        if impersonated is not None:
+            return impersonated
     if rungs._rendered_rung_applies(direct):
-        # One per-host gate across the feed-then-browser pair (`browser_escalation_gate`).
-        async with ctx.shared.browser_escalation_gate(url):
-            derived = await _run_rung(
-                ctx, direct.status, rungs._derived_api_rung(session, url, direct, host_sems=host_sems, ctx=ctx)
-            )
-            if derived is not None:
-                return derived
-            # Declined here rather than inside the rung, whose own gates all cost something.
-            if ctx.fast_path:
-                context._skip_for_fast_path(ctx, "rendered", direct, url)
-            else:
-                rendered = await _run_rung(ctx, direct.status, rungs._rendered_rung(url, direct, host_sems, ctx))
-                if rendered is not None:
-                    return rendered
-    # Reached only for the statuses the browser rungs do not claim (`_WAYBACK_TRIGGER_STATUSES`).
-    wayback = await _run_rung(
-        ctx, direct.status, rungs._wayback_rung(session, url, direct, host_sems=host_sems, ctx=ctx)
-    )
-    if wayback is not None and wayback.status == "success":
-        return wayback
-    # Last (the only paid rung), asked about the DIRECT outcome so an archive withhold does not close it.
-    read = await _run_rung(
-        ctx, direct.status, rungs._url_context_rung(session, url, direct, host_sems=host_sems, ctx=ctx)
-    )
-    if read is not None:
-        return read
-    return wayback if wayback is not None else direct
+        escalated = await _escalate_via_browser(session, url, direct, host_sems=host_sems, ctx=ctx)
+        if escalated is not None:
+            return escalated
+    return await _escalate_offsite(session, url, direct, host_sems=host_sems, ctx=ctx)
 
 
 async def _fetch_one(

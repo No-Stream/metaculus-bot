@@ -306,6 +306,21 @@ def joined_page_text(pdf: PdfText) -> tuple[str, tuple[int, ...]]:
     return "\n\n".join(pdf.pages), tuple(breaks)
 
 
+def disclosed_page_text(pdf: PdfText) -> str:
+    """The read pages as one string, led by a note when they are not the whole document.
+
+    Both writers of a PDF's flat text go through here, because that text is served with no header
+    of its own — a gap-fill ``pdf_local`` fetch window, and a later digest of a page held as text
+    — and a partial read that does not say so reads as the whole document. The wording is
+    :func:`truncation_note`'s, so this and the digest header cannot drift apart.
+    """
+    text = joined_page_text(pdf)[0].strip()
+    note = truncation_note(pdf)
+    if not note:
+        return text
+    return f"[Partial document read: {pdf.page_count} pages{note}]\n\n{text}"
+
+
 def select_passages(
     text: str,
     query: str,
@@ -364,7 +379,7 @@ def select_passages(
     ]
 
 
-def render_document_digest(pdf: PdfText, *, query: str, top_k: int, max_chars: int, source_url: str) -> str:
+def render_document_digest(pdf: PdfText, *, query: str, top_k: int, max_chars: int | None, source_url: str) -> str:
     """:func:`digest_pdf`'s block, for a caller that needs only the text.
 
     Kept only until the Tier-1 resolution-source fetcher moves to :func:`digest_pdf`, which it
@@ -373,7 +388,7 @@ def render_document_digest(pdf: PdfText, *, query: str, top_k: int, max_chars: i
     return digest_pdf(pdf, query=query, top_k=top_k, max_chars=max_chars, source_url=source_url).block
 
 
-def digest_pdf(pdf: PdfText, *, query: str, top_k: int, max_chars: int, source_url: str) -> DocumentDigest:
+def digest_pdf(pdf: PdfText, *, query: str, top_k: int, max_chars: int | None, source_url: str) -> DocumentDigest:
     """The forecaster/driver-facing block for one document: what it is, then what it says.
 
     Deterministic and I/O-free, so the same ``PdfText`` always renders the same block. The
@@ -402,7 +417,7 @@ def digest_pdf(pdf: PdfText, *, query: str, top_k: int, max_chars: int, source_u
     return DocumentDigest(block=_truncate_digest("\n\n".join(sections), max_chars), passages=len(passages))
 
 
-def digest_text(text: str, *, query: str, top_k: int, max_chars: int, source_url: str) -> DocumentDigest:
+def digest_text(text: str, *, query: str, top_k: int, max_chars: int | None, source_url: str) -> DocumentDigest:
     """The same digest for a document held as flat text — a fetched web page, not a PDF.
 
     Page-less by construction, so its passages carry no ``[p.N]`` label and the header states
@@ -771,14 +786,14 @@ def _digest_passages(passages: list[Passage], *, query: str) -> str:
     return "\n\n".join([header, *body])
 
 
-def _truncate_digest(block: str, max_chars: int) -> str:
-    """``block`` bounded to ``max_chars``, with the cut disclosed in the text.
+def _truncate_digest(block: str, max_chars: int | None) -> str:
+    """``block`` bounded to ``max_chars``, with the cut disclosed in the text; None is unbounded.
 
     The marker is never dropped to make room, even when ``max_chars`` is smaller than the
     marker itself: a block that silently ends mid-passage reads as a complete document
     digest, which is exactly the failure the marker exists to prevent.
     """
-    if len(block) <= max_chars:
+    if max_chars is None or len(block) <= max_chars:
         return block
     marker = f"[digest truncated at {max_chars} chars]"
     keep = max(0, max_chars - len(marker) - 1)  # -1 for the newline joining the two

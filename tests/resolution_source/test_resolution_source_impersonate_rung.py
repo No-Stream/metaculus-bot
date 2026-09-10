@@ -823,13 +823,13 @@ class TestImpersonateRungMarkerLines:
             resolution_source._log_fetch_outcome_markers(44211, [result])
 
         assert (
-            f"RESOLUTION_SOURCE_FETCH: question=44211 url={_URL} status=ok http=200 embeds=none route=impersonate"
+            f"RESOLUTION_SOURCE_FETCH: question=44211 url={_URL} status=ok http=200 embeds=none route=impersonate caller=resolution_source"
             in caplog.messages
         )
         (line,) = _escalation_lines(caplog)
         assert re.fullmatch(
             rf"RESOLUTION_SOURCE_ESCALATION: question=44211 url={re.escape(_URL)} "
-            r"from_status=blocked rung=impersonate outcome=success wall_s=\d+\.\d\d",
+            r"from_status=blocked rung=impersonate outcome=success wall_s=\d+\.\d\d caller=resolution_source",
             line,
         )
         fetch, escalations = self._harvest(caplog)
@@ -856,7 +856,7 @@ class TestImpersonateRungMarkerLines:
 
         assert (
             f"RESOLUTION_SOURCE_FETCH: question=44211 url={_URL} status=blocked http=403 embeds=none "
-            "route=impersonate failure_class=http_403 server=akamaighost"
+            "route=impersonate failure_class=http_403 server=akamaighost caller=resolution_source"
         ) in caplog.messages
         fetch, escalations = self._harvest(caplog)
         assert (fetch["status"], fetch["http"], fetch["route"]) == ("blocked", 403, "impersonate")

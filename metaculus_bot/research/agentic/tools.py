@@ -55,7 +55,7 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_IMPERSONATE_MIN_BUDGET_S,
     RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
 )
-from metaculus_bot.research import derived_api, impersonated_fetch
+from metaculus_bot.research import derived_api, document_cache, impersonated_fetch
 from metaculus_bot.research.agentic import local_document
 from metaculus_bot.research.agentic.fetch_outcomes import (
     _FETCH_MIN_CONTENT_CHARS,
@@ -688,9 +688,9 @@ def _pdf_local_outcome(url: str, plain: PlainFetchResult, *, start_char: int) ->
     re-keyed under the URL the driver asked for: the extraction cached it under the final hop,
     and a later ``read_document`` on the original URL would otherwise refetch and reparse it.
     """
-    pdf = local_document.cached_document(plain.url)
+    pdf = document_cache.cached_document(plain.url)
     if pdf is not None:
-        local_document.cache_document(url, pdf)
+        document_cache.cache_document(url, pdf)
     local_document.log_local_document_read(
         url,
         method=local_document.PDF_LOCAL_METHOD,
@@ -719,7 +719,7 @@ def _held_from_result(url: str, result: PlainFetchResult) -> local_document.Held
     if result.status == "blocked" and _fetch_plain_url_block(result.url) is not None:
         # A 3xx onto a question platform, held so the paid reader (Google's address) declines the same hop.
         return local_document.HeldDocument(refused_landing=result)
-    pdf = local_document.cached_document(result.url)
+    pdf = document_cache.cached_document(result.url)
     if pdf is not None:
         held = local_document.held_pdf(pdf)
     elif result.status == "ok" and result.method != DOCUMENT_NEEDED_METHOD:
@@ -787,7 +787,7 @@ async def _acquire_local_document(url: str) -> local_document.HeldDocument:
     gate back as it unwinds, so a fresh parse can start alongside the abandoned one. Recorded in
     FUTURE.md under "The PDF parse overruns ``max_seconds``".
     """
-    cached_pdf = local_document.cached_document(url)
+    cached_pdf = document_cache.cached_document(url)
     if cached_pdf is not None:
         return local_document.held_pdf(cached_pdf)
     cached_text = _FETCH_TEXT_CACHE.get(url)

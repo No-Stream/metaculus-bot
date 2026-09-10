@@ -10,7 +10,6 @@ from datetime import UTC, datetime
 import pytest
 
 from metaculus_bot.constants import RESOLUTION_SOURCE_WITHHELD_REPLY_LOG_CHARS
-from metaculus_bot.research import resolution_presentation
 from metaculus_bot.research.fetch_ladder import rungs
 from metaculus_bot.research.fetch_ladder.context import LadderContext, QuestionRungBudget
 from metaculus_bot.research.fetch_ladder.ladder import _fetch_one
@@ -24,6 +23,7 @@ from tests.resolution_source_fakes import (
     FakeResponse,
     FakeSession,
     arm_paid_rung,
+    capped_ctx,
     paid_reader,
     refused_page_with_robots,
 )
@@ -470,11 +470,10 @@ class TestUrlContextRung:
         model-mediated disclosure's length, the earlier bare-lead return exceeded the per-URL
         bound. The shared cap helper truncates the lead instead."""
         cap = 60
-        monkeypatch.setattr(resolution_presentation, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", cap)
         reader, _calls = paid_reader(text="The page reports 12 major work stoppages. " * 5)
         arm_paid_rung(monkeypatch, reader)
 
-        result = await _fetch_one(refused_page_with_robots(), _URL, {}, LadderContext(query="ask"))
+        result = await _fetch_one(refused_page_with_robots(), _URL, {}, capped_ctx(cap, query="ask"))
 
         assert result.status == "success"
         assert result.route == "url_context"

@@ -662,10 +662,10 @@ transports and moves onto `fetch_url` over the remaining steps of the unificatio
 in the knob table below is the target rather than today's reading. The package's modules depend on
 each other in one direction:
 `guard.py` (the SSRF preflight, the vetted DNS resolve, the aiohttp session, the per-host
-politeness gate), then `digest.py`, `policy.py` and `context.py`, then `classify.py` (the one
-classification path for a body), then `direct_fetch.py` (the bounded redirect loop and the single
-hop), then `rungs.py` (the seven escalation rungs), then `ladder.py` (the dispatcher and the
-entry point). The status, reason, route and skip vocabularies stay in
+politeness gate), then `digest.py` and `verdict.py` (what a caller makes of a body it read), then
+`policy.py` and `context.py`, then `classify.py` (the one classification path for a body), then
+`direct_fetch.py` (the bounded redirect loop and the single hop), then `rungs.py` (the seven
+escalation rungs), then `ladder.py` (the dispatcher and the entry point). The status, reason, route and skip vocabularies stay in
 `research/resolution_fetch_result.py`, where they were, because every string in that module is a
 telemetry contract the archive matches on.
 
@@ -688,16 +688,26 @@ platform self-reference refusal, and the per-question Wayback and paid-read caps
 drawn deliberately: a constant a test patches on the module that reads it goes inert the moment a
 rung reads it off a frozen dataclass instead, and it goes inert silently.
 
-The same rule decides when a declared knob starts being read. The wall pair is read off the policy
-today. The presentation knobs and the archive age bound carry the fetcher's values and stay module
-reads until the gap-fill preset arrives, because wiring either one now would kill a live patch site
-or add a branch only the second caller can take.
+The same rule decides when a declared knob starts being read: every knob below is read off the
+policy today except the two seats whose sibling implementations land separately.
+
+There are three gap-fill presets rather than one, because the loop runs the ladder three ways.
+`GAP_FILL_FETCH_POLICY` is the `fetch` tool's, `GAP_FILL_DOCUMENT_POLICY` is `read_document`'s free
+acquisition ladder (25 s, and no archive rung: it sits in front of the paid reader and an archived
+copy is not what a document read was asked for), and `GAP_FILL_DIRECT_POLICY` is one direct fetch
+with no rungs at all, for the robots.txt pre-check, whose whole point is the body a floor or a rung
+would replace. The three differ only in `total_wall_s` and `rungs_enabled`.
 
 | Knob | Resolution-source preset | Gap-fill preset |
 |---|---|---|
-| `total_wall_s`, `rung_wall_margin_s` | 45 s less a 2 s margin, the provider's own wall | 90 s for the `fetch` tool, 25 s for the document ladder |
+| `verdict` | `RESOLUTION_SOURCE_VERDICT`: both content floors, the header decides the branch | `GAP_FILL_VERDICT`: any non-empty extraction is content, the bytes decide the branch |
+| `rungs_enabled` | all five escalation rungs | `impersonate` / `rendered` / `wayback` for `fetch`, minus `wayback` for the document ladder |
+| `total_wall_s`, `rung_wall_margin_s` | 45 s less a 2 s margin, the provider's own wall | 90 s for the `fetch` tool, 25 s for the document ladder, no margin |
 | `per_url_max_chars` | 6,000 per URL, applied at presentation | None: the loop windows a page at presentation instead |
 | `wayback_max_age_days` | 30 days, past which a capture is withheld | None: the capture date is surfaced and the driver judges |
+| `wayback_extra_trigger_statuses` | empty | `unsupported_type`: the loop also substitutes for a body it could not read at all |
+| `wayback_needs_host_refusal` | False | True: a `blocked` carrying no host status is a refusal WE made |
+| `impersonate_dial_wall_s` | None: the rung's remaining budget, which is one question's worth | one plain hop's timeout, so a slow chain cannot spend a whole tool budget |
 | `disclose_unreadable_embeds` | True: a page hiding figures in an embed leads with that note | False |
 | `thin_content_escalation_chars` | None: escalate to the browser on status alone | 500: a success that short with no chart block escalates |
 | `collect_links` | False | True: the driver is handed the page's outbound links |
@@ -710,6 +720,131 @@ The Wayback row is the one genuine coupling rather than a preference. The 30-day
 calibrated on a page a question cites as its grading source: a month-old capture of the page a
 question grades on is still evidence about that page, and a URL a driver chose carries no such
 guarantee, so the loop surfaces the age and lets the driver decide.
+
+### What a verdict decides
+
+The READ is shared and identical for both callers: the charset-honouring decode, the ARIA-table
+rewrite, the calibrated two-pass trafilatura extraction with its line-shape metric, the inline
+chart-data read, the outbound-link collection, the meta-refresh detection, the pypdf parse. What
+the two callers differ in is the VERDICT on what came back, and that is one policy field
+(`policy.verdict`, `verdict.py`) rather than a flag per difference. Three decisions ride it.
+
+Which BRANCH a body takes. The fetcher routes on the Content-Type header, with the `%PDF-` sniff
+inside the fallback document branch, so a body labelled `text/html` is read as HTML whatever its
+bytes say. The driver routes on the bytes first, because a mislabeled document is common on the
+hosts it reaches: PDF magic or a declared PDF goes to the document branch, image magic or a
+declared image is refused as `unsupported_type` with the `image_needs_reader` reason (its own
+token, so the loop's adapter can escalate it to a model read), and an `<html` substring anywhere in
+the body routes to HTML even under an odd content type. A declared image is the one body the driver
+refuses WITHOUT reading, which is what `verdict.unread_route` exists for.
+
+Whether an HTML extraction counts as CONTENT. The fetcher publishes only text that clears the
+400-character chrome floor and the line-shape metric (`looks_like_page_chrome`,
+`_no_content_verdict`), because its section is captioned primary grading evidence; anything else is
+`embed_shell` / `js_wall` / `thin_page` with no text. The driver is handed any non-empty
+extraction, and an empty one is `js_wall`, which its adapter renders as this ladder's own `empty`.
+Both honour `chrome_metric_withheld`, so the 0.38 content-share metric is not a divergence.
+
+What a parsed DOCUMENT says. The fetcher runs the BM25 passage digest in the parse's own thread hop
+and withholds a document that matched no query term (`no_matching_passage`); the driver takes the
+whole joined text with its truncation note, holds the parse in `research/document_cache.py` for its
+own later ask-directed digest, and never withholds on a non-matching query. The parse itself never
+rides the `FetchResult`: `PdfText.pages` is the whole document (833,450 characters on the receipt
+file) against a 200,000-character archive cap, so one such field would truncate a whole question's
+archived payload to a preview.
+
+### The HTML extractor policy, and the one classification path
+
+`classify._extract_page_text` is the publishable extraction of an HTML body, and every decision in
+it has a receipt. ARIA-role tables are rewritten to real tables first, then trafilatura runs at
+default recall as the primary extractor with `favor_precision=True` as the fallback, and both are
+scored by `verdict.content_share`. Running BOTH settings is the 2026-09-03 calibration's verdict
+(`scratch/fetch_ladder_2026-09-03/chrome_calibration.md`: 118 bodies, five extractor variants on
+identical bytes, texts labelled by hand), because each setting alone loses pages the other reads.
+Precision alone withholds readable pages (kasa.go.kr pruned to 78 characters, two tracxn funding
+tables, manifold's market body). Default alone publishes chrome: on congress.gov it swaps the
+2,411-character bill-status card for 54,393 characters of a member-name dropdown, because
+trafilatura's readability fallback replaces the main extraction when readability's text is over
+twice as long and only precision prunes that dropdown out of the backup tree first; menu trees
+(abs.gov.au, kasa.go.kr) then clear the chrome floor as `success`. On the calibration corpus the
+two-pass policy publishes every labelled content text (46 of 46, three of them the congress.gov
+card) and blocks the navigation-tree chrome, at the cost of one extra pass on the pages that fail
+the metric. What it gives up: prose-shaped boilerplate (a cookie-consent wall, a glossary) passes
+any line-shape metric, and kasa.go.kr's news ticker is withheld with its menu. An extraction under
+the chrome floor skips the metric, because precision only ever shortens.
+
+The precision pass is the one skippable part, and it declines under
+`RESOLUTION_SOURCE_PRECISION_RETRY_MIN_BUDGET_S` of remaining wall. Nothing else budgets this work:
+the rendered rung gives the browser its whole remaining budget and classifies the DOM afterwards,
+and a 5 MiB navigation tree costs seconds per pass against the 2 s margin the rung leaves the outer
+`wait_for`. A skipped pass takes the exit a FAILED pass takes, the default text withheld under the
+metric, so the wall can only ever withhold a page here, never publish one the metric refused.
+
+Trafilatura gets the ORIGINAL BYTES in two cases, and in both its extraction is byte-identical to
+what it was before the ARIA rewrite existed: a page with no ARIA role at all, and a page our own
+decode mangled. The second is the one that matters. `decode_text_body` honours a BOM and the HTTP
+header's `charset`, but a page that declares its encoding only in a `<meta charset>` decodes as
+UTF-8 and comes back as mojibake, while trafilatura reading the bytes would have found the meta
+declaration. That is why the gate is `undecodable_ratio == 0.0` rather than
+`MAX_UNDECODABLE_CHAR_RATIO`: the shared bound is the refuse-the-whole-body threshold and is far
+too loose here, since a mostly-ASCII cp1252 page whose only non-UTF-8 bytes are accented characters
+scores about 0.01 against a bound of 0.10, and under the looser gate it took the rewrite and
+reached forecasters as `R<?>sum<?> ... Qu<?>bec` where the bytes path returns the accents.
+
+`classify._classify_html_body` is the one classification path for an HTML body, whichever rung
+obtained it and whichever caller asked. Three things about its ORDER are load-bearing. Both embed
+scans (`extract_datawrapper_charts`, `unreadable_data_embed_providers`) run on the RAW decoded HTML
+before and regardless of main-text extraction, because trafilatura drops iframes and embed scripts
+at every setting; the page's main text is trafilatura's to decode, which is why no vacuity check
+runs on that branch. The inline chart read runs on EVERY HTML page rather than only thin ones,
+because question 43949's page extracted about 80,000 characters of prose with none of the resolving
+figures in it, so a thin-only gate would miss the record the rung exists for; it runs in its own
+thread hop for the same reason the extraction does (one regex sweep plus a `json.loads` per config
+over a body up to the 5 MiB response cap, or a rendered DOM up to `RENDERED_DOM_MAX_CHARS`,
+measured at 22 ms on the 1.1 MB question-43949 page). And a chart block therefore RESCUES a page
+the chrome floor would otherwise withhold, including a JavaScript-walled one, where the config in
+the raw HTML is precisely the data the wall was hiding; a body the line-shape metric withheld does
+not ride along under that block, because the metric's verdict is that the text is chrome and
+publishing it filled the per-URL cap with navigation.
+
+`classify._raw_body_outcome` strips allow-listed markup on the text branches only: a CSV or
+plain-text body carrying an `<a href=…>` per row spends the per-URL budget on tags, while a JSON
+body's angle brackets sit inside string values that are the data. Both text types get the strip
+because the labels are demonstrably unreliable here, Datawrapper's own versioned route serving CSV
+as `application/octet-stream`.
+
+`classify._network_failure_class` buckets a transport exception for the fetch marker. The specific
+subclasses are tested FIRST because aiohttp's TLS and DNS connector errors both subclass
+`ClientConnectorError`, so the general connection bucket would swallow them, and the whole point of
+the field is to tell a host that refused our TLS from one our egress IP could not resolve.
+`malformed_response` is a response aiohttp's parser refused before the body was ours: a
+`Content-Encoding` it cannot decode (the trueup.io zstd failure that had the brotli and zstd
+decoders added, 2026-09-03), a header past the session's size caps, a bad status line. The parser
+raises those as `HttpProcessingError` and the client re-raises them as
+`ClientResponseError(status=400)`, a SIBLING of `ClientPayloadError` under `ClientError` rather than
+a subclass, so `decode` cannot claim them and `connection` used to; the two say different things,
+`decode` being a body that arrived and could not be read.
+
+### What a self-produced refusal carries
+
+`http_status` on a `FetchResult` means "a host answered us this", and nothing else. A refusal the
+ladder makes itself carries None: the SSRF rejection of a derived hop, and the platform
+self-reference refusal, both of which used to carry the redirect's own 301 or 302
+(`guard._vetted_hop_target`, which is why it takes no `http_status` argument at all). Two rungs key
+on that field to decide whether a second transport may be handed the URL — the impersonated retry
+on a host's 403, and the archive rung under `wayback_needs_host_refusal` — and handing either a URL
+we refused ourselves is the bypass the guard exists to prevent.
+
+### The thin-content escalation
+
+`_escalate_unresolved` returns a success unchanged, with one exception: a caller with a
+thin-content floor (`thin_content_escalation_chars`) can mark a success `escalate_rendered`, and
+that success goes to the browser and nothing else. A chart block pins the flag off, because a
+render replaces the client-side series with a DOM lacking it (question 43949). When the render
+declines or reads nothing, the thin text stands, which is the whole point of escalating on a
+success rather than on a failure; the archive and the paid reader are never reached, because those
+answer a page we could not read AT ALL and this one we did. The fetcher's verdict never sets the
+flag, so its dispatcher cannot take this branch.
 
 ### Why the rungs sit in this order
 
@@ -879,7 +1014,7 @@ welcome.
 | Drop attribution / degradation counters | `metaculus_bot/drop_telemetry.py`; `degradation_counters.py` formats immutable snapshots built by `forecaster.py` |
 | Research fan-out | `metaculus_bot/research/orchestrator.py`, `research/providers.py` |
 | Outbound fetch transports | `research/http_fetch.py` (plain HTTP, redirects, per-host gates), `research/fetch_ladder/guard.py` (the SSRF preflight, the vetted DNS resolve, the aiohttp session), `research/impersonated_fetch.py` (the `curl_cffi` TLS-impersonating retry of a 403, with its own DNS pin and per-hop re-guard), `research/rendered_fetch.py` (headless Chromium), `research/url_context_reader.py` (one paid Gemini `url_context` read), `research/robots_policy.py` (the `Google-Extended` pre-check in front of that read) |
-| The shared fetch ladder and its `fetch_url` entry point | `research/fetch_ladder/` (`policy.py` the per-caller knobs, `context.py` the per-URL and per-question bookkeeping, `classify.py` one body's classification, `direct_fetch.py` the redirect loop, `rungs.py` the seven rungs, `ladder.py` the dispatcher and the `fetch_url` entry point, `digest.py` the digest seat, `guard.py` the outbound guard), `research/resolution_fetch_result.py` (the status, reason and route vocabularies), `research/derived_api.py`, `research/wayback.py` |
+| The shared fetch ladder and its `fetch_url` entry point | `research/fetch_ladder/` (`policy.py` the per-caller knobs, `verdict.py` what a caller makes of a body it read, `context.py` the per-URL and per-question bookkeeping, `classify.py` one body's classification, `direct_fetch.py` the redirect loop, `rungs.py` the seven rungs, `ladder.py` the dispatcher and the `fetch_url` entry point, `digest.py` the digest seat, `guard.py` the outbound guard), `research/resolution_fetch_result.py` (the status, reason and route vocabularies), `research/document_cache.py` (the parses a run holds, which never ride a `FetchResult`), `research/derived_api.py`, `research/wayback.py` |
 | Resolution-source fetcher: its adapter over that ladder | `research/resolution_source.py` (URL selection, the Datawrapper second phase, the provider factory, the telemetry emitter and the rung counts) |
 | Resolution-source text and section budgets | `research/resolution_presentation.py` |
 | Datawrapper response classification, freshness and dataset ordering | `research/resolution_datawrapper.py`; requests and question budgets remain in `research/resolution_source.py` |

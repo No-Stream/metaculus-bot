@@ -283,11 +283,11 @@ class TestProviderLevelRungMarkers:
             await resolution_source_provider(is_benchmarking=False)(q)
 
         assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
-            f"RESOLUTION_SOURCE_FETCH: question=999 url={_URL} status=ok http=200 embeds=none route=rendered"
+            f"RESOLUTION_SOURCE_FETCH: question=999 url={_URL} status=ok http=200 embeds=none route=rendered caller=resolution_source"
         ]
         assert re.fullmatch(
             rf"RESOLUTION_SOURCE_ESCALATION: question=999 url={re.escape(_URL)} "
-            r"from_status=js_wall rung=rendered outcome=success wall_s=\d+\.\d\d",
+            r"from_status=js_wall rung=rendered outcome=success wall_s=\d+\.\d\d caller=resolution_source",
             next(m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_ESCALATION:")),
         )
         counts = pop_provider_detail(q.id_of_question, "resolution_source")["counts"]
@@ -310,7 +310,7 @@ class TestProviderLevelRungMarkers:
             section = await resolution_source_provider(is_benchmarking=False)(q)
 
         assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
-            f"RESOLUTION_SOURCE_FETCH: question=999 url={_URL} status=ok http=200 embeds=none route=derived_api"
+            f"RESOLUTION_SOURCE_FETCH: question=999 url={_URL} status=ok http=200 embeds=none route=derived_api caller=resolution_source"
         ]
         # Two escalation lines: the render fired (found the endpoint) and the derived-feed read
         # produced the text, and only the second is the route. Matched whole, like the sibling
@@ -320,12 +320,12 @@ class TestProviderLevelRungMarkers:
         assert len(escalations) == 2
         assert re.fullmatch(
             rf"RESOLUTION_SOURCE_ESCALATION: question=999 url={re.escape(_URL)} "
-            r"from_status=js_wall rung=rendered outcome=js_wall wall_s=\d+\.\d\d",
+            r"from_status=js_wall rung=rendered outcome=js_wall wall_s=\d+\.\d\d caller=resolution_source",
             escalations[0],
         )
         assert re.fullmatch(
             rf"RESOLUTION_SOURCE_ESCALATION: question=999 url={re.escape(_URL)} "
-            r"from_status=js_wall rung=derived_api outcome=success wall_s=\d+\.\d\d",
+            r"from_status=js_wall rung=derived_api outcome=success wall_s=\d+\.\d\d caller=resolution_source",
             escalations[1],
         )
         counts = pop_provider_detail(q.id_of_question, "resolution_source")["counts"]
@@ -356,11 +356,11 @@ class TestProviderLevelRungMarkers:
             section = await resolution_source_provider(is_benchmarking=False)(q)
 
         assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
-            f"RESOLUTION_SOURCE_FETCH: question=999 url={_URL} status=ok http=200 embeds=none route=impersonate"
+            f"RESOLUTION_SOURCE_FETCH: question=999 url={_URL} status=ok http=200 embeds=none route=impersonate caller=resolution_source"
         ]
         assert re.fullmatch(
             rf"RESOLUTION_SOURCE_ESCALATION: question=999 url={re.escape(_URL)} "
-            r"from_status=blocked rung=impersonate outcome=success wall_s=\d+\.\d\d",
+            r"from_status=blocked rung=impersonate outcome=success wall_s=\d+\.\d\d caller=resolution_source",
             next(m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_ESCALATION:")),
         )
         assert [call["url"] for call in calls] == [_URL]
@@ -418,11 +418,11 @@ class TestProviderLevelRungMarkers:
             section = await resolution_source_provider(is_benchmarking=False)(q)
 
         assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
-            f"RESOLUTION_SOURCE_FETCH: question=999 url={_URL} status=ok http=200 embeds=none route=wayback"
+            f"RESOLUTION_SOURCE_FETCH: question=999 url={_URL} status=ok http=200 embeds=none route=wayback caller=resolution_source"
         ]
         assert re.fullmatch(
             rf"RESOLUTION_SOURCE_ESCALATION: question=999 url={re.escape(_URL)} "
-            r"from_status=blocked rung=wayback outcome=success wall_s=\d+\.\d\d",
+            r"from_status=blocked rung=wayback outcome=success wall_s=\d+\.\d\d caller=resolution_source",
             next(m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_ESCALATION:")),
         )
         counts = pop_provider_detail(q.id_of_question, "resolution_source")["counts"]
@@ -454,11 +454,11 @@ class TestProviderLevelRungMarkers:
 
         assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
             f"RESOLUTION_SOURCE_FETCH: question=999 url={_URL} status=stale_data http=403 embeds=none "
-            "route=wayback failure_class=http_403 server=akamaighost"
+            "route=wayback failure_class=http_403 server=akamaighost caller=resolution_source"
         ]
         assert re.fullmatch(
             rf"RESOLUTION_SOURCE_ESCALATION: question=999 url={re.escape(_URL)} "
-            r"from_status=blocked rung=wayback outcome=stale_data wall_s=\d+\.\d\d",
+            r"from_status=blocked rung=wayback outcome=stale_data wall_s=\d+\.\d\d caller=resolution_source",
             next(m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_ESCALATION:")),
         )
 
@@ -476,11 +476,11 @@ class TestProviderLevelRungMarkers:
         # http=403: the paid read keeps the direct fetch's HTTP status (the host refused us),
         # since a model-mediated read has no status of its own.
         assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
-            f"RESOLUTION_SOURCE_FETCH: question=999 url={_URL} status=ok http=403 embeds=none route=url_context"
+            f"RESOLUTION_SOURCE_FETCH: question=999 url={_URL} status=ok http=403 embeds=none route=url_context caller=resolution_source"
         ]
         assert re.fullmatch(
             rf"RESOLUTION_SOURCE_ESCALATION: question=999 url={re.escape(_URL)} "
-            r"from_status=blocked rung=url_context outcome=success wall_s=\d+\.\d\d",
+            r"from_status=blocked rung=url_context outcome=success wall_s=\d+\.\d\d caller=resolution_source",
             next(m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_ESCALATION:")),
         )
         counts = pop_provider_detail(q.id_of_question, "resolution_source")["counts"]

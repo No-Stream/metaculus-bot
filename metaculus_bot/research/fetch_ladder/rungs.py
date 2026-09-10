@@ -30,7 +30,6 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV,
     RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS,
     RESOLUTION_SOURCE_URL_CONTEXT_MIN_BUDGET_S,
-    RESOLUTION_SOURCE_WAYBACK_MAX_AGE_DAYS,
     RESOLUTION_SOURCE_WAYBACK_MAX_ATTEMPTS,
     RESOLUTION_SOURCE_WAYBACK_MIN_BUDGET_S,
     RESOLUTION_SOURCE_WITHHELD_REPLY_LOG_CHARS,
@@ -38,6 +37,7 @@ from metaculus_bot.constants import (
 )
 from metaculus_bot.research import derived_api, impersonated_fetch, resolution_presentation
 from metaculus_bot.research.fetch_ladder import classify, context, direct_fetch, guard
+from metaculus_bot.research.fetch_ladder.policy import LadderPolicy
 from metaculus_bot.research.http_fetch import decode_text_body
 from metaculus_bot.research.impersonated_fetch import (
     ImpersonateBudgetExhausted,
@@ -117,14 +117,11 @@ def _impersonate_rung_applies(direct: FetchResult) -> bool:
 
 
 async def _impersonated_body_outcome(response: ImpersonatedResponse, ctx: context.LadderContext) -> FetchResult:
-    """Classify a body the impersonated retry read, on the same three-way routing as a direct 200.
+    """Classify a body the impersonated retry read, through the ladder's ONE body router.
 
-    The same content-type routing as :func:`_resolution_response_outcome`, read in the same order
-    and off the same vocabularies, so a rescued page is indistinguishable downstream from a
-    directly-fetched one: ``_HTML_CONTENT_TYPES`` to :func:`_classify_html_body`,
-    ``is_json_content_type`` or ``_RAW_TEXT_CONTENT_TYPES`` to :func:`_raw_body_outcome`, and
-    everything else, an empty Content-Type included, to :func:`_document_outcome` plus the parse
-    :func:`_finish_document` runs once a document is held.
+    :func:`classify._classify_body` is the same router a direct 200 takes, so a rescued page is
+    indistinguishable downstream from a directly-fetched one and a route the caller's verdict
+    gains reaches this rung with it rather than needing a second copy here.
 
     ``http_status`` is the IMPERSONATED response's 200, not the direct 403. The bytes came with a
     200 and that is the honest record: a rescue's fetch line reads ``status=ok http=200
@@ -145,25 +142,10 @@ async def _impersonated_body_outcome(response: ImpersonatedResponse, ctx: contex
     ``route=pdf_local``: the accounting a meta-refresh hop onto a PDF already produces, in the
     file's own words "the hop got us the bytes, the local read is what the text came from".
     """
-    content_type = response.content_type
-    if any(ct in content_type for ct in classify._HTML_CONTENT_TYPES):
-        classified = await classify._classify_html_body(
-            response.body,
-            response.url,
-            content_type,
-            http_status=response.status,
-            # What the retry left of the wall: the extractor's optional second pass declines under
-            # its floor rather than overrunning the provider.
-            remaining_wall_s=ctx.rung_budget_s(),
-        )
-        return classified.result
-    if is_json_content_type(content_type) or any(ct in content_type for ct in classify._RAW_TEXT_CONTENT_TYPES):
-        return classify._raw_body_outcome(response.body, response.url, content_type, http_status=response.status)
-    # The content-type router's verdict before the `%PDF-` sniff, as `_resolution_response_outcome`
-    # records it, so a document read off this rung pairs `pdf_local` with the same `from_status` a
-    # directly fetched one does.
-    outcome = classify._document_outcome(
-        response.body, response.url, content_type, ctx, http_status=response.status, from_status="unsupported_type"
+    # `_classify_body` rather than its hop-following sibling: this rung owns no redirect loop, and
+    # following one would mean deciding which transport dials the target (FUTURE.md has the entry).
+    outcome = await classify._classify_body(
+        response.body, response.url, response.content_type, ctx, http_status=response.status
     )
     if isinstance(outcome, classify._PendingDocument):
         return await classify._finish_document(outcome, ctx)
@@ -229,6 +211,18 @@ async def _impersonate_or_record_the_skip(
             exc,
         )
     return None
+
+
+def _impersonate_dial_budget_s(budget_s: float, pol: LadderPolicy) -> float:
+    """The wall the whole retry gets: this rung's remaining budget, capped where the caller caps it.
+
+    A caller whose own wall is far longer than one page's worth (the loop's 90 s ``fetch``) bounds
+    the retry at one plain hop's timeout, so a slow redirect chain cannot spend a whole tool budget
+    inside one transport. The fetcher caps nothing here, because its wall IS one question's worth.
+    """
+    if pol.impersonate_dial_wall_s is None:
+        return budget_s
+    return min(budget_s, pol.impersonate_dial_wall_s)
 
 
 async def _impersonate_rung(
@@ -315,6 +309,7 @@ async def _impersonate_rung(
     budget_s = ctx.claim_rung_budget("impersonate", direct.status, url, RESOLUTION_SOURCE_IMPERSONATE_MIN_BUDGET_S)
     if budget_s is None:
         return None
+    budget_s = _impersonate_dial_budget_s(budget_s, ctx.policy)
     attempt = ctx.start_rung("impersonate", direct.status, url)
     response = await _impersonate_or_record_the_skip(retry_url, budget_s, host_sems, attempt)
     if response is None:
@@ -367,35 +362,28 @@ async def _impersonate_rung(
     return None
 
 
-# This fetcher's key into the transport's render memos. Its "rendered to nothing" is the strong
-# form — the ARIA rewrite, the inline-chart read and the harvested feed all failed — so gap-fill
-# v2's weaker verdict on the same URL must never answer for it (rendered_fetch.MemoScope).
-_RENDER_MEMO_SCOPE: MemoScope = "resolution_source"
-
-
 def _rendered_rung_applies(direct: FetchResult) -> bool:
     """Whether a browser could plausibly turn ``direct`` into readable content.
 
-    Two triggers, both pages that answered 200 with nothing we could read: ``js_wall`` (the
-    population the rung was measured on — Chromium rescued 6 of the 8 archived walls that
-    still failed from a residential address on 2026-09-03) and the ``thin_page`` shape of
-    ``no_resolving_content``, where the extraction cleared the JS-wall floor and still carried
-    only chrome, which is the same client-side-assembly failure one floor up.
-
-    ``embed_shell`` is deliberately NOT a trigger, and that is a fact about the browser rather
-    than a policy choice: ``page.content()`` returns the MAIN FRAME's HTML, so an Infogram or
-    Flourish iframe comes back as an ``<iframe>`` tag whose document Chromium rendered
-    somewhere we never read. Rendering that page spends a 100-300 MB launch to re-derive the
-    same verdict. ``blocked`` is not a trigger either: the edge refused our address before any
-    HTML existed, and Chromium dials from the same address.
+    Three triggers, all pages that answered 200 with nothing this caller can use: ``js_wall``
+    (the population the rung was measured on), the ``thin_page`` shape of
+    ``no_resolving_content``, and a result the caller's own verdict marked
+    ``escalate_rendered`` — a success too short to be the page, which only the gap-fill preset
+    produces. Why ``embed_shell`` and ``blocked`` are NOT triggers: ``docs/architecture.md``,
+    "Why the rungs sit in this order".
     """
-    if direct.status == "js_wall":
+    if direct.escalate_rendered or direct.status == "js_wall":
         return True
     return direct.status == "no_resolving_content" and direct.status_reason == "thin_page"
 
 
 async def _render_or_record_the_skip(
-    url: str, budget_s: float, host_sems: dict[str, asyncio.Semaphore], attempt: RungAttempt
+    url: str,
+    budget_s: float,
+    host_sems: dict[str, asyncio.Semaphore],
+    attempt: RungAttempt,
+    *,
+    memo_scope: MemoScope,
 ) -> RenderedPage | None:
     """Run the transport under the rung's wall bound; on anything but a page, record why.
 
@@ -409,7 +397,7 @@ async def _render_or_record_the_skip(
         page = await asyncio.wait_for(
             render_page(
                 url,
-                memo_scope=_RENDER_MEMO_SCOPE,
+                memo_scope=memo_scope,
                 host_gate=guard._sem_for_host(host_sems, url),
                 goto_timeout_ms=goto_timeout_ms,
                 # The transport's exit (shared teardown bound, launch, driver stop) runs AFTER
@@ -564,14 +552,15 @@ async def _rendered_rung(
     render_url = direct.url
     if await guard._landing_refused(render_url, url, action="rendering"):
         return None
-    if rendered_to_nothing(render_url, memo_scope=_RENDER_MEMO_SCOPE):
+    memo_scope = ctx.policy.render_memo_scope
+    if rendered_to_nothing(render_url, memo_scope=memo_scope):
         ctx.skip_rung("rendered", direct.status, url, "rendered_no_text")
         return None
     budget_s = ctx.claim_rung_budget("rendered", direct.status, url, RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S)
     if budget_s is None:
         return None
     attempt = ctx.start_rung("rendered", direct.status, url)
-    page = await _render_or_record_the_skip(render_url, budget_s, host_sems, attempt)
+    page = await _render_or_record_the_skip(render_url, budget_s, host_sems, attempt, memo_scope=memo_scope)
     if page is None:
         return None
     if page.http_status is not None and page.http_status != 200:
@@ -601,6 +590,7 @@ async def _rendered_rung(
         # What the browser left of the wall: the render spent the rest, and the extractor's
         # optional second pass declines under its floor rather than overrunning the provider.
         remaining_wall_s=ctx.rung_budget_s(),
+        pol=ctx.policy,
     )
     if classified.result.chrome_metric_withheld:
         # The metric withheld the rendered DOM's extraction. `chrome_metric_withholds` counts a
@@ -618,7 +608,7 @@ async def _rendered_rung(
     derived = _derived_api_from_harvest(url, direct, page, ctx)
     if derived is not None:
         return derived
-    note_rendered_no_text(render_url, memo_scope=_RENDER_MEMO_SCOPE)
+    note_rendered_no_text(render_url, memo_scope=memo_scope)
     return None
 
 
@@ -645,11 +635,11 @@ def _derived_api_from_harvest(
     derived_api.remember_endpoint(url, harvested.url)
     endpoint = derived_api.DerivedEndpoint(endpoint_url=harvested.url, discovered_on=url)
     ctx.start_rung("derived_api", direct.status, url)
-    return _derived_api_result(url, endpoint, raw, http_status=direct.http_status)
+    return _derived_api_result(url, endpoint, raw, http_status=direct.http_status, cap=ctx.policy.per_url_max_chars)
 
 
 def _derived_api_result(
-    url: str, endpoint: derived_api.DerivedEndpoint, raw: str, *, http_status: int | None
+    url: str, endpoint: derived_api.DerivedEndpoint, raw: str, *, http_status: int | None, cap: int | None
 ) -> FetchResult:
     """One derived-feed result: the provenance lead, then the budgeted JSON.
 
@@ -661,7 +651,7 @@ def _derived_api_result(
     return FetchResult(
         url=url,
         status="success",
-        text=resolution_presentation._lead_then_capped_body(lead, raw, url),
+        text=resolution_presentation._lead_then_capped_body(lead, raw, url, cap=cap),
         http_status=http_status,
         content_type="application/json",
     )
@@ -711,17 +701,26 @@ async def _derived_api_rung(
             feed.content_type,
         )
         return None
-    return _derived_api_result(url, endpoint, feed.text, http_status=feed.http_status)
+    return _derived_api_result(url, endpoint, feed.text, http_status=feed.http_status, cap=ctx.policy.per_url_max_chars)
 
 
-# A page the archive can plausibly substitute for: the host refused us, never answered, or says
-# the URL is gone. Deliberately NOT `js_wall` — the archive stores the unrendered shell, so it
-# rescued 0 of the 8 archived walls that still failed on 2026-09-03 while the browser rung
-# rescued 6. Nor `no_resolving_content`: a page that answered 200 with chrome is one whose live
-# markup we have and whose numbers are elsewhere, and an older copy of the same chrome adds
-# nothing. `ssrf_blocked` is excluded because WE refused that URL, and handing it to a
-# third-party fetcher is precisely the bypass the guard exists to prevent.
+# A page the archive can plausibly substitute for: the host refused us, never answered, or says the
+# URL is gone. Why `js_wall`, `no_resolving_content` and `ssrf_blocked` are excluded:
+# docs/architecture.md "Why the rungs sit in this order".
 _WAYBACK_TRIGGER_STATUSES: frozenset[FetchStatus] = frozenset({"blocked", "error", "not_found"})
+
+
+def _wayback_rung_applies(direct: FetchResult, pol: LadderPolicy) -> bool:
+    """Whether the archive is a plausible substitute for ``direct``, for THIS caller.
+
+    The shared trigger set plus whatever the caller adds to it (the loop also substitutes for a
+    body it could not read at all). ``wayback_needs_host_refusal`` then drops a ``blocked`` that
+    carries no host status, which is a refusal WE made: handing that to a third-party fetcher is
+    the bypass ``ssrf_blocked``'s exclusion prevents, one reason over.
+    """
+    if direct.status not in (_WAYBACK_TRIGGER_STATUSES | pol.wayback_extra_trigger_statuses):
+        return False
+    return not (pol.wayback_needs_host_refusal and direct.status == "blocked" and direct.http_status is None)
 
 
 async def _wayback_snapshot_result(
@@ -778,7 +777,13 @@ async def _wayback_snapshot_result(
         )
         return None
     age_days = None if parsed is None else snapshot_age_days(parsed, ctx.now)
-    if parsed is None or age_days is None or age_days > RESOLUTION_SOURCE_WAYBACK_MAX_AGE_DAYS:
+    max_age_days = ctx.policy.wayback_max_age_days
+    if max_age_days is None:
+        # No bound: the capture date is surfaced and the caller's own reader weighs it, so an
+        # undatable capture is a decline rather than a withhold (there is nothing to disclose).
+        if parsed is None or age_days is None:
+            return None
+    elif parsed is None or age_days is None or age_days > max_age_days:
         logger.warning(
             "resolution_source wayback: capture for %s is not usable (final=%s, age=%s) — withheld as stale",
             urlparse(url).netloc,
@@ -812,12 +817,13 @@ async def _wayback_snapshot_result(
     return FetchResult(
         url=url,
         status="success",
-        text=resolution_presentation._lead_then_capped_body(lead, snapshot.text, url),
+        text=resolution_presentation._lead_then_capped_body(lead, snapshot.text, url, cap=ctx.policy.per_url_max_chars),
         http_status=snapshot.http_status,
         content_type=snapshot.content_type,
         datawrapper_charts=snapshot.datawrapper_charts,
         unreadable_embeds=snapshot.unreadable_embeds,
         precision_rescued=snapshot.precision_rescued,
+        links=snapshot.links,
     )
 
 
@@ -832,7 +838,7 @@ async def _wayback_rung(
     snapshot contends on the one ``web.archive.org`` host gate — which is the documented trade
     for the politeness that gate exists to provide.
     """
-    if direct.status not in _WAYBACK_TRIGGER_STATUSES:
+    if not _wayback_rung_applies(direct, ctx.policy):
         return None
     if ctx.claim_rung_budget("wayback", direct.status, url, RESOLUTION_SOURCE_WAYBACK_MIN_BUDGET_S) is None:
         return None
@@ -1148,7 +1154,7 @@ async def _url_context_rung(
     return FetchResult(
         url=url,
         status="success",
-        text=resolution_presentation._lead_then_capped_body(lead, answer, url),
+        text=resolution_presentation._lead_then_capped_body(lead, answer, url, cap=ctx.policy.per_url_max_chars),
         http_status=direct.http_status,
         content_type="text/plain",
     )

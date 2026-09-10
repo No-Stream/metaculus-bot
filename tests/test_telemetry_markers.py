@@ -1187,52 +1187,52 @@ class TestFinancialNoiseFlag:
 # Verbatim from resolution_source.py:_log_fetch_outcome_markers; one line per fetched URL, tier told apart by CDN url.
 RESOLUTION_SOURCE_FETCH_OK_LINE = (
     PFX + "RESOLUTION_SOURCE_FETCH: question=44554 url=https://www.racetothewh.com/senate/26 "
-    "status=ok http=200 embeds=none"
+    "status=ok http=200 embeds=none caller=resolution_source"
 )
 RESOLUTION_SOURCE_FETCH_EMBED_LINE = (
     PFX + "RESOLUTION_SOURCE_FETCH: question=44554 url=https://www.racetothewh.com/senate/26 "
-    "status=ok http=200 embeds=infogram,tableau"
+    "status=ok http=200 embeds=infogram,tableau caller=resolution_source"
 )
 RESOLUTION_SOURCE_FETCH_NO_CONTENT_LINE = (
     PFX + "RESOLUTION_SOURCE_FETCH: question=44556 url=https://tracker.example.com/senate "
-    "status=no_resolving_content http=200 embeds=infogram reason=embed_shell"
+    "status=no_resolving_content http=200 embeds=infogram reason=embed_shell caller=resolution_source"
 )
 RESOLUTION_SOURCE_FETCH_THIN_PAGE_LINE = (
     PFX + "RESOLUTION_SOURCE_FETCH: question=45088 url=https://data.wastewaterscan.org/ "
-    "status=no_resolving_content http=200 embeds=none reason=thin_page"
+    "status=no_resolving_content http=200 embeds=none reason=thin_page caller=resolution_source"
 )
 RESOLUTION_SOURCE_FETCH_NO_MATCHING_PASSAGE_LINE = (
     PFX + "RESOLUTION_SOURCE_FETCH: question=45363 url=https://www.bls.gov/news.release/pdf/wkstp.pdf "
-    "status=no_resolving_content http=200 embeds=none reason=no_matching_passage route=pdf_local"
+    "status=no_resolving_content http=200 embeds=none reason=no_matching_passage route=pdf_local caller=resolution_source"
 )
 RESOLUTION_SOURCE_FETCH_BLOCKED_LINE = (
     PFX + "RESOLUTION_SOURCE_FETCH: question=44211 url=https://www.cbp.gov/newsroom/stats "
-    "status=blocked http=403 embeds=none"
+    "status=blocked http=403 embeds=none caller=resolution_source"
 )
 RESOLUTION_SOURCE_FETCH_NO_RESPONSE_LINE = (
     PFX + "RESOLUTION_SOURCE_FETCH: question=44211 url=https://slow.example.com/x status=error http=n/a embeds=none"
 )
 RESOLUTION_SOURCE_FETCH_DATASET_LINE = (
     PFX + "RESOLUTION_SOURCE_FETCH: question=44841 url=https://static.dwcdn.net/data/kSCt4.csv "
-    "status=ok http=200 embeds=none"
+    "status=ok http=200 embeds=none caller=resolution_source"
 )
 # `route` names the rung that produced the outcome; keyed and last, so all 4 optional-tail combinations parse.
 RESOLUTION_SOURCE_FETCH_ROUTE_ONLY_LINE = (
     PFX + "RESOLUTION_SOURCE_FETCH: question=44554 url=https://www.racetothewh.com/senate/26 "
-    "status=ok http=200 embeds=none route=wayback"
+    "status=ok http=200 embeds=none route=wayback caller=resolution_source"
 )
 RESOLUTION_SOURCE_FETCH_REASON_AND_ROUTE_LINE = (
     PFX + "RESOLUTION_SOURCE_FETCH: question=44556 url=https://tracker.example.com/senate "
-    "status=no_resolving_content http=200 embeds=infogram reason=embed_shell route=rendered"
+    "status=no_resolving_content http=200 embeds=infogram reason=embed_shell route=rendered caller=resolution_source"
 )
 # failure_class, exc and server are keyed and sit after route (the 403/CDN diagnostics tail), so all subsets parse.
 RESOLUTION_SOURCE_FETCH_FAILURE_CLASS_LINE = (
     PFX + "RESOLUTION_SOURCE_FETCH: question=44211 url=https://www.cbp.gov/newsroom/stats "
-    "status=blocked http=403 embeds=none failure_class=http_403 server=akamaighost"
+    "status=blocked http=403 embeds=none failure_class=http_403 server=akamaighost caller=resolution_source"
 )
 RESOLUTION_SOURCE_FETCH_TRANSPORT_ERROR_LINE = (
     PFX + "RESOLUTION_SOURCE_FETCH: question=44211 url=https://slow.example.com/x "
-    "status=error http=n/a embeds=none failure_class=timeout exc=ServerTimeoutError"
+    "status=error http=n/a embeds=none failure_class=timeout exc=ServerTimeoutError caller=resolution_source"
 )
 
 
@@ -1383,11 +1383,11 @@ class TestResolutionSourceFetch:
 # Verbatim from resolution_source.py; one line per ESCALATED rung tried after the direct route failed to read the page.
 RESOLUTION_SOURCE_ESCALATION_RESCUED_LINE = (
     PFX + "RESOLUTION_SOURCE_ESCALATION: question=44556 url=https://tracker.example.com/senate "
-    "from_status=js_wall rung=rendered outcome=success wall_s=12.44"
+    "from_status=js_wall rung=rendered outcome=success wall_s=12.44 caller=resolution_source"
 )
 RESOLUTION_SOURCE_ESCALATION_FAILED_LINE = (
     PFX + "RESOLUTION_SOURCE_ESCALATION: question=44211 url=https://www.cbp.gov/newsroom/stats "
-    "from_status=blocked rung=impersonate outcome=blocked wall_s=3.07"
+    "from_status=blocked rung=impersonate outcome=blocked wall_s=3.07 caller=resolution_source"
 )
 
 

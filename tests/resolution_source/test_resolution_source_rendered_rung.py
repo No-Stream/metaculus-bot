@@ -8,7 +8,7 @@ import time
 
 import pytest
 
-from metaculus_bot.research import rendered_fetch, resolution_presentation, resolution_source
+from metaculus_bot.research import rendered_fetch, resolution_source
 from metaculus_bot.research.fetch_ladder import classify, guard, rungs
 from metaculus_bot.research.fetch_ladder.context import LadderContext
 from metaculus_bot.research.fetch_ladder.ladder import _fetch_one
@@ -30,6 +30,7 @@ from tests.resolution_source_fakes import (
     _prose_page,
     _rendered,
     _rendered_document,
+    capped_ctx,
 )
 
 # In the band between the JS-wall floor (100) and the chrome floor (400): the `thin_page` trigger.
@@ -662,7 +663,6 @@ class TestRenderedRungClassification:
         assert [chart.chart_id for chart in result.datawrapper_charts] == ["aB3dE"]
 
     async def test_the_per_url_cap_still_binds_on_a_rendered_page(self, monkeypatch):
-        monkeypatch.setattr(resolution_presentation, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", 200)
         monkeypatch.setattr(
             rungs,
             "render_page",
@@ -670,7 +670,7 @@ class TestRenderedRungClassification:
         )
         session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
 
-        result = await _fetch_one(session, _URL, {})
+        result = await _fetch_one(session, _URL, {}, capped_ctx(200))
 
         assert result.status == "success"
         assert len(result.text) <= 200

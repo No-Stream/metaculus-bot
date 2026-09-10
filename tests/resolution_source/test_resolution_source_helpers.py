@@ -19,8 +19,9 @@ import pytest
 
 from metaculus_bot.constants import RESOLUTION_SOURCE_WAYBACK_MAX_AGE_DAYS
 from metaculus_bot.research import resolution_presentation, resolution_source
-from metaculus_bot.research.fetch_ladder import classify
-from metaculus_bot.research.fetch_ladder.classify import looks_like_js_wall
+from metaculus_bot.research.fetch_ladder import classify, verdict
+from metaculus_bot.research.fetch_ladder.policy import RESOLUTION_SOURCE_POLICY
+from metaculus_bot.research.fetch_ladder.verdict import looks_like_js_wall
 from metaculus_bot.research.http_fetch import (
     MAX_UNDECODABLE_CHAR_RATIO,
     decode_text_body,
@@ -412,12 +413,12 @@ class TestSelectFetchableUrls:
 
 class TestLooksLikeJsWall:
     def test_short_text_flagged(self, monkeypatch):
-        monkeypatch.setattr(classify, "RESOLUTION_SOURCE_JS_WALL_MIN_CHARS", 100)
-        assert classify.looks_like_js_wall("only a few chars") is True
+        monkeypatch.setattr(verdict, "RESOLUTION_SOURCE_JS_WALL_MIN_CHARS", 100)
+        assert verdict.looks_like_js_wall("only a few chars") is True
 
     def test_long_text_not_flagged(self, monkeypatch):
-        monkeypatch.setattr(classify, "RESOLUTION_SOURCE_JS_WALL_MIN_CHARS", 20)
-        assert classify.looks_like_js_wall("x" * 30) is False
+        monkeypatch.setattr(verdict, "RESOLUTION_SOURCE_JS_WALL_MIN_CHARS", 20)
+        assert verdict.looks_like_js_wall("x" * 30) is False
 
     def test_whitespace_only_flagged(self):
         assert looks_like_js_wall("       \n\n   ") is True
@@ -853,7 +854,8 @@ class TestFormatResolutionSections:
         rescued fourth leave a remainder under the floor. Sizes derive from the constants so the
         scenario stays the reachable one."""
         total = resolution_presentation.RESOLUTION_SOURCE_TOTAL_MAX_CHARS
-        per_url = resolution_presentation.RESOLUTION_SOURCE_PER_URL_MAX_CHARS
+        per_url = RESOLUTION_SOURCE_POLICY.per_url_max_chars
+        assert per_url is not None
         leftover = resolution_presentation.RESOLUTION_SOURCE_MIN_SECTION_CHARS // 3
         fillers = [
             FetchResult(
@@ -867,7 +869,7 @@ class TestFormatResolutionSections:
             url=url,
             status="success",
             text=resolution_presentation._lead_then_capped_body(
-                wayback_lead(snapshot, 6.0, "blocked"), "x" * 8000, url
+                wayback_lead(snapshot, 6.0, "blocked"), "x" * 8000, url, cap=per_url
             ),
             http_status=200,
             content_type="text/html",
