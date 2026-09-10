@@ -349,7 +349,8 @@ class EnsembleSimulator:
                 score = self._score_aggregated_question(
                     data["question"], members, q_type=data["question_type"], strategy=strategy
                 )
-            except Exception as e:  # noqa: BLE001  # soft-fail boundary: one unaggregatable question must not abort the simulation
+            except ValueError as e:
+                # The only failure the _score_* methods raise for an unscoreable prediction; a bug still crashes.
                 logger.warning(f"Failed to aggregate predictions for question {q_id}: {e}")
                 continue
             if score is not None:
