@@ -1,32 +1,18 @@
-"""The resolution-source provider: an adapter over the shared fetch ladder.
+"""Resolution-source provider adapter.
 
-Reads the pages a question names as its own grading source, so every forecaster sees the ground
-truth the question will be scored against. ``select_fetchable_urls`` picks the cited URLs worth a
-fetch, ``fetch_resolution_sources`` fans one task per URL out to ``fetch_ladder.ladder.fetch_url``
-under ``RESOLUTION_SOURCE_POLICY`` with one shared aiohttp session, the process-wide per-host
-politeness map and one per-question rung budget, and ``resolution_presentation`` renders the result.
-A page embedding a Datawrapper chart earns one more phase here, the dataset hop, since trafilatura drops it.
+Selects URLs named by a question's resolution criteria, fetches them through the shared ladder
+under ``RESOLUTION_SOURCE_POLICY``, and presents the returned evidence to the research pipeline.
+This module owns provider-level orchestration: benchmarking and enablement gates, the shared
+session and host-politeness map, the per-question rung budget, the optional Datawrapper dataset
+hop, telemetry, diagnostics, and raw research records. The factory also applies the provider's
+question-level wall and fast-path controls.
 
-Two hard gates, both in the factory. ``is_benchmarking=True`` returns ``""``, because a page read
-today post-dates any backtest window, the same leakage guard the prediction-market provider carries.
-And ``RESOLUTION_SOURCE_ENABLED`` must be truthy.
+The fetch transport, body classification, escalation rungs, and per-rung deadlines live in
+``research/fetch_ladder/``. See ``docs/architecture.md`` ("The shared fetch ladder") and
+``docs/research.md`` ("Resolution-source fetcher") for those contracts and their boundaries.
 
-Every fetch runs inside one ``asyncio.wait_for`` on ``RESOLUTION_SOURCE_WALL_TIMEOUT``, which throws
-away every page that already fetched when it fires. That is why each rung bounds itself against the
-same clock, and why ``fast_path``, the question's thin-window mode, rides every context to make the
-two expensive rungs decline rather than drop this cheap, hard-capped provider.
-
-Telemetry is emitted here, at the per-question aggregation point, because that is where the question
-id exists: one ``RESOLUTION_SOURCE_FETCH`` line per fetched URL, one ``RESOLUTION_SOURCE_ESCALATION``
-line per rung that fired, the per-rung counts, and the results into the research archive.
-
-``strip_markdown_escapes``, ``looks_like_csv_rows`` and ``format_resolution_sections`` are re-exported
-here under ``noqa: F401`` for the Tier-1 suite, which imports them from this module path; none of the
-three moved in the ladder extraction, so the re-export cannot go stale.
-
-The fetch, its rungs, the body classification and the outbound guard live in ``research/fetch_ladder/``,
-documented in ``docs/architecture.md``, "The shared fetch ladder" and ``docs/research.md``,
-"Resolution-source fetcher".
+``strip_markdown_escapes``, ``looks_like_csv_rows`` and ``format_resolution_sections`` remain
+public re-exports for the Tier-1 test and presentation surfaces.
 """
 
 from __future__ import annotations

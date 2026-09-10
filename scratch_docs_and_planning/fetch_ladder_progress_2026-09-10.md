@@ -520,8 +520,9 @@ calibrated two-pass extraction with its line-shape metric, the inline chart read
 hop, the local document read with its parse gate, the Wayback rung with its per-question cap, the
 `+json` and empty-Content-Type admission, and per-rung wall floors on everything.
 
-Step 4 is complete. `GAP_FILL_FETCH_POLICY.rungs_enabled` now includes `derived_api`, so a feed an
-earlier render remembered for a host can be reused by the gap-fill loop. The rung, its per-host memo
+Step 4 is complete. Handoff status is **step 4 done**. `GAP_FILL_FETCH_POLICY.rungs_enabled` now
+includes `derived_api`, so a feed an earlier render remembered for a host can be reused by the gap-fill
+loop. The rung, its per-host memo
 and its budget gate were already live; the policy's `rung_not_enabled` skip was the only thing that
 kept reuse off. The regression in
 `tests/test_agentic_tools.py::TestGapFillV2DerivedApiOnEmptyRender::test_a_remembered_endpoint_is_gotten_for_a_second_same_host_url_before_render`
@@ -641,11 +642,9 @@ knobs; and in `ladder.py` only `fetch_url` and its imports). The other moved fil
 `resolution_source.py` and the three test modules this step barely touched) keep their findings for
 the scheduled repo-wide sweep, since nothing in them was rewritten here.
 
-Known follow-ups, none blocking: `resolution_source.py`'s 125-line module docstring still describes
-a ladder that has moved out from under it, and it is now purely the fetcher's adapter, so the
-rewrite is due and deliberately not bundled into step 2; seven tests inherited from 1a assert on
-records from a logger they never scoped and pass only because the root logger sits at WARNING;
-`rungs.py` at 1,155 lines trips the advisory monolithic-file threshold, left as one module because
+Known follow-ups, none blocking: the adapter docstring and logger scoping follow-ups are complete
+(`93c723b`; replay_audit confirmed six methods and seven assertions); `rungs.py` at 1,155 lines
+trips the advisory monolithic-file threshold, left as one module because
 the plan specifies it as one; and every comment-density and long-docstring finding in the moved
 files is left verbatim under the operator's scheduled repo-wide comment sweep, which is its own
 change (the two files step 2 created carry no findings).
