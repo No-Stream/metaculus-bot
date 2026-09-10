@@ -799,18 +799,25 @@ routes the donated-versus-personal key off that prefix, exactly as `FINANCIAL_CL
 bare `openai/` slug would dial OpenAI directly on a key this repo does not carry (the plan document
 wrote the slug without the prefix, and `GAP_FILL_RESOLVER_MODEL` can omit it only because
 `build_native_search_llm` adds it). The resolver probe of 2026-09-09
-(`scripts/probes/gap_fill_resolver_probe.py`, three runs on questions 44267 and 45199) priced luna at
-about a fifth of terra's cost per call at either effort, with no failed answers in any cell.
+(`scripts/probes/gap_fill_resolver_probe.py`, three runs on questions 44267 and 45199) priced luna at a
+fifth to a quarter of terra's cost per call at low effort (ratios 0.185 to 0.278) and at two-fifths to
+a half at the configured medium effort (ratios 0.386 to 0.486, luna at medium against terra at low,
+since terra was never probed at medium), with no failed answers in any of the 64 calls.
 
 ### PAGE_DIGEST_EXTRACTOR_TIMEOUT_S
 
-The ceiling on the one paid call. The same probe measured luna at medium effort at 13 to 33 s of wall
-on prompts of 20k to 58k tokens, with one 76 s call on an 84k-token prompt, and those calls carried
-web-search tool use inside them. The pre-filter below cuts the page to about 4k tokens before the model
-reads it, so a digest call should land well under this, and the constant is the ceiling that keeps a
-slow one inside the fetcher's 45 s `RESOLUTION_SOURCE_WALL_TIMEOUT` regardless. The call is bounded by
-`min(PAGE_DIGEST_EXTRACTOR_TIMEOUT_S, budget_seconds - PAGE_DIGEST_WALL_MARGIN_S)`, so a caller with
-less wall left than this gets a shorter call and never a longer one.
+The ceiling on the one paid call. The same probe's 16 luna calls at medium effort ran 13.3 to 76.1 s
+of wall, median 22.6 s, on prompts of 20k to 84k tokens, and only 6 of the 16 finished inside 20 s;
+every one of them also ran a web search, which the digest call does not. The pre-filter below cuts the
+page to about 4k tokens before the model reads it, so a digest call should land well under this, but
+that no-search latency is an extrapolation and not a measurement: `fallback_used` on the
+`RESOLUTION_SOURCE_FETCH` marker is the live reading of how often the ceiling binds once the fetch
+ladder wires the digest in. The constant stays at 20 s because the two errors are not symmetric: a
+ceiling that binds costs one cheap luna prompt and serves the BM25 digest that already shipped, while a
+30 s ceiling would hand up to 32 s of the fetcher's 45 s `RESOLUTION_SOURCE_WALL_TIMEOUT` to one page's
+digest on an unmeasured hunch. The call is bounded by `min(PAGE_DIGEST_EXTRACTOR_TIMEOUT_S,
+budget_seconds - elapsed - PAGE_DIGEST_WALL_MARGIN_S)`, where `elapsed` is the BM25 thread hop's own
+time, so a caller with less wall left than this gets a shorter call and never a longer one.
 
 ### PAGE_DIGEST_WALL_MARGIN_S
 
@@ -829,10 +836,12 @@ and nothing on the wall.
 
 ### PAGE_DIGEST_PREFILTER_MAX_CHARS
 
-About 4k tokens at the chars-over-four estimator, a fifth of the smallest prompts the probe timed. A
-page past it reaches the model as its best BM25 windows for the query (`DOCUMENT_DIGEST_WINDOW_CHARS`
-each, so 26 of them) in page order with `[...]` marking each cut, and a page under it goes whole. A long
-page on which no query token occurs at all sends its head instead, which is what a reader saw before.
+About 4k tokens at the chars-over-four estimator, a third of the smallest prompt the probe timed (13k
+tokens) and a fifth of the smallest medium-effort one (20k). A page past it reaches the model as its
+best BM25 windows for the query (`DOCUMENT_DIGEST_WINDOW_CHARS` each, so 26 of them) in page order,
+abutting windows spliced back together and `[...]` marking only a real cut, and a page under it goes
+whole. A long page on which no query token occurs at all sends its head instead, which is what a
+reader saw before.
 The fetch-gap inventory of 2026-09-09 counted 28% of the loop's plain reads hitting the 8,000-char
 presentation window, and the median plain read was under 4,000 chars, so the pre-filter fires on a
 minority of pages and the model reads most pages complete.

@@ -1449,8 +1449,9 @@ the pipeline spent it: `forecaster:openai` / `forecaster:anthropic` /
 `stacker`, `stacker_fallback`, `parser`, `summarizer`, `crux_analyzer`,
 `native_search`, `targeted_search`, `gap_fill_analyzer`, `gap_fill_resolver`,
 `gap_fill_v2_driver`, `market_query_author`, `market_ranker`,
-`financial_classifier`, `page_digest_extractor`, `perplexity_research`. The list lives in
-`credit_telemetry.llm_call_metadata`.
+`financial_classifier`, `page_digest_extractor`, `perplexity_research`. This list is the only
+enumeration: each role is a string literal at its builder call site, stamped onto every completion
+through `credit_telemetry.llm_call_metadata`.
 
 How the number is produced, because it decides how to read it:
 

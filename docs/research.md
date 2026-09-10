@@ -1887,8 +1887,11 @@ hallucination guard, and BM25 demoted to pre-filter and fallback.
 **What one call does.** `digest_page(text, query, budget_seconds=...)` returns a `PageDigest`
 (`passages`, `passages_returned`, `passages_grounded`, `fallback_used`, `method`). The page's
 opening window (`DOCUMENT_DIGEST_WINDOW_CHARS`, cut on a word boundary) always leads the passages,
-so a reader still sees what the page is. A page over `PAGE_DIGEST_PREFILTER_MAX_CHARS` is first cut
-to its best BM25 windows for the query, presented in page order with `[...]` at each cut; a shorter
+so a reader still sees what the page is. The BM25 ranking of the page (`document_text.select_passages`)
+and the page's normalisation run first, in one `asyncio.to_thread` hop like the two existing callers
+of that ranker, and the hop's elapsed time is charged against the caller's budget. A page over
+`PAGE_DIGEST_PREFILTER_MAX_CHARS` reaches the model as its best BM25 windows for the query in page
+order, abutting windows spliced back into one span and `[...]` marking only a real cut; a shorter
 page goes to the model whole. One call at `PAGE_DIGEST_EXTRACTOR_MODEL` and
 `PAGE_DIGEST_EXTRACTOR_EFFORT`, built through `build_llm_with_openrouter_fallback` like every
 support role, with a strict `response_format` schema (`PageDigestPassages`, a list of strings) and
@@ -1900,23 +1903,32 @@ caller's: the fetcher passes the question title plus resolution criteria, the lo
 driver's ask.
 
 **The grounding check is literal.** A returned passage is accepted only when it is a substring of
-the page text after whitespace normalisation (every run of whitespace collapsed to one space, on
-both sides). The passage a reader sees is the model's own text, so a copied table keeps its rows. A
-passage that fails is dropped and counted; a repeat of an accepted passage, or one already inside
-the opening window, is dropped but still counts as grounded. `passages_returned` minus
-`passages_grounded` is therefore the model's fabrication count for that page.
+the page text after whitespace and quote-glyph normalisation (every run of whitespace collapsed to
+one space and every straight, curly or backtick quote deleted, on both sides; the glyph rule is the
+one `agentic/provenance.py` learned when a curly quote retyped straight hid a verbatim copy). The
+passage a reader sees is the model's own text, so a copied table keeps its rows. A passage that fails
+is dropped and counted; a repeat of an accepted passage, or one already inside the opening window,
+is dropped but still counts as grounded. `passages_returned` minus `passages_grounded` is therefore
+the model's fabrication count for that page. At most `DOCUMENT_DIGEST_TOP_K` accepted passages are
+served after the opening, the same bound as the BM25 path, so the two mechanisms hand a caller the
+same order of text.
 
-**The fallback is today's digest.** BM25 (`document_text.select_passages`, `DOCUMENT_DIGEST_TOP_K`
-passages) is served with `fallback_used=True` and `method="bm25"` when the call raises one of the
-expected failures (the `asyncio.wait_for` timeout; any `openai.APIError`, which is the root of every
-litellm provider and API error; or a pydantic `ValidationError` on an off-schema answer), when
-nothing the model returned survives grounding, when the page is empty, or when the remaining wall is
-too short to try. Any other exception propagates. The call is bounded by
-`min(PAGE_DIGEST_EXTRACTOR_TIMEOUT_S, budget_seconds - PAGE_DIGEST_WALL_MARGIN_S)` and is not
-attempted below `PAGE_DIGEST_MIN_CALL_BUDGET_S`, so a caller hands over its remaining wall verbatim
-and the digest never lets a fetch overrun it. There is no retry: the fallback is the retry, and a
-second paid attempt cannot fit inside the wall. Receipts for every constant: docs/constants.md
-"Page digest".
+**The fallback is today's digest.** The first `DOCUMENT_DIGEST_TOP_K` windows of the BM25 ranking
+already computed are served with `fallback_used=True` and `method="bm25"` when the call raises one
+of the expected failures (the `asyncio.wait_for` timeout; any `openai.APIError`, which is the root
+of every litellm provider and API error; a pydantic `ValidationError` on an off-schema answer; or
+the bare `RuntimeError` forecasting-tools raises for an empty completion, recognised by
+`llm_retry.is_zero_output_failure` and the repo's most-seen zero-output failure), when nothing the
+model returned survives grounding, when the page is empty, or when the remaining wall is too short
+to try. Each of those paths logs one `PAGE_DIGEST` line naming its reason, which is the only place a
+skipped call is told from a failed one (the marker's three counters read the same). An answer whose
+grounded passages all lie inside the opening window is a success, not a fallback: the opening alone
+is served with `fallback_used=False`. Any other exception propagates. The call is bounded by
+`min(PAGE_DIGEST_EXTRACTOR_TIMEOUT_S, budget_seconds - elapsed - PAGE_DIGEST_WALL_MARGIN_S)`,
+where `elapsed` is the BM25 hop's own time, and is not attempted below
+`PAGE_DIGEST_MIN_CALL_BUDGET_S`, so a caller hands over its remaining wall verbatim and the digest
+never lets a fetch overrun it. There is no retry: the fallback is the retry, and a second paid
+attempt cannot fit inside the wall. Receipts for every constant: docs/constants.md "Page digest".
 
 **Billing and telemetry.** Every call is tagged `role=page_digest_extractor`, so it lands on the
 `CREDIT_ROLE_SPEND` ledger beside the other support roles: on a Metaculus run the donated key with
@@ -1926,11 +1938,13 @@ the personal fallback, on a Mantic run the personal key only, by the same rule a
 `fallback_used`) for the callers to append to their `RESOLUTION_SOURCE_FETCH` line as optional tail
 fields (docs/telemetry_markers.md "RESOLUTION_SOURCE_FETCH").
 
-**One known seam.** forecasting-tools raises a bare `RuntimeError` when a completion comes back as
-an empty string and an `AssertionError` when its content is `None`. Neither is caught here, because
-neither class is specific to the call, so an empty completion propagates to the caller rather than
-degrading to BM25. If the ladder's seat wants that shape degraded, the fix is a typed exception
-upstream or the seat's own boundary, not a broader catch here.
+**One known seam.** forecasting-tools trips a bare `assert isinstance(answer, str)` when a
+completion's content is `None` (the shape a reasoning model produces when it spends its whole
+budget on reasoning tokens). That `AssertionError` is not caught here, because catching it would
+also swallow the four unrelated invariant asserts in the same forecasting-tools method, so a
+`None`-content completion propagates to the caller rather than degrading to BM25. If the ladder's
+seat wants that shape degraded, the fix is a typed exception upstream or the seat's own boundary,
+not a broader catch here.
 
 ## Gap-fill (two passes, both concurrent, both on in prod)
 

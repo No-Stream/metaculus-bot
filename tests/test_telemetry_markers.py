@@ -1243,6 +1243,13 @@ RESOLUTION_SOURCE_FETCH_DIGEST_FALLBACK_LINE = (
     PFX + "RESOLUTION_SOURCE_FETCH: question=44554 url=https://www.bls.gov/news.release/empsit.nr0.htm "
     "status=ok http=200 embeds=none passages_returned=0 passages_grounded=0 fallback_used=True"
 )
+# Every optional tail group at once, in the documented order; the spec's positional groups make this order the contract.
+RESOLUTION_SOURCE_FETCH_FULL_TAIL_LINE = (
+    PFX + "RESOLUTION_SOURCE_FETCH: question=44211 url=https://www.cbp.gov/newsroom/stats "
+    "status=no_resolving_content http=200 embeds=none reason=thin_page route=rendered "
+    "failure_class=http_5xx exc=ServerTimeoutError server=akamaighost "
+    "passages_returned=3 passages_grounded=2 fallback_used=False"
+)
 
 
 class TestAsknewsNoArticles:
@@ -1413,6 +1420,19 @@ class TestResolutionSourceFetch:
             assert rec.get("passages_returned") is None
             assert rec.get("passages_grounded") is None
             assert rec.get("fallback_used") is None
+
+    def test_every_optional_tail_group_parses_together_in_the_documented_order(self):
+        """The spec ships ahead of its emitter, so this line is the order the emitter must follow: a digest
+        group written before `server` would parse, silently, with `server` harvested as None."""
+        rec = _parse_one(RESOLUTION_SOURCE_FETCH_FULL_TAIL_LINE)
+        assert rec["reason"] == "thin_page"
+        assert rec["route"] == "rendered"
+        assert rec["failure_class"] == "http_5xx"
+        assert rec["exc"] == "ServerTimeoutError"
+        assert rec["server"] == "akamaighost"
+        assert rec["passages_returned"] == 3
+        assert rec["passages_grounded"] == 2
+        assert rec["fallback_used"] is False
 
 
 # Verbatim from resolution_source.py; one line per ESCALATED rung tried after the direct route failed to read the page.

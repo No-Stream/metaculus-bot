@@ -106,7 +106,7 @@ def _norm(text: str) -> str:
 
 
 class TestGrounding:
-    """A passage is kept only when it is a literal substring of the page after whitespace normalisation."""
+    """A passage is kept only when it is a literal substring of the page after whitespace and quote-glyph normalisation."""
 
     async def test_mixed_returns_keep_only_the_literal_passages(self, monkeypatch, builder_calls) -> None:
         reflowed_tail = TAIL_TABLE.replace("\n", " ").replace("  ", " ")  # same text, whitespace reflowed
@@ -174,6 +174,70 @@ class TestGrounding:
         assert digest.passages_returned == 0
         assert digest.passages_grounded == 0
 
+    async def test_grounded_passages_inside_the_opening_are_a_success_not_a_fallback(
+        self, monkeypatch, builder_calls
+    ) -> None:
+        """The lede case: the model found the answer in the page's first window, so the opening alone is the digest."""
+        llm = ScriptedLlm(_passages_json(OPENING_SENTENCE))
+        _install(monkeypatch, llm, builder_calls)
+
+        digest = await digest_page(PAGE, QUERY, budget_seconds=RESOLUTION_SOURCE_WALL_TIMEOUT)
+
+        assert digest.method == DIGEST_METHOD_LLM_EXTRACTIVE
+        assert digest.fallback_used is False
+        assert digest.passages_returned == 1
+        assert digest.passages_grounded == 1
+        assert len(digest.passages) == 1
+        assert digest.passages[0].startswith(OPENING_SENTENCE)
+
+    async def test_the_llm_path_serves_at_most_top_k_passages_after_the_opening(
+        self, monkeypatch, builder_calls
+    ) -> None:
+        """The same bound as the BM25 path; the counters still report the full answer."""
+        many = [f"Paragraph {i}. {FILLER_SENTENCE}" for i in range(10, 30)]
+        llm = ScriptedLlm(_passages_json(*many))
+        _install(monkeypatch, llm, builder_calls)
+
+        digest = await digest_page(PAGE, QUERY, budget_seconds=RESOLUTION_SOURCE_WALL_TIMEOUT)
+
+        assert digest.passages_returned == 20
+        assert digest.passages_grounded == 20
+        assert len(digest.passages) == 1 + DOCUMENT_DIGEST_TOP_K
+        assert digest.passages[1:] == many[:DOCUMENT_DIGEST_TOP_K]
+
+    async def test_a_curly_quoted_sentence_retyped_with_straight_quotes_still_grounds(
+        self, monkeypatch, builder_calls
+    ) -> None:
+        quoted = "The commissioner said “the civilian unemployment rate for August 2026 was 4.3 percent” today."
+        page = "\n\n".join([OPENING_SENTENCE, *(f"Paragraph {i}. {FILLER_SENTENCE}" for i in range(4)), quoted])
+        assert len(page) > DOCUMENT_DIGEST_WINDOW_CHARS  # so the quoted sentence sits outside the opening
+        retyped = quoted.replace("“", '"').replace("”", '"')
+        llm = ScriptedLlm(_passages_json(retyped))
+        _install(monkeypatch, llm, builder_calls)
+
+        digest = await digest_page(page, QUERY, budget_seconds=RESOLUTION_SOURCE_WALL_TIMEOUT)
+
+        assert digest.passages_grounded == 1
+        assert digest.fallback_used is False
+        assert digest.passages[1] == retyped
+
+    async def test_a_passage_spliced_across_a_real_cut_is_not_grounded(self, monkeypatch, builder_calls) -> None:
+        """The one fabrication shape the pre-filter itself creates: text joined across a `[...]` cut."""
+        probe = ScriptedLlm(_passages_json())
+        _install(monkeypatch, probe, builder_calls)
+        await digest_page(PAGE, QUERY, budget_seconds=RESOLUTION_SOURCE_WALL_TIMEOUT)
+        page_text = probe.prompts[0].split("Page text:\n", 1)[1]
+        cut = page_text.index("\n[...]\n")
+        spliced = page_text[cut - 60 : cut + len("\n[...]\n") + 60]
+
+        llm = ScriptedLlm(_passages_json(spliced))
+        _install(monkeypatch, llm, builder_calls)
+        digest = await digest_page(PAGE, QUERY, budget_seconds=RESOLUTION_SOURCE_WALL_TIMEOUT)
+
+        assert digest.passages_returned == 1
+        assert digest.passages_grounded == 0
+        assert digest.fallback_used is True
+
 
 class TestPrefilter:
     """A page past the cap reaches the model as its best BM25 windows, in page order; a short page goes whole."""
@@ -224,6 +288,27 @@ class TestPrefilter:
         page_text = prompt.split("Page text:\n", 1)[1]
         assert page_text == PAGE[:PAGE_DIGEST_PREFILTER_MAX_CHARS]
 
+    async def test_a_table_spanning_several_windows_reaches_the_model_unbroken(
+        self, monkeypatch, builder_calls
+    ) -> None:
+        """Abutting windows are spliced back together; `[...]` marks only a real cut."""
+        table = "\n".join(
+            f"| Row {n} | Civilian unemployment rate, August 2026 | 4.{n % 10} percent |" for n in range(40)
+        )
+        filler = "\n\n".join(f"Paragraph {i}. {FILLER_SENTENCE}" for i in range(100))
+        page = f"{OPENING_SENTENCE}\n\n{filler}\n\n{table}"
+        assert len(page) > PAGE_DIGEST_PREFILTER_MAX_CHARS
+        assert len(table) > 3 * DOCUMENT_DIGEST_WINDOW_CHARS  # the table alone spans several windows
+        llm = ScriptedLlm(_passages_json())
+        _install(monkeypatch, llm, builder_calls)
+
+        await digest_page(page, QUERY, budget_seconds=RESOLUTION_SOURCE_WALL_TIMEOUT)
+
+        (prompt,) = llm.prompts
+        page_text = prompt.split("Page text:\n", 1)[1]
+        assert table in page_text
+        assert "[...]" in page_text  # the filler between the opening and the table was cut
+
 
 class TestWallBudget:
     """The call is bounded by min(per-call timeout, remaining budget less the margin) and never attempted below the floor."""
@@ -243,16 +328,35 @@ class TestWallBudget:
         assert digest.passages_grounded == 0
         assert digest.passages[0].startswith(OPENING_SENTENCE)
 
-    async def test_at_the_floor_the_call_is_made(self, monkeypatch, builder_calls) -> None:
+    async def test_just_above_the_floor_the_call_is_made(self, monkeypatch, builder_calls) -> None:
+        """The BM25 hop's own milliseconds are charged first, so the floor is tested with a little slack."""
         llm = ScriptedLlm(_passages_json(TAIL_TABLE))
         _install(monkeypatch, llm, builder_calls)
 
         digest = await digest_page(
-            PAGE, QUERY, budget_seconds=PAGE_DIGEST_WALL_MARGIN_S + PAGE_DIGEST_MIN_CALL_BUDGET_S
+            PAGE, QUERY, budget_seconds=PAGE_DIGEST_WALL_MARGIN_S + PAGE_DIGEST_MIN_CALL_BUDGET_S + 0.5
         )
 
         assert len(llm.prompts) == 1
         assert digest.fallback_used is False
+
+    async def test_a_slow_bm25_hop_is_charged_against_the_budget(self, monkeypatch, builder_calls) -> None:
+        """CPU spent before the call counts: a hop that eats the budget leaves no room for a call."""
+        monkeypatch.setattr(page_digest_module, "PAGE_DIGEST_WALL_MARGIN_S", 0.0)
+        monkeypatch.setattr(page_digest_module, "PAGE_DIGEST_MIN_CALL_BUDGET_S", 1.0)
+
+        def slow_select_passages(*args: Any, **kwargs: Any) -> list[Any]:
+            time.sleep(0.3)
+            return []
+
+        monkeypatch.setattr(page_digest_module, "select_passages", slow_select_passages)
+        llm = ScriptedLlm(_passages_json(TAIL_TABLE))
+        _install(monkeypatch, llm, builder_calls)
+
+        digest = await digest_page(PAGE, QUERY, budget_seconds=1.2)
+
+        assert llm.prompts == []
+        assert digest.fallback_used is True
 
     async def test_a_hung_call_is_cut_at_the_per_call_timeout(self, monkeypatch, builder_calls) -> None:
         monkeypatch.setattr(page_digest_module, "PAGE_DIGEST_EXTRACTOR_TIMEOUT_S", 0.05)
@@ -331,11 +435,32 @@ class TestExpectedFailures:
         assert digest.fallback_used is True
         assert digest.passages_returned == 0
 
-    async def test_an_unexpected_error_propagates(self, monkeypatch, builder_calls) -> None:
-        llm = ScriptedLlm(ZeroDivisionError("a bug in the call path"))
+    async def test_an_empty_completion_falls_back(self, monkeypatch, builder_calls) -> None:
+        """forecasting-tools' bare RuntimeError for an empty answer, the repo's most-seen zero-output failure."""
+        llm = ScriptedLlm(RuntimeError("LLM answer is an empty string. The model was m and the prompt was: p"))
         _install(monkeypatch, llm, builder_calls)
 
-        with pytest.raises(ZeroDivisionError):
+        digest = await digest_page(PAGE, QUERY, budget_seconds=RESOLUTION_SOURCE_WALL_TIMEOUT)
+
+        assert digest.fallback_used is True
+        assert digest.method == DIGEST_METHOD_BM25
+        assert digest.passages_returned == 0
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            ZeroDivisionError("a bug in the call path"),
+            RuntimeError("some other runtime failure"),
+            AssertionError("Answer is not a string and is of type: <class 'NoneType'>. Answer: None"),
+        ],
+        ids=lambda exc: type(exc).__name__,
+    )
+    async def test_an_unexpected_error_propagates(self, monkeypatch, builder_calls, exc) -> None:
+        """Only the empty-completion RuntimeError is expected; the None-content assert and everything else surface."""
+        llm = ScriptedLlm(exc)
+        _install(monkeypatch, llm, builder_calls)
+
+        with pytest.raises(type(exc)):
             await digest_page(PAGE, QUERY, budget_seconds=RESOLUTION_SOURCE_WALL_TIMEOUT)
 
 
@@ -369,6 +494,24 @@ class TestClientConstruction:
         assert metadata["role"] == "page_digest_extractor"
         assert metadata["key_alias"] == "personal"
         assert llm.litellm_kwargs["response_format"] is PageDigestPassages
+
+
+class TestOpeningPassage:
+    """The opening window is cut at whitespace of any kind, so a table or list head never ends mid-token."""
+
+    def test_a_newline_separated_head_is_cut_on_a_line_boundary(self) -> None:
+        rows = [f"row_{n}_value_{n * 7}" for n in range(200)]
+        text = "Table 1\n" + "\n".join(rows)
+        assert len(text) > DOCUMENT_DIGEST_WINDOW_CHARS
+
+        opening = page_digest_module._opening_passage(text)
+
+        assert opening.startswith("Table 1\n")
+        assert len(opening) > DOCUMENT_DIGEST_WINDOW_CHARS // 2  # not collapsed to the first token
+        assert opening.split("\n")[-1] in rows  # the last line is a whole row
+
+    def test_a_short_page_is_its_own_opening(self) -> None:
+        assert page_digest_module._opening_passage("  one short page  ") == "one short page"
 
 
 class TestConstants:
