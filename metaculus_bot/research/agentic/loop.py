@@ -82,6 +82,7 @@ from metaculus_bot.research.agentic.tool_schemas import (
 )
 from metaculus_bot.research.agentic.types import (
     Finding,
+    GhostContext,
     GhostForecast,
     LoopConfig,
     LoopResult,
@@ -101,6 +102,11 @@ from metaculus_bot.structured_output_schema import (
 logger = logging.getLogger(__name__)
 
 _NUDGE = "call conclude or use tools"
+
+# The two ghost markers; the v1 ghost's pair mirrors the plain ghost's shapes so one scorer reads both.
+_GHOST_MARKER = "GHOST_FORECAST"
+_GHOST_V1_MARKER = "GHOST_FORECAST_V1"
+_GHOST_TIMEOUT_S = 60.0
 
 
 def _validate_findings_payload(
@@ -365,7 +371,12 @@ async def _execute_tool_batch(
     )
 
 
-def _freeze_result(state: _LoopState, findings_markdown: str, ghost: GhostForecast | None) -> LoopResult:
+def _freeze_result(
+    state: _LoopState,
+    findings_markdown: str,
+    ghost: GhostForecast | None,
+    ghost_context: GhostContext | None = None,
+) -> LoopResult:
     state.telemetry.findings_count = len(state.findings)
     state.telemetry.pending_leads_count = len(state.pending_leads)
     state.telemetry.concluded_early = state.explicit_conclude and not state.telemetry.deadline_hit
@@ -375,6 +386,7 @@ def _freeze_result(state: _LoopState, findings_markdown: str, ghost: GhostForeca
         ghost=ghost,
         telemetry=state.telemetry,
         transcript=copy.deepcopy(state.messages),
+        ghost_context=ghost_context,
     )
 
 
@@ -504,26 +516,61 @@ async def _run_ghost_phase(
     signal and must not gate a run — score it against resolution, not the panel.
     """
     state.messages.append({"role": "user", "content": ghost_prompt})
+    assistant_message = await _complete_ghost(state.messages, tools_json, llm_call, log_prefix, phase="Ghost phase")
+    if assistant_message is None:
+        return None
+    state.messages.append(assistant_message)
+    return _log_ghost(assistant_message, log_prefix, _GHOST_MARKER)
+
+
+async def _complete_ghost(
+    messages: list[dict[str, Any]],
+    tools_json: list[dict[str, Any]],
+    llm_call: LlmCall,
+    log_prefix: str,
+    *,
+    phase: str,
+) -> dict[str, Any] | None:
+    """One tool-forbidden ghost completion on the research turns' tool list, or None on timeout or failure."""
     try:
         # Same tool list as the last research turn, tools forbidden via tool_choice: the cached prefix keeps matching.
-        response = await asyncio.wait_for(llm_call(state.messages, tools_json, tool_choice="none"), timeout=60.0)
-        assistant_message = _parse_response_message(response)
-        state.messages.append(assistant_message)
+        response = await asyncio.wait_for(llm_call(messages, tools_json, tool_choice="none"), timeout=_GHOST_TIMEOUT_S)
+        return _parse_response_message(response)
     except TimeoutError:
-        logger.warning("%sGhost phase timed out after 60s", log_prefix)
+        logger.warning("%s%s timed out after %.0fs", log_prefix, phase, _GHOST_TIMEOUT_S)
         return None
     except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except  # telemetry-only phase: a failed ghost must never cost the run its banked findings
-        logger.warning("%sGhost phase failed: %s: %s", log_prefix, type(exc).__name__, exc)
+        logger.warning("%s%s failed: %s: %s", log_prefix, phase, type(exc).__name__, exc)
         return None
 
+
+def _log_ghost(assistant_message: dict[str, Any], log_prefix: str, marker: str) -> GhostForecast:
+    """Parse a ghost answer once and log its lossy summary line plus the additive full-fidelity JSON companion."""
     raw_text = assistant_message["content"]
     qtype, parsed_summary, forecast = _summarize_ghost(raw_text)
     ghost = GhostForecast(qtype=qtype, raw_text=raw_text, parsed_summary=parsed_summary)
-    logger.info("%sGHOST_FORECAST: qtype=%s summary=%s", log_prefix, ghost.qtype, ghost.parsed_summary)
-    # Additive companion: the legacy line above stays byte-identical for the harvested archive.
+    logger.info("%s%s: qtype=%s summary=%s", log_prefix, marker, ghost.qtype, ghost.parsed_summary)
     if forecast is not None:
-        logger.info("%sGHOST_FORECAST_JSON: %s", log_prefix, json.dumps(forecast, separators=(",", ":")))
+        logger.info("%s%s_JSON: %s", log_prefix, marker, json.dumps(forecast, separators=(",", ":")))
     return ghost
+
+
+async def run_ghost_v1(context: GhostContext, ghost_prompt: str, *, log_prefix: str = "") -> GhostForecast | None:
+    """The v1 ghost: the plain ghost's brief plus gap-fill v1's section, branched off the pre-ghost transcript.
+
+    Sends the loop's transcript up to, not including, the plain ghost's prompt, so the driver
+    answers without seeing its own first ghost, on the same tool list with ``tool_choice="none"``
+    so the cached prefix keeps matching. Telemetry only, never published, never raises; logs
+    ``GHOST_FORECAST_V1`` and ``GHOST_FORECAST_V1_JSON`` in the plain ghost's shapes. What the
+    pair measures: docs/agentic_gap_fill.md "The ghost forecast".
+    """
+    messages = [*context.messages, {"role": "user", "content": ghost_prompt}]
+    assistant_message = await _complete_ghost(
+        messages, context.tools_json, context.llm_call, log_prefix, phase="v1 ghost phase"
+    )
+    if assistant_message is None:
+        return None
+    return _log_ghost(assistant_message, log_prefix, _GHOST_V1_MARKER)
 
 
 async def _run_loop_body(
@@ -561,13 +608,18 @@ async def _run_loop_body(
     state.telemetry.wall_s = now() - state.started_at_s
     findings_markdown = render_findings(state.findings, state.pending_leads)
     ghost: GhostForecast | None = None
+    ghost_context: GhostContext | None = None
     if ghost_prompt is not None and state.explicit_conclude:
+        # Captured before the ghost turn, so a second ghost branches off the same cached prefix without seeing the first.
+        ghost_context = GhostContext(
+            messages=copy.deepcopy(state.messages), tools_json=offered_tools, llm_call=llm_call
+        )
         ghost = await _run_ghost_phase(
             state=state, ghost_prompt=ghost_prompt, tools_json=offered_tools, llm_call=llm_call, log_prefix=log_prefix
         )
 
     _log_completion(state, log_prefix)
-    return _freeze_result(state, findings_markdown, ghost)
+    return _freeze_result(state, findings_markdown, ghost, ghost_context if ghost is not None else None)
 
 
 # Jitter allowance for the deadline-versus-inner-timeout test below; see docs/agentic_gap_fill.md.
@@ -643,4 +695,4 @@ async def run_agentic_loop(
         return _finalize_loop_exit(state, now_fn, log_prefix)
 
 
-__all__ = ["LlmCall", "run_agentic_loop"]
+__all__ = ["LlmCall", "run_agentic_loop", "run_ghost_v1"]

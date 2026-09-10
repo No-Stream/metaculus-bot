@@ -82,8 +82,14 @@ bound notes, options) is the question's real values, because the dry run and the
 later ghost forecast are only meaningful against the real template. The
 placeholder itself carries the prediction-market section header, because the
 panel's market-reading clause renders only when the research carries that header
-and prod emits it on every question; without it the skeleton would show the
-driver a template the panel never actually sees.
+and prod emits it on every question (present on 59 of the 60 newest archived
+artifact records; the provider omits it only on an empty pool, a soft-fail, a
+flag-off run or benchmarking); without it the skeleton would show the driver a
+template the panel never actually sees. It deliberately does not carry the
+time-series anchor header, whose incidence runs the other way (5 of 322 artifact
+records, 0 of the newest 30): hardcoding that one would manufacture a divergence
+on about 98% of numeric prompts to close one on about 2%, and the numeric template
+already names the anchor section in its resolution-metric bullets.
 
 **Step 2, research.** The driver pursues its targets with the tools, follows
 leads (a fetched page that references a more authoritative PDF is usually worth
@@ -156,7 +162,13 @@ escalates when the lighter one comes up short:
 2. **Plain HTTP** (`_fetch_plain`). An aiohttp GET with browser-like headers,
    SSRF-hardened: a `is_public_http_url` preflight, a connect-time filtering
    resolver, and a bounded manual redirect loop that re-guards every hop.
-   Trafilatura extracts the main text. A plain GET a host answers 403 is re-dialed
+   The HTML body is read through the Tier-1 resolution-source extraction steps
+   (`fetch_outcomes._plain_html_outcome`, since 2026-09-09): `_extract_page_text`
+   rewrites ARIA-role tables to real tables and runs the two-pass default/precision
+   policy, the inline chart-data read (`render_inline_chart_data`) leads the text
+   (a dashboard's resolving series lives only in its `data-chart` attribute), and a
+   `<meta http-equiv=refresh>` stub on an otherwise-empty page is followed as one
+   more hop through this same re-guarded redirect loop. A plain GET a host answers 403 is re-dialed
    once (`_try_impersonated_fetch`, since 2026-09-04) through the TLS-impersonating
    transport Tier 1 shares, `metaculus_bot/research/impersonated_fetch.py`, which
    presents a real Chrome fingerprint and carries its own DNS pin and per-hop re-guard
@@ -370,6 +382,28 @@ is not found verbatim in the run's tool contents is logged and counted in
 deduped per run on `(source_url, quote)`, so a finding re-listed in `conclude`'s
 `final_findings` counts once rather than once per submission.
 
+Two `Finding` fields carry their own rules. `derivation` (W3) is arithmetic-only
+synthesis over the finding's own quoted numbers: a derived table, bound or rate
+whose every input appears as a quoted value with a URL in that finding's quote and
+source fields. It is exempt from the detachment lint (arithmetic plus its result,
+no likelihood language, no new facts; `artifact.detachment_lint`) and rendered
+under a "Derived analysis" label so the panel weights it as our synthesis rather
+than a source claim. `verification_tier` (W4) is stamped by the loop at banking
+time from the URL-to-best-method-seen map, never driver-claimed (the free-text
+(A) to (D) tags in `claim` stay advisory): `fetched` when the URL was seen through
+a fetch or read (document, rendered, plain or cache), `snippet` when only through
+a search or news result, None until stamped (a briefing-only URL is never seen
+through a tool). A discrepancy finding must be `fetched` to keep the supersede
+banner; a snippet-tier discrepancy is demoted to "possible corrections", the
+131.3 failure mode (`gates._stamp_verification_tier`, `artifact.render_findings`).
+
+`GapAccountingEntry.status` (W2) is a plan gap's terminal disposition at conclude
+time: `resolved` (the fact was found), `unresolved_parked` (attempted,
+unresolvable this run, a pending lead) or `not_decision_relevant_on_inspection`
+(it turned out not to move the forecast). All three are honest outcomes; the
+conclude gate needs an entry with some action for every gap, not any particular
+status.
+
 ## The ghost forecast (telemetry only)
 
 After the driver concludes, the loop asks it to privately complete the forecast
@@ -414,6 +448,69 @@ plan emits the same pair as `GHOST_PRE` / `GHOST_PRE_JSON`
 (`_set_research_plan_tool`) from the driver's pre-research dry run, so the
 pre-versus-post delta measures whether v2's own research moved its own view.
 
+### The v1 ghost
+
+Since 2026-09-09 a second private forecast, the v1 ghost, is asked of the same
+driver at the same effort whenever gap-fill v1 produced a section on the
+question. Its brief is the plain ghost's plus that section, rendered under the
+same `## Targeted Gap-Fill (second pass)` header the panel reads it under
+(`driver_prompt.build_ghost_v1_prompt`). v1 and v2 run concurrently in one
+gather (`gap_fill_stages.run_gap_fill_passes`), so the loop itself never sees
+v1's section; the loop therefore hands out a `GhostContext` (the transcript up
+to, not including, the plain ghost's prompt, the tool list the last research
+turn offered, and the transport it used) through the seam's `ghost_context_sink`,
+and the stage issues the v1 ghost after the gather, once both sections exist
+(`agentic_gap_fill.run_gap_fill_v2_ghost_v1`, `loop.run_ghost_v1`). It runs
+only when both the plain ghost ran and v1's section exists, so every
+`GHOST_FORECAST_V1` has a `GHOST_FORECAST` partner in the same run; with
+gap-fill v1 off there is no second call and no marker.
+
+The request is cache-aligned the same way as the plain ghost: it re-sends the
+prefix the last research turn and the plain ghost just sent, with the same tool
+list and `tool_choice="none"`, so only v1's section and the instruction are new
+input, about a cent or two a question. It branches off the transcript from
+before the plain ghost's prompt rather than appending to it, so the driver
+answers without seeing its own first ghost and the pair measures v1's section
+alone. It never touches the loop's own transcript or its findings, never
+publishes, and never raises: a failure or a timeout (the same 60 s bound, plus
+the research phase's remaining budget) logs a WARNING and leaves the pair
+half-empty. It costs one driver call of research-phase latency after the gather,
+which the close-derived time budget bounds like everything else in the phase.
+Markers `GHOST_FORECAST_V1` / `GHOST_FORECAST_V1_JSON` have exactly the plain
+ghost's shapes; the archive payload carries it as `ghost_v1` beside `ghost`.
+
+What each pair measures, all on the same cheap driver and never as a panel proxy:
+
+- `GHOST_PRE_JSON` to `GHOST_FORECAST_JSON` (same run): what v2's own research
+  did to the driver. Positive delta = the loop moved the driver toward the truth.
+  This is the v2 instrument (`scripts/score_ghosts.py`, the `pre_post` read).
+- `GHOST_FORECAST_JSON` to `GHOST_FORECAST_V1_JSON` (same run): what v1's
+  section adds on top of v2's findings, the mirror read for v1 (`v1_pairs`).
+- `GHOST_FORECAST_JSON` versus the published forecast: the driver against the
+  ensemble, the original retire-v1 gate, read on the loop-moved subset only.
+
+### Scoring the ghosts
+
+`scripts/score_ghosts.py` (`make score_ghosts`) joins the harvested markers to the
+resolved-question dataset on `post_id` and log-scores each ghost the way Metaculus
+scores the published forecast. Two prod mechanisms decide how a numeric ghost is
+built. Native-discrete questions (Metaculus `type == "discrete"`) publish a CDF on
+a reduced grid (`cdf_size != 201`); prod builds every member directly on that grid
+(`numeric/pipeline._build_discrete_distribution`) and aggregates positionally, so
+the scorer builds the ghost with `num_points=len(published_cdf)` and step bounds
+scaled to that length (`grid_step_constraints`), and both sides share the native
+grid; no integer snap is involved (`discrete_snap` skips `cdf_size != 201`).
+Continuous questions (`cdf_size == 201`) are integer-snapped by prod only when a
+strict majority of the forecasters vote the outcome integer-valued; that vote is
+prod-side state absent from both the record and the ghost payload, and the snap
+is not reliably recoverable from the published CDF's shape, so the scorer scores
+the ghost as the smooth distribution it declared. On that integer-outcome
+minority the snapped published forecast holds a little extra mass on the
+resolution bucket, so those deltas are mildly biased against the ghost; it is
+bounded and does not touch the continuous questions that make up the bulk of the
+gate. Date ghosts are counted but unscoreable while the residual dataset excludes
+date questions.
+
 When the driver supplies a `dry_run_forecast` that is not a dict, or one that
 fails schema validation (the observed case is flat declared percentiles, run
 30718626314), `GHOST_PRE_JSON` is suppressed and `_set_research_plan_tool` logs a
@@ -438,6 +535,14 @@ out of budget. Three limits bound it:
 - **Max steps** `LoopConfig.max_steps`, which the seam doesn't override, so
   this one lives on the dataclass rather than in `constants.py` and takes no env
   var. A step is one driver turn.
+- **The gate caps**, also on the dataclass. `max_gaps` is how many ranked gaps
+  `set_research_plan` keeps (the driver ranks them, so the dropped tail is the
+  least valuable; `GAP_FILL_V2_MAX_GAPS` feeds it). `max_plan_nudges` is how many
+  times the W1 plan gate may reject an external tool call before the loop
+  soft-continues without a plan, so a driver that never plans cannot wedge it.
+  `max_conclude_gate_rejections` mirrors it for W2: how many early conclusions the
+  conclude gate may send back before accepting one unconditionally; a
+  budget-exhaustion conclusion bypasses the gate and never counts.
 
 There is also a **conclude threshold** `GAP_FILL_V2_CONCLUDE_THRESHOLD`. Once
 fewer than that many seconds remain, or the tool-call cap is hit, `_tool_schemas`
@@ -574,10 +679,26 @@ above, with no `question=`. Non-alertable: a fire is a paid call NOT billed, not
 host is the unit any rate is computed over, and a suspiciously high rate is the signal that
 the group parser is over-matching and withholding reads we could have had.
 
+Field notes on the counters whose names do not say everything. `rendered_fetches`
+counts fetches served by the headless-Chromium rung, a per-method count
+`per_tool_counts` cannot see. `dup_tool_calls` counts exact-duplicate (tool,
+normalized arguments) repeats, the stuck-detection nudge described under "The
+bounds". `provenance_rejections` counts findings dropped because their cited
+`source_url` never appeared in a tool result this run (the hard W3 gate), while
+`quote_mismatch_warnings` counts findings ACCEPTED despite a quote not found
+verbatim in the tool contents (warn-only, see "The findings gates").
+`plan_gaps` is the number of ranked gaps the driver registered in
+`set_research_plan`; `plan_skipped` is true when it never planned and the
+plan-nudge cap was hit, so the loop soft-continued unplanned (W1, a degraded run
+worth flagging); `conclude_gate_rejections` counts early conclusions the W2 gate
+sent back before accepting one, and persistent 2s in prod flag a gate that is too
+strict or a prompt that is unclear.
+
 For a richer trace, the seam accepts an `archive_sink` callback. When the loop
-actually ran, the orchestrator captures `{transcript, telemetry}` through it and
-writes it into the research archive (`persistence.py`), including empty-findings
-runs, whose telemetry is still worth keeping.
+actually ran, the orchestrator captures `{transcript, telemetry, ghost, ghost_v1}`
+through it and writes it into the research archive (`persistence.py`), including
+empty-findings runs, whose telemetry is still worth keeping; `ghost` and
+`ghost_v1` are the serialized ghost forecasts, None when that ghost did not run.
 
 ## Module layout
 
@@ -586,8 +707,8 @@ level up:
 
 | File | What's in it |
 | --- | --- |
-| `agentic_gap_fill.py` (one level up) | The seam. `run_gap_fill_v2` owns prompt/tool/config construction and the outermost soft-fail boundary, keeping the orchestrator thin. |
-| `agentic/loop.py` | `run_agentic_loop` and the turn loop: message management, the three internal tool handlers, per-call handler dispatch, the ghost phase, the `GAP_FILL_V2` completion marker, and the timeout/soft-fail wrapper. Everything that logs one of this loop's telemetry markers stays here so the markers keep their `...agentic.loop` logger. |
+| `agentic_gap_fill.py` (one level up) | The seam. `run_gap_fill_v2` owns prompt/tool/config construction and the outermost soft-fail boundary, keeping the orchestrator thin, and hands the loop's `GhostContext` out through `ghost_context_sink`; `run_gap_fill_v2_ghost_v1` is the v1 ghost the stage (`research/gap_fill_stages.py`) issues once both passes have landed. |
+| `agentic/loop.py` | `run_agentic_loop` and the turn loop: message management, the three internal tool handlers, per-call handler dispatch, the ghost phase, `run_ghost_v1`, the `GAP_FILL_V2` completion marker, and the timeout/soft-fail wrapper. Everything that logs one of this loop's telemetry markers stays here so the markers keep their `...agentic.loop` logger. |
 | `agentic/tool_schemas.py` | `_INTERNAL_TOOL_NAMES` (the loop's own tools, and their timeout) plus the JSON-schema builders for the tool list advertised each turn. |
 | `agentic/loop_state.py` | `_LoopState` (the one mutable per-run record), the `_ToolCall` / `_ToolExecutionResult` per-turn records, the assistant-message parsers that produce them, and the budget arithmetic. |
 | `agentic/provenance.py` | URL and quote normalization, the quote-grounding span logic, and the per-call harvesters behind the provenance gate and the W4 verification tiers. |
@@ -599,9 +720,9 @@ level up:
 | `agentic/tool_backends.py` | The outbound half of the tools: the AskNews and Exa clients with their retry ladders and concurrency caps, the Gemini `url_context` document read and its fixed in-thread ceiling, and the markdown formatting of what comes back. |
 | `agentic/tool_descriptions.py` | The driver-facing tool descriptions and JSON parameter schemas: behavioral text, so a change here changes what the driver does. |
 | `research/robots_policy.py` (outside `agentic/`, shared with the Tier-1 url_context rung) | The `Google-Extended` robots.txt group parser and per-host cache behind the pre-check on every paid read, written because `urllib.robotparser` falls back to `User-agent: *`. |
-| `agentic/driver_prompt.py` | The three prompt builders: `build_system_prompt`, `build_user_brief`, `build_ghost_prompt`, plus the `SupportedQuestion` type. |
+| `agentic/driver_prompt.py` | The four prompt builders: `build_system_prompt`, `build_user_brief`, `build_ghost_prompt`, `build_ghost_v1_prompt`, plus the `SupportedQuestion` type. |
 | `agentic/artifact.py` | `render_findings` (the output section) and `detachment_lint`. |
-| `agentic/types.py` | The dataclasses and Pydantic models: `ToolOutcome`, `ToolSpec`, `Finding`, `GhostForecast`, `LoopConfig`, `LoopTelemetry`, `LoopResult`. |
+| `agentic/types.py` | The dataclasses and Pydantic models: `ToolOutcome`, `ToolSpec`, `Finding`, `GhostForecast`, `LoopConfig`, `LoopTelemetry`, `GhostContext`, `LoopResult`. |
 | `agentic/llm.py` | `build_default_llm_call`, the litellm/OpenRouter binding with donated-key-first routing and personal-key fallback. |
 | `agentic/__init__.py` | Package exports. |
 

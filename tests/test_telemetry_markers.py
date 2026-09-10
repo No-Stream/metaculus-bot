@@ -71,6 +71,15 @@ GHOST_FORECAST_JSON_LINE = (
     "question=https://www.metaculus.com/questions/38975/ GHOST_FORECAST_JSON: "
     '{"qtype":"binary","prob":0.42}'
 )
+# Verbatim from research/agentic/loop.py:run_ghost_v1; the plain ghost's shapes under a _V1 token.
+GHOST_FORECAST_V1_LINE = (
+    "2026-09-09 14:25:31,000 - metaculus_bot.research.agentic.loop - INFO - "
+    "question=https://www.metaculus.com/questions/38975/ GHOST_FORECAST_V1: qtype=binary summary=posterior_prob=0.5500"
+)
+GHOST_FORECAST_V1_JSON_LINE = (
+    "2026-09-09 14:25:31,000 - metaculus_bot.research.agentic.loop - INFO - "
+    'question=https://www.metaculus.com/questions/38975/ GHOST_FORECAST_V1_JSON: {"qtype":"binary","prob":0.55}'
+)
 GHOST_FORECAST_JSON_NUMERIC_LINE = (
     "2026-07-17 14:25:11,002 - metaculus_bot.research.agentic.loop - INFO - "
     "question=12 GHOST_FORECAST_JSON: "
@@ -444,6 +453,44 @@ _OGIMET_2022_URL = (
 AGENTIC_FETCH_THROTTLED_LINE = (
     PFX + "AGENTIC_FETCH_THROTTLED: url=" + _OGIMET_2022_URL + " method=rendered chars=303 phrase=query per"
 )
+
+
+class TestGhostForecastV1:
+    """The ghost re-asked with gap-fill v1's section (2026-09-09): the plain ghost's two shapes under a _V1 token."""
+
+    def test_fields_match_the_plain_ghost_shape(self):
+        rec = _parse_one(GHOST_FORECAST_V1_LINE)
+        assert rec["marker"] == "ghost_forecast_v1"
+        assert (rec["qtype"], rec["summary"]) == ("binary", "posterior_prob=0.5500")
+        assert (rec["qid"], rec["qid_kind"]) == (38975, "post_id")
+
+    def test_json_payload_round_trips(self):
+        rec = _parse_one(GHOST_FORECAST_V1_JSON_LINE)
+        assert rec["marker"] == "ghost_forecast_v1_json"
+        assert json.loads(rec["forecast_json"]) == {"qtype": "binary", "prob": 0.55}
+        assert (rec["qid"], rec["qid_kind"]) == (38975, "post_id")
+
+    def test_the_six_ghost_tokens_land_in_six_files(self):
+        """GHOST_PRE(_JSON), GHOST_FORECAST(_JSON) and GHOST_FORECAST_V1(_JSON) share a prefix; each line must
+        harvest into exactly its own file, or a v1 ghost would silently pair with itself as a plain ghost."""
+        lines = [
+            GHOST_PRE_LINE,
+            GHOST_PRE_JSON_LINE,
+            GHOST_FORECAST_LINE,
+            GHOST_FORECAST_JSON_LINE,
+            GHOST_FORECAST_V1_LINE,
+            GHOST_FORECAST_V1_JSON_LINE,
+        ]
+        harvested = parse_log_text("\n".join(lines) + "\n", **_META)
+        for marker in (
+            "ghost_pre",
+            "ghost_pre_json",
+            "ghost_forecast",
+            "ghost_forecast_json",
+            "ghost_forecast_v1",
+            "ghost_forecast_v1_json",
+        ):
+            assert len(harvested[marker]) == 1, marker
 
 
 class TestAgenticFetchThrottled:

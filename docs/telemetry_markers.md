@@ -28,6 +28,7 @@ incidents behind the design.
 | `GAP_FILL_V2` | `research/agentic/loop.py:_log_completion` | Per-question gap-fill v2 agentic loop completion counters. |
 | `GHOST_PRE` / `GHOST_PRE_JSON` | `research/agentic/loop.py:_set_research_plan_tool` | Pre-research ghost snapshot (the counterpart to `GHOST_FORECAST` taken before research starts) and its JSON companion. |
 | `GHOST_FORECAST` / `GHOST_FORECAST_JSON` | `research/agentic/loop.py:_run_ghost_phase` | Concluding ghost-forecast summary and its full-fidelity JSON companion. |
+| `GHOST_FORECAST_V1` / `GHOST_FORECAST_V1_JSON` | `research/agentic/loop.py:run_ghost_v1`, issued from `research/gap_fill_stages.py` | The same ghost re-asked with gap-fill v1's section in its brief, once both passes have landed; the plain ghost's shapes under a `_V1` token. |
 | `AGENTIC_FETCH_THROTTLED` | `research/agentic/tools.py:_throttled_fetch_outcome` | Per-fetch: a host answered the gap-fill v2 ladder with a rate-limit interstitial under HTTP 200. |
 | `AGENTIC_FETCH_LOCAL_DOC` | `research/agentic/local_document.py:log_local_document_read` | Per-document: the gap-fill v2 ladder read a document locally instead of paying for a Gemini `url_context` call. |
 | `AGENTIC_URLCONTEXT_ROBOTS_SKIP` | `research/agentic/tools.py` | Per-URL: the gap-fill v2 paid document read was skipped before spending anything, because robots.txt disallows `Google-Extended`. |
@@ -240,6 +241,30 @@ the final `}` (it is the ghost scorer's `json.loads` input, kept verbatim since 
 mangle it). The `GHOST_FORECAST_JSON` token can't collide with `GHOST_FORECAST:` (the latter
 requires a `:` immediately after `GHOST_FORECAST`), so the two specs stay mutually exclusive
 under the one-marker-per-line `break`. `qid_kind` is `post_id`.
+
+### GHOST_FORECAST_V1
+
+`metaculus_bot/research/agentic/loop.py:run_ghost_v1`, issued by `research/gap_fill_stages.py` after
+both gap-fill passes have landed. Since 2026-09-09 the driver is asked a second private forecast whose
+brief is the plain ghost's plus gap-fill v1's section (`## Targeted Gap-Fill (second pass)`), sent on
+the loop's transcript up to, not including, the plain ghost's prompt, with the same tool list and
+`tool_choice="none"`, so it re-reads the cached prefix and never sees its own first ghost. The line
+has exactly the `GHOST_FORECAST` shape (`qtype=`, `summary=`) under the `GHOST_FORECAST_V1` token, so
+`scripts/score_ghosts.py` reads both with one parser. It is emitted only when v1's section exists on
+the question AND the plain ghost ran, so every record has a `GHOST_FORECAST` partner in the same run;
+with gap-fill v1 off there is no line. Paired with the plain ghost it measures v1's marginal value on
+the driver, the mirror of the `GHOST_PRE` to `GHOST_FORECAST` read that measures v2
+(docs/agentic_gap_fill.md "The ghost forecast"). `question=` comes from the same `log_prefix`
+mechanism, so `qid_kind` is `post_id`. The token cannot collide with `GHOST_FORECAST:` (that spec
+requires the colon right after `GHOST_FORECAST`) or with `GHOST_FORECAST_JSON:`.
+
+### GHOST_FORECAST_V1_JSON
+
+The v1 ghost's full-fidelity companion, `GHOST_FORECAST_JSON`'s shape under the `_V1` token, same
+emitter; suppressed when no structured block parsed. Together with `GHOST_FORECAST_JSON` from the same
+run it is the input of the `v1_pairs` read in `scripts/score_ghosts.py`. Also written into the research
+archive as the `ghost_v1` key of the `gap_fill_v2` payload (None when the v1 ghost did not run), beside
+`ghost`. `qid_kind` is `post_id`.
 
 ### AGENTIC_FETCH_THROTTLED
 

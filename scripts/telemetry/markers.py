@@ -174,6 +174,19 @@ MARKER_SPECS: list[MarkerSpec] = [
         qid_kind=QID_KIND_POST_ID,  # agentic_gap_fill.py log_prefix = question.page_url (post id)
     ),
     MarkerSpec(
+        "ghost_forecast_v1",
+        # Why: the plain ghost's shape with a _V1 token, so one scorer reads both. Receipt: docs/telemetry_markers.md "GHOST_FORECAST_V1".
+        re.compile(
+            r"(?:question=(?P<question>\S+)\s+)?GHOST_FORECAST_V1:\s*qtype=(?P<qtype>\S+)\s+summary=(?P<summary>.*)$"
+        ),
+        qid_kind=QID_KIND_POST_ID,  # agentic_gap_fill.py log_prefix = question.page_url (post id)
+    ),
+    MarkerSpec(
+        "ghost_forecast_v1_json",
+        re.compile(r"(?:question=(?P<question>\S+)\s+)?GHOST_FORECAST_V1_JSON:\s*(?P<forecast_json>\{.*\})\s*$"),
+        qid_kind=QID_KIND_POST_ID,  # agentic_gap_fill.py log_prefix = question.page_url (post id)
+    ),
+    MarkerSpec(
         "agentic_fetch_throttled",
         # Why: phrase is last since it may contain spaces. Receipt: docs/telemetry_markers.md "AGENTIC_FETCH_THROTTLED".
         re.compile(

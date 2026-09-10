@@ -519,6 +519,9 @@ _MARKET_READING_RULES = (
 # ``research/section_format.py`` imports it; the market clause gates on it. Receipt: docs/prompts.md "MARKET_SNAPSHOT_SECTION_HEADER".
 MARKET_SNAPSHOT_SECTION_HEADER = "## Prediction Market Snapshot"
 
+# The header gap-fill v1's section carries in the bundle; the orchestrator and the v1 ghost brief key on it.
+GAP_FILL_V1_SECTION_HEADER = "## Targeted Gap-Fill (second pass)"
+
 
 def _strong_evidence_market_clause(
     *,
@@ -928,10 +931,7 @@ def multiple_choice_prompt(question: MultipleChoiceQuestion, research: str) -> s
     )
 
 
-# ---------------------------------------------------------------------------
-# The continuous (numeric and date) forecaster prompt
-# ---------------------------------------------------------------------------
-# One template, ``_continuous_prompt``, varied by question kind and elicitation; slots in docs/prompts.md.
+# The continuous (numeric and date) forecaster prompt: one template varied by question kind and elicitation; docs/prompts.md.
 
 
 @dataclass(frozen=True)

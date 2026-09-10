@@ -23,6 +23,7 @@ from forecasting_tools.data_models.questions import DateQuestion
 from metaculus_bot.numeric.date_axis import as_epoch_question, format_epoch
 from metaculus_bot.numeric.utils import bound_messages, nominal_bounds
 from metaculus_bot.prompts import (
+    GAP_FILL_V1_SECTION_HEADER,
     MARKET_SNAPSHOT_SECTION_HEADER,
     _forecasting_window_str,
     binary_prompt,
@@ -243,21 +244,22 @@ complete the forecast yourself using the panel's template above, applying
 your findings. Output only the template's STRUCTURED FORECAST block.
 """
 
-# Every question type the bot forecasts has a template here; a date question's brief renders
-# its bounds as dates through the epoch adapter, never as epoch floats.
+_GHOST_V1_PROMPT = """\
+The research phase is closed; your findings are final and will be delivered
+as-is. A second, independent research pass ran alongside yours; its section
+follows, exactly as the panel will read it beside your findings.
+
+{v1_section}
+
+Now, separately and privately — this will NOT be shown to the panel — complete
+the forecast yourself using the panel's template above, applying your findings
+AND the section above. Output only the template's STRUCTURED FORECAST block.
+"""
+
+# Every type the bot forecasts has a template here; a date brief renders its bounds as dates, never epoch floats.
 SupportedQuestion = BinaryQuestion | MultipleChoiceQuestion | NumericQuestion | DateQuestion
 
-# Fills the template builders' research slot. Everything else in the skeleton
-# (units, bounds, options, resolution criteria) is the question's REAL values.
-# It carries MARKET_SNAPSHOT_SECTION_HEADER because the panel's market-reading clause is
-# gated on that header being present in the research. Prod emits the header on effectively
-# every question: the provider omits it only on an empty pool, a soft-fail, a flag-off run
-# or benchmarking, measured present on 59 of the 60 newest archived artifact records. So
-# without it here the skeleton would drop a clause almost every real panel prompt carries.
-# Deliberately NOT extended to TS_ANCHOR_SECTION_HEADER, whose incidence runs the other way
-# (5 of 322 artifact records, 0 of the newest 30): hardcoding that one would manufacture a
-# divergence on ~98% of numeric prompts to close one on ~2%, and the numeric template already
-# names the anchor section in its resolution-metric bullets.
+# Carries the market header so the skeleton keeps the market clause; why not the anchor header: docs/agentic_gap_fill.md.
 _TEMPLATE_RESEARCH_PLACEHOLDER = (
     "[research placeholder — the actual briefing is in the 'Current briefing' section of this message]"
     f"\n\n{MARKET_SNAPSHOT_SECTION_HEADER}\n"
@@ -273,6 +275,11 @@ def build_system_prompt(today: str) -> str:
 def build_ghost_prompt() -> str:
     """Return the ghost-forecast instruction appended after findings freeze."""
     return _GHOST_PROMPT
+
+
+def build_ghost_v1_prompt(v1_addendum: str) -> str:
+    """The plain ghost instruction plus gap-fill v1's section, under the header the bundle gives it."""
+    return _GHOST_V1_PROMPT.format(v1_section=f"{GAP_FILL_V1_SECTION_HEADER}\n\n{v1_addendum}")
 
 
 def _question_header(question: SupportedQuestion) -> str:
@@ -340,4 +347,10 @@ def build_user_brief(question: SupportedQuestion, bundle_markdown: str) -> str:
     )
 
 
-__all__ = ["SupportedQuestion", "build_ghost_prompt", "build_system_prompt", "build_user_brief"]
+__all__ = [
+    "SupportedQuestion",
+    "build_ghost_prompt",
+    "build_ghost_v1_prompt",
+    "build_system_prompt",
+    "build_user_brief",
+]

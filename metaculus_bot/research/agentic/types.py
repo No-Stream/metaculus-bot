@@ -1,8 +1,14 @@
+"""The agentic loop's data types: tool contracts, findings, the plan, and the loop's config, telemetry and result.
+
+Field rationale lives in docs/agentic_gap_fill.md ("The findings gates", "The bounds", "Telemetry",
+"The ghost forecast"); each field here carries at most one line of why.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -11,6 +17,9 @@ from metaculus_bot.constants import (
     GAP_FILL_V2_MAX_TOOL_CALLS,
     GAP_FILL_V2_WALL_DEADLINE,
 )
+
+if TYPE_CHECKING:
+    from metaculus_bot.research.agentic.llm import LlmCall
 
 
 class ToolOutcome(BaseModel):
@@ -31,6 +40,8 @@ class ToolSpec:
 
 
 class Finding(BaseModel):
+    """One citation-grounded finding; the W3 derivation and W4 tier rules: docs/agentic_gap_fill.md "The findings gates"."""
+
     claim: str
     source_url: str
     quote: str
@@ -38,22 +49,9 @@ class Finding(BaseModel):
     retrieved_how: str = ""
     topic: str = "general"
     discrepancy: bool = False
-    # Arithmetic-only synthesis over the finding's own quoted numbers (W3): a
-    # derived table, bound, or rate whose every input appears as a quoted value
-    # with URL in this finding's quote/source fields. Exempt from the
-    # detachment lint (arithmetic + its result, no likelihood language, no new
-    # facts — see artifact.detachment_lint); rendered under a "Derived analysis"
-    # label so the panel weights it as our synthesis, not a source claim.
+    # Arithmetic over the finding's own quoted numbers only, so it is exempt from the detachment lint (W3).
     derivation: str | None = None
-    # Retrieval-quality tier (W4), stamped by the loop at banking time from the
-    # finding's source_url via the URL->best-method-seen map — CODE-derived,
-    # never driver-claimed (the free-text (A)-(D) tags in `claim` stay advisory).
-    # "fetched" when the URL was seen via a fetch/read (document/rendered/plain/
-    # cache); "snippet" when only via a search/news result. None until stamped
-    # (a briefing-only URL is never seen through a tool, so it has no tier). A
-    # discrepancy finding must be "fetched" to keep the supersede banner — a
-    # snippet-tier discrepancy is demoted to "possible corrections" (the 131.3
-    # failure mode). See gates._stamp_verification_tier and artifact.render_findings.
+    # Code-stamped at banking time from the URL's best method seen, never driver-claimed (W4).
     verification_tier: Literal["fetched", "snippet"] | None = None
 
 
@@ -95,11 +93,7 @@ class ResearchPlan(BaseModel):
     gaps: list[PlannedGap] = Field(default_factory=list)
 
 
-# Terminal state the driver assigns each plan gap at conclude time (W2). A gap
-# is either resolved (the fact was found), parked (attempted, unresolvable this
-# run — a pending lead), or dismissed on inspection (turned out not to move the
-# forecast once looked at). All three are honest outcomes; the conclude gate
-# cares that every gap got AN entry with SOME action, not which status it is.
+# A plan gap's terminal disposition at conclude time (W2); the gate needs an entry per gap, not a particular status.
 GapStatus = Literal["resolved", "unresolved_parked", "not_decision_relevant_on_inspection"]
 
 
@@ -121,10 +115,8 @@ class GapAccountingEntry(BaseModel):
 
 @dataclass(slots=True)
 class LoopConfig:
-    # Budget defaults derive from the constants the production seam passes in
-    # (``agentic_gap_fill.run_gap_fill_v2``) rather than repeating their values, so a
-    # constant change (or an env override of one) can't leave this dataclass disagreeing
-    # with the loop it configures.
+    """The loop's knobs; the budget defaults derive from the constants the seam passes in, so the two cannot disagree."""
+
     model: str
     reasoning_effort: str = "medium"
     max_tool_calls: int = GAP_FILL_V2_MAX_TOOL_CALLS
@@ -132,18 +124,11 @@ class LoopConfig:
     conclude_threshold_s: float = GAP_FILL_V2_CONCLUDE_THRESHOLD
     max_result_chars: int = 8000
     max_steps: int = 20
-    # Max ranked gaps set_research_plan accepts (W1). Extra gaps beyond this are
-    # dropped (the driver ranks them, so the tail holds the least valuable).
+    # Ranked gaps set_research_plan keeps (W1); the driver ranks them, so the dropped tail is the least valuable.
     max_gaps: int = 4
-    # How many times the plan-required gate may reject an external tool call
-    # before the loop soft-continues without a plan (W1). Prevents a driver that
-    # never plans from wedging the loop.
+    # Plan-gate rejections before the loop soft-continues unplanned, so a driver that never plans cannot wedge it (W1).
     max_plan_nudges: int = 2
-    # How many times the conclude gate (W2) may reject an early conclusion before
-    # accepting it unconditionally. Mirrors max_plan_nudges: a pathological driver
-    # that can't satisfy the gap-accounting / fetch-floor invariants can't loop
-    # forever on conclude attempts. Budget-exhaustion conclusions bypass the gate
-    # entirely and never count against this cap.
+    # Conclude-gate rejections before an early conclusion is accepted anyway (W2); budget exhaustion bypasses the gate.
     max_conclude_gate_rejections: int = 2
     # The question ref the transport stamps on each call's ledger metadata, so PROMPT_SIZE_ALERT can name it.
     question_ref: str | None = None
@@ -151,15 +136,13 @@ class LoopConfig:
 
 @dataclass(slots=True)
 class LoopTelemetry:
+    """The GAP_FILL_V2 completion marker's fields; what each one counts: docs/agentic_gap_fill.md "Telemetry"."""
+
     model: str = ""
     steps: int = 0
     tool_calls: int = 0
     per_tool_counts: dict[str, int] = field(default_factory=dict)
-    # fetch calls whose outcome came from the headless-Chromium rung — a
-    # per-method count (per_tool_counts can't see which rung served a fetch).
     rendered_fetches: int = 0
-    # Exact-duplicate (tool, normalized-args) repeats within the run — plan
-    # §3.1 v1-lite stuck-detection (counter + gentle warning, no enforcement).
     dup_tool_calls: int = 0
     deadline_hit: bool = False
     concluded_early: bool = False
@@ -167,37 +150,26 @@ class LoopTelemetry:
     findings_count: int = 0
     pending_leads_count: int = 0
     lint_rejections: int = 0
-    # Findings dropped because their cited source_url never appeared in a tool
-    # result this run (and, for discrepancies, was not tool-sourced) — the hard
-    # provenance gate. See loop._validate_findings_payload.
     provenance_rejections: int = 0
-    # Findings ACCEPTED despite their quote not being found verbatim in the
-    # per-loop tool contents — a warn-only signal (read_document paraphrases and
-    # ellipsis-joined quotes make a hard gate too false-positive-prone; we
-    # measure the real miss rate first).
     quote_mismatch_warnings: int = 0
-    # Ranked gaps the driver registered via set_research_plan (W1). 0 when no
-    # plan was set (see plan_skipped).
     plan_gaps: int = 0
-    # True when the driver never called set_research_plan and the plan-nudge cap
-    # was hit, so the loop soft-continued without a plan (W1). A pathological
-    # driver can't wedge the loop on the plan gate; this flags the degraded run.
     plan_skipped: bool = False
-    # Early conclusions the W2 conclude gate rejected (missing gap accounting,
-    # too few tool calls, or an unmet fetch floor) before the loop accepted one.
-    # Persistent 2s in prod flag a gate that's too strict or a prompt that's
-    # unclear; see loop._conclude_tool and the GAP_FILL_V2 completion marker.
     conclude_gate_rejections: int = 0
-    # ``repr(exc)`` of the exception that tripped the loop's catch-all soft-fail
-    # (loop.py, the ``except Exception`` after the wall-deadline guard). None on
-    # every healthy run AND on a deadline hit (an expected degradation, not a
-    # crash — that path sets ``deadline_hit`` instead). This is the single field
-    # that distinguishes a real crash from a legitimate "driver found nothing"
-    # run: without it, a step-0 crash emits the byte-identical
-    # ``steps=0 tool_calls=0 findings=0`` marker as an idle run (the fastapi
-    # eager-import defect was silently dead for exactly this reason). The
-    # orchestrator reads it to bump the alertable crash counter.
+    # None on a healthy run AND on a deadline hit; the one field that tells a step-0 crash from an idle run.
     error: str | None = None
+
+
+@dataclass(slots=True)
+class GhostContext:
+    """What a second ghost needs to branch off the loop's cached prefix without seeing the first ghost.
+
+    ``messages`` is the transcript up to, not including, the plain ghost's prompt; ``tools_json``
+    is the tool list the last research turn offered; ``llm_call`` is the transport the loop used.
+    """
+
+    messages: list[dict[str, Any]]
+    tools_json: list[dict[str, Any]]
+    llm_call: LlmCall
 
 
 @dataclass(slots=True)
@@ -206,3 +178,5 @@ class LoopResult:
     ghost: GhostForecast | None
     telemetry: LoopTelemetry
     transcript: list[dict[str, Any]]
+    # Present only when the plain ghost ran, so every v1 ghost has its pair.
+    ghost_context: GhostContext | None = None
