@@ -1,5 +1,9 @@
 # Fall 2026 configuration: the cost pass, the residual round and the fall merge plan
 
+> **SUPERSEDED 2026-09-10** by `handoff-2026-09-10-fall-merge.md`. Four of the five chunks in
+> "What's left to do" are merged; the shared fetch ladder is half done on `fall/ladder`. Read the
+> newer handoff first; this file stays as the record of the 2026-09-09 round.
+
 **Date:** 2026-09-09 (late evening, Pacific)
 **Branch:** `mantic-competition` (off `main` at 660fd35; tip 0f51815; 56 commits carry today's
 committer date, four of them from the operator's peer session)
