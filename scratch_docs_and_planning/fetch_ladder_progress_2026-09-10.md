@@ -349,11 +349,13 @@ hop, the two-pass extraction, the ARIA rewrite (inside the extraction, which is 
 Only the derived-feed REUSE half is genuinely absent, and most of that arrives with the shared
 read. Size it after step 3 rather than assuming now.
 
-## Step 3 as built: `b059275` (3a, additive), `e0a8164` (3b, the switch), `c9127b9` (the loop's marker tests)
+## Step 3 as built: four commits
 
-All three green on the full gate set at the tip: `make test` 9,810 passed / 41 skipped / 5 deselected,
+`b059275` (3a, the additive half), `e0a8164` (3b, the switch), `c9127b9` (the loop's marker tests
+against the registered specs) and `0c01f88` (the fetch preset's wall pinned to the tool's ceiling).
+Green on the full gate set at the tip `0c01f88`: `make test` 9,811 passed / 41 skipped / 5 deselected,
 lint clean, typecheck 0 errors, 6 import contracts kept, deptry clean. The count is the baseline's
-9,766 plus the corpus's 21, the three loop marker tests, and the 20 the replay-script sibling added in
+9,766 plus the corpus's 21, four new tests here, and the 20 the replay-script sibling added in
 `ba328f1` / `06666e3`; the loop's own suite is otherwise unchanged in size, because what step 3 did
 there was move seams.
 
