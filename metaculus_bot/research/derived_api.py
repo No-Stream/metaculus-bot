@@ -4,8 +4,11 @@ A JavaScript dashboard's numbers are not in its HTML at any wait condition — t
 XHR after the DOM is ready. Measured 2026-09-03 across six such dashboards: grepping the served
 HTML for an API URL found ONE candidate (a Maps key), 3 of 4 hand-guessed endpoints were wrong,
 and recording the page's own XHR during a render found a working unauthenticated JSON endpoint
-for all six. So the discovery half rides the browser rung (``rendered_fetch``) and this module
-is the bookkeeping: pick the body worth serving, remember where it came from, and say so.
+for all six. Discovery is not admissibility, though: the 2026-09-04 QA found only about ONE of
+those six same-publisher-admissible (the rest load their data from a third-party host the
+registrable-domain rule excludes), so the served rescue is modest. So the discovery half rides
+the browser rung (``rendered_fetch``) and this module is the bookkeeping: pick the body worth
+serving, remember where it came from, and say so.
 
 The memory is per RUN and keyed by HOST, which is what makes the second question on a host free
 — but a host's feed is usually parameterised, so the endpoint one page loads is not necessarily

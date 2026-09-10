@@ -55,7 +55,7 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_IMPERSONATE_MIN_BUDGET_S,
     RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
 )
-from metaculus_bot.research import impersonated_fetch, resolution_source
+from metaculus_bot.research import derived_api, impersonated_fetch, resolution_source
 from metaculus_bot.research.agentic import local_document
 from metaculus_bot.research.agentic.fetch_outcomes import (
     _FETCH_MIN_CONTENT_CHARS,
@@ -108,6 +108,7 @@ from metaculus_bot.research.impersonated_fetch import (
 from metaculus_bot.research.rendered_fetch import (
     MemoScope,
     RenderDomOverCeiling,
+    RenderedPage,
     RenderOffHost,
     note_rendered_no_text,
     render_page,
@@ -393,6 +394,31 @@ async def _fetch_plain(url: str) -> PlainFetchResult:
     return PlainFetchResult(status="error", method="plain", text="Redirect limit exceeded.", links=[], url=url)
 
 
+def _derived_api_outcome(url: str, page: RenderedPage) -> PlainFetchResult | None:
+    """Serve the largest JSON feed a fruitless render already harvested, or None to stay empty.
+
+    A JavaScript dashboard whose DOM has no text after render usually loaded its figures over XHR,
+    which the render captured (``derived_api.largest_json``). Served directly with
+    ``derived_api_lead`` for provenance and ``method=derived_api`` (fetched tier), it is the page's
+    own feed. Only same-publisher bodies are admissible, about one of six measured dashboards
+    (2026-09-04 QA), so a modest rescue against an object the render already holds.
+    """
+    largest = derived_api.largest_json(page.json_responses)
+    if largest is None:
+        return None
+    endpoint = derived_api.DerivedEndpoint(endpoint_url=largest.url, discovered_on=url)
+    lead = derived_api.derived_api_lead(endpoint, url)
+    body_text = decode_text_body(largest.body, "application/json")[0]
+    return PlainFetchResult(
+        status="ok",
+        method="derived_api",
+        text=f"{lead}\n\n{body_text}",
+        links=[],
+        url=url,
+        content_type="application/json",
+    )
+
+
 async def _try_rendered_fetch(url: str) -> PlainFetchResult | None:
     """Render ``url`` in headless Chromium and read it as this ladder does a plain page.
 
@@ -442,6 +468,9 @@ async def _try_rendered_fetch(url: str) -> PlainFetchResult | None:
     links = _extract_links_from_html(page.html, page.document_url)
     text = (extracted or "").strip()
     if not text:
+        derived = _derived_api_outcome(url, page)
+        if derived is not None:
+            return derived
         note_rendered_no_text(url, memo_scope=_RENDER_MEMO_SCOPE)
         return PlainFetchResult(status="error", method="rendered", text="", links=links, url=url)
     return PlainFetchResult(
@@ -860,7 +889,10 @@ async def _rendered_escalation_outcome(
         if rendered.method == DOCUMENT_NEEDED_METHOD:
             return await read_document(rendered.url, _generic_document_ask(question_topic), ladder_exhausted=True)
         if rendered.status == "ok" and rendered.text:
-            return _read_content_outcome(url, rendered.text, rendered.links, method="rendered", start_char=start_char)
+            # rendered.method is "rendered" for a DOM read, "derived_api" for a harvested JSON feed.
+            return _read_content_outcome(
+                url, rendered.text, rendered.links, method=rendered.method, start_char=start_char
+            )
     # Rendered was unavailable, errored, or itself extracted nothing. Fall back to
     # plain ONLY when the plain fetch actually read (thin-but-real) content; a plain
     # fetch that produced nothing has no content to hand back and must not be

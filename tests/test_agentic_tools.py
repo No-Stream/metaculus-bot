@@ -4248,3 +4248,99 @@ class TestGapFillV2WaybackRung:
         assert outcome.method == "wayback"
         assert outcome.truncated is True
         assert "truncated at" in outcome.content_markdown
+
+
+class TestGapFillV2DerivedApiOnEmptyRender:
+    """Item C: when a render's DOM extracts nothing, serve the largest same-publisher JSON feed the
+    render already captured instead of returning empty. 33 of 80 rendered reads served under 500
+    chars; 61 never-read dashboard URLs (fetch-gap inventory, 2026-09-09)."""
+
+    _URL = "https://dashboard.example.gov/tracker"
+
+    @staticmethod
+    def _page(json_responses: tuple) -> rendered_fetch.RenderedPage:
+        return rendered_fetch.RenderedPage(
+            url=TestGapFillV2DerivedApiOnEmptyRender._URL,
+            content_type="text/html",
+            html="<html><body></body></html>",
+            json_responses=json_responses,
+            final_url=TestGapFillV2DerivedApiOnEmptyRender._URL,
+        )
+
+    def _empty_dom(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value=None))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: asyncio.Semaphore(1))
+        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+
+    def test_the_derived_api_serve_earns_the_fetched_tier(self) -> None:
+        assert _method_to_tier("derived_api") == "fetched"
+
+    @pytest.mark.asyncio
+    async def test_an_empty_render_serves_the_largest_harvested_json(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._empty_dom(monkeypatch)
+        feeds = (
+            rendered_fetch.HarvestedJson(url="https://dashboard.example.gov/config", body=b'{"f": 1}'),
+            rendered_fetch.HarvestedJson(
+                url="https://dashboard.example.gov/api/data", body=b'{"cases": 1240, "as_of": "2026-08-31"}'
+            ),
+        )
+        monkeypatch.setattr(agentic_tools, "render_page", AsyncMock(return_value=self._page(feeds)))
+
+        result = await agentic_tools._try_rendered_fetch(self._URL)
+
+        assert result is not None
+        assert result.status == "ok"
+        assert result.method == "derived_api"
+        assert '"cases": 1240' in result.text
+        assert '{"f": 1}' not in result.text  # the smaller config feed is not the one served
+        assert "data feed" in result.text
+        assert "https://dashboard.example.gov/api/data" in result.text
+
+    @pytest.mark.asyncio
+    async def test_an_empty_render_with_no_harvested_json_still_returns_empty(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._empty_dom(monkeypatch)
+        monkeypatch.setattr(agentic_tools, "render_page", AsyncMock(return_value=self._page(())))
+
+        result = await agentic_tools._try_rendered_fetch(self._URL)
+
+        assert result is not None
+        assert result.status == "error"
+        assert result.method == "rendered"
+        assert result.text == ""
+
+    @pytest.mark.asyncio
+    async def test_fetch_preserves_the_derived_api_method_through_escalation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The rendered escalation now keeps the rung's own method, so a derived-api serve is not
+        relabelled `rendered` on the way to the driver."""
+        monkeypatch.setattr(
+            agentic_tools,
+            "_fetch_plain",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    status="empty",
+                    method="plain",
+                    text="Plain fetch returned no extractable text.",
+                    links=[],
+                    url=self._URL,
+                    escalate_rendered=True,
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            agentic_tools,
+            "_try_rendered_fetch",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    status="ok", method="derived_api", text='[feed lead]\n\n{"cases": 1240}', links=[], url=self._URL
+                )
+            ),
+        )
+
+        outcome = await agentic_tools.fetch(self._URL)
+
+        assert outcome.method == "derived_api"
+        assert '{"cases": 1240}' in outcome.content_markdown

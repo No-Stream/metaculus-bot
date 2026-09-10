@@ -68,6 +68,8 @@ _METHOD_TO_TIER: dict[str, str] = {
     "impersonate": "fetched",
     # The archive served the host's own bytes with the age disclosed in-text (tools._try_wayback_fetch).
     "wayback": "fetched",
+    # The page's own JSON feed, harvested during its render and served directly (tools._derived_api_outcome).
+    "derived_api": "fetched",
     "cache": "fetched",
     "pdf_local": "fetched",
     "digest_local": "fetched",
