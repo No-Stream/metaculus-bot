@@ -794,6 +794,15 @@ def test_fetch_description_names_both_platform_hosts() -> None:
         assert host in fetch_outcomes._PLATFORM_FETCH_BLOCK_MSG
 
 
+def test_fetch_description_redirects_data_endpoints_to_the_briefing() -> None:
+    """Item D: the driver scraped FRED, Kalshi and Yahoo Finance 61 times across 23 questions
+    (fetch-gap inventory, 2026-09-09) though the briefing already carries them via their APIs, so
+    the description tells the driver to cite those sections instead."""
+    for source in ("FRED", "Kalshi", "Polymarket", "Yahoo Finance"):
+        assert source in FETCH_DESCRIPTION
+    assert "financial-data and prediction-market sections" in FETCH_DESCRIPTION
+
+
 @pytest.mark.asyncio
 async def test_fetch_plain_blocks_redirect_to_metaculus(monkeypatch: pytest.MonkeyPatch) -> None:
     session = _FakeSession(
