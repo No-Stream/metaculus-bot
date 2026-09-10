@@ -193,6 +193,16 @@ escalates when the lighter one comes up short:
    (`_fetch_plain_with_impersonated_retry` is the shared step), which matters more there:
    that ladder sits immediately in front of the paid `url_context` read, so a cold
    `read_document` on a bls.gov or cdc.gov page is digested for free instead of paid for.
+   When the plain rung and its retry both leave a host refusal (403/406/429) or a real
+   error, `fetch` tries the **Wayback Machine** (`_try_wayback_fetch`, since 2026-09-09):
+   the freshest `web.archive.org` capture, fetched through this same `_fetch_plain` and
+   reusing `research/wayback.py`'s pure helpers, served `method=wayback` (fetched tier)
+   with its capture date disclosed in-text (`wayback_lead`). Unlike Tier 1 it applies NO
+   age bound: Tier 1's 30-day cutoff is calibrated on a cited grading source and a
+   driver-chosen URL is not one, so the driver weighs freshness itself. It never fires on a
+   URL we refused ourselves (a `blocked` with no `http_status`), the SSRF-bypass exclusion,
+   and the inner URL a capture is OF is re-guarded (`resolution_source._hop_refusal`) so an
+   archived platform page cannot slip through.
 3. **Local PDF extraction** (`local_document.pdf_fetch_result`). A body that is
    a PDF (by content type or by magic bytes) is decoded with pypdf in a worker
    thread and served as its own full text (`method=pdf_local`), which paginates
@@ -247,7 +257,12 @@ escalates when the lighter one comes up short:
    escalation would spend (a js-walled `fetch` the driver follows with `read_document`) is
    skipped. That is the ONLY outcome memoized: a `blocked`, `error` or `throttled` GET is
    not, because the driver is told to retry those URLs and caching them would suppress a
-   retry the tool descriptions promise.
+   retry the tool descriptions promise. When the DOM extracts nothing but the render
+   already captured a same-publisher JSON feed over XHR (a dashboard loading its figures
+   client-side), `_derived_api_outcome` serves the largest such body directly
+   (`derived_api.largest_json`, `method=derived_api`, fetched tier) with `derived_api_lead`
+   for provenance, instead of returning empty; about one in six measured dashboards is
+   same-publisher-admissible, so a modest rescue against an object the render already holds.
 5. **read_document.** If the URL turns out to be an image, or a PDF with no text
    layer at all, `fetch` auto-escalates to `read_document` so the driver keeps
    its "handled automatically" promise without spending a second tool call. The
