@@ -21,6 +21,7 @@ import pytest
 from forecasting_tools import MetaculusQuestion
 
 from metaculus_bot.ablation.cache import AblationCache
+from metaculus_bot.ablation.prune import run_prune_for_qids
 from metaculus_bot.backtest.scoring import GroundTruth
 
 # ---------------------------------------------------------------------------
@@ -327,18 +328,33 @@ async def test_run_prune_for_qids_handles_subprocess_failure(
 
 
 @pytest.mark.asyncio
+async def test_run_prune_for_qids_propagates_an_unexpected_redactor_error(
+    cache: AblationCache,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A subprocess failure or timeout is absorbed per batch; a bug class is not, so the stage stops on it."""
+    triples = [(_make_question(qid), _make_ground_truth(qid), f"raw blob {qid}") for qid in (1, 2)]
+    _patch_subprocess(monkeypatch, [KeyError("redactor bug")])
+
+    with pytest.raises(KeyError, match="redactor bug"):
+        await run_prune_for_qids(triples, cache, batch_size=10)
+
+    assert cache.read_pruned_research(1) is None
+    assert cache.read_pruned_research(2) is None
+
+
+@pytest.mark.asyncio
 async def test_run_prune_for_qids_handles_invalid_json(
     cache: AblationCache,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    from metaculus_bot.ablation.prune import run_prune_for_qids
-
+    """Unparseable stdout nulls the batch, and the per-qid recovery retries each qid once."""
     triples = [
         (_make_question(1), _make_ground_truth(1), "raw blob 1"),
         (_make_question(2), _make_ground_truth(2), "raw blob 2"),
     ]
-    _patch_subprocess(monkeypatch, ["this is definitely not valid JSON {{{{"])
+    _patch_subprocess(monkeypatch, ["this is definitely not valid JSON {{{{"] * 3)
 
     import logging
 

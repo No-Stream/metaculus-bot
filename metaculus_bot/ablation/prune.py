@@ -591,11 +591,8 @@ async def _process_batch(
     except subprocess.CalledProcessError as exc:
         await _report_redactor_subprocess_failure(cache, qids, exc)
         return out
-    except TimeoutError as exc:
-        logger.exception("Redactor subprocess timed out for qids=%s: %s", qids, exc)
-        return out
-    except Exception as exc:
-        logger.exception("Redactor subprocess raised unexpected error for qids=%s: %s", qids, exc)
+    except TimeoutError:
+        logger.exception("Redactor subprocess timed out for qids=%s", qids)
         return out
 
     ground_truths = {_require_qid(q): gt for q, gt, _ in batch}
