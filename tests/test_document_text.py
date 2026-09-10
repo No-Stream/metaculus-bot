@@ -196,19 +196,6 @@ class TestIsPdfBody:
         assert not is_pdf_body(b"<html><body>not a pdf</body></html>")
         assert not is_pdf_body(b"")
 
-    def test_agrees_with_the_agentic_private_check(self) -> None:
-        """The duplicated one-liner must stay equivalent on the PDF branch it duplicates.
-
-        `research/agentic/fetch_outcomes.py` keeps its own `_body_is_document`, which also
-        matches PNG/JPEG/GIF magic. Importing it HERE (test-only) pins the PDF half without
-        putting an agentic -> document_text-caller edge in the shipped package, which would
-        invert the dependency this module exists to sit under.
-        """
-        from metaculus_bot.research.agentic.fetch_outcomes import _body_is_document
-
-        for body in (b"%PDF-1.7\nx", b"  %PDF-1.4", b"plain text", b"", b'{"json": true}'):
-            assert is_pdf_body(body) == _body_is_document(body), f"disagreed on {body!r}"
-
 
 class TestExtraction:
     def test_text_per_page(self) -> None:

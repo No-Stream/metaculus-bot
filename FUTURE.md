@@ -697,8 +697,8 @@ characters. The driver asked for a rendered or screenshot value in 9 `conclude` 
 questions (question 14333's Figure 2 curve, question 44857's StatCounter bar chart, question 44950's GWIS
 map images, question 44881's Robo Tracker leaderboard rows).
 
-**Sketch.** After `_try_rendered_fetch` extracts nothing, `page.screenshot()` on the `RenderedPage` the
-transport already holds, then one vision read through the existing `url_context_reader` client (the same
+**Sketch.** After `fetch_ladder.rungs._rendered_rung` extracts nothing, `page.screenshot()` on the
+`RenderedPage` the transport already holds, then one vision read through the existing `url_context_reader` client (the same
 Gemini key and robots pre-check) with the driver's `ask`. Return the answer as a `read_document`-shaped
 outcome with a new method token so the provenance map can grant it no higher than the `snippet` tier;
 a model's reading of pixels is not a fetched page.
@@ -749,6 +749,18 @@ service.
 **Why not now.** Frequency is a handful per hundred questions and the resolving fact rarely lives in a
 post; where it did (question 45202's Musk posts on Grok 4.7), the same claim was carried by a news
 citation (axios.com) that a Wayback or impersonated fetch reaches.
+
+## A rendered page that lands on a document no longer escalates to the reader
+
+The gap-fill v2 loop's own browser rung used to check the rendered page's Content-Type and, for a
+document or an image, hand the URL to `read_document` rather than classifying the DOM. The shared
+browser rung (`fetch_ladder/rungs._rendered_rung`) classifies every rendered DOM as HTML, so a page
+whose client-side redirect lands on a PDF now reads as a JavaScript wall and the driver is told
+nothing was readable. Narrow in practice: the render only happens after a 200 whose body was already
+classified as HTML-ish, so the landing has to change type mid-navigation. Restoring it means a
+caller-dependent branch inside the rung, which is the shape the proportion rule refuses for a case
+nobody has measured, so it is recorded rather than built. Recorded 2026-09-10 with step 3 of the
+fetch-ladder unification.
 
 ## Research-triage round 2026-07-16 (lit + repo survey + codebase verification)
 
@@ -1542,7 +1554,7 @@ the prose below names each one's position.
    diagnostics side cannot, which is the actual gap to close.
 
 A fourth, smaller observation from the 2026-08-26 live-QA rerun (pre-existing, not from this
-wave): the agentic `_fetch_plain` textual allowlist (`text/plain`, `text/csv`,
+wave): the shared direct-fetch classifier's textual allowlist (`text/plain`, `text/csv`,
 `application/json`, unchanged since 56c0d2f) refuses FRED's fredgraph CSVs, which are served
 as `Content-Type: application/csv`, with a clean "Unsupported content type" error, so such URLs
 ride the fetch ladder's later rungs. One allowlist entry if agentic FRED reads ever matter.
@@ -1686,13 +1698,16 @@ contradicted that retry has since been fixed as well, and needed no per-URL outc
 nor told "its result will not have changed", while `max_tool_calls` still caps a throttle spin.
 One adjacent thing is still left alone on purpose, because it touches timing rather than detection:
 
-**No request SPACING.** Same-host fetches already serialize on the per-host `Semaphore(1)` v2
-shares with Tier-1 (`tools._host_gate`), but Ogimet asked for 20 s BETWEEN queries and nothing
-waits. So a parallel same-host batch still trips a spacing rule; it is now disclosed and retryable
-instead of silently wrong. Adding a per-host minimum interval means new sleep/deadline logic on the
-path the wall deadline already governs, which is the highest-risk surface in this package. If it is
-ever wanted, the cheap version is a per-host "next allowed at" timestamp consulted inside the
-existing gate, and it needs its own review pass.
+**No request SPACING.** Same-host fetches already serialize on the per-host `Semaphore(1)`. The
+gap-fill loop's `_FETCH_HOST_SEMAPHORES` map remains separate from the Tier-1 ladder map: the
+rendered rung can hold the loop's host gate across a Chromium launch for up to 35 s, so folding the
+maps would put that wait in front of a fetcher request whose 45 s wall is already running. Ogimet
+asked for 20 s BETWEEN queries and nothing waits. So a parallel same-host batch still trips a
+spacing rule; it is now disclosed and retryable instead of silently wrong. Adding a per-host
+minimum interval means new sleep/deadline logic on the path the wall deadline already governs,
+which is the highest-risk surface in this package. If it is ever wanted, the cheap version is a
+per-host "next allowed at" timestamp consulted inside the existing gate, and it needs its own review
+pass.
 
 Also unhandled, and cheaper to leave: `read_document` (rung 3, Gemini `url_context`) applies no
 throttle check, so an interstitial the reader summarises would still come back as a document read.
@@ -1743,6 +1758,9 @@ make the gap-fill analyzer treat a criteria-named URL as mandatory) sketched in
 already covers the API-backed financial subset.
 
 ### Resolution-source fetcher: Tier-2 LLM fetch + oversized-source summarization (added 2026-07-09)
+
+Feasibility probe (2026-07-08): 75% of questions cite an explicit source URL and ~62.5% of those
+are recoverable by a plain browser-headers fetch, which is where the Tier-1 target below comes from.
 
 Tier-1 deterministic fetcher shipped `66e31c0` (`research/resolution_source.py` +
 `research/http_fetch.py`, `RESOLUTION_SOURCE_ENABLED`). Smoke-validated on 40 cached questions
@@ -3596,7 +3614,7 @@ render budget sized to the DOM the browser actually returned.
 
 ### The HTML extraction runs inside the per-host gate and the open response (added 2026-09-04; LOW)
 
-`_fetch_one_hop` holds the loop-wide per-host `Semaphore(1)` and the aiohttp response context
+`fetch_ladder.direct_fetch._fetch_one_hop` holds the loop-wide per-host `Semaphore(1)` and the aiohttp response context
 across the HTML branch's `to_thread` extraction, on the grounds that trafilatura on a capped page
 is short next to the request it follows. Since extractor policy D (2026-09-03) that branch can
 run TWO trafilatura passes, and since the same day the gate is process-wide, so a second pass on

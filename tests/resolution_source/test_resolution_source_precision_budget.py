@@ -16,19 +16,15 @@ from __future__ import annotations
 
 import time
 
-from metaculus_bot.research import resolution_source
+from metaculus_bot.constants import RESOLUTION_SOURCE_PRECISION_RETRY_MIN_BUDGET_S
+from metaculus_bot.research.fetch_ladder import classify, rungs
+from metaculus_bot.research.fetch_ladder.classify import _extract_page_text, content_share, looks_like_page_chrome
+from metaculus_bot.research.fetch_ladder.context import LadderContext
+from metaculus_bot.research.fetch_ladder.ladder import _fetch_one
+from metaculus_bot.research.fetch_ladder.policy import RESOLUTION_SOURCE_POLICY
+from metaculus_bot.research.fetch_ladder.rungs import _rendered_rung_applies
 from metaculus_bot.research.rendered_fetch import RenderedPage
-from metaculus_bot.research.resolution_source import (
-    RESOLUTION_SOURCE_PRECISION_RETRY_MIN_BUDGET_S,
-    RESOLUTION_SOURCE_WALL_TIMEOUT,
-    FetchContext,
-    FetchResult,
-    _extract_page_text,
-    _fetch_one,
-    _rendered_rung_applies,
-    content_share,
-    looks_like_page_chrome,
-)
+from metaculus_bot.research.resolution_source import RESOLUTION_SOURCE_WALL_TIMEOUT, FetchResult
 from tests.resolution_source_fakes import FakeResponse, FakeSession, _fake_render
 
 _URL = "https://portal.example.com/statistics"
@@ -48,10 +44,10 @@ _CARD = (
 )
 
 
-def _spent_context(wall_left_s: float) -> FetchContext:
+def _spent_context(wall_left_s: float) -> LadderContext:
     """A per-URL context whose remaining wall (``rung_budget_s``) is about ``wall_left_s``."""
-    margin = resolution_source.RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S
-    return FetchContext(started=time.monotonic() - (RESOLUTION_SOURCE_WALL_TIMEOUT - margin - wall_left_s))
+    margin = RESOLUTION_SOURCE_POLICY.rung_wall_margin_s
+    return LadderContext(started=time.monotonic() - (RESOLUTION_SOURCE_WALL_TIMEOUT - margin - wall_left_s))
 
 
 def _install_fake_extractor(monkeypatch, *, precision: str | None, default_cost_s: float = 0.0) -> list[bool]:
@@ -67,15 +63,15 @@ def _install_fake_extractor(monkeypatch, *, precision: str | None, default_cost_
             time.sleep(default_cost_s)
         return _MENU
 
-    monkeypatch.setattr(resolution_source, "_extract_main_text", _extract)
+    monkeypatch.setattr(classify, "_extract_main_text", _extract)
     return calls
 
 
 class TestPrecisionRetryBudget:
     def test_the_fixtures_are_what_the_policy_decides_on(self):
         assert not looks_like_page_chrome(_MENU)
-        assert content_share(_MENU) < resolution_source.RESOLUTION_SOURCE_CONTENT_SHARE_MIN
-        assert content_share(_CARD) >= resolution_source.RESOLUTION_SOURCE_CONTENT_SHARE_MIN
+        assert content_share(_MENU) < classify.RESOLUTION_SOURCE_CONTENT_SHARE_MIN
+        assert content_share(_CARD) >= classify.RESOLUTION_SOURCE_CONTENT_SHARE_MIN
 
     def test_unbounded_by_default_the_second_pass_runs_and_rescues(self, monkeypatch):
         """The two existing call shapes: no ``remaining_wall_s`` at all, and plenty of it."""
@@ -128,7 +124,7 @@ class TestPrecisionRetryBudget:
             del body, url, favor_precision
             return _CARD
 
-        monkeypatch.setattr(resolution_source, "_extract_main_text", _content)
+        monkeypatch.setattr(classify, "_extract_main_text", _content)
 
         extraction = _extract_page_text(_HTML, _BODY, _URL, 0.0, remaining_wall_s=-5.0)
 
@@ -143,7 +139,7 @@ class TestPrecisionRetryBudgetThroughTheLadder:
         calls = _install_fake_extractor(monkeypatch, precision=_CARD)
         session = FakeSession({_URL: FakeResponse(200, body=_BODY)})
 
-        rescued = await _fetch_one(session, _URL, {}, FetchContext())
+        rescued = await _fetch_one(session, _URL, {}, LadderContext())
         assert calls == [False, True]
         assert rescued.status == "success"
         assert rescued.precision_rescued is True
@@ -161,7 +157,7 @@ class TestPrecisionRetryBudgetThroughTheLadder:
         assert _rendered_rung_applies(withheld)
 
     @staticmethod
-    async def _render_a_menu_tree(monkeypatch, ctx: FetchContext) -> tuple[list[bool], FetchResult]:
+    async def _render_a_menu_tree(monkeypatch, ctx: LadderContext) -> tuple[list[bool], FetchResult]:
         """Drive the ladder with a direct body AND a rendered DOM that both extract to chrome.
 
         The browser floor is lowered so the rung is admitted on a nearly spent wall (the real
@@ -169,18 +165,18 @@ class TestPrecisionRetryBudgetThroughTheLadder:
         precision pass extracts nothing, so both classifications withhold and the URL is memoised
         as rendered-to-nothing; one URL per test, because that memo outlives the call.
         """
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S", 1.0)
+        monkeypatch.setattr(rungs, "RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S", 1.0)
         calls = _install_fake_extractor(monkeypatch, precision=None)
         rendered_dom = "<html><body><nav>" + "".join(f"<a href='/{i}'>Menu item {i:03d}</a>" for i in range(60))
         rendered_dom += "</nav></body></html>"
         page = RenderedPage(url=_URL, content_type="text/html", html=rendered_dom)
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(page, []))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(page, []))
         session = FakeSession({_URL: FakeResponse(200, body=_BODY)})
         result = await _fetch_one(session, _URL, {}, ctx)
         return calls, result
 
     async def test_a_rendered_dom_gets_its_second_pass_with_wall_to_spare(self, monkeypatch):
-        calls, result = await self._render_a_menu_tree(monkeypatch, FetchContext())
+        calls, result = await self._render_a_menu_tree(monkeypatch, LadderContext())
 
         # The direct classification (default, precision), then the rendered DOM's (default, precision).
         assert calls == [False, True, False, True]

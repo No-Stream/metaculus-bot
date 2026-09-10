@@ -71,7 +71,7 @@ class WaybackSnapshot:
 def wayback_snapshot_url(url: str, *, now: datetime) -> str:
     """The archive URL to fetch for ``url``'s freshest stored capture, as of ``now``.
 
-    ``now`` is the caller's wall clock (``FetchContext.now``), threaded in for the same reason
+    ``now`` is the caller's wall clock (``LadderContext.now``), threaded in for the same reason
     the age disclosure's is: the request and the age rendered off what comes back have to be one
     instant, and a clock read inside here would make the request depend on when the rung
     happened to run rather than on the fetch it belongs to. Only the year is used, per

@@ -62,13 +62,13 @@ _METHOD_TO_TIER: dict[str, str] = {
     "document": "fetched",
     "rendered": "fetched",
     "plain": "fetched",
-    # The impersonated retry read the host's own bytes through libcurl (tools._try_impersonated_fetch);
+    # The impersonated retry read the host's own bytes through the shared impersonated rung;
     # absent from here a page it really did retrieve would stay untiered and its discrepancy
     # silently demoted below the briefing, the 131.3 failure mode above.
     "impersonate": "fetched",
-    # The archive served the host's own bytes with the age disclosed in-text (tools._try_wayback_fetch).
+    # The archive served the host's own bytes with the age disclosed in-text (the shared Wayback rung).
     "wayback": "fetched",
-    # The page's own JSON feed, harvested during its render and served directly (tools._derived_api_outcome).
+    # The page's own JSON feed, harvested during its render and served directly (the shared derived rung).
     "derived_api": "fetched",
     "cache": "fetched",
     "pdf_local": "fetched",

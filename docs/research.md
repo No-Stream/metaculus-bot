@@ -1319,7 +1319,9 @@ the cited URL, which is what the escalation line names. One accounting consequen
 2026-09-04: on a `route=rendered` rescue the `FetchResult.url`, which is the `url=` of the
 `RESOLUTION_SOURCE_FETCH` line and the published `### <url>` heading, is that landing URL, while the
 `RESOLUTION_SOURCE_ESCALATION` line's `url=` is the cited URL, so a per-URL join between the two
-lines must key on the escalation line; before that boundary the two agreed. The transport's own post-gate need is
+lines must key on the escalation line; before that boundary the two agreed. A rescued result keeps the DIRECT
+fetch's `http_status`, which is the `http=` on the fetch line: Chromium reports no status on a salvaged DOM, and
+the fact worth archiving is that the page answered 200 and carried nothing readable. The transport's own post-gate need is
 higher: `RENDER_MIN_GOTO_MS` (5 s of navigation) plus `RENDER_POST_GOTO_TAIL_MS` (the 2 s settle
 and the 5 s DOM-read bound, reserved so a goto that runs its budget out can still be salvaged)
 plus `RENDER_EXIT_RESERVE_MS` (3 s, described below), 15 s in all, so a render admitted with 12 to
@@ -1661,7 +1663,7 @@ is the paid reader's, a page Gemini retrieved whose answer said it does not disc
 of them live in `research/resolution_fetch_result.py` with the rest of the vocabulary.
 
 `vacuous_body_status` (`research/resolution_fetch_result.py`) is the one place that
-decision is made, on every raw-body branch, Tier-1 JSON/text/CSV and the Tier-2
+decision is made, on every raw-body branch, Tier-1 JSON/XML/text/CSV and the Tier-2
 dataset alike. Three ways a 200 carries nothing. It could not be DECODED: the body is
 decoded BOM-first, then by its declared charset, and an undecodable-character ratio
 above `MAX_UNDECODABLE_CHAR_RATIO` is refused as `unsupported_type`, because mojibake
@@ -2245,8 +2247,8 @@ auto-escalating ladder: plain → local PDF extraction → headless Chromium →
 `read_document`), and `read_document` (acquisition-first: the free rungs, then
 `GAP_FILL_V2_READER_MODEL` via Gemini url_context). Two of those rungs are transports shared
 with the Tier-1 resolution-source ladder rather than copies of it: the Chromium render
-(`research/rendered_fetch.py`, over which `tools._try_rendered_fetch` is now a thin mapping onto
-this ladder's own result type) and the url_context read
+(`research/rendered_fetch.py`, called by the shared `fetch_ladder.rungs._rendered_rung`) and the
+url_context read
 (`research/url_context_reader.py`, with the `Google-Extended` pre-check in
 `research/robots_policy.py`, moved out of `research/agentic/` when the second caller arrived).
 It runs under a wall deadline

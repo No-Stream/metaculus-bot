@@ -270,7 +270,8 @@ archive as the `ghost_v1` key of the `gap_fill_v2` payload (None when the v1 gho
 ### AGENTIC_FETCH_THROTTLED
 
 Per-fetch: the gap-fill v2 fetch ladder read a 200-OK body that was the host's rate-limit
-interstitial rather than the page it asked for (`research/agentic/tools.py:_throttled_fetch_outcome`).
+interstitial rather than the page it asked for. The shared ladder detects the body; the tool handler
+emits the marker through `research/agentic/tools.py:_throttled_fetch_outcome`.
 Registered because the event had no trace at all before it, and its whole failure mode is looking
 like a success: on q45191, two throttled ogimet.com fetches were served to the driver as
 `status: ok`, cached, and replayed on its own retry, so the exact-date reference class it
@@ -278,7 +279,7 @@ published came to 4 years instead of 6. No `question=`: the tool handlers run be
 `log_prefix` and have no question id, exactly like the credit markers, so a join goes through the
 run id.
 
-`phrase` is the entry of `fetch_outcomes.FETCH_THROTTLE_PHRASES` that fired and is last in the
+`phrase` is the entry of `fetch_ladder.throttle.FETCH_THROTTLE_PHRASES` that fired and is last in the
 regex because it contains spaces; with `chars` (the body's length) it is what lets a prod fire be
 graded a true or false positive, and the phrase list and the `FETCH_THROTTLE_PAGE_MAX_CHARS` cap
 are retuned on evidence rather than taste.
@@ -639,6 +640,16 @@ the digest, so a page under the digest threshold and every archived line still p
 harvested as None. The spec was added ahead of its emitter: the fetch-ladder unification's callers
 append the three values off the `PageDigest` the digest returns.
 
+`caller` (optional, 2026-09-10) names which of the two callers of the shared fetch ladder emitted
+the line: `resolution_source` for the resolution-source fetcher, `gap_fill_v2` for the gap-fill v2
+agentic loop, whose `fetch` and `read_document` tools moved onto the same ladder and gained this
+per-URL record they never had. Last in the keyed tail, after the optional digest fields, for the same reason every
+group before it is keyed and tail-positioned: every archived line parses unchanged, and an absent
+value keeps meaning "does not apply" rather than "old record". A `gap_fill_v2` line carries
+`question=None` (the loop's three event markers do the same, because the tool call has no question
+id in hand), so a join to a question goes through the run id. The marker NAME reads as a slight
+misnomer for a loop fetch, and names are contracts here, so the misnomer is the correct price.
+
 ### RESOLUTION_SOURCE_ESCALATION
 
 One line per escalated-URL rung attempt: the direct fetch could not read the page, so the ladder
@@ -673,6 +684,9 @@ parse, and the paid rung opens its attempt only after its `Google-Extended` robo
 (a real request, bounded at `ROBOTS_FETCH_TIMEOUT_S`), so that pre-check is not in its `wall_s`, a
 15-30% under-count against the rung's 15s floor when the pre-check has to fetch. Skipped attempts
 emit no line at all and ride `details["counts"]` instead.
+
+`caller` (optional, 2026-09-10) is the same field the fetch marker carries, with the same two
+values and the same reason for sitting keyed at the tail; see that section.
 
 The token cannot collide with `RESOLUTION_SOURCE_FETCH`: both specs match on their own full marker
 word plus the colon, and neither word is a prefix of the other, so the one-marker-per-line `break`

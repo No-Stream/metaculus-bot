@@ -177,127 +177,121 @@ rows, four Kalshi GETs) live with the backends, documented in `docs/research.md`
 
 ### The fetch ladder
 
-`fetch` (`tools.py` `fetch`) tries progressively heavier methods and only
-escalates when the lighter one comes up short:
+`fetch` runs the SHARED fetch ladder, `metaculus_bot/research/fetch_ladder/`, through one entry
+point: `ladder.fetch_url(url, policy=..., ctx=...)`. The rung order, the transports, the SSRF guard,
+the classification of a body and the per-rung wall bounds are all documented once, in
+`docs/architecture.md` "The shared fetch ladder"; this section is only what is THIS caller's.
 
-1. **Cache.** A repeat fetch of the same URL, including `start_char`
-   continuations, is served from an in-process LRU cache with no network call.
-2. **Plain HTTP** (`_fetch_plain`). An aiohttp GET with browser-like headers,
-   SSRF-hardened: a `is_public_http_url` preflight, a connect-time filtering
-   resolver, and a bounded manual redirect loop that re-guards every hop.
-   The HTML body is read through the Tier-1 resolution-source extraction steps
-   (`fetch_outcomes._plain_html_outcome`, since 2026-09-09): `_extract_page_text`
-   rewrites ARIA-role tables to real tables and runs the two-pass default/precision
-   policy, the inline chart-data read (`render_inline_chart_data`) leads the text
-   (a dashboard's resolving series lives only in its `data-chart` attribute), and a
-   `<meta http-equiv=refresh>` stub on an otherwise-empty page is followed as one
-   more hop through this same re-guarded redirect loop. A plain GET a host answers 403 is re-dialed
-   once (`_try_impersonated_fetch`, since 2026-09-04) through the TLS-impersonating
-   transport Tier 1 shares, `metaculus_bot/research/impersonated_fetch.py`, which
-   presents a real Chrome fingerprint and carries its own DNS pin and per-hop re-guard
-   because libcurl never passes aiohttp's filtering resolver. The trigger is the host's
-   403 alone: `PlainFetchResult.http_status` is set only by a non-200 response, so the
-   `blocked` this ladder produces itself for a non-public URL or a question-platform
-   self-reference (metaculus.com or `competitions.mantic.com`; no `http_status`) can
-   never reach the second transport. The body
-   goes through `_plain_body_outcome`, the same classification a plain body gets (the
-   local PDF rung included), and a page-shaped result carries `method=impersonate`,
-   which `provenance._METHOD_TO_TIER` grants the `fetched` tier; a document keeps its
-   own rung's method. Every decline (the default-on kill switch
-   `RESOLUTION_SOURCE_IMPERSONATE_ENABLED`, the per-run host memo shared with Tier 1,
-   a still-refused host, any transport refusal) leaves the `blocked` outcome exactly
-   as it was. Bounded to one plain hop's `RESOLUTION_SOURCE_HTTP_TIMEOUT` for the whole
-   retry, and to the plain rung's own two body caps (`RESOLUTION_SOURCE_MAX_RESPONSE_BYTES`
-   for a page, `DOCUMENT_TEXT_PDF_MAX_BYTES` for a declared PDF). The trigger set, the kill
-   switch and the memo-write rule are the transport's (`IMPERSONATE_TRIGGER_STATUSES`,
-   `impersonation_enabled`, `note_refusal_if_block_shaped`, which memoizes both the host
-   dialed and the host that answered a block), read at call time so this ladder and Tier 1
-   cannot drift apart. The same retry runs in `read_document`'s local-document ladder
-   (`_fetch_plain_with_impersonated_retry` is the shared step), which matters more there:
-   that ladder sits immediately in front of the paid `url_context` read, so a cold
-   `read_document` on a bls.gov or cdc.gov page is digested for free instead of paid for.
-   When the plain rung and its retry both leave a host refusal (403/406/429) or a real
-   error, `fetch` tries the **Wayback Machine** (`_try_wayback_fetch`, since 2026-09-09):
-   the freshest `web.archive.org` capture, fetched through this same `_fetch_plain` and
-   reusing `research/wayback.py`'s pure helpers, served `method=wayback` (fetched tier)
-   with its capture date disclosed in-text (`wayback_lead`). Unlike Tier 1 it applies NO
-   age bound: Tier 1's 30-day cutoff is calibrated on a cited grading source and a
-   driver-chosen URL is not one, so the driver weighs freshness itself. It never fires on a
-   URL we refused ourselves (a `blocked` with no `http_status`), the SSRF-bypass exclusion,
-   and the inner URL a capture is OF is re-guarded (`resolution_source._hop_refusal`) so an
-   archived platform page cannot slip through.
-3. **Local PDF extraction** (`local_document.pdf_fetch_result`). A body that is
-   a PDF (by content type or by magic bytes) is decoded with pypdf in a worker
-   thread and served as its own full text (`method=pdf_local`), which paginates
-   through `start_char` exactly as a long HTML page does. This is why the capped
-   body read now happens BEFORE the document check: the classifier used to decide
-   a PDF was unreadable without looking at a single byte of it. Measured
-   2026-09-03, pypdf pulled 833,450 chars out of a 6.7 MB 220-page report in
-   5.3 s while the paid reader returned nothing for the same file, so a declared
-   PDF is read under the larger `DOCUMENT_TEXT_PDF_MAX_BYTES` cap; a body past
-   even that is reported as `oversize_document` rather than escalated, since a
-   document too big to read locally is also too big to be worth having a model
-   retrieve. The parse is held for the run, so pagination and a later
-   `read_document` on the same URL neither refetch nor reparse. A read that stopped
-   early says so in the text it serves, led by
-   `[Partial document read: N pages; stopped at the M-page read cap]` or
-   `[Partial document read: N pages; stopped after M pages on the extraction time budget]`.
-   The clause is `document_text.truncation_note`, shared with the digest header so the
-   two wordings cannot drift, and without it the driver pages to the end, sees
-   `truncated=False`, and can report an absence over pages nobody read. The parse itself
-   contends for `http_fetch.pdf_parse_semaphore()`, two slots held loop-wide with the
-   Tier-1 resolution-source PDF rung. It bounds concurrent parses and their pypdf arenas,
-   not how many fetched bodies are resident.
-4. **Headless Chromium** (`_try_rendered_fetch` in `agentic/tools.py`, a thin mapping onto
-   this ladder's `PlainFetchResult` over the shared browser transport
-   `metaculus_bot/research/rendered_fetch.py`, which the Tier-1 resolution-source rendered
-   rung uses too). If plain extraction returns too little text (below
-   `GAP_FILL_V2_MIN_CONTENT_CHARS`), the ladder re-fetches with Playwright's headless
-   Chromium to run JavaScript. It waits for DOM-ready plus a fixed settle rather than for
-   network idle, and salvages `page.content()` when the navigation itself times out: 4 of
-   the 10 render rescues in the 2026-09-03 replay came from pages whose DOM was complete
-   when `page.goto` raised. The rung's 35 s ceiling is unchanged; the settle comes out of
-   the goto budget. The SSRF guard is re-applied to every request Chromium makes EXCEPT
-   three that Playwright's request interception cannot see, and since 2026-09-04 two of
-   those three are closed by other mechanisms in the same transport. A server-side
-   redirect hop is auto-continued by the driver and stays invisible to the ROUTE HANDLER,
-   the callback that re-checks each request the browser is about to make; what closes it
-   for the main frame is the transport's landing-host check, which after the navigation
-   settles compares the LANDING HOST, the hostname `page.url` ended up on, with the PINNED
-   HOST that its `--host-resolver-rules` launch argument covers, and refuses the DOM
-   unread when the two differ (the comparison runs again after the read, so a navigation that
-   commits during `page.content()` is discarded unpublished, and it fails shut, so Chromium's
-   own error document after a failed navigation is refused too). This ladder folds that refusal into the same None it
-   returns for a render that read nothing. A WebSocket handshake, which routes through a
-   separate Playwright API, is blocked by a `route_web_socket` handler that never connects
-   the socket to a server. What is left is a request Playwright cannot attribute to a
-   frame, auto-continued the same way, and a cross-host subresource whose host Chromium
-   resolves with no pin of ours. The route-guard comment in `research/rendered_fetch.py`
-   states what each of those means and what Chromium's own Local Network Access check does
-   and does not cover. If Playwright isn't installed, this rung logs a one-time warning
-   and the plain result stands. A URL where Chromium ran and extracted nothing is
-   remembered for the run and never rendered again, so the second launch a documented
-   escalation would spend (a js-walled `fetch` the driver follows with `read_document`) is
-   skipped. That is the ONLY outcome memoized: a `blocked`, `error` or `throttled` GET is
-   not, because the driver is told to retry those URLs and caching them would suppress a
-   retry the tool descriptions promise. When the DOM extracts nothing but the render
-   already captured a same-publisher JSON feed over XHR (a dashboard loading its figures
-   client-side), `_derived_api_outcome` serves the largest such body directly
-   (`derived_api.largest_json`, `method=derived_api`, fetched tier) with `derived_api_lead`
-   for provenance, instead of returning empty; about one in six measured dashboards is
-   same-publisher-admissible, so a modest rescue against an object the render already holds.
-5. **read_document.** If the URL turns out to be an image, or a PDF with no text
-   layer at all, `fetch` auto-escalates to `read_document` so the driver keeps
-   its "handled automatically" promise without spending a second tool call. The
-   `method` field on the result tells the driver which rung actually served it. The
-   escalation passes `ladder_exhausted=True`, an internal argument saying the free rungs
-   just ran for this URL, so `read_document` does not re-request a page (or re-download an
-   image the plain rung classified off its Content-Type). It is deliberately absent from the
-   driver-facing schema, which stays `(url, ask)`: the loop binds handlers with `**arguments`
-   straight off the model, so an advertised (or merely hallucinated)
-   `ladder_exhausted: true` would skip the free ladder and pay. `build_gap_fill_tools`
-   wraps the real function to enforce that, the same way it hides `fetch`'s
-   `question_topic`.
+**What the loop contributes to the ladder.** Three presets in `fetch_ladder/policy.py`:
+`GAP_FILL_FETCH_POLICY` for the `fetch` tool (a 90 s wall, matching the ToolSpec ceiling; the
+impersonated retry, the browser and the archive), `GAP_FILL_DOCUMENT_POLICY` for `read_document`'s
+free acquisition ladder (25 s, and no archive rung, because that ladder sits immediately in front of
+the paid reader and an archived copy is not what a document read was asked for) and
+`GAP_FILL_DIRECT_POLICY` for the robots.txt pre-check (one direct fetch, no rung). All three carry
+`GAP_FILL_VERDICT`, which is what makes the driver's reading of a body different from the fetcher's:
+the bytes decide the branch rather than the Content-Type header, any non-empty extraction is content
+rather than having to clear a 400-character chrome floor, a success under
+`GAP_FILL_V2_MIN_CONTENT_CHARS` with no chart block earns the browser, and a document is served as
+its whole text with its parse held for the run rather than as a query-ranked digest.
+
+**Rungs this caller does not run.** The derived-API REUSE rung (a feed an earlier render on the host
+recorded) and the paid `url_context` rung are absent from every gap-fill preset, so the dispatcher
+records a `rung_not_enabled` skip and moves on. The HARVEST half of the derived feed — the JSON a
+fruitless render already captured, served with `derived_api_lead` for provenance and
+`method=derived_api` — is inside the browser rung and does run.
+
+**The per-question context.** `agentic_gap_fill.run_gap_fill_v2` builds ONE `LadderContext` per
+question (`tools.question_ladder_context`) and captures it into the two handlers that fetch. It
+carries the per-question rung budget, which is what caps a question at two archive snapshots and two
+paid reads however many URLs the driver picks — a cap this loop did not have before it moved onto the
+shared ladder. Everything per call (the ask, the wall origin, the rung list) is derived off it in
+`tools._per_call_ctx`, because one tool call is one wall.
+
+**What stays in `tools.py`.** The `start_char` window presentation over the ladder's complete
+process-run artifact; the question-platform refusal, which runs before the ladder because it is this caller's own
+policy and must refuse before anything is dialed (the resolution-source fetcher drops those URLs when
+it selects them); the throttle outcome and marker presentation after the shared ladder has classified
+the body; the auto-escalation to
+`read_document` for a document no local rung can turn into text; and the two shared fetch markers,
+emitted after each tool call with `question=None`.
+
+### The shared fetch ladder, and the adapter over it
+
+The ladder speaks the resolution-source vocabulary — thirteen `FetchStatus` values, eight `FetchRoute`
+values, a `status_reason` where a status has more than one rule behind it — and the driver reads seven
+statuses plus a `method` the verification-tier map keys on. `agentic/ladder_adapter.py` is the ONE
+place the two meet, so a status the ladder gains cannot silently become an `ok` the loop stamps
+`fetched`. Its table:
+
+| `FetchStatus` (and reason) | loop `status` | loop `method` | what the driver is told |
+|---|---|---|---|
+| `success` | `ok` | from the `route`: `direct`/`meta_refresh` → `plain`, `pdf_local`, `impersonate`, `derived_api`, `rendered`, `wayback` | the text the ladder read |
+| `throttled` | `throttled` | `throttled` | blank text; the original rung is retained in the throttle marker |
+| `js_wall`, `empty_body`, `no_resolving_content` | `empty` | `plain` | "Plain fetch returned no extractable text." |
+| `unsupported_type` + `undecodable_body` | `empty` | `plain` | "Plain fetch could not decode the body as text." |
+| `unsupported_type` (any other) | `error` | `plain` | "Unsupported content type: X" |
+| `unsupported_type` + `image_needs_reader` | `ok` | `document_needed` | the use-`read_document` placeholder |
+| `unreadable_document` (scan, encrypted, malformed) | `ok` | `document_needed` | the same placeholder |
+| `blocked` with a host status | `blocked` | `plain` | "Fetch blocked with HTTP N." |
+| `blocked` with none (a refusal we made) | `blocked` | `plain` | the platform-block message, hosts named |
+| `ssrf_blocked` | `blocked` | `plain` | non-public URL, or non-public redirect target |
+| `not_found` | `error` | `plain` | "Fetch failed with HTTP N." |
+| `error` + `oversize_document` | `error` | `oversize_document` | the too-large-to-read message |
+| `error` (a 5xx, a malformed redirect, an over-cap body, a transport failure, a spent redirect budget) | `error` | `plain` | one clause per shape |
+
+Five facts of the tool contract the adapter exists to preserve, each pinned by a test: `ok` means
+content was read and nothing else, because `provenance._harvest_verification_tiers` grants the
+`fetched` tier on status alone; `method` is a `provenance._METHOD_TO_TIER` token for a real read and
+one the map does not carry for a non-read; `http_status` is set only by a host's response, never by a
+refusal the ladder made itself; `escalate_rendered` is the caller's thin-content signal with a chart
+block pinning it off; and links resolve against the DOCUMENT url, after a client-side redirect.
+
+One capability the shared browser rung does not carry: the loop's old rendered rung escalated a
+render whose Content-Type was a document to `read_document`, and the shared rung classifies every
+rendered DOM as HTML instead. A page whose client-side redirect lands on a PDF now reads as a
+JavaScript wall rather than escalating. `FUTURE.md` carries the entry.
+
+### The shared throttle check
+
+A host that is throttling us answers HTTP 200 with a short interstitial in place of the page it was
+asked for, so every status check on the ladder passes and the driver reads the refusal as the page's
+content. Receipt: question 45191 (2026-08-10), where three parallel fetches of ogimet.com daily
+summaries tripped that host's spacing rule and two came back as a 304-character body reading
+"gsynext: Limit for old data queries exceeded. Permitted a query per 20 seconds per IP" under
+`status="ok"` — which was then cached and replayed on the driver's own retry, so the exact-date
+reference class it published came to 4 years instead of 6 and the forecast under-committed to the
+winner it had already named.
+
+The neutral `fetch_ladder.throttle.matched_throttle_phrase` predicate runs before either caller's
+verdict presents an HTML or raw-text body. The size half is why it
+is safe: the phrases alone would demote a real page that merely discusses rate limits, while a size
+floor alone would demote every legitimately short source (a one-line official statement), which the
+ladder deliberately keeps as `ok`. Bare "slow down" is left out on purpose, being ordinary English
+where the rest are throttle idiom, and missing a throttle only preserves today's behaviour whereas a
+false positive discards a page we really did read. `FETCH_THROTTLE_PAGE_MAX_CHARS` is 1,200 against
+the receipt's 304-character body (303 stripped, which is what the cap sees). PDF bodies bypass this
+detector. A direct throttle is terminal, so it does not launch the browser, consult an offsite rung,
+or write a cache entry. A rendered throttle keeps `route=rendered` and the rendered attempt's
+`outcome=throttled`. The FetchResult carries blank text plus only the matching phrase and stripped
+character count needed for the existing marker. An interstitial is deliberately NOT cached, which
+is the half question 45191 turned on: the body was cached under
+`method="rendered"` and served straight back on the driver's retry, so that retry could not have
+succeeded however many slots it spent.
+
+### Why the question platforms' own hosts are refused
+
+`fetch_outcomes._fetch_plain_url_block` refuses metaculus.com and `competitions.mantic.com` from our
+runner IP, on the caller-supplied URL and again on every redirect hop. A Metaculus question page is a
+JavaScript SPA whose near-empty plain fetch would escalate to headless Chromium, whose route guard
+then permits the SPA's own XHR fan-out to the Metaculus API, all from our IP and on the same host the
+critical API calls use. Refusing before the ladder runs kills both our-IP rungs. `read_document` runs
+the same check first, before its free ladder and before the paid Gemini read, which dials from
+Google's address and is the one rung the our-IP refusal could not otherwise reach: it would read a
+platform page the driver handed it, other bots' forecasts included on a Mantic question page.
+`FETCH_DESCRIPTION` also tells the driver not to fetch those hosts, and the resolution-source
+pre-filter never cites one, so the driver only ever meets a platform URL it picked out of a search
+result. The resolution-source ladder's own paid rung is closed to a self-reference the same way
+(`rungs._url_context_rung_applies`).
 
 ### The free digest, and the one shape it refuses
 
@@ -332,9 +326,9 @@ than traded away.
 ### The robots pre-check on the paid read
 
 Before the paid `url_context` read (and only there; the free rungs are unaffected),
-`read_document` fetches `<scheme>://<host>/robots.txt` once per host through the same
-SSRF-guarded plain fetch (`_fetch_plain`, under `robots_policy.ROBOTS_FETCH_TIMEOUT_S`, the
-bound the Tier-1 resolution-source reader shares), with the verdict cached process-wide and
+`read_document` fetches `<scheme>://<host>/robots.txt` once per host through the shared direct
+fetch in the ladder (`fetch_ladder.direct_fetch._fetch_direct`, under
+`robots_policy.ROBOTS_FETCH_TIMEOUT_S`, the bound the Tier-1 resolution-source reader shares), with the verdict cached process-wide and
 filled single-flight, so concurrent callers on one host share one read. Only the
 `Google-Extended` group is honoured,
 because that is the product token Gemini's retrieval obeys: a host disallowing it refuses
@@ -752,9 +746,10 @@ level up:
 | `agentic/provenance.py` | URL and quote normalization, the quote-grounding span logic, and the per-call harvesters behind the provenance gate and the W4 verification tiers. |
 | `agentic/gates.py` | The W1 plan gate's nudge and gap coercion, the W2 conclude gate, the W3 `source_url` check, and W4 tier stamping plus idempotent findings banking. |
 | `agentic/dispatch.py` | One assistant turn's tool calls in, one tool message each out: batch admission (plan gate, call budget, duplicate detection), provenance absorption, and the tool-message/rejection rendering. |
-| `agentic/tools.py` | `build_gap_fill_tools` and the four tool handlers, including the escalating fetch ladder and its SSRF hardening. |
-| `agentic/local_document.py` | The local PDF rung, the run's held-parse cache, the passage digest `read_document` serves, the url_context size gate, and the `AGENTIC_FETCH_LOCAL_DOC` marker. |
-| `agentic/fetch_outcomes.py` | Response classification for the plain `fetch` rung: content-type and magic-byte sniffers, the outbound-link collector, the question-platform self-reference refusal (metaculus.com and `competitions.mantic.com`), and the per-body-shape outcome builders including the throttle interstitial. |
+| `agentic/tools.py` | `build_gap_fill_tools`, `question_ladder_context` and the four tool handlers, plus `_fetch_via_ladder`, the one seam onto the shared fetch ladder, and this caller's window presentation and throttle outcome. |
+| `agentic/ladder_adapter.py` | One `FetchResult` read as this ladder's own `PlainFetchResult`: the status and method tables, and the message the driver is told for every non-read. |
+| `agentic/local_document.py` | What the free ladder holds for one URL (`HeldDocument`), the passage digest `read_document` serves, the url_context size gate, and the `AGENTIC_FETCH_LOCAL_DOC` marker. The parses themselves are held in `research/document_cache.py`, shared with the ladder's document verdict. |
+| `agentic/fetch_outcomes.py` | This ladder's result type (`PlainFetchResult`), the question-platform self-reference refusal (metaculus.com and `competitions.mantic.com`), and the escalate-to-a-reader outcome. Its per-body-shape builders are dead since the loop moved onto the shared classifier and are deleted with the rest of the loop's own rungs. |
 | `agentic/tool_backends.py` | The outbound half of the tools: the AskNews and Exa clients with their retry ladders and concurrency caps, the Gemini `url_context` document read and its fixed in-thread ceiling, and the markdown formatting of what comes back. |
 | `agentic/tool_descriptions.py` | The driver-facing tool descriptions and JSON parameter schemas: behavioral text, so a change here changes what the driver does. |
 | `research/robots_policy.py` (outside `agentic/`, shared with the Tier-1 url_context rung) | The `Google-Extended` robots.txt group parser and per-host cache behind the pre-check on every paid read, written because `urllib.robotparser` falls back to `User-agent: *`. |

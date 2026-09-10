@@ -21,19 +21,14 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from metaculus_bot.research import resolution_source
+from metaculus_bot.research.fetch_ladder import classify, guard, rungs, verdict
+from metaculus_bot.research.fetch_ladder.context import LadderContext
+from metaculus_bot.research.fetch_ladder.ladder import _fetch_one
+from metaculus_bot.research.fetch_ladder.rungs import _WAYBACK_TRIGGER_STATUSES, _rendered_rung_applies
+from metaculus_bot.research.fetch_ladder.verdict import content_share, looks_like_page_chrome
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail
 from metaculus_bot.research.rendered_fetch import RenderedPage
-from metaculus_bot.research.resolution_source import (
-    _WAYBACK_TRIGGER_STATUSES,
-    FetchContext,
-    _fetch_one,
-    _rendered_rung_applies,
-    _rung_counts,
-    content_share,
-    looks_like_page_chrome,
-    resolution_source_provider,
-)
+from metaculus_bot.research.resolution_source import _rung_counts, resolution_source_provider
 from metaculus_bot.research.wayback import wayback_snapshot_url
 from tests.resolution_source_fakes import (
     _JS_SHELL,
@@ -126,7 +121,7 @@ class TestContentShare:
     """The metric, pinned on hand-computable strings."""
 
     def test_a_line_at_the_cutoff_counts_and_one_under_it_does_not(self):
-        cutoff = resolution_source.RESOLUTION_SOURCE_CONTENT_LINE_MIN_CHARS
+        cutoff = verdict.RESOLUTION_SOURCE_CONTENT_LINE_MIN_CHARS
         assert content_share("x" * cutoff) == 1.0
         assert content_share("x" * (cutoff - 1)) == 0.0
 
@@ -150,7 +145,7 @@ class TestContentShare:
         """The receipt's margin: navigation chrome tops out at 0.329 (the kasa homepage, an
         ambiguous menu plus ticker) and the thinnest labelled content is 0.431 (the
         wastewaterscan dashboard). A threshold outside that band re-litigates the study."""
-        assert 0.329 < resolution_source.RESOLUTION_SOURCE_CONTENT_SHARE_MIN < 0.431
+        assert 0.329 < classify.RESOLUTION_SOURCE_CONTENT_SHARE_MIN < 0.431
 
 
 class TestChromeShapedPages:
@@ -158,10 +153,10 @@ class TestChromeShapedPages:
         """P3-2 repro (c): abs.gov.au's release archive extracts 11,725 chars of listing lines
         and published as `success`. The extraction clears the floor by a wide margin, which
         is what makes this the metric's case and not the floor's."""
-        extracted = resolution_source._extract_main_text(_MENU_TREE, _URL)
+        extracted = classify._extract_main_text(_MENU_TREE, _URL)
         assert extracted is not None
         assert not looks_like_page_chrome(extracted)
-        assert content_share(extracted) < resolution_source.RESOLUTION_SOURCE_CONTENT_SHARE_MIN
+        assert content_share(extracted) < classify.RESOLUTION_SOURCE_CONTENT_SHARE_MIN
         session = FakeSession({_URL: FakeResponse(200, body=_MENU_TREE)})
 
         result = await _fetch_one(session, _URL, {})
@@ -193,8 +188,8 @@ class TestChromeShapedPages:
             await asyncio.sleep(0)
             return RenderedPage(url=url, content_type="text/html", html=_document(f"<p>{_RENDERED_PROSE}</p>").decode())
 
-        monkeypatch.setattr(resolution_source, "render_page", _render)
-        direct_only = await resolution_source._classify_html_body(_MENU_TREE, _URL, "text/html", http_status=200)
+        monkeypatch.setattr(rungs, "render_page", _render)
+        direct_only = await classify._classify_html_body(_MENU_TREE, _URL, "text/html", http_status=200)
         assert _rendered_rung_applies(direct_only.result)
         session = FakeSession({_URL: FakeResponse(200, body=_MENU_TREE)})
 
@@ -210,7 +205,7 @@ class TestChromeShapedPages:
         with none of `Latest Action` / `Passed House` in it; under `favor_precision` the same
         bytes extract to the 2,411-char status card. The card clears the floor and the
         metric, so it is what publishes."""
-        monkeypatch.setattr(resolution_source, "_extract_main_text", _fake_extractor(_MEMBER_DROPDOWN, _STATUS_CARD))
+        monkeypatch.setattr(classify, "_extract_main_text", _fake_extractor(_MEMBER_DROPDOWN, _STATUS_CARD))
         assert not looks_like_page_chrome(_MEMBER_DROPDOWN)
         session = FakeSession({_URL: FakeResponse(200, body=_document("<p>irrelevant</p>"))})
 
@@ -236,7 +231,7 @@ class TestChromeShapedPages:
     async def test_a_page_whose_precision_fallback_also_fails_is_withheld(self, monkeypatch, precision_text):
         """Both extractions have to fail before the page is withheld, and the withhold is the
         `thin_page` reason so the rendered rung still gets its turn."""
-        monkeypatch.setattr(resolution_source, "_extract_main_text", _fake_extractor(_MEMBER_DROPDOWN, precision_text))
+        monkeypatch.setattr(classify, "_extract_main_text", _fake_extractor(_MEMBER_DROPDOWN, precision_text))
         session = FakeSession({_URL: FakeResponse(200, body=_document("<p>irrelevant</p>"))})
 
         result = await _fetch_one(session, _URL, {})
@@ -252,13 +247,13 @@ class TestChromeShapedPages:
         """The common case pays for no second parse: the precision pass runs only once the
         default extraction has failed the metric."""
         calls: list[bool] = []
-        real = resolution_source._extract_main_text
+        real = classify._extract_main_text
 
         def _spy(body: bytes | str, url: str, *, favor_precision: bool = False) -> str | None:
             calls.append(favor_precision)
             return real(body, url, favor_precision=favor_precision)
 
-        monkeypatch.setattr(resolution_source, "_extract_main_text", _spy)
+        monkeypatch.setattr(classify, "_extract_main_text", _spy)
         session = FakeSession({_URL: FakeResponse(200, body=article_html)})
 
         result = await _fetch_one(session, _URL, {})
@@ -321,7 +316,7 @@ class TestExtractorPolicyCounts:
             }
         )
         withheld = await _fetch_one(session, menu_url, {})
-        monkeypatch.setattr(resolution_source, "_extract_main_text", _fake_extractor(_MEMBER_DROPDOWN, _STATUS_CARD))
+        monkeypatch.setattr(classify, "_extract_main_text", _fake_extractor(_MEMBER_DROPDOWN, _STATUS_CARD))
         rescued = await _fetch_one(session, card_url, {})
 
         counts = _rung_counts([withheld, rescued])
@@ -332,7 +327,7 @@ class TestExtractorPolicyCounts:
     async def test_the_keys_reach_the_provider_detail(self, monkeypatch):
         monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
         session = FakeSession({_URL: FakeResponse(200, body=_MENU_TREE)})
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
         q = _mock_question(resolution_criteria=f"Resolves per {_URL} on release.")
 
         await resolution_source_provider(is_benchmarking=False)(q)
@@ -369,7 +364,7 @@ class TestThePolicyTravelsWithEveryRoute:
             await asyncio.sleep(0)
             return RenderedPage(url=url, content_type="text/html", html=_MENU_TREE.decode())
 
-        monkeypatch.setattr(resolution_source, "render_page", _render)
+        monkeypatch.setattr(rungs, "render_page", _render)
         session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
 
         result = await _fetch_one(session, _URL, {})
@@ -387,8 +382,8 @@ class TestThePolicyTravelsWithEveryRoute:
         belongs to the result the rung serves. Without the carry, a rescue inside an archived body
         publishes its text while `precision_fallback_rescues` reads zero, which is the count the
         policy's own calibration is read back on."""
-        monkeypatch.setattr(resolution_source, "_WAYBACK_TRIGGER_STATUSES", _WAYBACK_TRIGGER_STATUSES)
-        monkeypatch.setattr(resolution_source, "_extract_main_text", _fake_extractor(_MEMBER_DROPDOWN, _STATUS_CARD))
+        monkeypatch.setattr(rungs, "_WAYBACK_TRIGGER_STATUSES", _WAYBACK_TRIGGER_STATUSES)
+        monkeypatch.setattr(classify, "_extract_main_text", _fake_extractor(_MEMBER_DROPDOWN, _STATUS_CARD))
         # A past year, so a rung reading its own clock instead of the fetch's would ask the archive
         # for a URL no handler serves (the same reason `TestWaybackRung._NOW` is dated back).
         now = datetime(2025, 9, 4, tzinfo=UTC)
@@ -401,7 +396,7 @@ class TestThePolicyTravelsWithEveryRoute:
             }
         )
 
-        result = await _fetch_one(session, _URL, {}, FetchContext(now=now))
+        result = await _fetch_one(session, _URL, {}, LadderContext(now=now))
 
         assert result.status == "success"
         assert result.route == "wayback"

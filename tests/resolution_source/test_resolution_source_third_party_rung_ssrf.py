@@ -26,16 +26,17 @@ from typing import get_args
 
 import pytest
 
-from metaculus_bot.research import impersonated_fetch, resolution_source
-from metaculus_bot.research.impersonated_fetch import IMPERSONATE_TRIGGER_STATUSES
-from metaculus_bot.research.resolution_fetch_result import FetchResult, FetchStatus
-from metaculus_bot.research.resolution_source import (
+from metaculus_bot.research import impersonated_fetch
+from metaculus_bot.research.fetch_ladder import guard, rungs
+from metaculus_bot.research.fetch_ladder.context import LadderContext
+from metaculus_bot.research.fetch_ladder.ladder import _fetch_one
+from metaculus_bot.research.fetch_ladder.rungs import (
     _URL_CONTEXT_TRIGGER_STATUSES,
     _WAYBACK_TRIGGER_STATUSES,
-    FetchContext,
-    _fetch_one,
     _impersonate_rung_applies,
 )
+from metaculus_bot.research.impersonated_fetch import IMPERSONATE_TRIGGER_STATUSES
+from metaculus_bot.research.resolution_fetch_result import FetchResult, FetchStatus
 from tests.resolution_source_fakes import (
     FakeResponse,
     FakeSession,
@@ -71,7 +72,7 @@ def _resolve_the_intranet_host_privately(monkeypatch):
         address = "10.0.0.7" if host == "intranet.example.com" else "8.8.8.8"
         return [(0, 0, 0, "", (address, 0))]
 
-    monkeypatch.setattr(resolution_source.socket, "getaddrinfo", _sync_ainfo)
+    monkeypatch.setattr(guard.socket, "getaddrinfo", _sync_ainfo)
 
 
 @pytest.mark.usefixtures("_resolve_the_intranet_host_privately")
@@ -87,7 +88,7 @@ class TestTheArchiveNeverFetchesAUrlWeRefused:
         constant OBJECT is restored rather than a copy, so the population asserted on here cannot
         drift from the one prod uses.
         """
-        monkeypatch.setattr(resolution_source, "_WAYBACK_TRIGGER_STATUSES", _WAYBACK_TRIGGER_STATUSES)
+        monkeypatch.setattr(rungs, "_WAYBACK_TRIGGER_STATUSES", _WAYBACK_TRIGGER_STATUSES)
 
     def _session(self) -> FakeSession:
         """A session that WOULD serve the archive, keyed by prefix so any snapshot URL matches.
@@ -109,7 +110,7 @@ class TestTheArchiveNeverFetchesAUrlWeRefused:
     async def test_a_refused_url_never_reaches_the_archive(self, url):
         session = self._session()
 
-        result = await _fetch_one(session, url, {}, FetchContext(now=_NOW))
+        result = await _fetch_one(session, url, {}, LadderContext(now=_NOW))
 
         assert result.status == "ssrf_blocked"
         assert result.route == "direct"
@@ -147,7 +148,7 @@ class TestThePaidReaderNeverSeesAUrlWeRefused:
         # pre-check goes through the same guarded fetch, so both are refused before any GET.
         session = FakeSession({})
 
-        result = await _fetch_one(session, url, {}, FetchContext(now=_NOW, query="ask"))
+        result = await _fetch_one(session, url, {}, LadderContext(now=_NOW, query="ask"))
 
         assert result.status == "ssrf_blocked"
         assert result.route == "direct"
@@ -174,13 +175,13 @@ class TestTheImpersonatedRetryNeverDialsAUrlWeRefused:
     async def test_a_refused_url_is_never_retried_under_impersonation(self, url, monkeypatch):
         calls: list[dict[str, object]] = []
         monkeypatch.setattr(
-            resolution_source,
+            rungs,
             "fetch_impersonated",
             fake_impersonated_fetch(_impersonated(200, body=_prose_page("Whatever the host served.")), calls),
         )
         session = FakeSession({})
 
-        result = await _fetch_one(session, url, {}, FetchContext(now=_NOW))
+        result = await _fetch_one(session, url, {}, LadderContext(now=_NOW))
 
         assert result.status == "ssrf_blocked"
         assert result.route == "direct"
@@ -222,4 +223,4 @@ class TestBothTriggerSetsExcludeOurOwnRefusal:
         """The two rung tests above are only meaningful while these URLs are refused. A preflight
         that started allowing link-local literals, or a DNS stub that stopped answering privately,
         would make both of them pass by never producing ``ssrf_blocked`` at all."""
-        assert await resolution_source.is_public_http_url(url) is False
+        assert await guard.is_public_http_url(url) is False

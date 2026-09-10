@@ -100,6 +100,7 @@ from metaculus_bot.research.http_fetch import MAX_UNDECODABLE_CHAR_RATIO, Datawr
 # grounding chunks produced a confident fabricated table with fake `[primary]` tags.
 FetchStatus = Literal[
     "success",
+    "throttled",
     "blocked",
     "not_found",
     "js_wall",
@@ -146,6 +147,9 @@ FetchStatus = Literal[
 # `blocked` because that spelling is the contract; the reason is what keeps the paid rung off the
 # URL (`_url_context_rung_applies`), the way `ssrf_blocked` is kept out of its trigger set, and
 # what separates "the host refused us" from "we refused the host" on the fetch marker.
+#
+# `oversize_document` and `image_needs_reader` are the two bodies a caller declined to READ, and
+# `undecodable_body` the `unsupported_type` of one that arrived as mojibake (docs/architecture.md).
 FetchStatusReason = Literal[
     "embed_shell",
     "thin_page",
@@ -157,6 +161,9 @@ FetchStatusReason = Literal[
     "parse_contention",
     "not_addressed",
     "metaculus_self_ref",
+    "oversize_document",
+    "image_needs_reader",
+    "undecodable_body",
 ]
 
 # Why a RUNG ATTEMPT never ran, carried on `RungAttempt.skipped_reason` (empty when the rung
@@ -236,7 +243,9 @@ FetchStatusReason = Literal[
 #   `read_document` of a URL no question cited). The memo doing its job rather than a
 #   failure, the same distinction `rendered_no_text` draws for the browser; folded into the fired
 #   count it would read as a host refusing us twice.
+# `rung_not_enabled` — the caller's policy does not carry this rung (docs/architecture.md, the knob table).
 RungSkipReason = Literal[
+    "rung_not_enabled",
     "wall_budget",
     "wayback_cap",
     "url_context_cap",
@@ -395,7 +404,7 @@ class RungAttempt:
     ``wall_s`` and ``outcome`` are THIS rung's own: what the attempt cost, and the status
     that stood once it was over — its rescue, its verdict (the Wayback withhold, the paid
     reader's ``ungrounded``), or the direct status it left standing when it declined. Both
-    are None until the dispatcher closes the rung (``FetchContext.close_rungs``), because a
+    are None until the dispatcher closes the rung (``LadderContext.close_rungs``), because a
     rung is only over once its result is known a layer above where the attempt is created:
     the meta-refresh hop ends when the followed request comes back, the browser rung when
     its harvest fallback has been tried. A rung that measures something finer stamps itself
@@ -467,7 +476,7 @@ class FetchResult:
     # majority and renders no extra telemetry at all.
     route: FetchRoute = "direct"
     rung_attempts: list[RungAttempt] = field(default_factory=list)
-    # The HTML extractor policy's decisions (`resolution_source._extract_page_text`); False off
+    # The HTML extractor policy's decisions (`classify._extract_page_text`); False off
     # the HTML path. `chrome_metric_withheld`: the line-shape metric withheld an HTML extraction
     # of this URL somewhere on its ladder — an extraction that cleared the chrome floor on
     # navigation alone. That is a fact about the URL's ladder, not necessarily about this
@@ -483,6 +492,10 @@ class FetchResult:
     # `precision_fallback_rescues`), so no status or reason token moved.
     chrome_metric_withheld: bool = False
     precision_rescued: bool = False
+    # Empty unless `policy.collect_links`, so an archived record stays byte-identical (see the doc).
+    links: list[str] = field(default_factory=list)
+    # The caller's thin-content signal (`policy.thin_content_escalation_chars`); False for the fetcher.
+    escalate_rendered: bool = False
     # Provenance for Tier-2 dataset results (None on ordinary page fetches).
     chart_id: str | None = None
     chart_title: str | None = None
@@ -505,6 +518,17 @@ class FetchResult:
     failure_class: str | None = None
     exc: str | None = None
     server: str | None = None
+    # True only on a freshly presented process-run cache hit. The cached payload itself is a
+    # separate policy-neutral artifact and never rides this archive-facing result.
+    cache_hit: bool = False
+    # The shared 200-interstitial detector's evidence, retained so the loop can emit its
+    # existing marker without carrying the refused body as fetch text.
+    throttle_phrase: str | None = None
+    throttle_chars: int | None = None
+    # Page-digest counts; absent on ordinary reads so old marker lines stay byte-identical.
+    passages_returned: int | None = None
+    passages_grounded: int | None = None
+    fallback_used: bool | None = None
 
     def __post_init__(self) -> None:
         """Enforce the ``text`` invariant the field comment states.

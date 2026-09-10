@@ -18,7 +18,7 @@ transfer, a plaintext listener behind an ``https`` URL raises ``SSLError``) live
 cannot be faked. They monkeypatch the pin helper to accept ``127.0.0.1`` so the SSRF vetting, which
 rightly refuses loopback, does not stand in the way of the mechanism under test.
 
-The DNS the SSRF vetting resolves through is stubbed per test on ``resolution_source.socket``, the
+The DNS the SSRF vetting resolves through is stubbed per test on ``guard.socket``, the
 one module every reader of the guard resolves it on, so a hostname's addresses are whatever the
 test says and nothing leaves the process.
 """
@@ -48,8 +48,8 @@ from curl_cffi.requests import Headers, Response
 from curl_cffi.requests import exceptions as curl_exceptions
 
 from metaculus_bot.constants import IMPERSONATE_BROWSER_TARGET, RESOLUTION_SOURCE_MIN_HOP_TIMEOUT_S
-from metaculus_bot.research import impersonated_fetch, rendered_fetch, resolution_fetch_result, resolution_source
-from metaculus_bot.research.agentic import fetch_outcomes
+from metaculus_bot.research import impersonated_fetch, rendered_fetch, resolution_fetch_result
+from metaculus_bot.research.fetch_ladder import classify, guard
 from metaculus_bot.research.http_fetch import MAX_REDIRECTS
 from metaculus_bot.research.impersonated_fetch import (
     IMPERSONATE_BLOCK_STATUSES,
@@ -285,7 +285,7 @@ def dns(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[str]]:
                 infos.append((socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 0)))
         return infos
 
-    monkeypatch.setattr(resolution_source.socket, "getaddrinfo", _getaddrinfo)
+    monkeypatch.setattr(guard.socket, "getaddrinfo", _getaddrinfo)
     return table
 
 
@@ -1081,7 +1081,7 @@ class TestBudgetBoundedLookup:
             del candidate_url
             await asyncio.sleep(5.0)
 
-        monkeypatch.setattr(resolution_source, "_hop_refusal", _slow_refusal)
+        monkeypatch.setattr(guard, "_hop_refusal", _slow_refusal)
         curl = install_fake_curl(monkeypatch, _redirect(f"https://{_OTHER_HOST}/x"), _page())
 
         with pytest.raises(ImpersonateBudgetExhausted) as excinfo:
@@ -1180,7 +1180,7 @@ class TestFailureMapping:
         assert curl.sessions[0].closed
 
     def test_every_failure_class_the_direct_path_speaks_is_reachable(self) -> None:
-        """The vocabulary the transport claims to mirror (``resolution_source._network_failure_class``)
+        """The vocabulary the transport claims to mirror (``classify._network_failure_class``)
         has six tokens; before the ``HTTPError`` clause ``malformed_response`` was one it could
         never emit."""
         reachable = {
@@ -1502,10 +1502,11 @@ class TestDeclaredPdf:
         copy had drifted (v2 read ``application/pdf`` alone), so an ``application/x-pdf`` PDF was
         read as a document by one path and escalated as unknown by the other."""
         assert impersonated_fetch.PDF_CONTENT_TYPES is resolution_fetch_result.PDF_CONTENT_TYPES
-        assert resolution_source.PDF_CONTENT_TYPES is resolution_fetch_result.PDF_CONTENT_TYPES
-        assert fetch_outcomes.PDF_CONTENT_TYPES is resolution_fetch_result.PDF_CONTENT_TYPES
+        assert classify.PDF_CONTENT_TYPES is resolution_fetch_result.PDF_CONTENT_TYPES
         for content_type in ("application/pdf", "application/x-pdf; charset=binary", "text/html", ""):
-            assert fetch_outcomes._content_type_is_pdf(content_type) is declared_pdf(content_type)
+            assert any(token in content_type for token in resolution_fetch_result.PDF_CONTENT_TYPES) is declared_pdf(
+                content_type
+            )
 
 
 class TestEgressGuard:

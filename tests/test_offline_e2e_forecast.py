@@ -47,9 +47,10 @@ from metaculus_bot.llm_configs import (
     STACKER_LLM,
     SUMMARIZER_LLM,
 )
-from metaculus_bot.research import gemini_search, prediction_market, resolution_source
+from metaculus_bot.research import gemini_search, prediction_market
 from metaculus_bot.research import providers as research_providers
 from metaculus_bot.research.agentic import llm as agentic_llm
+from metaculus_bot.research.fetch_ladder import guard
 
 _NOW = datetime.now(UTC)
 _OPEN = _NOW - timedelta(days=30)
@@ -584,10 +585,10 @@ def _install_provider_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
 
     # Prediction-market + resolution-source aiohttp sessions.
     monkeypatch.setattr(prediction_market, "_get_session", _FakeHttpSession)
-    monkeypatch.setattr(resolution_source, "_get_session", _FakeHttpSession)
+    monkeypatch.setattr(guard, "_get_session", _FakeHttpSession)
     # example.gov has no DNS for the SSRF preflight; mirrors tests/resolution_source/conftest.py.
     monkeypatch.setattr(
-        resolution_source.socket,
+        guard.socket,
         "getaddrinfo",
         lambda *a, **k: [(0, 0, 0, "", ("8.8.8.8", 0))],
     )

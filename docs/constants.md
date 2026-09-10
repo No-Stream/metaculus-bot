@@ -941,7 +941,7 @@ workflow yaml turns it off without a code change. Read with `default=True`.
 ### RESOLUTION_SOURCE_MIN_HOP_TIMEOUT_S
 
 A floor under the per-hop timeout that the two SSRF-guarded fetchers derive from the remaining wall
-budget, `resolution_source._fetch_one_hop` and the impersonated transport alike. A hop reached with the
+budget, `fetch_ladder.direct_fetch._fetch_one_hop` and the impersonated transport alike. A hop reached with the
 budget already spent still gets a token attempt rather than a guaranteed-expired one: nothing
 downstream distinguishes "timed out at 0.0 s" from "timed out at 0.5 s", and a fast host answering in
 200 ms is a page we would otherwise refuse for free. Small enough that the overshoot stays well inside

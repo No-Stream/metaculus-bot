@@ -1,4 +1,4 @@
-.PHONY: install lock test test_verbose all lint lint_imports deps format typecheck typecheck_ty cov audit run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research sync_telemetry sync_raw_research sync_all resync_from_store backfill_research download_research download_run_logs download_raw_research backfill_comments score_ghosts close_margin_watch supply_probe supply_probe_mantic cost_report dispatch_watch cronjob_dispatch_setup backtest_with_cache run_mantic run_mantic_one strip_bench probe_resolver
+.PHONY: install lock test test_verbose all lint lint_imports deps format typecheck typecheck_ty cov audit run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research sync_telemetry sync_raw_research sync_all resync_from_store backfill_research download_research download_run_logs download_raw_research backfill_comments score_ghosts close_margin_watch supply_probe supply_probe_mantic cost_report dispatch_watch cronjob_dispatch_setup backtest_with_cache run_mantic run_mantic_one strip_bench probe_resolver replay_ladder
 
 # Stream logs live from recipes; avoid per-target buffering
 MAKEFLAGS += --output-sync=none
@@ -355,6 +355,16 @@ probe_resolver:
 # `gh run list`; no dispatch, no LLM, no publish). ARGS="--days 14", ARGS="--expected-dispatch-per-hour 0".
 dispatch_watch:
 	uv run python scripts/dispatch_watch.py $(ARGS)
+
+# Replay the archived per-URL fetch outcomes through the unified fetch ladder's rung selection: for
+# each archived direct outcome, which rungs each LadderPolicy preset would consult and in what
+# order, plus any archived rescue (impersonate, rendered, derived_api, wayback, url_context) the new
+# dispatcher no longer attempts. Every rung is stubbed to decline, so nothing is dialed: read-only
+# and free, no network, no LLM, no publish. A LOCAL pre-merge check, never CI. Point --archive-dir
+# at a checkout that HAS the gitignored archive. ARGS="--format json", ARGS="--policy NAME",
+# ARGS="--limit 200".
+replay_ladder:
+	uv run python scripts/fetch_ladder_replay.py $(ARGS)
 
 # Idempotent setup of the cron-job.org jobs that dispatch the bot workflows twice an hour each
 # (GitHub delivers about 22% of scheduled cron firings, see docs/operations.md "Scheduling

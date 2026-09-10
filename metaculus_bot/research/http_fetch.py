@@ -24,8 +24,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from html.parser import HTMLParser
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import aiohttp
 import aiohttp.abc
@@ -602,6 +603,57 @@ def unreadable_data_embed_providers(html_text: str) -> list[str]:
 # The target is returned RAW (not joined against a base) so the caller keeps ownership of
 # resolution and of the SSRF re-guard every derived URL has to pass: this module has no
 # business deciding what is safe to fetch.
+# Bounded because the driver reads the list and a link farm would fill its window with hrefs.
+PAGE_LINK_CAP = 25
+
+
+class _LinkCollector(HTMLParser):
+    """Absolute, de-duplicated http(s) hrefs of a page, up to ``cap``."""
+
+    def __init__(self, *, base_url: str, cap: int) -> None:
+        super().__init__(convert_charrefs=True)
+        self._base_url = base_url
+        self._cap = cap
+        self._links: list[str] = []
+        self._seen: set[str] = set()
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if len(self._links) >= self._cap or tag.lower() != "a":
+            return
+        href = None
+        for name, value in attrs:
+            if name.lower() == "href":
+                href = value
+                break
+        if not href:
+            return
+        absolute = urljoin(self._base_url, href)
+        parsed = urlparse(absolute)
+        if parsed.scheme not in ("http", "https"):
+            return
+        if absolute in self._seen:
+            return
+        self._seen.add(absolute)
+        self._links.append(absolute)
+
+    @property
+    def links(self) -> list[str]:
+        return list(self._links)
+
+
+def extract_page_links(html_text: str, base_url: str, *, cap: int = PAGE_LINK_CAP) -> list[str]:
+    """The page's outbound links, resolved against ``base_url``: the DOCUMENT the DOM came from.
+
+    Shared because both callers' HTML classification collects them off one parse; only the
+    gap-fill preset keeps them (``LadderPolicy.collect_links``), since the driver navigates by
+    them and the fetcher never does.
+    """
+    parser = _LinkCollector(base_url=base_url, cap=cap)
+    parser.feed(html_text)
+    parser.close()
+    return parser.links
+
+
 _META_TAG_RE = re.compile(r"<meta\s([^>]*)>", re.IGNORECASE)
 _HTTP_EQUIV_REFRESH_RE = re.compile(r"http-equiv\s*=\s*[\"']?\s*refresh\b", re.IGNORECASE)
 _CONTENT_ATTR_RE = re.compile(r"content\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))", re.IGNORECASE)
