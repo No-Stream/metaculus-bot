@@ -56,28 +56,39 @@ def api_get(endpoint: str, token: str, params: dict | None = None) -> dict:
     return resp.json()
 
 
-def fetch_all_comments(token: str) -> list[dict]:
-    """Paginate through all bot comments."""
+def _page_comments(token: str, params: dict[str, object]) -> list[dict]:
+    """Page one ``/comments/`` listing to exhaustion, on top of the caller's params."""
     comments: list[dict] = []
     offset = 0
     while True:
-        data = api_get(
-            "/comments/",
-            token,
-            params={
-                "author": BOT_USER_ID,
-                "limit": PAGE_SIZE,
-                "offset": offset,
-            },
-        )
+        data = api_get("/comments/", token, params={**params, "limit": PAGE_SIZE, "offset": offset})
         results = data.get("results", [])
         comments.extend(results)
-        logger.info(f"Fetched {len(comments)} comments so far (offset={offset})")
+        logger.info(f"Fetched {len(comments)} comments so far ({offset=}, {params=})")
         if not results or data.get("next") is None:
             break
         offset += PAGE_SIZE
         time.sleep(FETCH_DELAY)
     return comments
+
+
+def fetch_all_comments(token: str) -> list[dict]:
+    """Every bot comment, public and private, deduplicated by comment id.
+
+    The bot POSTs comments private and Metaculus flips older ones public server-side, so the
+    default author listing serves only the flipped ones (docs/performance_analysis.md, "The
+    research archive's latest/ records come from three writers").
+    """
+    public = _page_comments(token, {"author": BOT_USER_ID})
+    private = _page_comments(token, {"author": BOT_USER_ID, "is_private": "true"})
+
+    merged: dict[int, dict] = {}
+    for comment in (*public, *private):
+        merged[comment["id"]] = comment
+
+    n_public, n_private, n_unique = len(public), len(private), len(merged)
+    logger.info(f"Fetched bot comments: {n_public=} {n_private=} {n_unique=}")
+    return list(merged.values())
 
 
 def get_question_id_for_post(post_id: int, token: str) -> int | None:
@@ -251,8 +262,7 @@ def main():
 
     token = get_token()
 
-    # Confirm www.metaculus.com is the real API before sending the token
-    # (DNS-parking incident — see metaculus_bot/api_preflight.py).
+    # Confirm the host is the real API before the token goes out (metaculus_bot/api_preflight.py).
     verify_metaculus_api_identity()
 
     logger.info("Fetching bot comments from Metaculus API...")

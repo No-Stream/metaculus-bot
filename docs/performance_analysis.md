@@ -126,6 +126,14 @@ so their absence means "old record", not "degraded run".
 (`RESEARCH_SECTION_CHAR_LIMIT` / `COMMENT_CHAR_LIMIT`), sections re-headed one level
 deeper (so `^## ` presence probes read near-zero), and missing `resolution_criteria`.
 
+Both comment readers, the residual pull in `collector.py` (`fetch_bot_comments`) and this
+backfill's `fetch_all_comments`, list the author's comments TWICE, once plain and once with
+`is_private=true`, and merge the two by comment id. The bot POSTs every comment private and
+Metaculus flips older ones public server-side, so the plain listing serves only the flipped
+ones: on 2026-09-09 it returned 1,054 public summer comments and none of the six private
+comments from 2026-09-07, and a single-listing pull yields fall records with no comment text,
+no `bot_comment_created_at` and no per-model parse.
+
 A third writer, `scripts/backfill_research_from_logs.py`, parses run logs and keys its
 `qid` on the **POST id** while every other writer keys on the **QUESTION id**. The two
 share one integer space, so a single `by_qid/<N>.jsonl` can legitimately hold two

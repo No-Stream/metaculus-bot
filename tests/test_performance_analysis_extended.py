@@ -538,6 +538,88 @@ class TestFetchResolvedQuestions:
 
 
 # ---------------------------------------------------------------------------
+# collector — the comment pull covers public and private comments
+# ---------------------------------------------------------------------------
+
+
+class TestFetchBotComments:
+    """The comment pull has to list the private comments as well as the public ones.
+
+    The bot POSTs every comment with ``is_private: true`` and Metaculus flips older ones
+    public server-side, so the default author listing served the 1,054 summer comments and
+    none of the six fall ones (verified live 2026-09-09), which is a residual round whose
+    records carry no comment text, no ``bot_comment_created_at`` and no per-model parse. The
+    pins: both param sets are requested, the return is their union, a comment served by both
+    appears once, and each listing still pages to exhaustion.
+    """
+
+    def _install_pages(
+        self, monkeypatch, public_pages: list[list[dict]], private_pages: list[list[dict]]
+    ) -> list[dict]:
+        seen: list[dict] = []
+        remaining = {False: list(public_pages), True: list(private_pages)}
+
+        def fake_api_get(path: str, token: str, params: dict | None = None) -> dict:
+            call_params = dict(params or {})
+            seen.append({"path": path, "token": token, "params": call_params})
+            pages = remaining[bool(call_params.get("is_private"))]
+            page = pages.pop(0)
+            return {"results": page, "next": "next-page" if pages else None}
+
+        monkeypatch.setattr(collector, "_api_get", fake_api_get)
+        monkeypatch.setattr(collector, "FETCH_DELAY_SECS", 0.0)
+        return seen
+
+    @staticmethod
+    def _comment(comment_id: int, post_id: int) -> dict:
+        return {"id": comment_id, "on_post": post_id, "text": f"*Forecaster 1*: {comment_id}%\n"}
+
+    def test_returns_the_union_of_the_public_and_private_listings(self, monkeypatch):
+        public = self._comment(1, 11)
+        private = self._comment(2, 22)
+        seen = self._install_pages(monkeypatch, [[public]], [[private]])
+
+        comments = collector.fetch_bot_comments(275109, "bot-token")
+
+        assert comments == [public, private]
+        assert [call["path"] for call in seen] == ["/comments/", "/comments/"]
+        assert [call["params"].get("is_private") for call in seen] == [None, "true"]
+        for call in seen:
+            assert call["params"]["author"] == 275109
+            assert call["params"]["limit"] == collector.PAGE_SIZE
+            assert call["token"] == "bot-token"
+
+    def test_a_comment_served_by_both_listings_appears_once(self, monkeypatch):
+        """Metaculus flips comments public in place, so the two listings overlap during the
+        flip and a duplicate would give one post two records of the same forecast."""
+        flipped = self._comment(7, 77)
+        self._install_pages(monkeypatch, [[flipped, self._comment(8, 88)]], [[flipped]])
+
+        comments = collector.fetch_bot_comments(275109, "bot-token")
+
+        assert [c["id"] for c in comments] == [7, 8]
+
+    def test_each_listing_pages_to_exhaustion(self, monkeypatch):
+        public_pages = [[self._comment(1, 11)], [self._comment(2, 22)]]
+        private_pages = [[self._comment(3, 33)], [self._comment(4, 44)], [self._comment(5, 55)]]
+        seen = self._install_pages(monkeypatch, public_pages, private_pages)
+
+        comments = collector.fetch_bot_comments(275109, "bot-token")
+
+        assert [c["id"] for c in comments] == [1, 2, 3, 4, 5]
+        public_offsets = [c["params"]["offset"] for c in seen if c["params"].get("is_private") is None]
+        private_offsets = [c["params"]["offset"] for c in seen if c["params"].get("is_private") == "true"]
+        assert public_offsets == [0, collector.PAGE_SIZE]
+        assert private_offsets == [0, collector.PAGE_SIZE, 2 * collector.PAGE_SIZE]
+
+    def test_an_author_with_no_comments_is_one_page_per_listing(self, monkeypatch):
+        seen = self._install_pages(monkeypatch, [[]], [[]])
+
+        assert collector.fetch_bot_comments(275109, "bot-token") == []
+        assert len(seen) == 2
+
+
+# ---------------------------------------------------------------------------
 # collector — bot_comment_created_at field
 # ---------------------------------------------------------------------------
 

@@ -107,24 +107,41 @@ def fetch_resolved_questions(tournament: str, token: str) -> list[dict]:
     return posts
 
 
-def fetch_bot_comments(author_id: int, token: str) -> list[dict]:
-    """Fetch all comments by a given author, paginated. Returns list of raw comment dicts."""
+def _page_comments(token: str, params: dict[str, object]) -> list[dict]:
+    """Page one ``/comments/`` listing to exhaustion, on top of the caller's params."""
     comments: list[dict] = []
     offset = 0
     while True:
-        data = _api_get(
-            "/comments/",
-            token,
-            params={"author": author_id, "limit": PAGE_SIZE, "offset": offset},
-        )
+        data = _api_get("/comments/", token, params={**params, "limit": PAGE_SIZE, "offset": offset})
         results = data.get("results", [])
         comments.extend(results)
-        logger.info(f"Fetched comments page: {offset=}, got {len(results)} comments")
+        logger.info(f"Fetched comments page: {offset=}, got {len(results)} comments, {params=}")
         if not results or data.get("next") is None:
             break
         offset += PAGE_SIZE
         time.sleep(FETCH_DELAY_SECS)
     return comments
+
+
+def fetch_bot_comments(author_id: int, token: str) -> list[dict]:
+    """Every comment by an author, public and private, deduplicated by comment id.
+
+    The bot POSTs comments with ``is_private: true`` and Metaculus flips older ones public
+    server-side, so the default author listing serves only the flipped ones and the recent
+    private comments come back solely under ``is_private=true`` (verified live 2026-09-09,
+    when the six fall comments were missing from a 1,054-comment public pull). Returns raw
+    comment dicts, public listing order first.
+    """
+    public = _page_comments(token, {"author": author_id})
+    private = _page_comments(token, {"author": author_id, "is_private": "true"})
+
+    merged: dict[int, dict] = {}
+    for comment in (*public, *private):
+        merged[comment["id"]] = comment
+
+    n_public, n_private, n_unique = len(public), len(private), len(merged)
+    logger.info(f"Fetched author comments: {n_public=} {n_private=} {n_unique=}")
+    return list(merged.values())
 
 
 # ---------------------------------------------------------------------------
@@ -510,26 +527,17 @@ def build_performance_dataset(
     *,
     prior_records: Sequence[dict] | None = None,
 ) -> list[dict]:
-    """Fetch questions + comments, match them, parse per-model predictions, compute scores.
+    """Fetch questions and comments, match them, parse per-model predictions, compute scores.
 
-    Returns the structured dataset as a list of record dicts.
-    Token defaults to METACULUS_TOKEN env var.
-
-    Each record is also stamped with the research-archive treatment tags
-    (``anchor_present`` / ``gfv2_present`` / ``gfv2_loop_ran`` / ``gfv2_confidence`` /
-    ``anchor_confidence`` / ``research_source_class``) read off
-    ``research_archive_dir``; questions with no archive record — including every
-    record when the archive isn't on disk — carry None on all six, never False.
-    ``gfv2_loop_ran`` is additionally None on any record whose writer could not have
-    carried the v2 payload, so the untreated arm of a v2 cut holds only measured
-    Falses (see :mod:`metaculus_bot.performance_analysis.research_tags`).
-
-    Pass ``prior_records`` (a previous round's dataset) to diff this pull against it and tag
-    every question Metaculus re-resolved or re-scored in place — the q44798 failure mode,
-    where a resolution changed from 80 to 82 with no timestamp moving and a prior round's
-    tables went stale silently. See
-    :mod:`metaculus_bot.performance_analysis.rescore_diff`; with no prior supplied the tag
-    fields are None, meaning "not compared" rather than "unchanged".
+    Returns the dataset as a list of record dicts; ``token`` defaults to ``METACULUS_TOKEN``.
+    Every record is stamped with the six research-archive treatment tags read off
+    ``research_archive_dir`` (:mod:`~metaculus_bot.performance_analysis.research_tags`), and
+    with ``prior_records`` (a previous round's dataset) it is also diffed against that pull to
+    tag whatever Metaculus re-resolved or re-scored in place
+    (:mod:`~metaculus_bot.performance_analysis.rescore_diff`). Both tag families read as
+    TERNARIES, where None means "not measured" and only False means measured-and-absent:
+    docs/performance_analysis.md, "Pass --prior on every round pull" and "Two treatment tags
+    read as TERNARY".
     """
     if token is None:
         token = os.environ["METACULUS_TOKEN"]

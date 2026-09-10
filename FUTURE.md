@@ -2465,7 +2465,11 @@ them OUT of feature work, land as their own PRs.
   deliberately did NOT import collector's private helper (the contract does not fit and promoting it
   would have edited a shared file mid-fan-out), so the consolidation is this follow-up: one public
   helper in a shared module, parameterized on retry budget and raising `requests` exceptions, with
-  all three call sites repointed.
+  all three call sites repointed. **The duplication widened 2026-09-09**: both comment readers now
+  page the author listing twice (plain, then `is_private=true`) and merge by comment id, so
+  `collector._page_comments` and `backfill_research_from_comments._page_comments` are the same
+  fourteen-line loop twice over, differing only in delay (0.5 s against 2.0 s) and in the 429 retry
+  the script still lacks. Carry the public-plus-private merge into the shared helper when it lands.
 - **Split `tests/test_telemetry_markers.py` by marker family, and re-measure this list first (added
   2026-09-01, forge R7).** That file is **2,283** lines and each marker family's tests are already
   independent, so splitting it is mechanical the next time anything touches it. The sizes in the
@@ -2512,6 +2516,14 @@ them OUT of feature work, land as their own PRs.
   own modules). Behaviour-neutral, and the Metaculus renders stay pinned byte for byte by
   `tests/prompts/test_pmf_prompt.py::TestPercentileFillIsTodaysText`, so it is safe to do blind;
   it is not done here per this section's standing rule.
+
+  **`tests/test_performance_analysis_extended.py` measured 2026-09-09: 1,910 lines**, over the
+  ceiling and listed nowhere until now (found by the smell hook while the private-comment fix added
+  one class to it). Two independent groups share only the module's four record/post builders: the
+  analysis cuts (`mc_summary`, `no_bias_check`, the PIT and percentile classes, `per_model_cohort`)
+  and the collector (fetch, build, rescore, report), so the split is mechanical the next time
+  anything touches the file; not done inside a one-function fix, and not while sibling branches are
+  merging into this one.
 - **Dedupe the peg anchor when two tickers share one (added 2026-09-01, forge R15).** The bundle's
   peg-anchor block is decided per ticker inside `_fetch_yfinance_data`
   (`research/financial_data.py`), so a question naming two pegged crosses that share an anchor
