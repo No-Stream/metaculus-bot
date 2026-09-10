@@ -577,6 +577,17 @@ FINANCIAL_FRED_VINTAGE_PRINTS: int = 4
 # Unbounded before, and the executor is shared. Receipt: docs/constants.md "MAX_FINANCIAL_IDENTIFIERS".
 MAX_FINANCIAL_IDENTIFIERS: int = 12
 
+# --- SEC EDGAR client (research/sec_edgar.py; standalone, not yet a ladder rung) ---
+
+# Unset means the client refuses to dial: no anonymous User-Agent. Receipt: docs/constants.md "SEC_EDGAR_CONTACT_EMAIL_ENV".
+SEC_EDGAR_CONTACT_EMAIL_ENV: str = "SEC_EDGAR_CONTACT_EMAIL"
+# SEC's fair-access form is "<company or person> <contact email>". Receipt: docs/constants.md "SEC_EDGAR_USER_AGENT_TEMPLATE".
+SEC_EDGAR_USER_AGENT_TEMPLATE: str = "metaculus-bot {contact_email}"
+# Under SEC's published 10/s ceiling, with margin for sleep granularity. Receipt: docs/constants.md "SEC_EDGAR_MAX_REQUESTS_PER_SECOND".
+SEC_EDGAR_MAX_REQUESTS_PER_SECOND: float = 8.0
+# A large filer's companyfacts and an inline-XBRL 10-K both pass 5 MiB. Receipt: docs/constants.md "SEC_EDGAR_MAX_RESPONSE_BYTES".
+SEC_EDGAR_MAX_RESPONSE_BYTES: int = 16 * 1024 * 1024
+
 # --- Soft deadlines to keep batch wall-clock inside the tournament cron window ---
 
 # Caps one stuck forecaster at a loud drop. Receipt: docs/constants.md "FORECASTER_SOFT_DEADLINE".

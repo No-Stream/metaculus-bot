@@ -1812,6 +1812,58 @@ data known at forecast time is the answer without leaking the resolution. The
 text anchor is on in production; the chart-image side-channel
 (`TS_ANCHOR_CHART_ENABLED`) is a separate flag and is off.
 
+### SEC EDGAR client (`research/sec_edgar.py`; standalone, not yet a ladder rung)
+
+A client for SEC EDGAR's public JSON APIs, built 2026-09-09 so that sec.gov stops being a
+blocked host. Nothing calls it yet: the wiring belongs to the fetch-ladder unification, where a
+URL whose host is registered gets answered by its API before any page fetch is attempted
+("known API translation"). Until then it is importable, tested against recorded fixtures, and
+inert.
+
+**Why an API client rather than another fetch rung.** The 2026-09-09 fetch-gap inventory counted
+12 blocked events on sec.gov across 5 questions (`Archives/edgar/data/...` filing documents:
+SpaceX's S-1 amendments, Uber's 10-K and the Delivery Hero 8-K, Oracle's 10-K, an ETF 10-Q), all
+HTTP 403 to the browser-shaped fetch. That 403 is EDGAR's fair-access policy
+(sec.gov/os/webmaster-faq, "Developers"): automated access must "declare your user agent in
+request headers" in the form `Sample Company Name AdminContact@<sample company domain>.com`,
+and "our current maximum access rate is 10 requests per second". A browser fingerprint is the
+wrong answer to a policy that asks for a name and an address, and the same facts are served as
+JSON on data.sec.gov, so the fix is a client that follows the policy.
+
+**What it reaches.** Every function takes the session from `edgar_session()`:
+
+| Function | Endpoint | What it answers |
+|---|---|---|
+| `company_submissions(session, cik_or_ticker)` | `data.sec.gov/submissions/CIK##########.json`, and `www.sec.gov/files/company_tickers.json` when given a ticker | A filer's identity and its recent filings, each with `form`, `filing_date`, `report_date`, `primary_document` and a `primary_document_url` |
+| `company_facts(session, cik)` | `data.sec.gov/api/xbrl/companyfacts/CIK##########.json` | Every XBRL fact the filer reported; `CompanyFacts.values(concept, unit, taxonomy=)` returns them dated, oldest first, with the form and filing they came from |
+| `frame(session, concept, unit, period)` | `data.sec.gov/api/xbrl/frames/{taxonomy}/{concept}/{unit}/{period}.json` | One concept across every filer for a calendar period, `CY####`, `CY####Q#` or `CY####Q#I` |
+| `full_text_search(session, query, date_from=, date_to=, forms=)` | `efts.sec.gov/LATEST/search-index?q=&dateRange=custom&startdt=&enddt=&forms=` | Filings since 2001 matching a phrase, filtered by root form and file date, each hit carrying a `document_url` |
+| `filing_document(session, url)` | `www.sec.gov/Archives/edgar/data/{cik}/{accession}/{file}` | The raw bytes and content type of one filing document; EDGAR hosts only |
+| `ticker_to_cik(session, ticker)`, `pad_cik(cik)`, `filing_document_url(cik, accession, file)` | | The lookups the above are built from |
+
+The endpoint shapes were read from SEC's API page (sec.gov/search-filings/edgar-application-
+programming-interfaces) and confirmed against live responses on 2026-09-09; the full-text search
+parameters were confirmed from the server's echoed query (`terms` on `root_forms`, `range` on
+`file_date`), since SEC publishes no reference for that endpoint.
+
+**The fair-access rule as implemented.** The User-Agent is
+`SEC_EDGAR_USER_AGENT_TEMPLATE` with the contact read from `SEC_EDGAR_CONTACT_EMAIL` when the
+session opens; unset, `edgar_session()` raises `SecEdgarContactUnsetError` before any socket
+opens, so an anonymous User-Agent is never sent (a guard fails shut). Request starts are spaced
+to `SEC_EDGAR_MAX_REQUESTS_PER_SECOND` (8, under SEC's 10) by one process-wide, loop-scoped
+spacer shared across all three EDGAR hosts and every concurrent question, and each request also
+holds the shared per-host politeness semaphore from `http_fetch`. Bodies stream through
+`read_body_capped` under `SEC_EDGAR_MAX_RESPONSE_BYTES` (16 MiB, because a large filer's
+companyfacts is 7.9 MB and Oracle's inline-XBRL 10-K is 6.9 MB, both past the 5 MiB page cap).
+No retries: a 403 is a policy verdict and a 429 is the ceiling itself, and either raises
+`SecEdgarError` with the status and SEC's body snippet. The transport is `http_fetch.build_session`
+with the 20 s `RESOLUTION_SOURCE_HTTP_TIMEOUT`.
+
+**The operator's one manual step, before it is wired in:** set `SEC_EDGAR_CONTACT_EMAIL` in the
+local `.env` (see `.env.template`) and as a GitHub Actions secret surfaced into every bot
+workflow's environment. Without it the client raises on first use, which is the intended
+behaviour and also why no workflow should reference the module until the secret exists.
+
 ## Gap-fill (two passes, both concurrent, both on in prod)
 
 After the primary + add-on bundle is assembled, two independent gap-fill passes

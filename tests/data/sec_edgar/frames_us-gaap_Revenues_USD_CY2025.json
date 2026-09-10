@@ -1,0 +1,29 @@
+{
+ "taxonomy": "us-gaap",
+ "tag": "Revenues",
+ "ccp": "CY2025",
+ "uom": "USD",
+ "label": "Revenues",
+ "description": "Amount of revenue recognized from goods sold, services rendered, insurance premiums, or other activities that constitute an earning process. Includes, but is no",
+ "pts": 2227,
+ "data": [
+  {
+   "accn": "0001193125-26-102079",
+   "cik": 2098,
+   "entityName": "ACME UNITED CORP",
+   "loc": "US-CT",
+   "start": "2025-01-01",
+   "end": "2025-12-31",
+   "val": 196541816
+  },
+  {
+   "accn": "0000002969-25-000055",
+   "cik": 2969,
+   "entityName": "AIR PRODUCTS AND CHEMICALS, INC.",
+   "loc": "US-PA",
+   "start": "2024-10-01",
+   "end": "2025-09-30",
+   "val": 12037300000
+  }
+ ]
+}

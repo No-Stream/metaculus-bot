@@ -1240,6 +1240,35 @@ saturated pool burn their `wait_for` budget without executing, so an over-eager 
 degrades unrelated providers on others. Twelve is well above any plausible real question, since the classifier
 prompt asks for the resolving series rather than a sector sweep, while bounding the worst case.
 
+## SEC EDGAR client (`research/sec_edgar.py`; standalone, not yet a ladder rung)
+
+### SEC_EDGAR_CONTACT_EMAIL_ENV, SEC_EDGAR_USER_AGENT_TEMPLATE
+
+SEC's fair-access policy (sec.gov/os/webmaster-faq, "Developers", read 2026-09-09) asks automated clients to
+"declare your user agent in request headers" in the form `Sample Company Name AdminContact@<sample company
+domain>.com`, and the 403s sec.gov returned to the bot's browser-shaped fetches (12 blocked events over 5
+questions in the archived gap-fill v2 transcripts) are that policy, not an anti-bot wall. The template carries
+the identity half; the contact half is read from the env var when a session opens, never committed, and an unset
+value makes `edgar_session()` raise before any socket opens. Fail shut rather than fall back to an anonymous
+User-Agent, because sending one is exactly what the policy forbids and what gets an address blocked.
+
+### SEC_EDGAR_MAX_REQUESTS_PER_SECOND
+
+The same FAQ page: "our current maximum access rate is 10 requests per second", monitored per source. The client
+spaces request STARTS process-wide across all three EDGAR hosts (www, data, efts) through one loop-scoped spacer,
+so concurrent questions share the budget. Eight rather than ten leaves margin for `asyncio.sleep` granularity and
+for the odd request another path in the process might make to sec.gov; the ceiling is SEC's and the margin is
+ours, so a future measurement showing headroom can raise this toward ten.
+
+### SEC_EDGAR_MAX_RESPONSE_BYTES
+
+Measured 2026-09-09 with a declared User-Agent: JPMorgan's `companyfacts` JSON is 7.9 MB decompressed, Oracle's
+inline-XBRL 10-K primary document (`orcl-20260531.htm`, cited by question 45199) is 6.9 MB, Uber's 10-K 3.2 MB,
+a `frames` response for `Revenues/USD/CY2025` 341 KB, `company_tickers.json` 797 KB. The 5 MiB page cap the
+resolution-source fetcher uses (`RESOLUTION_SOURCE_MAX_RESPONSE_BYTES`) would therefore drop both the facts of a
+large filer and the very filings a question cites, so this client has its own cap at 16 MiB, still streamed
+through `read_body_capped` so peak memory during the read is bounded by it.
+
 ## Soft deadlines to keep batch wall-clock inside the tournament cron window
 
 ### FORECASTER_SOFT_DEADLINE

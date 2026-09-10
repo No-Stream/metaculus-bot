@@ -1,0 +1,78 @@
+{
+ "cik": 19617,
+ "entityName": "JPMORGAN CHASE & CO",
+ "facts": {
+  "dei": {
+   "EntityCommonStockSharesOutstanding": {
+    "label": "Entity Common Stock, Shares Outstanding",
+    "description": "Indicate number of shares or other units outstanding of each of registrant's classes of capital or common stock or other ownership interests, if and as stated on cover of related periodic report. Where multiple classes or units exist define each class/interest by adding class of stock items such as Common Class A [Member], Common Class B [Member] or Partnership Interest [Member] onto the Instrument [Domain] of the Entity Listings, Instrument.",
+    "units": {
+     "shares": [
+      {
+       "end": "2026-03-31",
+       "val": 2679511418,
+       "accn": "0001628280-26-029344",
+       "fy": 2026,
+       "fp": "Q1",
+       "form": "10-Q",
+       "filed": "2026-05-01",
+       "frame": "CY2026Q1I"
+      },
+      {
+       "end": "2026-06-30",
+       "val": 2658186195,
+       "accn": "0001628280-26-054343",
+       "fy": 2026,
+       "fp": "Q2",
+       "form": "10-Q",
+       "filed": "2026-08-06",
+       "frame": "CY2026Q2I"
+      }
+     ]
+    }
+   }
+  },
+  "us-gaap": {
+   "Revenues": {
+    "label": "Revenues",
+    "description": "Amount of revenue recognized from goods sold, services rendered, insurance premiums, or other activities that constitute an earning process. Includes, but is no",
+    "units": {
+     "USD": [
+      {
+       "start": "2024-01-01",
+       "end": "2024-12-31",
+       "val": 177556000000,
+       "accn": "0000019617-25-000270",
+       "fy": 2024,
+       "fp": "FY",
+       "form": "10-K",
+       "filed": "2025-02-14"
+      },
+      {
+       "start": "2024-01-01",
+       "end": "2024-12-31",
+       "val": 177556000000,
+       "accn": "0001628280-26-008131",
+       "fy": 2025,
+       "fp": "FY",
+       "form": "10-K",
+       "filed": "2026-02-13",
+       "frame": "CY2024"
+      },
+      {
+       "start": "2025-01-01",
+       "end": "2025-12-31",
+       "val": 182447000000,
+       "accn": "0001628280-26-008131",
+       "fy": 2025,
+       "fp": "FY",
+       "form": "10-K",
+       "filed": "2026-02-13",
+       "frame": "CY2025"
+      }
+     ]
+    }
+   }
+  }
+ }
+}

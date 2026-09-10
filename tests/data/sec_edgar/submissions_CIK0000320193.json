@@ -1,0 +1,107 @@
+{
+ "cik": "0000320193",
+ "entityType": "operating",
+ "sic": "3571",
+ "sicDescription": "Electronic Computers",
+ "name": "Apple Inc.",
+ "tickers": [
+  "AAPL"
+ ],
+ "exchanges": [
+  "Nasdaq"
+ ],
+ "fiscalYearEnd": "0926",
+ "stateOfIncorporation": "CA",
+ "filings": {
+  "recent": {
+   "accessionNumber": [
+    "0001140361-26-035636",
+    "0000320193-25-000079",
+    "0000320193-26-000020"
+   ],
+   "filingDate": [
+    "2026-09-03",
+    "2025-10-31",
+    "2026-07-31"
+   ],
+   "reportDate": [
+    "2026-09-01",
+    "2025-09-27",
+    "2026-06-27"
+   ],
+   "acceptanceDateTime": [
+    "2026-09-03T22:30:44.000Z",
+    "2025-10-31T10:01:26.000Z",
+    "2026-07-31T10:01:02.000Z"
+   ],
+   "act": [
+    "",
+    "34",
+    "34"
+   ],
+   "form": [
+    "4",
+    "10-K",
+    "10-Q"
+   ],
+   "fileNumber": [
+    "",
+    "001-36743",
+    "001-36743"
+   ],
+   "filmNumber": [
+    "",
+    "251437791",
+    "261225227"
+   ],
+   "items": [
+    "",
+    "",
+    ""
+   ],
+   "core_type": [
+    "4",
+    "XBRL",
+    "XBRL"
+   ],
+   "size": [
+    4681,
+    9392337,
+    5946811
+   ],
+   "isXBRL": [
+    0,
+    1,
+    1
+   ],
+   "isInlineXBRL": [
+    0,
+    1,
+    1
+   ],
+   "isXBRLNumeric": [
+    0,
+    null,
+    1
+   ],
+   "primaryDocument": [
+    "xslF345X06/form4.xml",
+    "aapl-20250927.htm",
+    "aapl-20260627.htm"
+   ],
+   "primaryDocDescription": [
+    "FORM 4",
+    "10-K",
+    "10-Q"
+   ]
+  },
+  "files": [
+   {
+    "name": "CIK0000320193-submissions-001.json",
+    "filingCount": 1246,
+    "filingFrom": "1994-01-26",
+    "filingTo": "2015-07-20"
+   }
+  ]
+ }
+}
