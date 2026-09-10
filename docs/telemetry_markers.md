@@ -83,6 +83,7 @@ incidents behind the design.
 | `GEMINI_USAGE` | `research/gemini_search.py`, `research/agentic/tool_backends.py`, `research/resolution_source.py` | Per-call google-genai token and grounded-query accounting for all three Gemini surfaces. |
 | `AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED` | `research/agentic/tools.py:read_document` | The `read_document` twin of `GEMINI_UNGROUNDED_SUPPRESSED`. |
 | `GAP_FILL_ANALYZER_FAILED` | `research/targeted.py:run_gap_fill_pass` | Gap-fill v1's analyzer died. |
+| `GAP_FILL_V1_TRIAGE` | `research/targeted.py:run_gap_fill_pass` | Per-question gap-fill v1 triage: how many gaps the analyzer listed, how many the resolver searched, and the count dropped per reason before any spend. |
 | `CREDIT_BALANCE` / `CREDIT_SPEND` / `CREDIT_ROLE_SPEND` / `CREDIT_FLOOR_BREACH` | `credit_telemetry.py` | OpenRouter credit balance, spend, per-role spend, and floor-breach markers. |
 | `CREDIT_RUN_SUMMARY` | `credit_telemetry.py:log_run_summary` | Per-run, on every path: the role ledger folded to dollars per question, by key, with the run's token totals and largest prompt. |
 | `PROMPT_SIZE_ALERT` | `credit_telemetry.py:_alert_on_oversized_prompt` | Per-call WARN: one LLM call's prompt exceeded `PROMPT_TOKENS_ALERT_THRESHOLD`. |
@@ -1203,6 +1204,31 @@ had no gaps. Gap-fill isn't one of the orchestrator's `_run_one` providers, so i
 are one of the largest research spend lines (~44%). `detail` captures greedily to end-of-line
 because it holds the exception's `str`. `qid_kind` is `question_id` (`targeted.py` passes
 `question.id_of_question`).
+
+### GAP_FILL_V1_TRIAGE
+
+Per-question gap-fill v1 triage (`research/targeted.py:run_gap_fill_pass`, added 2026-09-09), emitted
+once for every question whose analyzer answered, so `listed=0` is "the analyzer answered and produced
+no parsable gaps" (an unparseable reply lands there too, traced only by the `GapFill: could not parse
+analyzer JSON` warning in the run log) and a dead analyzer is `GAP_FILL_ANALYZER_FAILED` alone.
+`listed` is the analyzer's slot count (a malformed item keeps its slot), `kept` the number the
+resolver searched, and the five `dropped_*` counts partition the rest, one reason per gap in the
+order the triage applies them: `dropped_not_answerable` (the analyzer graded `answerable_now` false:
+the gap can only be answered by an observation not yet made or a result not yet published),
+`dropped_in_first_pass` (`already_in_first_pass` true: the first pass already states the value with
+its date), `dropped_same_need` (`same_need_as` named an earlier gap whose need a kept gap is
+searching or the first pass answers), `dropped_schema` (a grade was omitted or mistyped, or the slot
+was malformed, and the gap is dropped rather than read as passing) and `dropped_over_cap` (a survivor
+past `GAP_FILL_MAX_GAPS`, which applies after the filter). `listed = kept + sum(dropped_*)` on every
+line. The line is INFO, except when every listed slot dropped as `dropped_schema`, which is WARNING:
+the analyzer has stopped emitting the grades and v1 has gone dark while it still bills, the same
+outcome `GAP_FILL_ANALYZER_FAILED` warns about; the level is not part of the marker contract, so the
+harvester reads both. Receipt: about a third of v1's resolver
+calls bought nothing on the archive (`scratch/cost_pass_2026-09-09/v1_gap_redundancy/REDUNDANCY.md`),
+and this marker is how that share is measured once the filter is live; the dropped gaps themselves,
+with position and reason, ride the raw research record (`provider="gap_fill"`, key `dropped`). The
+rules and the receipts: `docs/research.md` "v1 triage". `qid_kind` is `question_id` (`targeted.py`
+passes `question.id_of_question`).
 
 ### CREDIT_BALANCE
 

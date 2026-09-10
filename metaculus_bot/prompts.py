@@ -2037,10 +2037,13 @@ def gap_fill_analyzer_prompt(
 
     Returns a JSON list of gap objects (or empty list), at most ``max_gaps``, ordered most
     forecast-moving first (the cap truncates, so order is the ranking). The analyzer fills
-    its slots whatever it is told — 55-77% of archived records sit at the cap — so the prompt
-    spends its words on WHICH gaps earn a slot rather than on how many to return. ``options``
-    is the MC ballot (see ``_mc_options_line``) — a gap like "no coverage of candidate X" is
-    only findable when the analyzer knows the candidates.
+    its slots whatever it is told — since 2026-07-17 it fills every slot on about half of
+    questions and lists three or more gaps on 96% — so the prompt spends its words on WHICH
+    gaps earn a slot rather than on how many to return. Each gap carries three grades
+    (``answerable_now``, ``already_in_first_pass``, ``same_need_as``) that
+    ``research/targeted.py`` ``triage_gaps`` reads to drop a gap before its search is paid
+    for. ``options`` is the MC ballot (see ``_mc_options_line``) — a gap like "no coverage of
+    candidate X" is only findable when the analyzer knows the candidates.
     """
     benchmarking_warning = _benchmarking_warning("gap_flagging") if is_benchmarking else ""
     resolution_block = (resolution_criteria or "(none provided)").strip()
@@ -2105,13 +2108,25 @@ def gap_fill_analyzer_prompt(
         trailing slot holds the gap that would change the answer least. Do NOT add rank
         fields or scores; keep the schema exactly as below.
 
+        GRADE EVERY GAP. Fill the three grade fields honestly: code reads them and drops a
+        failing gap before its search is paid for. answerable_now is false when the gap can
+        only be answered by an observation not yet made or a result not yet published.
+        already_in_first_pass is true when the first-pass research already states the value
+        or fact with its date. same_need_as
+        is the position (1 = the first gap) of an earlier gap in this list that the same fact
+        from the same source would answer, else null; a dashboard and its monthly summary, or
+        official and preliminary results, are one need and one search.
+
         Output STRICT JSON, nothing else, matching this schema exactly:
 
         {{"gaps": [
             {{
                 "gap": "<specific factual question to resolve>",
                 "why_matters": "<1 sentence on why resolving this would change the forecast>",
-                "search_query": "<suggested search query, concise and specific>"
+                "search_query": "<suggested search query, concise and specific>",
+                "answerable_now": <true or false>,
+                "already_in_first_pass": <true or false>,
+                "same_need_as": <position of the earlier gap this restates, or null>
             }}
         ]}}
 

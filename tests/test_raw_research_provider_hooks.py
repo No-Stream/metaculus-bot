@@ -160,7 +160,16 @@ async def test_resolution_source_emits_raw_fetch_results(monkeypatch: pytest.Mon
 
 @pytest.mark.asyncio
 async def test_gap_fill_emits_gaps_and_results() -> None:
-    gaps = [{"gap": "what is X", "search_query": "X", "why_matters": "because"}]
+    gaps = [
+        {
+            "gap": "what is X",
+            "search_query": "X",
+            "why_matters": "because",
+            "answerable_now": True,
+            "already_in_first_pass": False,
+            "same_need_as": None,
+        }
+    ]
 
     with (
         patch("metaculus_bot.research.targeted._run_analyzer", AsyncMock(return_value=gaps)),
@@ -175,3 +184,4 @@ async def test_gap_fill_emits_gaps_and_results() -> None:
     payload = rec.call_args.kwargs["payload"]
     assert payload["gaps"] == gaps
     assert payload["results"] == ["answer to X"]
+    assert payload["dropped"] == []

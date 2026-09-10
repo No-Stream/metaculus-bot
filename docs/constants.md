@@ -1076,6 +1076,14 @@ random one. Three was still judged unsafe, but the fifth gap is empirically a co
 about 27% of 221 archived bundles rendered a fifth gap and the observed fifth gaps were confirmatory, so 5 to
 4 is near-zero risk. Do not go below 4.
 
+Since 2026-09-09 the cap applies to the gaps that survive the grade triage (`research/targeted.py`
+`triage_gaps`, `docs/research.md` "v1 triage"), not to the analyzer's raw list, so a gap dropped as
+future-dated, already answered by the first pass, or a restatement never displaces a kept one. The analyzer
+is still asked for at most this many, so the cap binds only when it over-lists; a survivor past it is counted
+as `dropped_over_cap` on the `GAP_FILL_V1_TRIAGE` marker. The 2026-09-09 cost pass confirmed the "do not go
+below 4" rule from the other side: a positional cap of 2 would have dropped the useful gap on 4 of 6 traced
+questions, which is why the lean-out is by grade rather than by count.
+
 ### GAP_FILL_ANALYZER_TIMEOUT
 
 The analyzer call is non-grounded, with no Google Search, and should return quickly. A tight timeout prevents

@@ -1346,7 +1346,11 @@ Three findings from the 2026-07-18 bundle content audit
    (future-dated, or re-buying the first pass; about $0.21 of its $0.71) with paraphrase repeats
    on one question in three, and a positional cap of 2 would drop the useful gap on 4 of 6 traced
    questions, so any lean must be grade-based (structured analyzer fields, filter and dedupe in
-   code), not positional. v1 costs $0.76 a question, the largest single line (cost pass,
+   code), not positional. **The grade-based lean SHIPPED 2026-09-09** (three grade fields on the
+   analyzer, `triage_gaps` in `research/targeted.py`, the `GAP_FILL_V1_TRIAGE` marker;
+   `docs/research.md` "v1 triage"); its saving, about $0.21 a question on the archive, is confirmed
+   only by a paid run, and the `dropped` lists in the first fall runs' raw research records are the
+   precision check on the analyzer's grading. v1 costs $0.76 a question, the largest single line (cost pass,
    2026-09-09), so the "~$190/quarter" saving this item once carried is superseded. **The fall
    decision, before the first fall question closes on 2026-09-28, is the operator's:** v1 leaned
    (about $1.70 to $1.85 a question, above the $1.50 ceiling) or v1 off (about $1.37). Two v1

@@ -3628,6 +3628,48 @@ class TestGapFillAnalyzerFailed:
         assert rec["error"] == "TimeoutError"
 
 
+# Verbatim from research/targeted.py:run_gap_fill_pass; see docs/telemetry_markers.md "GAP_FILL_V1_TRIAGE".
+GAP_FILL_V1_TRIAGE_LINE = (
+    PFX + "GAP_FILL_V1_TRIAGE: question=44912 listed=4 kept=2 dropped_not_answerable=1 dropped_in_first_pass=0 "
+    "dropped_same_need=1 dropped_schema=0 dropped_over_cap=0"
+)
+# Verbatim from research/gap_fill_stages.py; shares the GAP_FILL_V1_ prefix with the triage marker.
+GAP_FILL_V1_CUT_LINE = PFX_WARN + "GAP_FILL_V1_CUT_FOR_BUDGET: question=44912; research phase ran out of budget"
+
+
+class TestGapFillV1Triage:
+    def test_fields(self):
+        rec = _parse_one(GAP_FILL_V1_TRIAGE_LINE)
+        assert rec["marker"] == "gap_fill_v1_triage"
+        assert rec["listed"] == 4
+        assert rec["kept"] == 2
+        assert rec["dropped_not_answerable"] == 1
+        assert rec["dropped_in_first_pass"] == 0
+        assert rec["dropped_same_need"] == 1
+        assert rec["dropped_schema"] == 0
+        assert rec["dropped_over_cap"] == 0
+
+    def test_question_ref_is_a_question_id(self):
+        rec = _parse_one(GAP_FILL_V1_TRIAGE_LINE)
+        assert rec["qid"] == 44912
+        assert rec["qid_kind"] == "question_id"
+
+    def test_a_question_with_no_gaps_is_a_record_not_an_absence(self):
+        """listed=0 is the analyzer answering and finding nothing; a dead analyzer is GAP_FILL_ANALYZER_FAILED."""
+        rec = _parse_one(
+            PFX + "GAP_FILL_V1_TRIAGE: question=44912 listed=0 kept=0 dropped_not_answerable=0 "
+            "dropped_in_first_pass=0 dropped_same_need=0 dropped_schema=0 dropped_over_cap=0"
+        )
+        assert rec["marker"] == "gap_fill_v1_triage"
+        assert rec["listed"] == 0
+        assert rec["kept"] == 0
+
+    def test_does_not_collide_with_the_budget_cut_marker(self):
+        """Both tokens start GAP_FILL_V1_; each spec must claim only its own line."""
+        assert _parse_one(GAP_FILL_V1_CUT_LINE)["marker"] == "gap_fill_cut_for_budget"
+        assert _parse_one(GAP_FILL_V1_TRIAGE_LINE)["marker"] == "gap_fill_v1_triage"
+
+
 class TestMarkerNotInsideNoqaDirective:
     """HARNESS-SCAN-EXEMPT markers must never sit inside a ``# noqa:`` code list.
 
