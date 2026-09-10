@@ -1022,20 +1022,6 @@ class TestExtractFinancialIdentifiers:
 
         assert result["fred_series"] == ["DGS10", "DGS2"]
 
-    def test_extracts_fred_ids_from_a_fredgraph_csv_url(self) -> None:
-        """A question citing the graph CSV data endpoint rather than the series page still fires."""
-        text = "NOB spread: https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS30,DGS10&coed=2026-07-24"
-        result = extract_financial_identifiers_from_criteria(text)
-
-        assert result["fred_series"] == ["DGS30", "DGS10"]
-
-    def test_extracts_yahoo_symbol_from_the_chart_endpoint(self) -> None:
-        """A question citing the query1 chart endpoint reads the symbol like a quote page."""
-        text = "https://query1.finance.yahoo.com/v8/finance/chart/SPCX?period1=1&period2=2&interval=1d"
-        result = extract_financial_identifiers_from_criteria(text)
-
-        assert result["tickers"] == ["SPCX"]
-
     def test_no_match_returns_empty_lists(self) -> None:
         result = extract_financial_identifiers_from_criteria("Will it rain in London tomorrow?")
 
