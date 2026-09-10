@@ -90,11 +90,13 @@ Paid or externally visible. Ask before each:
   replicates and capped by `--max-spend-usd` (default 10). A bare call prints the plan and
   refuses, `ARGS="--dry-run"` is the free view, and the run stays blocked until the operator
   confirms OpenRouter's 18+ attestation for the default model.
-- The resolution-source provider IS a paid surface (`RESOLUTION_SOURCE_URL_CONTEXT_ENABLED` is
-  ON in every bot workflow): when every free rung of its fetch ladder has failed to read a cited
-  page, Gemini's `url_context` reader reads it on the operator's personal `GOOGLE_API_KEY`,
-  bounded to `RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS` (2) paid reads per question. Detail:
-  `docs/operations.md`.
+- The resolution-source provider IS a paid surface. Each cited HTML page longer than the
+  per-URL presentation cap can make one OpenRouter `page_digest_extractor` call, and each
+  gap-fill `read_document` of held flat text can make another; these calls do not share the
+  document-reader cap. Separately, when every free rung has failed to read a cited page,
+  Gemini's `url_context` reader uses the operator's personal `GOOGLE_API_KEY`, bounded to
+  `RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS` (2) paid reads per question. Detail:
+  `docs/operations.md` and `docs/research.md` "Page digest".
 - Anything invoking research providers or the ensemble against real questions, including a
   one-off script an agent writes to do so.
 
@@ -119,8 +121,9 @@ Free and safe. Run freely:
   week-over-week median; run `make sync_telemetry` first. `ARGS="--days 7"` narrows the window.
 - `make check_credits`: reads both OpenRouter key balances.
 - `uv run python scripts/probes/fetch_diagnostic.py`: public GETs plus the production ladder. It
-  forces the ladder's one paid rung (the Gemini `url_context` read) off in the process environment
-  before any probe runs, so it stays free even on a laptop whose `.env` enables that rung.
+  replaces the page-digest extractor with BM25 and forces the Gemini `url_context` rung off in the
+  process environment before any probe runs, so it stays free on a laptop whose `.env` carries
+  production keys.
 
 ## Repo overrides
 

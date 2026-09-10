@@ -41,13 +41,22 @@ import pytest
 from google.genai import types as genai_types
 
 from metaculus_bot.constants import RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV
+from metaculus_bot.research import page_digest
 from metaculus_bot.research.fetch_ladder import guard, rungs
 from metaculus_bot.research.http_fetch import reset_host_semaphores
 from metaculus_bot.research.impersonated_fetch import reset_impersonation_memo
 from metaculus_bot.research.resolution_fetch_result import FetchRoute, FetchStatus, RungAttempt, RungSkipReason
 from metaculus_bot.research.robots_policy import reset_robots_cache
 from scripts.probes import fetch_diagnostic, gemini_verify
-from tests.resolution_source_fakes import _URL, _impersonated, arm_paid_rung, paid_reader, refused_page_with_robots
+from tests.resolution_source_fakes import (
+    _URL,
+    FakeResponse,
+    FakeSession,
+    _impersonated,
+    arm_paid_rung,
+    paid_reader,
+    refused_page_with_robots,
+)
 
 
 def _probe_response() -> genai_types.GenerateContentResponse:
@@ -232,6 +241,32 @@ class TestFetchDiagnosticForcesThePaidRungOff:
         assert result.status == "success"
         assert result.route == "url_context"
         assert len(forced_403_ladder) == 1
+
+    async def test_long_html_never_builds_the_page_digest_llm(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Column D keeps the production fetch path while replacing its paid digest seat."""
+        body = (
+            "<html><body><article>"
+            + ("Employment and unemployment figures for the diagnostic control. " * 200)
+            + "</article></body></html>"
+        ).encode()
+        session = FakeSession({_URL: FakeResponse(200, body=body, content_type="text/html")})
+
+        def _getaddrinfo(host: str, port: Any, *args: Any, **kwargs: Any) -> list[tuple[Any, ...]]:
+            del host, port, args, kwargs
+            return [(0, 0, 0, "", ("8.8.8.8", 0))]
+
+        monkeypatch.setattr(guard.socket, "getaddrinfo", _getaddrinfo)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
+        monkeypatch.setattr(
+            page_digest,
+            "build_llm_with_openrouter_fallback",
+            lambda **_kwargs: pytest.fail("the free diagnostic built the paid digest client"),
+        )
+
+        result = await fetch_diagnostic.probe_ladder(_URL)
+
+        assert result.status == "success"
+        assert session.requested == [_URL]
 
     async def test_main_forcing_the_flag_off_keeps_the_paid_reader_unspent(
         self, forced_403_ladder: list[dict[str, Any]]
