@@ -632,8 +632,7 @@ async def _try_wayback_fetch(
         return None
     parsed = parse_snapshot_url(snapshot.url)
     if parsed is None:
-        # Undatable: the archive answered our year request directly rather than a dated capture, so
-        # the copy cannot carry the age disclosure that makes it admissible.
+        # Undatable: the archive answered the year request directly, so no dated capture to date-disclose.
         return None
     if await resolution_source._hop_refusal(innermost_url(parsed.inner_url)) is not None:
         return None
@@ -855,8 +854,7 @@ async def fetch(url: str, start_char: int = 0, *, question_topic: str = "") -> T
 
     plain = await _fetch_plain_with_impersonated_retry(url)
     if _wayback_applies(plain):
-        # A host that refused us or never answered: the archive is the one free route whose egress
-        # is not ours. A rescue serves with its capture date disclosed; a decline leaves plain as-is.
+        # The archive is the one free route whose egress is not ours; a decline leaves plain as-is.
         rescued = await _try_wayback_fetch(url, plain)
         if rescued is not None:
             return _read_content_outcome(url, rescued.text, rescued.links, method="wayback", start_char=start_char)
