@@ -2098,7 +2098,7 @@ class TestReadDocumentRefusesQuestionPlatformPages:
         """The supplied URL clears the guard; where it LEADS does not. The free ladder refuses the hop,
         and that refusal has to reach the paid rung too: Gemini dials from Google's address and would
         follow the same redirect onto the page the guard exists to refuse, billing a read for it. The
-        sibling ladder closes the same hop (``resolution_source._url_context_rung_applies``)."""
+        sibling ladder closes the same hop (``rungs._url_context_rung_applies``)."""
         session = self._redirecting_onto_the_platform(monkeypatch)
         monkeypatch.setenv("GOOGLE_API_KEY", "key")
         reader = _no_paid_reader(monkeypatch)

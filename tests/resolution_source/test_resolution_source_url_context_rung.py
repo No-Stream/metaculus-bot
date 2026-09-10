@@ -10,10 +10,12 @@ from datetime import UTC, datetime
 import pytest
 
 from metaculus_bot.constants import RESOLUTION_SOURCE_WITHHELD_REPLY_LOG_CHARS
-from metaculus_bot.research import resolution_presentation, resolution_source
+from metaculus_bot.research import resolution_presentation
+from metaculus_bot.research.fetch_ladder import rungs
 from metaculus_bot.research.fetch_ladder.context import LadderContext, QuestionRungBudget
+from metaculus_bot.research.fetch_ladder.ladder import _fetch_one
 from metaculus_bot.research.resolution_presentation import format_resolution_sections
-from metaculus_bot.research.resolution_source import _fetch_one, _rung_counts
+from metaculus_bot.research.resolution_source import _rung_counts
 from tests.resolution_source_fakes import (
     _ROBOTS_URL,
     _URL,
@@ -36,7 +38,7 @@ class TestUrlContextRung:
         the only one whose product is a model's answer rather than the host's bytes."""
         reader, calls = paid_reader()
         monkeypatch.setenv("GOOGLE_API_KEY", "key")
-        monkeypatch.setattr(resolution_source, "run_url_context_read", reader)
+        monkeypatch.setattr(rungs, "run_url_context_read", reader)
         monkeypatch.delenv("RESOLUTION_SOURCE_URL_CONTEXT_ENABLED", raising=False)
 
         result = await _fetch_one(refused_page_with_robots(), _URL, {})
@@ -70,7 +72,7 @@ class TestUrlContextRung:
         reader, _calls = paid_reader(retrievals=0, statuses=["URL_RETRIEVAL_STATUS_ERROR"])
         arm_paid_rung(monkeypatch, reader)
 
-        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.resolution_source"):
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.fetch_ladder.rungs"):
             result = await _fetch_one(refused_page_with_robots(), _URL, {}, LadderContext(query="ask"))
 
         assert result.status == "ungrounded"
@@ -99,7 +101,7 @@ class TestUrlContextRung:
         reader, _calls = paid_reader(text="NOT_ADDRESSED. The page lists office hours only.")
         arm_paid_rung(monkeypatch, reader)
 
-        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.resolution_source"):
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.fetch_ladder.rungs"):
             result = await _fetch_one(refused_page_with_robots(), _URL, {}, LadderContext(query="ask"))
 
         assert result.status == "no_resolving_content"
@@ -127,7 +129,7 @@ class TestUrlContextRung:
 
         arm_paid_rung(monkeypatch, _read)
 
-        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.resolution_source"):
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.fetch_ladder.rungs"):
             await _fetch_one(refused_page_with_robots(), _URL, {}, LadderContext(query="ask"))
 
         assert (
@@ -148,7 +150,7 @@ class TestUrlContextRung:
         reader, _calls = paid_reader(text=reply)
         arm_paid_rung(monkeypatch, reader)
 
-        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.fetch_ladder.rungs"):
             result = await _fetch_one(refused_page_with_robots(), _URL, {}, LadderContext(query="ask"))
 
         assert result.status_reason == "not_addressed"
@@ -168,7 +170,7 @@ class TestUrlContextRung:
         )
         arm_paid_rung(monkeypatch, reader)
 
-        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.fetch_ladder.rungs"):
             result = await _fetch_one(refused_page_with_robots(), _URL, {}, LadderContext(query="ask"))
 
         assert result.status == "ungrounded"
@@ -183,7 +185,7 @@ class TestUrlContextRung:
 
         arm_paid_rung(monkeypatch, _read)
 
-        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.fetch_ladder.rungs"):
             result = await _fetch_one(refused_page_with_robots(), _URL, {}, LadderContext(query="ask"))
 
         assert result.status == "ungrounded"
@@ -196,7 +198,7 @@ class TestUrlContextRung:
         arm_paid_rung(monkeypatch, reader)
         session = refused_page_with_robots(robots=b"User-agent: Google-Extended\nDisallow: /\n")
 
-        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.fetch_ladder.rungs"):
             result = await _fetch_one(session, _URL, {}, LadderContext(query="ask"))
 
         assert result.status == "blocked"
@@ -321,7 +323,7 @@ class TestUrlContextRung:
         reader, calls = paid_reader()
         monkeypatch.setenv("RESOLUTION_SOURCE_URL_CONTEXT_ENABLED", "true")
         monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
-        monkeypatch.setattr(resolution_source, "run_url_context_read", reader)
+        monkeypatch.setattr(rungs, "run_url_context_read", reader)
 
         result = await _fetch_one(refused_page_with_robots(), _URL, {}, LadderContext(query="ask"))
 
@@ -370,8 +372,8 @@ class TestUrlContextRung:
         result = await _fetch_one(session, _URL, {}, LadderContext(query="ask"))
 
         assert result.status == "success"
-        assert calls[0]["attempts"] == resolution_source.RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS
-        assert calls[0]["timeout_ms"] == int((16.0 - resolution_source.RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S) * 1000)
+        assert calls[0]["attempts"] == rungs.RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS
+        assert calls[0]["timeout_ms"] == int((16.0 - rungs.RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S) * 1000)
 
     async def test_a_pre_check_that_eats_the_room_skips_before_paying(self, monkeypatch):
         reader, calls = paid_reader()
@@ -403,7 +405,7 @@ class TestUrlContextRung:
 
         reader, calls = paid_reader()
         arm_paid_rung(monkeypatch, reader)
-        monkeypatch.setattr(resolution_source, "ROBOTS_FETCH_TIMEOUT_S", 0.05)
+        monkeypatch.setattr(rungs, "ROBOTS_FETCH_TIMEOUT_S", 0.05)
         session = refused_page_with_robots(extra={_ROBOTS_URL: _HangingResponse(200, content_type="text/plain")})
 
         started = time.monotonic()
@@ -440,7 +442,7 @@ class TestUrlContextRung:
         """The paid rung's analogue of the Wayback per-question cap: a question citing several
         dead sources pays at most RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS times inside one
         provider wall, and the read the cap declines records a `url_context_cap` skip."""
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS", 2)
+        monkeypatch.setattr(rungs, "RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS", 2)
         reader, calls = paid_reader()
         arm_paid_rung(monkeypatch, reader)
         shared = QuestionRungBudget()

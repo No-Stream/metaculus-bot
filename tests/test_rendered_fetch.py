@@ -31,7 +31,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from metaculus_bot.research import rendered_fetch, resolution_source
 from metaculus_bot.research.agentic import tools as agentic_tools
 from metaculus_bot.research.derived_api import DerivedEndpoint, derived_api_lead, largest_json
-from metaculus_bot.research.fetch_ladder import guard
+from metaculus_bot.research.fetch_ladder import guard, rungs
 from metaculus_bot.research.fetch_ladder.context import LadderContext
 from metaculus_bot.research.rendered_fetch import HarvestedJson, RenderedPage
 from metaculus_bot.research.resolution_fetch_result import FetchResult
@@ -491,7 +491,7 @@ class TestTheRenderMemos:
 
         direct = FetchResult(url=_PAGE_URL, status="js_wall", text="", http_status=200, content_type="text/html")
         ctx = LadderContext()
-        tier1_result = await resolution_source._rendered_rung(_PAGE_URL, direct, {}, ctx)
+        tier1_result = await rungs._rendered_rung(_PAGE_URL, direct, {}, ctx)
 
         assert len(chromium.launch_args) == 2
         assert tier1_result is None
@@ -536,11 +536,11 @@ class TestTheNavigationBudgetAfterTheGates:
             await asyncio.sleep(0)
             raise rendered_fetch.RenderBudgetExpired(f"under 5000ms left for {url}")
 
-        monkeypatch.setattr(resolution_source, "render_page", _expired)
+        monkeypatch.setattr(rungs, "render_page", _expired)
         direct = FetchResult(url=_PAGE_URL, status="js_wall", text="", http_status=200, content_type="text/html")
         ctx = LadderContext()
 
-        result = await resolution_source._rendered_rung(_PAGE_URL, direct, {}, ctx)
+        result = await rungs._rendered_rung(_PAGE_URL, direct, {}, ctx)
 
         assert result is None
         assert [attempt.skipped_reason for attempt in ctx.rungs] == ["wall_budget"]
@@ -705,11 +705,11 @@ class TestTheNavigationBudgetAfterTheGates:
             calls.append({"url": url, "called_at": time.monotonic(), **kwargs})
             await asyncio.sleep(0)
 
-        monkeypatch.setattr(resolution_source, "render_page", _recording_render)
+        monkeypatch.setattr(rungs, "render_page", _recording_render)
         monkeypatch.setattr(LadderContext, "rung_budget_s", lambda self: 20.0)
         direct = FetchResult(url=_PAGE_URL, status="js_wall", text="", http_status=200, content_type="text/html")
 
-        await resolution_source._rendered_rung(_PAGE_URL, direct, {}, LadderContext())
+        await rungs._rendered_rung(_PAGE_URL, direct, {}, LadderContext())
 
         (call,) = calls
         assert call["memo_scope"] == _TIER1_SCOPE
@@ -752,11 +752,11 @@ class TestTheDomCeiling:
             await asyncio.sleep(0)
             raise rendered_fetch.RenderDomOverCeiling(f"the rendered DOM of {url} is over the ceiling")
 
-        monkeypatch.setattr(resolution_source, "render_page", _too_large)
+        monkeypatch.setattr(rungs, "render_page", _too_large)
         direct = FetchResult(url=_PAGE_URL, status="js_wall", text="", http_status=200, content_type="text/html")
         ctx = LadderContext()
 
-        result = await resolution_source._rendered_rung(_PAGE_URL, direct, {}, ctx)
+        result = await rungs._rendered_rung(_PAGE_URL, direct, {}, ctx)
 
         assert result is None
         assert [attempt.skipped_reason for attempt in ctx.rungs] == ["render_dom_too_large"]
@@ -1004,12 +1004,12 @@ class TestTheMainFrameStatus:
             await asyncio.sleep(0)
             return RenderedPage(url=url, content_type="text/html", html=self._CHALLENGE, http_status=403)
 
-        monkeypatch.setattr(resolution_source, "render_page", _blocked_render)
+        monkeypatch.setattr(rungs, "render_page", _blocked_render)
         direct = FetchResult(url=_PAGE_URL, status="js_wall", text="", http_status=200, content_type="text/html")
         ctx = LadderContext()
 
-        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.resolution_source"):
-            result = await resolution_source._rendered_rung(_PAGE_URL, direct, {}, ctx)
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.fetch_ladder.rungs"):
+            result = await rungs._rendered_rung(_PAGE_URL, direct, {}, ctx)
 
         assert result is None
         # A 403 or 429 is retryable, so the URL is not memoised as rendered-to-nothing.
@@ -1023,10 +1023,10 @@ class TestTheMainFrameStatus:
             await asyncio.sleep(0)
             return RenderedPage(url=url, content_type="text/html", html=self._CHALLENGE, http_status=200)
 
-        monkeypatch.setattr(resolution_source, "render_page", _ok_render)
+        monkeypatch.setattr(rungs, "render_page", _ok_render)
         direct = FetchResult(url=_PAGE_URL, status="js_wall", text="", http_status=200, content_type="text/html")
 
-        result = await resolution_source._rendered_rung(_PAGE_URL, direct, {}, LadderContext())
+        result = await rungs._rendered_rung(_PAGE_URL, direct, {}, LadderContext())
 
         assert result is not None
         assert result.status == "success"
@@ -1357,11 +1357,11 @@ class TestTheLandingHost:
             calls.append(url)
             await asyncio.sleep(0)
 
-        monkeypatch.setattr(resolution_source, "render_page", _recording_render)
+        monkeypatch.setattr(rungs, "render_page", _recording_render)
         landed = "https://www.dashboard.example.com/senate"
         direct = FetchResult(url=landed, status="js_wall", text="", http_status=200, content_type="text/html")
 
-        result = await resolution_source._rendered_rung(_PAGE_URL, direct, {}, LadderContext())
+        result = await rungs._rendered_rung(_PAGE_URL, direct, {}, LadderContext())
 
         assert result is None
         assert calls == [landed]
@@ -1376,11 +1376,11 @@ class TestTheLandingHost:
                 requested_url=url, final_url="http://10.0.0.8/status", pinned_host="dashboard.example.com"
             )
 
-        monkeypatch.setattr(resolution_source, "render_page", _off_host)
+        monkeypatch.setattr(rungs, "render_page", _off_host)
         direct = FetchResult(url=_PAGE_URL, status="js_wall", text="", http_status=200, content_type="text/html")
         ctx = LadderContext()
 
-        result = await resolution_source._rendered_rung(_PAGE_URL, direct, {}, ctx)
+        result = await rungs._rendered_rung(_PAGE_URL, direct, {}, ctx)
 
         assert result is None
         assert [attempt.skipped_reason for attempt in ctx.rungs] == ["render_off_host"]
@@ -1628,7 +1628,7 @@ class TestTheDomReadIsBounded:
         direct = FetchResult(url=_PAGE_URL, status="js_wall", text="", http_status=200, content_type="text/html")
         ctx = LadderContext()
 
-        result = await resolution_source._rendered_rung(_PAGE_URL, direct, {}, ctx)
+        result = await rungs._rendered_rung(_PAGE_URL, direct, {}, ctx)
 
         assert result is None
         assert [attempt.skipped_reason for attempt in ctx.rungs] == ["render_timeout"]

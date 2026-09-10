@@ -9,12 +9,13 @@ import time
 import pytest
 
 from metaculus_bot.research import rendered_fetch, resolution_presentation, resolution_source
-from metaculus_bot.research.fetch_ladder import classify, guard
+from metaculus_bot.research.fetch_ladder import classify, guard, rungs
 from metaculus_bot.research.fetch_ladder.context import LadderContext
+from metaculus_bot.research.fetch_ladder.ladder import _fetch_one
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail
 from metaculus_bot.research.rendered_fetch import HarvestedJson, RenderedPage
 from metaculus_bot.research.resolution_fetch_result import FetchResult
-from metaculus_bot.research.resolution_source import _fetch_one, _rung_counts, resolution_source_provider
+from metaculus_bot.research.resolution_source import _rung_counts, resolution_source_provider
 from tests.resolution_source_fakes import (
     _FEED_URL,
     _INFOGRAM_EMBED_MARKUP,
@@ -54,7 +55,7 @@ def _hanging_render(calls: list[str]):
 def _admit_a_render_with(monkeypatch: pytest.MonkeyPatch, budget_s: float) -> None:
     """Let the rung fire on a sub-second budget. The production floor is 12 s, and a test that
     waited it out would cost more than the suite's whole rendered-rung coverage."""
-    monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S", 0.01)
+    monkeypatch.setattr(rungs, "RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S", 0.01)
     monkeypatch.setattr(LadderContext, "rung_budget_s", lambda self: budget_s)
 
 
@@ -94,7 +95,7 @@ class TestRenderedRungTriggers:
     async def test_a_js_wall_is_rescued_and_claims_the_route(self, monkeypatch):
         calls: list[dict[str, object]] = []
         monkeypatch.setattr(
-            resolution_source,
+            rungs,
             "render_page",
             _fake_render(_rendered_document(f"<h1>Polling average</h1><p>{_RENDERED_PROSE}</p>"), calls),
         )
@@ -116,7 +117,7 @@ class TestRenderedRungTriggers:
         failure one floor up: above the JS-wall floor, still nothing but chrome."""
         calls: list[dict[str, object]] = []
         monkeypatch.setattr(
-            resolution_source,
+            rungs,
             "render_page",
             _fake_render(_rendered_document(f"<h1>Polling average</h1><p>{_RENDERED_PROSE}</p>"), calls),
         )
@@ -137,7 +138,7 @@ class TestRenderedRungTriggers:
         somewhere a render never reads. Launching would spend 100-300 MB to re-derive the
         same verdict."""
         calls: list[dict[str, object]] = []
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(_rendered("<html></html>"), calls))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(_rendered("<html></html>"), calls))
         session = FakeSession(
             {_URL: FakeResponse(200, body=_embed_shell_page(_INFOGRAM_EMBED_MARKUP), content_type="text/html")}
         )
@@ -153,7 +154,7 @@ class TestRenderedRungTriggers:
     async def test_a_non_200_is_not_escalated_to_the_browser(self, monkeypatch, status):
         """Chromium dials from the same address the edge just refused, and a 404 has no page."""
         calls: list[dict[str, object]] = []
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(_rendered("<html></html>"), calls))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(_rendered("<html></html>"), calls))
         session = FakeSession({_URL: FakeResponse(status, body=b"nope", content_type="text/html")})
 
         result = await _fetch_one(session, _URL, {})
@@ -164,7 +165,7 @@ class TestRenderedRungTriggers:
 
     async def test_a_successful_direct_fetch_never_escalates(self, monkeypatch, article_html):
         calls: list[dict[str, object]] = []
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(_rendered("<html></html>"), calls))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(_rendered("<html></html>"), calls))
         session = FakeSession({_URL: FakeResponse(200, body=article_html, content_type="text/html")})
 
         result = await _fetch_one(session, _URL, {})
@@ -180,7 +181,7 @@ class TestRenderedRungBudget:
 
     async def test_it_is_skipped_below_the_floor(self, monkeypatch):
         calls: list[dict[str, object]] = []
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(_rendered("<html></html>"), calls))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(_rendered("<html></html>"), calls))
         monkeypatch.setattr(LadderContext, "rung_budget_s", lambda self: 4.0)
         session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
 
@@ -201,7 +202,7 @@ class TestRenderedRungBudget:
     async def test_the_navigation_budget_comes_off_the_remaining_wall(self, monkeypatch):
         """A render admitted with 20 s left may not then help itself to the full 35 s cap."""
         calls: list[dict[str, object]] = []
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(None, calls))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(None, calls))
         monkeypatch.setattr(LadderContext, "rung_budget_s", lambda self: 20.0)
         session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
 
@@ -211,7 +212,7 @@ class TestRenderedRungBudget:
 
     async def test_a_generous_budget_is_still_capped_at_the_transport_ceiling(self, monkeypatch):
         calls: list[dict[str, object]] = []
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(None, calls))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(None, calls))
         monkeypatch.setattr(LadderContext, "rung_budget_s", lambda self: 600.0)
         session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
 
@@ -227,7 +228,7 @@ class TestRenderedRungDeclines:
     async def test_an_unavailable_renderer_is_a_skip_not_a_fired_rung(self, monkeypatch):
         """Chromium's install step is `continue-on-error` in every workflow, so its absence is
         by design — and nothing was rendered, so the attempt must claim no route."""
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(None, []))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(None, []))
         session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
 
         result = await _fetch_one(session, _URL, {})
@@ -246,7 +247,7 @@ class TestRenderedRungDeclines:
         we tried the browser and this is still the answer — the meta-refresh convention."""
         calls: list[dict[str, object]] = []
         monkeypatch.setattr(
-            resolution_source,
+            rungs,
             "render_page",
             _fake_render(_rendered(_JS_SHELL.decode()), calls),
         )
@@ -262,7 +263,7 @@ class TestRenderedRungDeclines:
 
     async def test_a_rescued_render_is_not_memoized(self, monkeypatch):
         monkeypatch.setattr(
-            resolution_source,
+            rungs,
             "render_page",
             _fake_render(_rendered_document(f"<h1>Polling average</h1><p>{_RENDERED_PROSE}</p>"), []),
         )
@@ -291,7 +292,7 @@ class TestRenderedRungTimeout:
     async def test_a_render_still_queued_at_the_budget_is_cut_off_and_recorded_as_the_wall(self, monkeypatch):
         """The transport never answers (no browser ran), so the rung's own bound is what fires."""
         calls: list[str] = []
-        monkeypatch.setattr(resolution_source, "render_page", _hanging_render(calls))
+        monkeypatch.setattr(rungs, "render_page", _hanging_render(calls))
         _admit_a_render_with(monkeypatch, 0.2)
         session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
 
@@ -311,7 +312,7 @@ class TestRenderedRungTimeout:
         so this one queues on the gate with the wall running and never reaches a launch. Recorded
         as ``render_timeout`` it inflated a count documented as a fact about the page while the
         wall-budget counts stayed at zero."""
-        monkeypatch.setattr(resolution_source, "render_page", rendered_fetch.render_page)
+        monkeypatch.setattr(rungs, "render_page", rendered_fetch.render_page)
         _admit_a_render_with(monkeypatch, 0.2)
         gate = rendered_fetch._RENDERED_FETCH_GLOBAL_SEMAPHORE
         for _ in range(rendered_fetch.RENDER_LAUNCH_CAP):
@@ -332,7 +333,7 @@ class TestRenderedRungTimeout:
             await asyncio.sleep(0)
             raise rendered_fetch.RenderTimeout("the DOM read of tracker.example.com outlived 5000ms")
 
-        monkeypatch.setattr(resolution_source, "render_page", _timed_out)
+        monkeypatch.setattr(rungs, "render_page", _timed_out)
         session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
 
         result = await _fetch_one(session, _URL, {})
@@ -354,7 +355,7 @@ class TestRenderedRungRefusedByTheEdge:
             html=_rendered_document("<h1>Checking your browser</h1><p>" + "Please wait. " * 60 + "</p>").html,
             http_status=403,
         )
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(challenge, []))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(challenge, []))
         session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
 
         with caplog.at_level("INFO", logger="metaculus_bot.research.resolution_source"):
@@ -392,7 +393,7 @@ class TestRenderedRungLandedOffHost:
         )
 
     async def test_an_off_host_landing_is_its_own_skip_and_claims_no_route(self, monkeypatch, caplog):
-        monkeypatch.setattr(resolution_source, "render_page", self._off_host_render)
+        monkeypatch.setattr(rungs, "render_page", self._off_host_render)
         session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
 
         with caplog.at_level("INFO", logger="metaculus_bot.research.resolution_source"):
@@ -408,7 +409,7 @@ class TestRenderedRungLandedOffHost:
 
     async def test_the_count_reaches_the_providers_details(self, monkeypatch):
         monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
-        monkeypatch.setattr(resolution_source, "render_page", self._off_host_render)
+        monkeypatch.setattr(rungs, "render_page", self._off_host_render)
         session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
         monkeypatch.setattr(guard, "_get_session", lambda: session)
         question = _mock_question(resolution_criteria=f"Resolves per {_URL}")
@@ -443,7 +444,7 @@ class TestRenderedRungRendersTheFinalUrl:
         calls: list[dict[str, object]] = []
         rescued = _rendered_document(f"<h1>Polling average</h1><p>{_RENDERED_PROSE}</p>")
         page = RenderedPage(url=self._FINAL, content_type="text/html", html=rescued.html, final_url=self._FINAL)
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(page, calls))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(page, calls))
 
         result = await _fetch_one(self._redirected_session(), _URL, {})
 
@@ -463,7 +464,7 @@ class TestRenderedRungRendersTheFinalUrl:
         landed = f"{self._FINAL}/2026/?tab=polls"
         rescued = _rendered_document(f"<h1>Polling average</h1><p>{_RENDERED_PROSE}</p>")
         page = RenderedPage(url=self._FINAL, content_type="text/html", html=rescued.html, final_url=landed)
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(page, []))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(page, []))
 
         result = await _fetch_one(self._redirected_session(), _URL, {})
 
@@ -476,7 +477,7 @@ class TestRenderedRungRendersTheFinalUrl:
     async def test_the_render_memos_are_keyed_on_the_rendered_url(self, monkeypatch):
         calls: list[dict[str, object]] = []
         empty = RenderedPage(url=self._FINAL, content_type="text/html", html=_JS_SHELL.decode(), final_url=self._FINAL)
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(empty, calls))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(empty, calls))
 
         first = await _fetch_one(self._redirected_session(), _URL, {})
         second = await _fetch_one(self._redirected_session(), _URL, {})
@@ -497,12 +498,12 @@ class TestRenderedRungRendersTheFinalUrl:
         hand-built direct result: the URL the browser dials is decided here, so the refusal lives
         here too, and it declines before any attempt is opened."""
         calls: list[dict[str, object]] = []
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(_rendered("<html></html>"), calls))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(_rendered("<html></html>"), calls))
         direct = FetchResult(url=landed, status="js_wall", text="", http_status=200, content_type="text/html")
         ctx = LadderContext()
 
         with caplog.at_level("WARNING", logger="metaculus_bot.research.resolution_source"):
-            result = await resolution_source._rendered_rung(_URL, direct, {}, ctx)
+            result = await rungs._rendered_rung(_URL, direct, {}, ctx)
 
         assert result is None
         assert calls == []
@@ -519,7 +520,7 @@ class TestASlowRenderLeavesTheSiblingPagesStanding:
 
     async def test_the_provider_returns_the_other_page_inside_its_wall(self, monkeypatch, article_html, caplog):
         monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
-        monkeypatch.setattr(resolution_source, "render_page", _hanging_render([]))
+        monkeypatch.setattr(rungs, "render_page", _hanging_render([]))
         _admit_a_render_with(monkeypatch, 0.2)
         session = FakeSession(
             {
@@ -562,7 +563,7 @@ class TestRenderedRungMetricWithhold:
     here, whether the harvested feed then rescues the page or nothing does."""
 
     async def test_a_withheld_rendered_dom_with_no_rescue_is_counted_once(self, monkeypatch):
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(_menu_tree_dom(), []))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(_menu_tree_dom(), []))
         session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
 
         result = await _fetch_one(session, _URL, {})
@@ -585,7 +586,7 @@ class TestRenderedRungMetricWithhold:
             html=menu_tree.html,
             json_responses=(HarvestedJson(url=_FEED_URL, body=feed),),
         )
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(page, []))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(page, []))
         session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
 
         result = await _fetch_one(session, _URL, {})
@@ -615,7 +616,7 @@ class TestOneJsonVocabulary:
             html=_JS_SHELL.decode(),
             json_responses=(HarvestedJson(url=_FEED_URL, body=self._FEED),),
         )
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(harvested, calls))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(harvested, calls))
         second_url = "https://tracker.example.com/house"
         session = FakeSession(
             {
@@ -657,7 +658,7 @@ class TestRenderedRungClassification:
             f"<h1>Polling average</h1><p>{_RENDERED_PROSE}</p>"
             '<iframe title="Approval tracker" src="https://datawrapper.dwcdn.net/aB3dE/7/"></iframe>'
         )
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(page, []))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(page, []))
         session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
 
         result = await _fetch_one(session, _URL, {})
@@ -668,7 +669,7 @@ class TestRenderedRungClassification:
     async def test_the_per_url_cap_still_binds_on_a_rendered_page(self, monkeypatch):
         monkeypatch.setattr(resolution_presentation, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", 200)
         monkeypatch.setattr(
-            resolution_source,
+            rungs,
             "render_page",
             _fake_render(_rendered_document(f"<h1>Polling average</h1><p>{_RENDERED_PROSE * 20}</p>"), []),
         )

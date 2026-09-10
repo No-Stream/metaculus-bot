@@ -20,9 +20,10 @@ import aiohttp
 import pytest
 
 from metaculus_bot.research import impersonated_fetch, resolution_chart_data, resolution_presentation, resolution_source
-from metaculus_bot.research.fetch_ladder import classify, guard
+from metaculus_bot.research.fetch_ladder import classify, context, direct_fetch, guard, rungs
 from metaculus_bot.research.fetch_ladder.classify import looks_like_js_wall, looks_like_page_chrome
 from metaculus_bot.research.fetch_ladder.context import LadderContext
+from metaculus_bot.research.fetch_ladder.ladder import _fetch_one
 from metaculus_bot.research.http_fetch import host_semaphores, pdf_parse_semaphore, semaphore_for_host
 from metaculus_bot.research.impersonated_fetch import IMPERSONATE_TRIGGER_STATUSES
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail
@@ -33,7 +34,6 @@ from metaculus_bot.research.resolution_presentation import (
 )
 from metaculus_bot.research.resolution_source import (
     FetchResult,
-    _fetch_one,
     _fetch_result_sources,
     _rung_counts,
     fetch_resolution_sources,
@@ -1319,7 +1319,7 @@ class TestMetaRefreshHop:
         result = await _fetch_one(session, "https://loop.example.com/p", {})
 
         assert result.status == "error"
-        assert len(session.requested) == resolution_source.MAX_REDIRECTS + 1
+        assert len(session.requested) == direct_fetch.MAX_REDIRECTS + 1
 
     async def test_a_page_that_already_has_content_is_served_as_is(self, article_html):
         """Some content-management systems emit a refresh tag beside real content (a
@@ -1414,12 +1414,12 @@ class TestTheHopRefusalPolicy:
 
         monkeypatch.setattr(guard, "_hop_refusal", _refuse)
         renders: list[dict[str, object]] = []
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(None, renders))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(None, renders))
         landed = "https://www.tracker.example.com/senate"
         direct = FetchResult(url=landed, status="js_wall", text="", http_status=200, content_type="text/html")
 
         with caplog.at_level("WARNING", logger="metaculus_bot.research.resolution_source"):
-            result = await resolution_source._rendered_rung(_URL, direct, {}, LadderContext())
+            result = await rungs._rendered_rung(_URL, direct, {}, LadderContext())
 
         assert result is None
         assert calls == [landed]
@@ -1469,10 +1469,10 @@ class TestTheHopRefusalPolicy:
         monkeypatch.setattr(guard, "_landing_refused", _refused)
         monkeypatch.setattr(impersonated_fetch, "IMPERSONATE_TRIGGER_STATUSES", IMPERSONATE_TRIGGER_STATUSES)
         renders: list[dict[str, object]] = []
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(None, renders))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(None, renders))
         dials: list[dict[str, object]] = []
         monkeypatch.setattr(
-            resolution_source,
+            rungs,
             "fetch_impersonated",
             fake_impersonated_fetch(_impersonated(200, body=_prose_page("Whatever the host served.")), dials),
         )
@@ -1481,8 +1481,8 @@ class TestTheHopRefusalPolicy:
         refused = FetchResult(url=landed, status="blocked", text="", http_status=403, content_type="text/html")
         ctx = LadderContext()
 
-        assert await resolution_source._rendered_rung(_URL, walled, {}, ctx) is None
-        assert await resolution_source._impersonate_rung(_URL, refused, host_sems={}, ctx=ctx) is None
+        assert await rungs._rendered_rung(_URL, walled, {}, ctx) is None
+        assert await rungs._impersonate_rung(_URL, refused, host_sems={}, ctx=ctx) is None
 
         assert seen == [(landed, _URL, "rendering"), (landed, _URL, "re-dialing")]
         assert renders == []
@@ -1760,7 +1760,7 @@ class TestPdfParseGate:
             started=time.monotonic()
             - (
                 resolution_source.RESOLUTION_SOURCE_WALL_TIMEOUT
-                - resolution_source.RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S
+                - context.RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S
                 - classify.RESOLUTION_SOURCE_PDF_MIN_BUDGET_S
                 - 0.05
             ),
@@ -1828,15 +1828,13 @@ class TestPerHopRequestTimeout:
 
         await _fetch_one(session, "https://slow.example.com/page", {}, LadderContext())
 
-        assert session.get_kwargs[0]["timeout"].total == resolution_source.RESOLUTION_SOURCE_HTTP_TIMEOUT
+        assert session.get_kwargs[0]["timeout"].total == direct_fetch.RESOLUTION_SOURCE_HTTP_TIMEOUT
 
     async def test_a_hop_late_in_the_wall_is_clamped_to_the_remaining_budget(self, article_html):
         session = self._session(article_html)
         elapsed = 35.0
         expected = (
-            resolution_source.RESOLUTION_SOURCE_WALL_TIMEOUT
-            - elapsed
-            - resolution_source.RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S
+            resolution_source.RESOLUTION_SOURCE_WALL_TIMEOUT - elapsed - context.RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S
         )
 
         await _fetch_one(
@@ -1845,7 +1843,7 @@ class TestPerHopRequestTimeout:
 
         timeout = session.get_kwargs[0]["timeout"]
         assert timeout.total == pytest.approx(expected, abs=0.5)
-        assert timeout.total < resolution_source.RESOLUTION_SOURCE_HTTP_TIMEOUT
+        assert timeout.total < direct_fetch.RESOLUTION_SOURCE_HTTP_TIMEOUT
         assert timeout.sock_read == timeout.total, "a per-request ClientTimeout replaces the session's, so both fields"
 
     async def test_a_spent_budget_still_gets_a_token_attempt_rather_than_a_zero_timeout(self, article_html):
@@ -1860,5 +1858,5 @@ class TestPerHopRequestTimeout:
             LadderContext(started=time.monotonic() - 2 * resolution_source.RESOLUTION_SOURCE_WALL_TIMEOUT),
         )
 
-        assert session.get_kwargs[0]["timeout"].total == resolution_source.RESOLUTION_SOURCE_MIN_HOP_TIMEOUT_S
+        assert session.get_kwargs[0]["timeout"].total == direct_fetch.RESOLUTION_SOURCE_MIN_HOP_TIMEOUT_S
         assert result.status == "success", "the floor is a real attempt, not a formality"

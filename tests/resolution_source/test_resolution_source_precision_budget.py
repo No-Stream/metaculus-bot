@@ -17,17 +17,13 @@ from __future__ import annotations
 import time
 
 from metaculus_bot.constants import RESOLUTION_SOURCE_PRECISION_RETRY_MIN_BUDGET_S
-from metaculus_bot.research import resolution_source
-from metaculus_bot.research.fetch_ladder import classify
+from metaculus_bot.research.fetch_ladder import classify, context, rungs
 from metaculus_bot.research.fetch_ladder.classify import _extract_page_text, content_share, looks_like_page_chrome
 from metaculus_bot.research.fetch_ladder.context import LadderContext
+from metaculus_bot.research.fetch_ladder.ladder import _fetch_one
+from metaculus_bot.research.fetch_ladder.rungs import _rendered_rung_applies
 from metaculus_bot.research.rendered_fetch import RenderedPage
-from metaculus_bot.research.resolution_source import (
-    RESOLUTION_SOURCE_WALL_TIMEOUT,
-    FetchResult,
-    _fetch_one,
-    _rendered_rung_applies,
-)
+from metaculus_bot.research.resolution_source import RESOLUTION_SOURCE_WALL_TIMEOUT, FetchResult
 from tests.resolution_source_fakes import FakeResponse, FakeSession, _fake_render
 
 _URL = "https://portal.example.com/statistics"
@@ -49,7 +45,7 @@ _CARD = (
 
 def _spent_context(wall_left_s: float) -> LadderContext:
     """A per-URL context whose remaining wall (``rung_budget_s``) is about ``wall_left_s``."""
-    margin = resolution_source.RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S
+    margin = context.RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S
     return LadderContext(started=time.monotonic() - (RESOLUTION_SOURCE_WALL_TIMEOUT - margin - wall_left_s))
 
 
@@ -168,12 +164,12 @@ class TestPrecisionRetryBudgetThroughTheLadder:
         precision pass extracts nothing, so both classifications withhold and the URL is memoised
         as rendered-to-nothing; one URL per test, because that memo outlives the call.
         """
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S", 1.0)
+        monkeypatch.setattr(rungs, "RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S", 1.0)
         calls = _install_fake_extractor(monkeypatch, precision=None)
         rendered_dom = "<html><body><nav>" + "".join(f"<a href='/{i}'>Menu item {i:03d}</a>" for i in range(60))
         rendered_dom += "</nav></body></html>"
         page = RenderedPage(url=_URL, content_type="text/html", html=rendered_dom)
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(page, []))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(page, []))
         session = FakeSession({_URL: FakeResponse(200, body=_BODY)})
         result = await _fetch_one(session, _URL, {}, ctx)
         return calls, result

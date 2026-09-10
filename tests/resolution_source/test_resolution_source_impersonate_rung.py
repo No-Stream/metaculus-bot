@@ -4,7 +4,7 @@ Measured 2026-09-04 from a GitHub Actions runner (`scripts/probes/fetch_diagnost
 Akamai-fronted federal hosts answered the bot's own aiohttp client 403 and the same GET through
 `curl_cffi` with Chrome impersonation 200, so the refusal was a fingerprint verdict and is
 recoverable client-side. The transport (`research/impersonated_fetch.py`) is patched at the
-import seam `resolution_source.fetch_impersonated` throughout; the suite's `_block_native_egress`
+import seam `fetch_ladder.rungs.fetch_impersonated` throughout; the suite's `_block_native_egress`
 guard stays armed underneath, so a rung that reached the real transport would fail at teardown.
 """
 
@@ -25,8 +25,10 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
 )
 from metaculus_bot.research import impersonated_fetch, resolution_source
-from metaculus_bot.research.fetch_ladder import classify
+from metaculus_bot.research.fetch_ladder import classify, rungs
 from metaculus_bot.research.fetch_ladder.context import LadderContext
+from metaculus_bot.research.fetch_ladder.ladder import _fetch_one
+from metaculus_bot.research.fetch_ladder.rungs import _WAYBACK_TRIGGER_STATUSES, _impersonate_rung_applies
 from metaculus_bot.research.impersonated_fetch import (
     IMPERSONATE_TRIGGER_STATUSES,
     ImpersonateBodyTooLarge,
@@ -41,12 +43,7 @@ from metaculus_bot.research.impersonated_fetch import (
 )
 from metaculus_bot.research.resolution_fetch_result import ROUTE_CAVEATS, FetchResult, FetchStatus
 from metaculus_bot.research.resolution_presentation import format_resolution_sections
-from metaculus_bot.research.resolution_source import (
-    _WAYBACK_TRIGGER_STATUSES,
-    _fetch_one,
-    _impersonate_rung_applies,
-    _rung_counts,
-)
+from metaculus_bot.research.resolution_source import _rung_counts
 from metaculus_bot.research.wayback import wayback_snapshot_url
 from scripts.telemetry.markers import parse_log_text
 from tests.resolution_source_fakes import (
@@ -68,7 +65,8 @@ from tests.test_document_text import build_text_pdf
 
 _NOW = datetime(2026, 9, 4, tzinfo=UTC)
 _SECOND_URL = "https://tracker.example.com/house"
-_LOGGER = "metaculus_bot.research.resolution_source"
+# The package prefix: the rung's own lines sit under `fetch_ladder.rungs`, the markers under the fetcher.
+_LOGGER = "metaculus_bot.research"
 _META = {
     "run_id": "999",
     "workflow": "tournament",
@@ -105,7 +103,7 @@ def _arm_the_retry(monkeypatch):
 
 def _transport(monkeypatch, answer) -> list[dict[str, object]]:
     calls: list[dict[str, object]] = []
-    monkeypatch.setattr(resolution_source, "fetch_impersonated", fake_impersonated_fetch(answer, calls))
+    monkeypatch.setattr(rungs, "fetch_impersonated", fake_impersonated_fetch(answer, calls))
     return calls
 
 
@@ -193,14 +191,14 @@ class TestImpersonateRungRescue:
     async def test_the_retry_is_bounded_by_the_remaining_wall(self, monkeypatch):
         monkeypatch.setattr(LadderContext, "rung_budget_s", lambda self: 7.5)
         calls = _transport(monkeypatch, _impersonated(200, body=_prose_page(_RENDERED_PROSE)))
-        before = resolution_source.time.monotonic()
+        before = rungs.time.monotonic()
 
         await _fetch_one(_refused_page(), _URL, {}, LadderContext(now=_NOW))
 
         (call,) = calls
         deadline = call["deadline_monotonic_s"]
         assert isinstance(deadline, float)
-        assert before + 7.5 <= deadline <= resolution_source.time.monotonic() + 7.5
+        assert before + 7.5 <= deadline <= rungs.time.monotonic() + 7.5
 
     async def test_the_rescue_renders_the_impersonate_caveat(self, monkeypatch):
         _transport(monkeypatch, _impersonated(200, body=_prose_page(_RENDERED_PROSE)))
@@ -568,7 +566,7 @@ class TestImpersonateRungLadderPosition:
 
     @pytest.fixture(autouse=True)
     def _arm_the_rungs_behind_it(self, monkeypatch):
-        monkeypatch.setattr(resolution_source, "_WAYBACK_TRIGGER_STATUSES", _WAYBACK_TRIGGER_STATUSES)
+        monkeypatch.setattr(rungs, "_WAYBACK_TRIGGER_STATUSES", _WAYBACK_TRIGGER_STATUSES)
 
     async def test_a_rescue_reaches_neither_the_archive_nor_the_paid_reader(self, monkeypatch):
         _transport(monkeypatch, _impersonated(200, body=_prose_page(_RENDERED_PROSE)))
@@ -651,7 +649,7 @@ class TestImpersonateRungDialsTheLandingUrl:
         ctx = LadderContext(now=_NOW)
 
         with caplog.at_level(logging.WARNING, logger=_LOGGER):
-            result = await resolution_source._impersonate_rung(_URL, direct, host_sems={}, ctx=ctx)
+            result = await rungs._impersonate_rung(_URL, direct, host_sems={}, ctx=ctx)
 
         assert result is None
         assert calls == []
@@ -780,7 +778,7 @@ class TestImpersonateRungBodyClassification:
         )
         if isinstance(via_direct, classify._PendingDocument):
             via_direct = await classify._finish_document(via_direct, direct_ctx)
-        via_impersonated = await resolution_source._impersonated_body_outcome(
+        via_impersonated = await rungs._impersonated_body_outcome(
             _impersonated(200, body=body, content_type=content_type), impersonated_ctx
         )
 

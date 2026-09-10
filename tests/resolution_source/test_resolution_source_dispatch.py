@@ -10,13 +10,15 @@ from datetime import UTC, datetime, timedelta
 
 from metaculus_bot.constants import RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV
 from metaculus_bot.research import impersonated_fetch, resolution_source
-from metaculus_bot.research.fetch_ladder import guard
+from metaculus_bot.research.fetch_ladder import guard, rungs
 from metaculus_bot.research.fetch_ladder.context import LadderContext
+from metaculus_bot.research.fetch_ladder.ladder import _fetch_one
+from metaculus_bot.research.fetch_ladder.rungs import _WAYBACK_TRIGGER_STATUSES
 from metaculus_bot.research.impersonated_fetch import IMPERSONATE_TRIGGER_STATUSES
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail
 from metaculus_bot.research.rendered_fetch import HarvestedJson, RenderedPage
 from metaculus_bot.research.resolution_fetch_result import ROUTE_CAVEATS
-from metaculus_bot.research.resolution_source import _WAYBACK_TRIGGER_STATUSES, _fetch_one, resolution_source_provider
+from metaculus_bot.research.resolution_source import resolution_source_provider
 from metaculus_bot.research.wayback import wayback_snapshot_url
 from tests.resolution_source_fakes import (
     _FEED_URL,
@@ -70,7 +72,7 @@ class TestEscalationLinesArePerRung:
             await asyncio.sleep(0.02)
             return harvested
 
-        monkeypatch.setattr(resolution_source, "render_page", _slow_render)
+        monkeypatch.setattr(rungs, "render_page", _slow_render)
         session = FakeSession(
             {
                 _URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html"),
@@ -114,7 +116,7 @@ class TestEscalationLinesArePerRung:
         target = "https://cdc.example.com/data/current"
         stub = "https://cdc.example.com/surveillance"
         monkeypatch.setattr(
-            resolution_source,
+            rungs,
             "render_page",
             _fake_render(_rendered_document(f"<h1>Polling average</h1><p>{_RENDERED_PROSE}</p>"), []),
         )
@@ -149,7 +151,7 @@ class TestFastPath:
         calls: list[dict[str, object]] = []
         monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
         monkeypatch.setattr(
-            resolution_source,
+            rungs,
             "render_page",
             _fake_render(_rendered_document(f"<h1>Polling average</h1><p>{_RENDERED_PROSE}</p>"), calls),
         )
@@ -170,7 +172,7 @@ class TestFastPath:
         calls: list[dict[str, object]] = []
         monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
         monkeypatch.setattr(
-            resolution_source,
+            rungs,
             "render_page",
             _fake_render(_rendered_document(f"<h1>Polling average</h1><p>{_RENDERED_PROSE}</p>"), calls),
         )
@@ -207,11 +209,11 @@ class TestFastPath:
 
     async def test_the_cheap_rungs_still_run_on_the_fast_path(self, monkeypatch):
         """The Wayback rung and a remembered derived feed are ordinary GETs and stay in."""
-        monkeypatch.setattr(resolution_source, "_WAYBACK_TRIGGER_STATUSES", _WAYBACK_TRIGGER_STATUSES)
+        monkeypatch.setattr(rungs, "_WAYBACK_TRIGGER_STATUSES", _WAYBACK_TRIGGER_STATUSES)
         now = datetime(2026, 9, 4, tzinfo=UTC)
         snapshot = _snapshot_url(_URL, captured=now - timedelta(days=2))
         feed_page = "https://tracker.example.com/house"
-        resolution_source.derived_api.remember_endpoint(feed_page, _FEED_URL)
+        rungs.derived_api.remember_endpoint(feed_page, _FEED_URL)
         session = FakeSession(
             {
                 _URL: FakeResponse(403, body=b"", content_type="text/html"),
@@ -237,7 +239,7 @@ class TestFastPath:
         monkeypatch.setattr(impersonated_fetch, "IMPERSONATE_TRIGGER_STATUSES", IMPERSONATE_TRIGGER_STATUSES)
         calls: list[dict[str, object]] = []
         monkeypatch.setattr(
-            resolution_source,
+            rungs,
             "fetch_impersonated",
             fake_impersonated_fetch(_impersonated(200, body=_prose_page(_RENDERED_PROSE)), calls),
         )
@@ -269,7 +271,7 @@ class TestProviderLevelRungMarkers:
     async def test_the_rendered_rung_names_its_route_through_the_provider(self, monkeypatch, caplog):
         monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
         monkeypatch.setattr(
-            resolution_source,
+            rungs,
             "render_page",
             _fake_render(_rendered_document(f"<h1>Polling average</h1><p>{_RENDERED_PROSE}</p>"), []),
         )
@@ -299,7 +301,7 @@ class TestProviderLevelRungMarkers:
             html=_JS_SHELL.decode(),
             json_responses=(HarvestedJson(url=_FEED_URL, body=b'{"series":[{"v":1}]}'),),
         )
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(harvested, []))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(harvested, []))
         session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
         monkeypatch.setattr(guard, "_get_session", lambda: session)
         q = _mock_question(resolution_criteria=f"Resolves per {_URL}")
@@ -342,7 +344,7 @@ class TestProviderLevelRungMarkers:
         monkeypatch.setattr(impersonated_fetch, "IMPERSONATE_TRIGGER_STATUSES", IMPERSONATE_TRIGGER_STATUSES)
         calls: list[dict[str, object]] = []
         monkeypatch.setattr(
-            resolution_source,
+            rungs,
             "fetch_impersonated",
             fake_impersonated_fetch(_impersonated(200, body=_prose_page(_RENDERED_PROSE)), calls),
         )
@@ -395,7 +397,7 @@ class TestProviderLevelRungMarkers:
         ``test_the_per_question_paid_read_cap_binds_across_cited_urls``
         (``test_resolution_source_url_context_rung.py``)."""
         monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
-        monkeypatch.setattr(resolution_source, "_WAYBACK_TRIGGER_STATUSES", _WAYBACK_TRIGGER_STATUSES)
+        monkeypatch.setattr(rungs, "_WAYBACK_TRIGGER_STATUSES", _WAYBACK_TRIGGER_STATUSES)
         # Real now, so the capture stays inside the age bound regardless of when the suite runs;
         # the provider builds the request URL off its own `datetime.now(UTC)`, same year, so the
         # prefix-keyed handler matches.
@@ -434,7 +436,7 @@ class TestProviderLevelRungMarkers:
         nothing keeps the cited host's own status and diagnostics; only the success path reports
         the snapshot's status, because those bytes are the archive's."""
         monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
-        monkeypatch.setattr(resolution_source, "_WAYBACK_TRIGGER_STATUSES", _WAYBACK_TRIGGER_STATUSES)
+        monkeypatch.setattr(rungs, "_WAYBACK_TRIGGER_STATUSES", _WAYBACK_TRIGGER_STATUSES)
         now = datetime.now(UTC)
         snapshot = _snapshot_url(_URL, captured=now - timedelta(days=400))
         session = FakeSession(

@@ -13,9 +13,9 @@ import asyncio
 
 import pytest
 
-from metaculus_bot.research import impersonated_fetch, rendered_fetch, resolution_source
+from metaculus_bot.research import impersonated_fetch, rendered_fetch
 from metaculus_bot.research.derived_api import reset_derived_endpoints
-from metaculus_bot.research.fetch_ladder import guard
+from metaculus_bot.research.fetch_ladder import guard, rungs
 from metaculus_bot.research.http_fetch import reset_host_semaphores, reset_pdf_parse_semaphore
 from metaculus_bot.research.impersonated_fetch import reset_impersonation_memo
 from metaculus_bot.research.robots_policy import reset_robots_cache
@@ -65,7 +65,7 @@ def _decline_the_browser_rung(monkeypatch):
     where the ``continue-on-error`` Chromium install failed — which is also what keeps every
     pre-ladder expectation in this package intact, minus the one ``renderer_unavailable`` skip
     the attempt now records. Tests that exercise the rung monkeypatch
-    ``resolution_source.render_page`` again in the test body; that later patch wins.
+    ``rungs.render_page`` again in the test body; that later patch wins.
     """
 
     async def _declined(
@@ -82,7 +82,7 @@ def _decline_the_browser_rung(monkeypatch):
         # A real yield point, so the stub schedules like the browser rung it stands in for.
         await asyncio.sleep(0)
 
-    monkeypatch.setattr(resolution_source, "render_page", _declined)
+    monkeypatch.setattr(rungs, "render_page", _declined)
 
 
 @pytest.fixture(autouse=True)
@@ -107,7 +107,7 @@ def _decline_the_wayback_rung(monkeypatch):
     otherwise hide from every test in the package — in
     ``test_resolution_source_third_party_rung_ssrf.py``.
     """
-    monkeypatch.setattr(resolution_source, "_WAYBACK_TRIGGER_STATUSES", frozenset())
+    monkeypatch.setattr(rungs, "_WAYBACK_TRIGGER_STATUSES", frozenset())
 
 
 @pytest.fixture(autouse=True)
@@ -127,7 +127,7 @@ def _decline_the_impersonate_rung(monkeypatch):
     by both fetchers as a module attribute at call time, so emptying it here is one switch for the
     Tier-1 rung and for gap-fill v2's two ladders alike (``tests/test_agentic_tools.py`` flips the
     same switch). Tests that exercise the rung restore the transport's OWN constant object
-    (imported, so the two cannot drift) and patch ``resolution_source.fetch_impersonated`` with a
+    (imported, so the two cannot drift) and patch ``rungs.fetch_impersonated`` with a
     double. The trigger population is pinned in ``test_resolution_source_impersonate_rung.py`` and
     its ``ssrf_blocked`` exclusion in ``test_resolution_source_third_party_rung_ssrf.py``.
     """

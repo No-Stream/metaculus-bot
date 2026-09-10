@@ -41,8 +41,7 @@ import pytest
 from google.genai import types as genai_types
 
 from metaculus_bot.constants import RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV
-from metaculus_bot.research import resolution_source
-from metaculus_bot.research.fetch_ladder import guard
+from metaculus_bot.research.fetch_ladder import guard, rungs
 from metaculus_bot.research.http_fetch import reset_host_semaphores
 from metaculus_bot.research.impersonated_fetch import reset_impersonation_memo
 from metaculus_bot.research.resolution_fetch_result import FetchRoute, FetchStatus, RungAttempt, RungSkipReason
@@ -210,14 +209,14 @@ class TestFetchDiagnosticForcesThePaidRungOff:
             await asyncio.sleep(0)  # a real yield point, so the stub schedules like the transport
             return _impersonated(403, url=url)
 
-        monkeypatch.setattr(resolution_source, "fetch_impersonated", _still_refused)
+        monkeypatch.setattr(rungs, "fetch_impersonated", _still_refused)
 
         async def _no_browser(*args: Any, **kwargs: Any) -> None:
             del args, kwargs
             await asyncio.sleep(0)  # the browser rung's declined signal, scheduled like the render
 
-        monkeypatch.setattr(resolution_source, "render_page", _no_browser)
-        monkeypatch.setattr(resolution_source, "_WAYBACK_TRIGGER_STATUSES", frozenset())
+        monkeypatch.setattr(rungs, "render_page", _no_browser)
+        monkeypatch.setattr(rungs, "_WAYBACK_TRIGGER_STATUSES", frozenset())
         yield calls
         reset_host_semaphores()
         reset_robots_cache()

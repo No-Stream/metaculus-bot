@@ -27,10 +27,11 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS,
     RESOLUTION_SOURCE_URL_CONTEXT_MIN_BUDGET_S,
 )
-from metaculus_bot.research import resolution_source
+from metaculus_bot.research.fetch_ladder import rungs
 from metaculus_bot.research.fetch_ladder.context import LadderContext
+from metaculus_bot.research.fetch_ladder.ladder import _fetch_one
 from metaculus_bot.research.gemini_client_config import gemini_retry_sleep_allowance_s
-from metaculus_bot.research.resolution_source import _fetch_one, _rung_counts
+from metaculus_bot.research.resolution_source import _rung_counts
 from tests.resolution_source_fakes import _URL, arm_paid_rung, paid_reader, refused_page_with_robots
 
 # Comfortably above the rung's floor, so the read runs and the kwargs are observable. Chosen
@@ -73,7 +74,7 @@ class TestThePaidReadIsBoundedByTheRemainingWall:
 
         reader, _calls = paid_reader()
         arm_paid_rung(monkeypatch, reader, budget_s=_ROOMY_BUDGET_S)
-        monkeypatch.setattr(resolution_source.asyncio, "wait_for", _recording_wait_for)
+        monkeypatch.setattr(rungs.asyncio, "wait_for", _recording_wait_for)
 
         result = await _fetch_one(refused_page_with_robots(), _URL, {}, LadderContext(query="ask"))
 
@@ -128,7 +129,7 @@ class TestATimedOutReadPublishesNothing:
         reader, calls = paid_reader(raises=TimeoutError)
         arm_paid_rung(monkeypatch, reader, budget_s=_ROOMY_BUDGET_S)
 
-        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.resolution_source"):
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.fetch_ladder.rungs"):
             result = await _fetch_one(refused_page_with_robots(), _URL, {}, LadderContext(query="ask"))
 
         assert len(calls) == 1

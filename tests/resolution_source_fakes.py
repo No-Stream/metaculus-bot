@@ -28,8 +28,7 @@ from unittest.mock import MagicMock
 from urllib.parse import urlparse
 
 from metaculus_bot.constants import GOOGLE_API_KEY_ENV, RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV
-from metaculus_bot.research import resolution_source
-from metaculus_bot.research.fetch_ladder import classify, context
+from metaculus_bot.research.fetch_ladder import classify, context, rungs
 from metaculus_bot.research.impersonated_fetch import ImpersonatedResponse
 from metaculus_bot.research.rendered_fetch import RenderedPage
 
@@ -467,7 +466,7 @@ def arm_paid_rung(monkeypatch: Any, reader: Any, *, budget_s: float | None = Non
     """
     monkeypatch.setenv(RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV, "true")
     monkeypatch.setenv(GOOGLE_API_KEY_ENV, "key")
-    monkeypatch.setattr(resolution_source, "run_url_context_read", reader)
+    monkeypatch.setattr(rungs, "run_url_context_read", reader)
     if budget_s is not None:
         monkeypatch.setattr(context.LadderContext, "rung_budget_s", lambda self: budget_s)
 
@@ -491,7 +490,7 @@ def refused_page_with_robots(*, robots: bytes = ROBOTS_ALLOW_ALL, extra: _Handle
 # --- Impersonated-retry scaffolding (shared by the Tier-1 rung, SSRF, dispatch and fetch modules
 # and by gap-fill v2's `tests/test_agentic_tools.py`) ---
 # The transport is `research/impersonated_fetch.py`; every test patches its own ladder's import
-# seam (`resolution_source.fetch_impersonated` for Tier 1, `agentic_tools.fetch_impersonated` for
+# seam (`fetch_ladder.rungs.fetch_impersonated` for Tier 1, `agentic_tools.fetch_impersonated` for
 # gap-fill v2) with the double below rather than the transport's own session, so the suite's
 # `_block_native_egress` guard stays armed underneath it.
 

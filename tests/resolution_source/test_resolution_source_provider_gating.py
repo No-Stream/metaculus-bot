@@ -16,14 +16,10 @@ from unittest.mock import AsyncMock, patch
 
 from metaculus_bot.research import resolution_source
 from metaculus_bot.research.fetch_ladder import guard
+from metaculus_bot.research.fetch_ladder.ladder import _fetch_one
 from metaculus_bot.research.http_fetch import FilteringResolver
 from metaculus_bot.research.provider_diagnostics import _counts_suffix, pop_provider_detail
-from metaculus_bot.research.resolution_source import (
-    FetchResult,
-    _fetch_one,
-    _fetch_result_sources,
-    resolution_source_provider,
-)
+from metaculus_bot.research.resolution_source import FetchResult, _fetch_result_sources, resolution_source_provider
 from tests.resolution_source_fakes import (
     FakeResponse,
     FakeSession,

@@ -26,17 +26,17 @@ from typing import get_args
 
 import pytest
 
-from metaculus_bot.research import impersonated_fetch, resolution_source
-from metaculus_bot.research.fetch_ladder import guard
+from metaculus_bot.research import impersonated_fetch
+from metaculus_bot.research.fetch_ladder import guard, rungs
 from metaculus_bot.research.fetch_ladder.context import LadderContext
-from metaculus_bot.research.impersonated_fetch import IMPERSONATE_TRIGGER_STATUSES
-from metaculus_bot.research.resolution_fetch_result import FetchResult, FetchStatus
-from metaculus_bot.research.resolution_source import (
+from metaculus_bot.research.fetch_ladder.ladder import _fetch_one
+from metaculus_bot.research.fetch_ladder.rungs import (
     _URL_CONTEXT_TRIGGER_STATUSES,
     _WAYBACK_TRIGGER_STATUSES,
-    _fetch_one,
     _impersonate_rung_applies,
 )
+from metaculus_bot.research.impersonated_fetch import IMPERSONATE_TRIGGER_STATUSES
+from metaculus_bot.research.resolution_fetch_result import FetchResult, FetchStatus
 from tests.resolution_source_fakes import (
     FakeResponse,
     FakeSession,
@@ -88,7 +88,7 @@ class TestTheArchiveNeverFetchesAUrlWeRefused:
         constant OBJECT is restored rather than a copy, so the population asserted on here cannot
         drift from the one prod uses.
         """
-        monkeypatch.setattr(resolution_source, "_WAYBACK_TRIGGER_STATUSES", _WAYBACK_TRIGGER_STATUSES)
+        monkeypatch.setattr(rungs, "_WAYBACK_TRIGGER_STATUSES", _WAYBACK_TRIGGER_STATUSES)
 
     def _session(self) -> FakeSession:
         """A session that WOULD serve the archive, keyed by prefix so any snapshot URL matches.
@@ -175,7 +175,7 @@ class TestTheImpersonatedRetryNeverDialsAUrlWeRefused:
     async def test_a_refused_url_is_never_retried_under_impersonation(self, url, monkeypatch):
         calls: list[dict[str, object]] = []
         monkeypatch.setattr(
-            resolution_source,
+            rungs,
             "fetch_impersonated",
             fake_impersonated_fetch(_impersonated(200, body=_prose_page("Whatever the host served.")), calls),
         )

@@ -7,11 +7,14 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from metaculus_bot.research import resolution_presentation, resolution_source
+from metaculus_bot.research import resolution_presentation
+from metaculus_bot.research.fetch_ladder import rungs
 from metaculus_bot.research.fetch_ladder.context import LadderContext, QuestionRungBudget
+from metaculus_bot.research.fetch_ladder.ladder import _fetch_one
+from metaculus_bot.research.fetch_ladder.rungs import _WAYBACK_TRIGGER_STATUSES
 from metaculus_bot.research.resolution_fetch_result import ROUTE_CAVEATS
 from metaculus_bot.research.resolution_presentation import format_resolution_sections
-from metaculus_bot.research.resolution_source import _WAYBACK_TRIGGER_STATUSES, _fetch_one, _rung_counts
+from metaculus_bot.research.resolution_source import _rung_counts
 from metaculus_bot.research.wayback import wayback_snapshot_url
 from tests.resolution_source_fakes import (
     _JS_SHELL,
@@ -50,7 +53,7 @@ class TestWaybackRung:
         The module's constant OBJECT is restored rather than a copy, so the trigger population
         these tests assert on cannot drift from the one prod uses.
         """
-        monkeypatch.setattr(resolution_source, "_WAYBACK_TRIGGER_STATUSES", _WAYBACK_TRIGGER_STATUSES)
+        monkeypatch.setattr(rungs, "_WAYBACK_TRIGGER_STATUSES", _WAYBACK_TRIGGER_STATUSES)
 
     def _ctx(self) -> LadderContext:
         return LadderContext(now=self._NOW)
@@ -111,7 +114,7 @@ class TestWaybackRung:
     async def test_a_js_wall_never_reaches_the_archive(self, monkeypatch):
         """The archive stores the unrendered shell: it rescued 0 of 8 archived walls while the
         browser rung rescued 6."""
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(None, []))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(None, []))
         session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
 
         result = await _fetch_one(session, _URL, {}, self._ctx())
@@ -257,7 +260,7 @@ class TestWaybackRung:
             }
         )
 
-        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.fetch_ladder.rungs"):
             result = await _fetch_one(session, _URL, {}, self._ctx())
 
         assert result.status == "blocked"
@@ -341,7 +344,7 @@ class TestWaybackRung:
             archived=FakeResponse(200, body=_JS_SHELL, content_type="text/html"),
         )
 
-        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.fetch_ladder.rungs"):
             result = await _fetch_one(session, _URL, {}, self._ctx())
 
         assert result.status == "blocked"

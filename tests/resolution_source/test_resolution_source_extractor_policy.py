@@ -21,19 +21,14 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from metaculus_bot.research import resolution_source
-from metaculus_bot.research.fetch_ladder import classify, guard
+from metaculus_bot.research.fetch_ladder import classify, guard, rungs
 from metaculus_bot.research.fetch_ladder.classify import content_share, looks_like_page_chrome
 from metaculus_bot.research.fetch_ladder.context import LadderContext
+from metaculus_bot.research.fetch_ladder.ladder import _fetch_one
+from metaculus_bot.research.fetch_ladder.rungs import _WAYBACK_TRIGGER_STATUSES, _rendered_rung_applies
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail
 from metaculus_bot.research.rendered_fetch import RenderedPage
-from metaculus_bot.research.resolution_source import (
-    _WAYBACK_TRIGGER_STATUSES,
-    _fetch_one,
-    _rendered_rung_applies,
-    _rung_counts,
-    resolution_source_provider,
-)
+from metaculus_bot.research.resolution_source import _rung_counts, resolution_source_provider
 from metaculus_bot.research.wayback import wayback_snapshot_url
 from tests.resolution_source_fakes import (
     _JS_SHELL,
@@ -193,7 +188,7 @@ class TestChromeShapedPages:
             await asyncio.sleep(0)
             return RenderedPage(url=url, content_type="text/html", html=_document(f"<p>{_RENDERED_PROSE}</p>").decode())
 
-        monkeypatch.setattr(resolution_source, "render_page", _render)
+        monkeypatch.setattr(rungs, "render_page", _render)
         direct_only = await classify._classify_html_body(_MENU_TREE, _URL, "text/html", http_status=200)
         assert _rendered_rung_applies(direct_only.result)
         session = FakeSession({_URL: FakeResponse(200, body=_MENU_TREE)})
@@ -369,7 +364,7 @@ class TestThePolicyTravelsWithEveryRoute:
             await asyncio.sleep(0)
             return RenderedPage(url=url, content_type="text/html", html=_MENU_TREE.decode())
 
-        monkeypatch.setattr(resolution_source, "render_page", _render)
+        monkeypatch.setattr(rungs, "render_page", _render)
         session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
 
         result = await _fetch_one(session, _URL, {})
@@ -387,7 +382,7 @@ class TestThePolicyTravelsWithEveryRoute:
         belongs to the result the rung serves. Without the carry, a rescue inside an archived body
         publishes its text while `precision_fallback_rescues` reads zero, which is the count the
         policy's own calibration is read back on."""
-        monkeypatch.setattr(resolution_source, "_WAYBACK_TRIGGER_STATUSES", _WAYBACK_TRIGGER_STATUSES)
+        monkeypatch.setattr(rungs, "_WAYBACK_TRIGGER_STATUSES", _WAYBACK_TRIGGER_STATUSES)
         monkeypatch.setattr(classify, "_extract_main_text", _fake_extractor(_MEMBER_DROPDOWN, _STATUS_CARD))
         # A past year, so a rung reading its own clock instead of the fetch's would ask the archive
         # for a URL no handler serves (the same reason `TestWaybackRung._NOW` is dated back).

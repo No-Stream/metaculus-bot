@@ -34,6 +34,7 @@ from metaculus_bot.research.resolution_fetch_result import (
     RungAttempt,
     http_failure_class,
     server_header_token,
+    vacuous_body_status,
 )
 from metaculus_bot.research.resolution_presentation import format_resolution_sections
 from metaculus_bot.research.resolution_source import (
@@ -45,7 +46,6 @@ from metaculus_bot.research.resolution_source import (
     looks_like_csv_rows,
     select_fetchable_urls,
     strip_markdown_escapes,
-    vacuous_body_status,
 )
 from metaculus_bot.research.wayback import WaybackSnapshot, wayback_lead
 from tests.resolution_source_fakes import cdc_aria_stat_block_page, cp1252_aria_stat_block_page
