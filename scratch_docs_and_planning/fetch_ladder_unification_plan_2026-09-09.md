@@ -237,22 +237,26 @@ The operator resolved all three the day the plan was written, so none of them bl
 
 The page digest, as agreed. A new paid support role, `page_digest_extractor`, reads a long page's
 text plus the question (and, in the loop, the driver's ask) and returns the verbatim passages that
-bear on the question, in ranked order. Its slug lives in a support-role constant,
-`PAGE_DIGEST_EXTRACTOR_MODEL` in `constants.py`, one of the two files
-`tests/test_model_name_locations.py` allows a model id in; the candidates are
-`google/gemini-3.8-flash` and `openai/gpt-5.6-luna`, and the roster rule says pick the live one at
-build time. Every call is tagged `role=page_digest_extractor`, so it lands in the
-`CREDIT_ROLE_SPEND` ledger like every other role. The grounding check is literal: a returned
+bear on the question, in ranked order. The operator chose the model on 2026-09-09:
+`openai/gpt-5.6-luna` at reasoning effort `medium` ("luna is dirt cheap and medium will still be
+fast enough"), with `google/gemini-3.8-flash` as the noted alternative. Both halves of that choice
+are constants in `constants.py`, `PAGE_DIGEST_EXTRACTOR_MODEL` and `PAGE_DIGEST_EXTRACTOR_EFFORT`,
+since that file is one of the two `tests/test_model_name_locations.py` allows a model id in. Every
+call is tagged `role=page_digest_extractor`, so it lands in the `CREDIT_ROLE_SPEND` ledger like
+every other role. The grounding check is the hallucination guard, and it is literal: a returned
 passage is accepted only when it is a substring of the page text after whitespace normalisation,
 and a passage that fails is dropped and counted. The page's opening passage is always kept ahead of
 the ranked ones, so a reader still sees what the page is.
 
 BM25 keeps two jobs. It is the free pre-filter that cuts a very long page to a few thousand tokens
 before the model reads it, and it is the fallback when the call fails, returns nothing grounded, or
-exceeds its per-call budget inside the 45 s wall. That fallback path is today's behaviour, which is
-what makes the timing change strictly safer. Cost is fractions of a cent per long page, and about
-28 percent of the loop's plain reads hit the length window per the inventory. Three optional
-tail-keyed fields ride the fetch marker: `passages_returned`, `passages_grounded`, `fallback_used`.
+exceeds its per-call budget inside the 45 s wall. Set that per-call budget from luna-medium's
+measured latency in today's probe, about 17 to 33 s of wall at medium effort on 40k-token prompts,
+which is why the pre-filter must cut the page first for the call to fit inside the fetch wall. That
+fallback path is today's behaviour, which is what makes the timing change strictly safer. Cost is
+fractions of a cent per long page, and about 28 percent of the loop's plain reads hit the length
+window per the inventory. Three optional tail-keyed fields ride the fetch marker:
+`passages_returned`, `passages_grounded`, `fallback_used`.
 
 ## Constraints from the 2026-09-09 rung ports
 
