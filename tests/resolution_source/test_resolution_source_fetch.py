@@ -1346,7 +1346,7 @@ class TestMetaRefreshHop:
         )
         spent = LadderContext(started=time.monotonic() - resolution_source.RESOLUTION_SOURCE_WALL_TIMEOUT)
 
-        with caplog.at_level("WARNING", logger="metaculus_bot.research.resolution_source"):
+        with caplog.at_level("WARNING", logger="metaculus_bot.research.fetch_ladder.context"):
             result = await _fetch_one(session, "https://cdc.example.com/surveillance", {}, spent)
 
         assert result.status == "js_wall"
@@ -1419,7 +1419,7 @@ class TestTheHopRefusalPolicy:
         landed = "https://www.tracker.example.com/senate"
         direct = FetchResult(url=landed, status="js_wall", text="", http_status=200, content_type="text/html")
 
-        with caplog.at_level("WARNING", logger="metaculus_bot.research.resolution_source"):
+        with caplog.at_level("WARNING", logger="metaculus_bot.research.fetch_ladder.guard"):
             result = await rungs._rendered_rung(_URL, direct, {}, LadderContext())
 
         assert result is None
@@ -1442,7 +1442,7 @@ class TestTheHopRefusalPolicy:
         monkeypatch.setattr(guard, "_hop_refusal", _refuse)
         allowed_landing = "https://www.tracker.example.com/senate"
 
-        with caplog.at_level("WARNING", logger="metaculus_bot.research.resolution_source"):
+        with caplog.at_level("WARNING", logger="metaculus_bot.research.fetch_ladder.guard"):
             same = await guard._landing_refused(_URL, _URL, action="rendering")
             allowed = await guard._landing_refused(allowed_landing, _URL, action="rendering")
             refused = await guard._landing_refused("http://10.0.0.8/status", _URL, action="re-dialing")
@@ -1612,7 +1612,7 @@ class TestLocalPdfReading:
             query="hospitalizations", started=time.monotonic() - resolution_source.RESOLUTION_SOURCE_WALL_TIMEOUT
         )
 
-        with caplog.at_level("WARNING", logger="metaculus_bot.research.resolution_source"):
+        with caplog.at_level("WARNING", logger="metaculus_bot.research.fetch_ladder.context"):
             result = await _fetch_one(self._session(), "https://cdc.example.com/report.pdf", {}, spent)
 
         assert result.status == "unsupported_type"
@@ -1768,7 +1768,7 @@ class TestPdfParseGate:
         )
         url = "https://busy.example.com/report.pdf"
 
-        with caplog.at_level("WARNING", logger="metaculus_bot.research.resolution_source"):
+        with caplog.at_level("WARNING", logger="metaculus_bot.research.fetch_ladder.classify"):
             result = await _fetch_one(self._session(url), url, {}, spent)
 
         assert result.status == "unsupported_type"

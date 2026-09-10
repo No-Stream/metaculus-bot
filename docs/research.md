@@ -1312,7 +1312,9 @@ the cited URL, which is what the escalation line names. One accounting consequen
 2026-09-04: on a `route=rendered` rescue the `FetchResult.url`, which is the `url=` of the
 `RESOLUTION_SOURCE_FETCH` line and the published `### <url>` heading, is that landing URL, while the
 `RESOLUTION_SOURCE_ESCALATION` line's `url=` is the cited URL, so a per-URL join between the two
-lines must key on the escalation line; before that boundary the two agreed. The transport's own post-gate need is
+lines must key on the escalation line; before that boundary the two agreed. A rescued result keeps the DIRECT
+fetch's `http_status`, which is the `http=` on the fetch line: Chromium reports no status on a salvaged DOM, and
+the fact worth archiving is that the page answered 200 and carried nothing readable. The transport's own post-gate need is
 higher: `RENDER_MIN_GOTO_MS` (5 s of navigation) plus `RENDER_POST_GOTO_TAIL_MS` (the 2 s settle
 and the 5 s DOM-read bound, reserved so a goto that runs its budget out can still be salvaged)
 plus `RENDER_EXIT_RESERVE_MS` (3 s, described below), 15 s in all, so a render admitted with 12 to

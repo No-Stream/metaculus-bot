@@ -32,9 +32,7 @@ from tests.resolution_source_fakes import (
     _rendered_document,
 )
 
-# Above RESOLUTION_SOURCE_JS_WALL_MIN_CHARS (100) and below the chrome floor (400): the band
-# where a 200 carries real prose that is nothing but page furniture, which is what
-# `no_resolving_content` / `thin_page` means and what the rendered rung's second trigger is.
+# In the band between the JS-wall floor (100) and the chrome floor (400): the `thin_page` trigger.
 _TAB_LIST_CHROME = (
     "Nationwide. Midwest. Northeast. South. West. Select a region above to load its series. "
     "Data updates weekly. About the data. Methodology. Contact us. Terms of use."
@@ -64,8 +62,7 @@ def _assert_the_direct_result_stands_after_a_cut(result: FetchResult, skipped_re
     assert result.route == "direct"
     attempts = [a for a in result.rung_attempts if a.rung == "rendered"]
     assert [a.skipped_reason for a in attempts] == [skipped_reason]
-    # The timed-out memo is the TRANSPORT's, written only when a browser actually ran (pinned in
-    # tests/test_rendered_fetch.py); the rung never writes the rendered-to-nothing memo on a cut.
+    # The memo is the transport's, written only when a browser ran (pinned in tests/test_rendered_fetch.py).
     assert rendered_fetch.rendered_to_nothing(result.url, memo_scope="resolution_source") is False
     assert rendered_fetch._PLAYWRIGHT_WARNED is False
     counts = _rung_counts([result])
@@ -106,9 +103,7 @@ class TestRenderedRungTriggers:
         assert result.status == "success"
         assert result.route == "rendered"
         assert "Nebraska Senate polling average" in result.text
-        # The record keeps the direct fetch's HTTP status: the page answered 200 and carried
-        # no text, which is the fact worth archiving. Chromium reports no status on a salvaged
-        # DOM, so borrowing its status would sometimes be None.
+        # The direct fetch's status is kept because Chromium reports none on a salvaged DOM (docs/research.md).
         assert result.http_status == 200
         assert len(calls) == 1
 
@@ -502,7 +497,7 @@ class TestRenderedRungRendersTheFinalUrl:
         direct = FetchResult(url=landed, status="js_wall", text="", http_status=200, content_type="text/html")
         ctx = LadderContext()
 
-        with caplog.at_level("WARNING", logger="metaculus_bot.research.resolution_source"):
+        with caplog.at_level("WARNING", logger="metaculus_bot.research.fetch_ladder.guard"):
             result = await rungs._rendered_rung(_URL, direct, {}, ctx)
 
         assert result is None

@@ -1721,6 +1721,9 @@ already covers the API-backed financial subset.
 
 ### Resolution-source fetcher: Tier-2 LLM fetch + oversized-source summarization (added 2026-07-09)
 
+Feasibility probe (2026-07-08): 75% of questions cite an explicit source URL and ~62.5% of those
+are recoverable by a plain browser-headers fetch, which is where the Tier-1 target below comes from.
+
 Tier-1 deterministic fetcher shipped `66e31c0` (`research/resolution_source.py` +
 `research/http_fetch.py`, `RESOLUTION_SOURCE_ENABLED`). Smoke-validated on 40 cached questions
 (`scratch/resolution_source_smoke_2026-07-09/REPORT.md`): 24/40 (60%) get a non-empty snapshot vs

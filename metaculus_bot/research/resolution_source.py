@@ -1,126 +1,41 @@
-"""Resolution-source fetcher: Tier-1 cited pages + a Tier-2 Datawrapper hop.
+"""The resolution-source provider: an adapter over the shared fetch ladder.
 
-Fetches the URL(s) explicitly cited in a Metaculus question's resolution
-criteria (or fine print), extracts main content with trafilatura, and returns
-a compact markdown section that every forecaster reads as the ground truth
-the question will be graded against.
+Reads the pages a question names as its own grading source, so every forecaster sees the
+ground truth the question will be scored against. ``select_fetchable_urls`` pulls the cited
+URLs out of the resolution criteria and the fine print, drops the ones that belong to another
+provider or point back at the question platform, and caps what is left at
+``RESOLUTION_SOURCE_MAX_URLS``. ``fetch_resolution_sources`` then fans one task per URL out to
+``fetch_ladder.ladder.fetch_url`` under ``RESOLUTION_SOURCE_POLICY``, each with its own
+``LadderContext`` and all of them sharing one aiohttp session, the process-wide per-host
+politeness map and one per-question rung budget. ``_document_query`` is the text a cited PDF's
+passages are ranked against, the question's title plus its resolution criteria. What comes back
+is rendered by ``resolution_presentation.format_resolution_sections``; the orchestrator prepends
+the ``## Resolution Source Snapshot`` header.
 
-Tier 1 is plain HTTP with browser-like headers, no LLM calls, no retries. When it
-cannot read a page, an ESCALATION LADDER runs (`_escalate_unresolved`), each rung
-self-bounded against the same provider wall and each returning a result that went
-through the SAME classification path (`_classify_html_body`), so a rescued page is
-indistinguishable downstream from a directly-fetched one. The `route` on every
-result says which rung produced it. Heavy anti-bot on a host that refuses our
-address is the one shape no rung here fixes (see `FetchStatus` — `blocked` /
-`js_wall` / `no_resolving_content` results are retained in the returned list as
-that seam).
+Two hard gates, both in the factory. ``is_benchmarking=True`` returns ``""``, because a page read
+today post-dates any backtest window, the same leakage guard the prediction-market provider
+carries. And ``RESOLUTION_SOURCE_ENABLED`` must be truthy.
 
-A 200-OK page whose extraction is under `RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS`
-is page CHROME and is withheld as `no_resolving_content` rather than published as
-grading evidence. `status_reason` says which shape: `embed_shell` when the raw
-HTML names a routeless data embed (Infogram / Flourish / Tableau), so we know the
-numbers exist and we have no route to them (qids 44554/44556, whose tracker
-rendered 2.9k chars of forecast background as "primary grading evidence" with
-zero polling numbers in it); `no_matching_passage` when a cited document read in full
-discusses nothing the question asks about, the one shape that is a document rather than
-a page and the one the paid rung is not allowed to re-read; `thin_page` otherwise
-(q45088's 127-char SPA tab list, q45215's 385 chars of region names — five such renders
-in the 2026-09-01 round, none naming a provider, which is why the floor is no longer
-gated on one).
-A page ABOVE the floor keeps its text when that text is content-shaped, plus a
-one-line disclosure where an embed hid figures from it. Over the floor on short lines
-alone (`content_share` under `RESOLUTION_SOURCE_CONTENT_SHARE_MIN`: a menu tree, a
-member dropdown) it is still chrome; the same body is re-extracted under
-`favor_precision`, and the page is withheld as `thin_page` when that fails too
-(`_extract_page_text`).
+Every fetch runs inside one ``asyncio.wait_for`` on ``RESOLUTION_SOURCE_WALL_TIMEOUT``, and that
+wall throws away every page that already fetched when it fires. That is why each rung of the
+ladder bounds itself against the same clock rather than trusting the outer wall to cut it, and
+why ``fast_path``, the question's thin-window mode, rides every context to make the two expensive
+rungs decline instead of dropping this provider, which is cheap and hard-capped.
 
-Three free rungs sit under Tier 1, all deterministic and none of them a model call.
-An ARIA-TABLE REWRITE runs before every extraction (`rewrite_aria_tables`): a
-`<div role="table">` stat block is a real table trafilatura cannot see, and cdc.gov's
-cyclosporiasis block published as an unlabelled "17,180 / 2" with its hospitalization
-count missing entirely. A META-REFRESH HOP follows the redirect no status announces —
-the same host's surveillance URLs answer 200 with a ~300-byte stub carrying only
-`<meta http-equiv="refresh">`, which read as a JS wall — returning the target as the
-next hop so it re-enters this same classification path under the shared `MAX_REDIRECTS`
-cap and the same per-hop SSRF checks. A cited PDF is READ LOCALLY
-(`research/document_text.py`, pypdf + BM25 passage selection against the question's
-title and resolution criteria) instead of being dropped unread; bytes we read and could
-not turn into text are `unreadable_document`, which is a different fact from
-`unsupported_type` and the only one a paid document read could ever rescue. Each rung is
-self-bounding against the provider wall the way the Datawrapper hop is, because the
-outer `asyncio.wait_for` discards every page that already fetched when it fires.
+The Datawrapper dataset hop is this module's own second network phase inside that same wall
+rather than a ladder rung. Poll trackers lock their resolving daily series inside a chart iframe
+that trafilatura drops, so a fetched page whose raw HTML embeds one earns a fetch of that chart's
+live version-free CSV, on whatever wall the page phase left behind.
+``research/resolution_datawrapper.py`` owns that hop's classification and freshness rules.
 
-The IMPERSONATED RETRY (`_impersonate_rung`, transport `research/impersonated_fetch.py`)
-is the one rung that leaves aiohttp without leaving our address: a page that answered
-our client 403 is re-dialed once through libcurl presenting a real Chrome TLS and HTTP/2
-fingerprint, and the body re-enters the same classification path (HTML, a document, or
-the raw text family). Measured 2026-09-04 from a GitHub Actions runner: four of the four
-Akamai-fronted federal hosts that refused our aiohttp client (bls.gov, cdc.gov,
-fsis.usda.gov, one of them a PDF) answered the impersonated GET 200, so that refusal is a
-fingerprint verdict rather than an egress-IP one; the hosts that refused both stay the
-Wayback and paid rungs' population. It sits between the direct fetch and the archive so a
-live page beats a stale capture, and before the paid reader so a rescue saves the read.
-Free, 403-only, memoized per host for the run, and behind a default-on kill switch
-(`RESOLUTION_SOURCE_IMPERSONATE_ENABLED`). libcurl never touches aiohttp's connect-time
-resolver, so the transport carries the SSRF invariants itself (a pre-resolved, pinned
-connection per hop; every redirect re-guarded under the shared `MAX_REDIRECTS` cap).
+Telemetry is emitted here, at the per-question aggregation point, because that is where the
+question id exists: one ``RESOLUTION_SOURCE_FETCH`` line per fetched URL, one
+``RESOLUTION_SOURCE_ESCALATION`` line per rung that fired, the per-rung counts into the
+provider-diagnostics block, and the results themselves into the research archive.
 
-A rung that leaves our own aiohttp client AND our address is the browser: a page that
-answered 200 with nothing
-readable (`js_wall`, or the `thin_page` shape of `no_resolving_content`) is RENDERED
-in headless Chromium (`research/rendered_fetch.py`, the same transport and the same
-process-global Semaphore(2) launch cap the gap-fill v2 fetch ladder uses) and the DOM
-re-enters the classification path. Measured 2026-09-03: Chromium rescued 6 of the 8
-archived JS walls that still failed from a residential address. It runs from the
-escalation ladder rather than inside the response context, so no aiohttp response is
-held open across it — but it DOES re-acquire the same loop-wide per-host gate and hold
-it across the launch-cap queue, the launch, the navigation, the settle and the teardown,
-because Chromium dials that host itself (FUTURE.md item 5 carries the amplifier). The
-transport recomputes the navigation budget once both gates are held, so a render that
-queued behind them navigates on what is actually left or declines before a launch.
-
-Inline chart configs are read straight out of the page we already hold
-(`resolution_chart_data.render_inline_chart_data`): a Highcharts `data-chart`
-attribute or `Highcharts.chart(...)` call carries its series as JSON, which
-trafilatura drops at every setting. Zero LLM calls, no second request. It runs on
-every HTML page, not only thin ones, because q43949's resolving page extracted
-~80k chars of prose carrying none of the resolving figures while its annual
-series — ending in the live count the question was graded on — sat in the
-attribute. Chart data counts as CONTENT, so it also rescues a page the chrome
-floor would otherwise withhold.
-
-Tier 2 (2026-08, qids 44858/44841): when a fetched page's RAW HTML embeds a
-Datawrapper chart, fetch that chart's live "Get the data" CSV — poll trackers
-lock their resolving daily series inside these iframes, which trafilatura
-drops at every setting. The hop uses ONLY the version-free
-`static.dwcdn.net/data/<chart_id>.csv` route: the page-pinned
-`datawrapper.dwcdn.net/<id>/<version>/dataset.csv` form serves months-stale
-snapshots as HTTP 200 (the naive fix the 2026-08-24 verifications refuted).
-A `Last-Modified` freshness guard withholds any dataset older than
-`RESOLUTION_SOURCE_DATAWRAPPER_MAX_AGE_DAYS` (or undatable) as `stale_data`
-rather than serving stale data as live.
-
-Success means CONTENT, on every raw-body branch (Tier-1 JSON/text/CSV and the
-Tier-2 dataset alike): a body that is empty, undecodable, or — for a dataset —
-not row-shaped gets a failure status via `vacuous_body_status`, never
-`success`. An empty 200 body used to render an empty section under the "primary
-grading evidence" caveat, suppress the all-failed notice for its siblings, and
-report `ok` to provider diagnostics.
-
-Design anchors:
-
-- 2026-07-08 feasibility probe found 75% of questions cite an explicit source
-  URL and ~62.5% of them are recoverable by a plain browser-headers fetch.
-- Extraction is trafilatura in a thread (`asyncio.to_thread`) — the parse is
-  CPU-bound sync C code.
-- Per-host politeness: one `asyncio.Semaphore(1)` per netloc, acquired around
-  each redirect hop's GET and keyed on THAT hop's host — so chains converging
-  on one final host still serialize there. Distinct hosts run concurrently up
-  to the connector limit. The map is PROCESS-WIDE (`http_fetch.host_semaphores`),
-  so the gate holds across the several questions researching at once; it used to
-  be rebuilt per provider call, which gave each question its own gate.
-- Char caps apply to RAW (non-LLM-processed) content only; the LLM-emitted
-  research bundle is never truncated (see the resolution-source plan).
+The fetch itself, its escalation rungs, the body classification and the outbound guard all
+live in ``research/fetch_ladder/``. Why the rungs sit in that order and what each policy knob
+buys: ``docs/architecture.md``, "The shared fetch ladder".
 """
 
 from __future__ import annotations
@@ -266,7 +181,7 @@ async def fetch_resolution_sources(urls: list[str], *, query: str = "", fast_pat
     (:func:`http_fetch.host_semaphores`, scoped to the running loop) rather than a
     fresh dict per call: with one map per call, six questions fetching the same host
     concurrently each held their own semaphore and hit it six times at once. Every
-    ``_fetch_one`` task shares it, so each hop contends on ITS host's semaphore —
+    ``ladder.fetch_url`` task shares it, so each hop contends on ITS host's semaphore —
     chains from different initial hosts that converge on one final host still
     serialize there; the Tier-2 dataset fetches contend on the dwcdn host's semaphore
     the same way. Session is closed in ``finally``.
@@ -401,7 +316,7 @@ def _log_fetch_outcome_markers(qid: int | None, results: list[FetchResult]) -> N
 
     Emitted here, at the per-question aggregation point, because that is where the
     question id exists — threading it down through ``fetch_resolution_sources`` /
-    ``_fetch_one`` / the response-classification helpers would change the signature
+    ``ladder._fetch_one`` / the ladder's classification helpers would change the signature
     of the whole monkeypatched fetch surface to carry a value only a log line reads.
 
     Tier-2 dataset hops ride the same marker and are identified by their url, which
@@ -571,7 +486,7 @@ def _rung_counts(results: list[FetchResult]) -> dict[str, int]:
         # line-shape metric withheld an HTML extraction of the URL somewhere on its ladder — the
         # final result's own (including a chart-rescued page, whose chart block still published
         # without that text) or the direct fetch's, carried onto the rung result that replaced it
-        # (`_fetch_one`). `chrome_metric_withholds_rescued`: the subset a rung past the direct
+        # (`ladder._fetch_one`). `chrome_metric_withholds_rescued`: the subset a rung past the direct
         # fetch then served (`route` is not `direct` and the result is a success) — the policy's
         # headline win, a menu tree withheld and the price table rendered, which summed off the
         # rescue's own flag alone reached neither key. `precision_fallback_rescues`: the published
