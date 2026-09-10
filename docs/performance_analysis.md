@@ -459,10 +459,12 @@ and the treated and comparison eras are whatever values that field holds. The pa
 the coarse eras there; sub-eras go to their own fields (`triple_subera` holds
 `triple_pre_market` / `triple_ranked_market`, `triple_subera_fine` holds `ranked_markets`,
 `post_dry_key_fix`, `ft_0292` and so on), so a sub-era arm needs `--era-field <field>`, which
-names the field both arms are selected on and is echoed in the report header. An arm value that
-the named field never carries fails shut with "no scoreable records" rather than running on an
-empty arm. Every number is spot peer through `platform_scores.spot_peer_score`. The report
-prints four blocks:
+names the field both arms are selected on and is echoed in the report header. An arm with no
+scoreable records, whether a value the field never carries or a sub-era none of whose questions
+has resolved yet, is a clean non-zero exit rather than a bootstrap over an empty array: the
+message names the arm and lists the values the field does hold, so a mistyped era name is
+diagnosed on the spot, and the same condition raises `EmptyArmError` in the library. Every number
+is spot peer through `platform_scores.spot_peer_score`. The report prints four blocks:
 
 - **Arms.** n, effective n (distinct UTC resolution days), exclusions, unscoreable records
   (no spot peer, submit time or resolve time), spot mean and median, fraction negative, lag
@@ -555,10 +557,27 @@ round's "symmetric exclusions" row). The per-type horizon-matched rows match the
 against all 184 is +11.04 on both.
 
 **Retarget the comparison each season.** The summer six-model arm is nearly exhausted; from
-the next round the interesting cut is the September `fall_config` merges against the
-`ranked_markets` sub-era (or the whole `triple_era`). Once the tagging pass writes `fall_config`
-into `triple_subera_fine`, that read is
-`--era-field triple_subera_fine --treated-era fall_config --comparison-era ranked_markets`.
+the next round the interesting cut is the fall configuration against the `ranked_markets`
+sub-era (or the whole `triple_era`). The 2026-09-09 round's tagging pass (`era_tags.py` in the
+round directory, a data table of `(tag, opens at)` rows keyed on merge-to-main committer
+timestamps) writes `fall_config` into `triple_subera_fine` for every record submitted at or after
+2026-09-05T01:59:24Z, the merge of PR #66. It is ONE bucket for the three September merges (PRs
+#66, #67 and #68), because no question was forecast between the first and the last of them, so a
+finer split could never hold data; a first cut that split the three would have tagged every fall
+question `fall_target` and left the preregistered `fall_config` arm empty for good. The cost-pass
+merge, once on `main`, is one appended row in that table and opens the next fine sub-era inside
+the same coarse `triple_fall_config` bucket; the preregistration names which fine sub-era is the
+primary arm. The preregistered read (`scratch_docs_and_planning/fall_2026_preregistration.md`) is
+
+```bash
+uv run python -m metaculus_bot.performance_analysis.era_gap --dataset <round>/perf_all_tagged.json \
+    --era-field triple_subera_fine --treated-era fall_config --comparison-era ranked_markets \
+    --strict --clusters <round>/cluster_structure.json
+```
+
+Run before the first `fall_config` question resolves (on 2026-09-09 six were forecast and none had
+closed) it exits with `era arm 'fall_config' has no scoreable records; nothing to compare yet` plus
+the field's value counts, and prints no report.
 
 ## The clip-threshold sweep
 

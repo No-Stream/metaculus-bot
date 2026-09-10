@@ -74,10 +74,13 @@ verdict reads the cluster-bootstrap interval with that file passed as `--cluster
 The score gap (a) is the primary comparison, treated minus comparison in spot-peer points. Its
 estimator is the one `era_gap` prints on its watch row: each record's spot peer residualized on the
 pooled per-type mean, with the comparison arm capped at the treated arm's longest submit-to-resolve
-lag, both arms STRICT. The tagging pass must write the sub-era names into `config_era`, the field the
-module reads, and the invocation is `uv run python -m metaculus_bot.performance_analysis.era_gap
---dataset <round>/perf_all_tagged.json --treated-era <fall sub-era> --comparison-era ranked_markets
---strict --clusters <round>/cluster_structure.json`. A concern verdict commits us to a trace dossier
+lag, both arms STRICT. The tagging pass writes the sub-era names into `triple_subera_fine`
+(`config_era` holds only the coarse eras, and the module selects its arms on whichever field
+`--era-field` names), so the invocation is `uv run python -m metaculus_bot.performance_analysis.era_gap
+--dataset <round>/perf_all_tagged.json --era-field triple_subera_fine --treated-era <fall sub-era>
+--comparison-era ranked_markets --strict --clusters <round>/cluster_structure.json`, with
+`fall_config` as the fall sub-era until the cost pass merges. Run before the first treated question
+has resolved, it exits with a message naming the empty arm and prints no report. A concern verdict commits us to a trace dossier
 for every fall miss against the `ranked_markets` code and a merge-by-merge review of the September
 changes. Any revert is an operator decision at a new era boundary. The per-type table stays
 exploratory at every checkpoint: summer's gap rested on one cell of 12 discrete questions, and a fall
