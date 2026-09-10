@@ -124,11 +124,11 @@ class TestKalshi:
         async def _fake_get(session, url, **_):
             if "/events/" in url:
                 return None
-            return {"market": {"title": "Single strike market", "ticker": "KXONE", "status": "active"}}
+            return {"market": {"title": "Single strike market", "ticker": "KXONE-26DEC", "status": "active"}}
 
         monkeypatch.setattr(backends, "_kalshi_fetch_json", _fake_get)
 
-        result = await backends.market_snapshot(venue="kalshi", market="KXONE", session=object())
+        result = await backends.market_snapshot(venue="kalshi", market="KXONE-26DEC", session=object())
 
         assert result.status == "ok"
         assert "Single strike market" in result.content_markdown
@@ -139,9 +139,73 @@ class TestKalshi:
 
         monkeypatch.setattr(backends, "_kalshi_fetch_json", _none)
 
-        result = await backends.market_snapshot(venue="kalshi", market="KXNOPE", session=object())
+        result = await backends.market_snapshot(venue="kalshi", market="KXNOPE-26DEC", session=object())
 
         assert result.status == "not_found"
+
+    async def test_a_lowercase_ticker_still_reads_the_event_endpoint(self, monkeypatch: pytest.MonkeyPatch):
+        calls: list[str] = []
+
+        async def _fake_get(session, url, **_):
+            calls.append(url)
+            return {"event": {"title": "US unemployment August", "event_ticker": "KXU3-26AUG", "markets": []}}
+
+        monkeypatch.setattr(backends, "_kalshi_fetch_json", _fake_get)
+
+        result = await backends.market_snapshot(venue="kalshi", market="kxu3-26aug", session=object())
+
+        assert result.status == "ok"
+        assert any("events/KXU3-26AUG" in url for url in calls)
+
+    async def test_detail_get_budget_caps_at_four_across_calls(self):
+        """Patch the session, not _kalshi_fetch_json, so the real budget check inside it runs."""
+
+        class _Resp:
+            status = 404
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+        class _CountingSession:
+            def __init__(self) -> None:
+                self.gets = 0
+
+            def get(self, url, timeout=None):
+                self.gets += 1
+                return _Resp()
+
+        session = _CountingSession()
+        budget = backends.KalshiGetBudget()
+
+        for _ in range(5):
+            await backends.market_snapshot(
+                venue="kalshi", market="KXQ-26DEC", session=session, kalshi_detail_budget=budget
+            )
+
+        assert session.gets == backends.MAX_KALSHI_DETAIL_GETS
+
+    async def test_polymarket_outage_is_error_not_no_match(self, monkeypatch: pytest.MonkeyPatch):
+        async def _outage(session, query, *, width):
+            return None
+
+        monkeypatch.setattr(venues, "polymarket_search", _outage)
+
+        result = await backends.market_snapshot(venue="polymarket", market="fed", session=object())
+
+        assert result.status == "error"
+
+    async def test_five_row_cap(self, monkeypatch: pytest.MonkeyPatch):
+        async def _many(session, query, *, width):
+            return [_match(f"Market {i}", 0.5) for i in range(12)]
+
+        monkeypatch.setattr(venues, "polymarket_search", _many)
+
+        result = await backends.market_snapshot(venue="polymarket", market="anything", session=object())
+
+        assert result.content_markdown.count("| polymarket |") == backends.MARKET_SNAPSHOT_ROWS
 
 
 class TestPredictIt:

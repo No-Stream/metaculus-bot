@@ -99,6 +99,10 @@ class TestFredSeriesIds:
     def test_ignores_the_release_calendar(self):
         assert parse.fred_series_ids("https://fred.stlouisfed.org/releases/calendar?rid=199&y=2026") == []
 
+    def test_caps_the_id_list_per_url_at_two(self):
+        """One graph URL cannot expand into an unbounded fetch set."""
+        assert parse.fred_series_ids("https://fred.stlouisfed.org/graph/fredgraph.csv?id=A,B,C,D") == ["A", "B"]
+
 
 class TestYahooSymbols:
     @pytest.mark.parametrize(
@@ -151,3 +155,7 @@ class TestKalshiTicker:
     )
     def test_rejects_non_market_urls(self, url: str):
         assert parse.kalshi_ticker(url) is None
+
+    def test_rejects_a_two_segment_series_slug(self):
+        """A /markets/{series}/{slug} page has no market ticker; its last segment is a slug, not a ticker."""
+        assert parse.kalshi_ticker("https://kalshi.com/markets/kxu3/unemployment") is None

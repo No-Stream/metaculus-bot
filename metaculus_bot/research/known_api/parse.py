@@ -38,8 +38,10 @@ _FRED_PAGE_PATH_RE = re.compile(rf"/(?:series|data)/({_FRED_ID})")
 _YAHOO_CHART_PATH_RE = re.compile(rf"/v8/finance/chart/({_YAHOO_SYMBOL})")
 # `/quote/{symbol}` Yahoo page path (regional or bare host).
 _YAHOO_QUOTE_PATH_RE = re.compile(rf"/quote/({_YAHOO_SYMBOL})")
-# Kalshi market ticker: the LAST path segment of a /markets/... or /api/v#/markets/... URL.
-_KALSHI_TICKER_RE = re.compile(r"/(?:api/v\d+/)?markets/(?:[^/?#]+/)*([^/?#]+)")
+# The path segments after /markets/ or /api/v#/markets/; the last is the market ticker.
+_KALSHI_MARKETS_RE = re.compile(r"/(?:api/v\d+/)?markets/(.+)")
+# At most two FRED series per URL: the one archived multi-id URL is a NOB spread, served as two.
+_MAX_FRED_IDS_PER_URL = 2
 
 
 def strip_markdown_escapes(text: str) -> str:
@@ -101,7 +103,9 @@ def fred_series_ids(text: str) -> list[str]:
         parsed = urlparse(url)
         query = parse_qs(parsed.query)
         if "id" in query:
-            ids.extend(part for value in query["id"] for part in value.split(",") if part)
+            # Cap the id list per URL, so one graph URL cannot expand into an unbounded fetch set.
+            per_url = [part for value in query["id"] for part in value.split(",") if part]
+            ids.extend(per_url[:_MAX_FRED_IDS_PER_URL])
         elif "seid" in query:
             ids.extend(query["seid"])
         elif "series_id" in query:
@@ -138,13 +142,23 @@ def yahoo_symbols(text: str) -> list[str]:
 
 
 def kalshi_ticker(url: str) -> str | None:
-    """The market ticker of a Kalshi market/event URL, upper-cased, or None.
+    """The market ticker of a Kalshi market URL, upper-cased, or None.
 
-    Reads the site path (``/markets/{ticker}``, ``/markets/{series}/{slug}/{ticker}``) and the
-    API path (``/api/v#/markets/{ticker}``); the ticker is always the last path segment. Only
-    ``kalshi.com`` market URLs qualify -- the contract-terms PDF on S3 does not.
+    Reads ``/markets/{ticker}``, ``/markets/{series}/{slug}/{ticker}`` and the API path
+    ``/api/v#/markets/{ticker}``. On a multi-segment path the last segment is the ticker only when
+    it starts with the series (first) segment; otherwise the URL points at a series/slug page with
+    no market ticker (``/markets/kxu3/unemployment``), which returns None so the fetcher does not
+    burn detail GETs on a 404. Only ``kalshi.com`` market URLs qualify.
     """
     if _host(url) != "kalshi.com":
         return None
-    match = _KALSHI_TICKER_RE.search(urlparse(url).path)
-    return match.group(1).upper() if match else None
+    match = _KALSHI_MARKETS_RE.search(urlparse(url).path)
+    if not match:
+        return None
+    segments = [segment for segment in match.group(1).split("/") if segment]
+    if not segments:
+        return None
+    if len(segments) == 1:
+        return segments[0].upper()
+    ticker = segments[-1].upper()
+    return ticker if ticker.startswith(segments[0].upper()) else None

@@ -99,8 +99,35 @@ class TestFredSeriesKeyed:
         result = await backends.fred_series(series_id="DGS30", start=date(2000, 1, 1))
 
         rendered_rows = result.content_markdown.count("\n  - ")
-        assert rendered_rows <= MAX_OBSERVATIONS
-        assert str(MAX_OBSERVATIONS) in result.content_markdown
+        assert rendered_rows == MAX_OBSERVATIONS
+        assert f"capped at {MAX_OBSERVATIONS}" in result.content_markdown
+        # Newest kept: the first rendered row is the series' last date, the last row is 399 days earlier.
+        newest = dates[-1].strftime("%Y-%m-%d")
+        oldest_kept = dates[-MAX_OBSERVATIONS].strftime("%Y-%m-%d")
+        first_row = result.content_markdown.split("\n  - ")[1]
+        assert first_row.startswith(newest)
+        assert oldest_kept in result.content_markdown
+
+    async def test_empty_series_with_a_window_is_empty_not_a_crash(self, monkeypatch: pytest.MonkeyPatch):
+        self._patch_key(monkeypatch)
+        # FRED returns an empty (RangeIndex) series for a window with no observations.
+        monkeypatch.setattr(fred_rendering, "Fred", lambda api_key: _FakeFred(pd.Series([], dtype="float64")))
+
+        result = await backends.fred_series(series_id="CSUSHPISA", start=date(2026, 9, 1), end=date(2026, 9, 10))
+
+        assert result.status == "empty"
+
+    async def test_first_release_label_only_when_the_comparison_renders(self, monkeypatch: pytest.MonkeyPatch):
+        self._patch_key(monkeypatch)
+        data = _series({"2026-06-01": 4.2, "2026-07-01": 4.3})
+        monkeypatch.setattr(fred_rendering, "Fred", lambda api_key: _FakeFred(data, title="UNRATE"))
+        # No first-release table available: the header must not claim one over current-vintage rows.
+        monkeypatch.setattr(fred_rendering, "_fetch_fred_first_releases", lambda *a, **k: None)
+
+        result = await backends.fred_series(series_id="UNRATE", first_release=True)
+
+        assert result.status == "ok"
+        assert "first-release" not in result.content_markdown
 
     async def test_default_window_is_the_last_thirty(self, monkeypatch: pytest.MonkeyPatch):
         self._patch_key(monkeypatch)
@@ -186,3 +213,43 @@ class TestYahooHistory:
         await backends.yahoo_history(ticker="^VIX", column="High")
 
         assert seen["column"] == "High"
+
+    async def test_transport_error_is_error(self, monkeypatch: pytest.MonkeyPatch):
+        def _raise(spec, ceiling, **kw):
+            raise OSError("connection reset")
+
+        monkeypatch.setattr(ts_fetch, "fetch_series", _raise)
+
+        result = await backends.yahoo_history(ticker="^GSPC")
+
+        assert result.status == "error"
+        assert "OSError" in result.content_markdown
+
+    async def test_a_wide_window_widens_the_fetch_lookback(self, monkeypatch: pytest.MonkeyPatch):
+        seen: dict[str, int] = {}
+
+        def _capture(spec, ceiling, *, lookback_years=15, **kw):
+            seen["lookback_years"] = lookback_years
+            return _series({"2026-09-08": 12.3})
+
+        monkeypatch.setattr(ts_fetch, "fetch_series", _capture)
+
+        await backends.yahoo_history(ticker="^GSPC", start=date(2005, 1, 1), end=date(2026, 1, 1))
+
+        assert seen["lookback_years"] > 15
+
+
+class TestFredArguments:
+    async def test_neither_series_id_nor_search_is_error(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("FRED_API_KEY", "test-key")
+
+        result = await backends.fred_series()
+
+        assert result.status == "error"
+
+    async def test_search_without_a_key_is_error(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.delenv("FRED_API_KEY", raising=False)
+
+        result = await backends.fred_series(search="treasury")
+
+        assert result.status == "error"

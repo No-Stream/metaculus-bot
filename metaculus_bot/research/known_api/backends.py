@@ -21,7 +21,9 @@ import logging
 import os
 import re
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from itertools import islice
 from typing import Any, cast
 from xml.etree.ElementTree import ParseError
 
@@ -38,7 +40,7 @@ from metaculus_bot.constants import (
 from metaculus_bot.research import document_text, fred_rendering, sec_edgar, ts_fetch
 from metaculus_bot.research.known_api.result import KnownApiResult
 from metaculus_bot.research.known_api.translate import KnownApiCall
-from metaculus_bot.research.market_retrieval import queries, rendering, venues
+from metaculus_bot.research.market_retrieval import generation, queries, rendering, venues
 from metaculus_bot.research.market_retrieval.http import PLATFORM_HTTP_TIMEOUT, read_json_capped
 from metaculus_bot.research.market_retrieval.types import MarketMatch, MarketSnapshot
 from metaculus_bot.research.number_format import format_decimal_change, format_decimal_value
@@ -55,20 +57,50 @@ MAX_OBSERVATIONS = 400
 FRED_SEARCH_LIMIT = 5
 # A market snapshot renders at most this many rows.
 MARKET_SNAPSHOT_ROWS = 5
-# The per-question ceiling on Kalshi detail GETs, enforced by a semaphore the caller passes in.
+# The per-question ceiling on Kalshi detail GETs, enforced by the counting budget below.
 MAX_KALSHI_DETAIL_GETS = 4
 # ".../trade-api/v2", derived off the catalogue URL so the base cannot drift from the venue's.
 KALSHI_API_BASE = venues.KALSHI_EVENTS_URL.rsplit("/", 1)[0]
-# A Kalshi market ticker: upper-case alphanumerics and dashes, no whitespace (free text is fuzzy-matched).
-_KALSHI_TICKER_SHAPE = re.compile(r"[A-Z0-9][A-Z0-9-]*\Z")
+# A Kalshi market ticker: alphanumerics and dashes with a dash, no whitespace (free text is fuzzy-matched).
+_KALSHI_TICKER_SHAPE = re.compile(r"[A-Za-z0-9]+-[A-Za-z0-9-]+\Z")
 # A filing document's extracted text is capped at the gap-fill loop's own per-result char budget.
 EDGAR_DOC_MAX_CHARS = 8000
 # A company page renders this many of its most recent filings (SEC serves them newest first).
 EDGAR_FILINGS_ROWS = 15
 
 
+@dataclass
+class KalshiGetBudget:
+    """A per-question ceiling on Kalshi detail GETs.
+
+    A semaphore would cap concurrency, not the total; the gap-fill driver calls sequentially, so
+    only a counter enforces "at most N GETs per question". The caller builds one per question.
+    """
+
+    remaining: int = MAX_KALSHI_DETAIL_GETS
+
+    def take(self) -> bool:
+        """Consume one GET's budget; False when the per-question ceiling is already reached."""
+        if self.remaining <= 0:
+            return False
+        self.remaining -= 1
+        return True
+
+
 def _today() -> date:
     return datetime.now(tz=UTC).date()
+
+
+# ts_fetch's own default lookback; a wider explicit window needs a wider fetch or it silently truncates.
+DEFAULT_LOOKBACK_YEARS = 15
+
+
+def _lookback_years(start: date | None, end: date | None) -> int:
+    """Enough lookback for ts_fetch to reach ``start``, else its default; keyed/keyless can't disagree."""
+    if start is None:
+        return DEFAULT_LOOKBACK_YEARS
+    span_days = ((end or _today()) - start).days
+    return max(DEFAULT_LOOKBACK_YEARS, span_days // 365 + 2)
 
 
 def _window(series: pd.Series, *, start: date | None, end: date | None) -> pd.Series:
@@ -79,6 +111,9 @@ def _window(series: pd.Series, *, start: date | None, end: date | None) -> pd.Se
     unbounded table.
     """
     clean = series.dropna().sort_index()
+    # An empty FRED series carries a RangeIndex, so a Timestamp comparison would raise; bail first.
+    if clean.empty:
+        return clean
     if start is not None:
         clean = clean[clean.index >= pd.Timestamp(start)]
     if end is not None:
@@ -102,7 +137,10 @@ def _observation_lines(series: pd.Series, *, total: int) -> list[str]:
     """Newest-first observation rows, with a caption when the window was capped."""
     newest_first = series.iloc[::-1]
     caption = f"- Observations (newest first, {len(series)} of {total}"
-    caption += f"; capped at {MAX_OBSERVATIONS})" if total > MAX_OBSERVATIONS else ")"
+    # Only claim the cap when it actually bound the result, not on a short default-window read.
+    caption += (
+        f"; capped at {MAX_OBSERVATIONS})" if len(series) == MAX_OBSERVATIONS and total > MAX_OBSERVATIONS else ")"
+    )
     rows = [
         f"  - {cast(pd.Timestamp, ts).strftime('%Y-%m-%d')}: {format_decimal_value(float(value))}"
         for ts, value in newest_first.items()
@@ -120,6 +158,7 @@ async def _bounded(sync_call: Callable[[], KnownApiResult], *, label: str) -> Kn
     try:
         return await asyncio.wait_for(asyncio.to_thread(sync_call), timeout=FRED_YAHOO_CALL_TIMEOUT_S)
     except TimeoutError:
+        logger.warning("known_api %s timed out after %ss", label, FRED_YAHOO_CALL_TIMEOUT_S)
         return KnownApiResult(
             status="error", content_markdown=f"{label} timed out after {FRED_YAHOO_CALL_TIMEOUT_S}s.", source_url=""
         )
@@ -158,9 +197,9 @@ def _fred_series_keyed_sync(
 
 def _fred_series_keyless_sync(series_id: str, *, start: date | None, end: date | None) -> KnownApiResult:
     source_url = f"https://fred.stlouisfed.org/series/{series_id}"
-    revises = series_id.upper() not in ts_fetch.FRED_NON_REVISING_SERIES
-    spec = ts_fetch.SeriesSpec(source="fred", series_id=series_id, revises=revises)
-    data = ts_fetch.fetch_series(spec, end or _today())
+    # revises=False: a live read wants current values, matching the keyed path (this is not a backtest).
+    spec = ts_fetch.SeriesSpec(source="fred", series_id=series_id)
+    data = ts_fetch.fetch_series(spec, end or _today(), lookback_years=_lookback_years(start, end))
     return _render_fred(series_id, data, source_url, fred=None, start=start, end=end, first_release=False)
 
 
@@ -183,10 +222,10 @@ def _render_fred(
             source_url=source_url,
         )
     title = _fred_title(fred, series_id)
-    header = f"### {series_id} ({title})" + (" [first release]" if first_release else "")
-    block = _render_series_block(header=header, source_url=source_url, series=windowed, total=total)
-    if first_release and fred is not None:
-        block += _fred_first_release_note(fred, series_id, windowed)
+    # The rendered observations are the current vintage; label the first-release table only if it renders.
+    note = _fred_first_release_note(fred, series_id, windowed) if (first_release and fred is not None) else ""
+    header = f"### {series_id} ({title})" + (" [with first-release comparison]" if note else "")
+    block = _render_series_block(header=header, source_url=source_url, series=windowed, total=total) + note
     return KnownApiResult(status="ok", content_markdown=block, source_url=source_url, links=[source_url])
 
 
@@ -258,10 +297,13 @@ async def fred_series(
                     content_markdown=f"FRED has no series {series_id!r}: {exc}",
                     source_url=source_url,
                 )
+            logger.warning("known_api FRED %s failed (ValueError): %s", series_id or search, exc)
             return KnownApiResult(
                 status="error", content_markdown=f"FRED fetch failed (ValueError): {exc}", source_url=source_url
             )
-        except OSError as exc:
+        # ParseError (a non-XML error body) subclasses SyntaxError, not OSError; name it or it escapes.
+        except (OSError, ParseError) as exc:
+            logger.warning("known_api FRED %s failed (%s): %s", series_id or search, type(exc).__name__, exc)
             return KnownApiResult(
                 status="error",
                 content_markdown=f"FRED fetch failed ({type(exc).__name__}): {exc}",
@@ -274,7 +316,7 @@ async def fred_series(
 def _yahoo_history_sync(ticker: str, *, start: date | None, end: date | None, column: str) -> KnownApiResult:
     source_url = f"https://finance.yahoo.com/quote/{ticker}/history/"
     spec = ts_fetch.SeriesSpec(source="yfinance", series_id=ticker, column=column)  # type: ignore[arg-type]
-    data = ts_fetch.fetch_series(spec, end or _today())
+    data = ts_fetch.fetch_series(spec, end or _today(), lookback_years=_lookback_years(start, end))
     total = int(data.dropna().shape[0])
     windowed = _window(data, start=start, end=end)
     if windowed.empty:
@@ -311,6 +353,7 @@ async def yahoo_history(
                 status="not_found", content_markdown=f"Yahoo Finance {ticker!r}: {exc}", source_url=source_url
             )
         except (OSError, ValueError) as exc:
+            logger.warning("known_api Yahoo %s failed (%s): %s", ticker, type(exc).__name__, exc)
             return KnownApiResult(
                 status="error",
                 content_markdown=f"Yahoo fetch failed ({type(exc).__name__}): {exc}",
@@ -320,32 +363,32 @@ async def yahoo_history(
     return await _bounded(_run, label=f"Yahoo {ticker}")
 
 
-async def _kalshi_fetch_json(session: Any, url: str, *, semaphore: asyncio.Semaphore | None = None) -> dict | None:
-    """One bounded Kalshi detail GET, gated by the per-question semaphore; None on any non-200 or failure."""
-    gate = semaphore or asyncio.Semaphore(MAX_KALSHI_DETAIL_GETS)
+async def _kalshi_fetch_json(session: Any, url: str, *, budget: KalshiGetBudget | None = None) -> dict | None:
+    """One Kalshi detail GET under the per-question budget; None on an exhausted budget or any non-200."""
+    if budget is not None and not budget.take():
+        return None
     timeout = aiohttp.ClientTimeout(total=PLATFORM_HTTP_TIMEOUT, sock_read=PLATFORM_HTTP_TIMEOUT)
-    async with gate:
-        try:
-            async with session.get(url, timeout=timeout) as resp:
-                if resp.status != 200:
-                    return None
-                body = await read_json_capped(resp, label=f"kalshi {url}")
-        except (TimeoutError, aiohttp.ClientError):
-            return None
+    try:
+        async with session.get(url, timeout=timeout) as resp:
+            if resp.status != 200:
+                return None
+            body = await read_json_capped(resp, label=f"kalshi {url}")
+    except (TimeoutError, aiohttp.ClientError):
+        return None
     return body if isinstance(body, dict) else None
 
 
-async def _kalshi_by_ticker(session: Any, ticker: str, semaphore: asyncio.Semaphore | None) -> MarketMatch | None:
+async def _kalshi_by_ticker(session: Any, ticker: str, budget: KalshiGetBudget | None) -> MarketMatch | None:
     """One Kalshi event by ticker, from the event endpoint falling to the market endpoint."""
     event_url = f"{KALSHI_API_BASE}/events/{ticker}?with_nested_markets=true"
-    data = await _kalshi_fetch_json(session, event_url, semaphore=semaphore)
+    data = await _kalshi_fetch_json(session, event_url, budget=budget)
     if data:
         event = dict(data.get("event") or data)
         event["markets"] = event.get("markets") or data.get("markets") or []
         match = venues.kalshi_event_match(event, match_confidence=1.0, channel="known_api")
         if match is not None:
             return match
-    market_data = await _kalshi_fetch_json(session, f"{KALSHI_API_BASE}/markets/{ticker}", semaphore=semaphore)
+    market_data = await _kalshi_fetch_json(session, f"{KALSHI_API_BASE}/markets/{ticker}", budget=budget)
     if not market_data:
         return None
     market = market_data.get("market") or market_data
@@ -359,26 +402,21 @@ async def _kalshi_by_ticker(session: Any, ticker: str, semaphore: asyncio.Semaph
     return venues.kalshi_event_match(single, match_confidence=1.0, channel="known_api")
 
 
-def _ranked_matches(
+def _kalshi_fuzzy(catalogue: list[dict[str, Any]], query: str) -> list[MarketMatch]:
+    """The catalogue's best matches for a free-text query, zero requests.
+
+    Reuses the prediction-market provider's own scored generator so the two cannot drift (its
+    docstring warns that a second copy silently diverges); ``islice`` builds only the rows kept.
+    """
+    return list(islice(generation._kalshi_universe_channel([query], catalogue), MARKET_SNAPSHOT_ROWS))
+
+
+def _predictit_ranked(
     scored: list[tuple[float, Any]], builder: Callable[[float, Any], MarketMatch | None]
 ) -> list[MarketMatch]:
-    """The top rows a fuzzy score put first, built into MarketMatch rows, capped at the snapshot width."""
+    """The top PredictIt rows a fuzzy score put first, built into rows, capped at the snapshot width."""
     ordered = sorted(scored, key=lambda pair: pair[0], reverse=True)[:MARKET_SNAPSHOT_ROWS]
     return [match for score, item in ordered if (match := builder(score, item)) is not None]
-
-
-def _kalshi_fuzzy(catalogue: list[dict[str, Any]], query: str) -> list[MarketMatch]:
-    """The catalogue's best matches for a free-text query, scored over titles and rules, zero requests."""
-    usable = [
-        event for event in catalogue if isinstance(event, dict) and (event.get("title") or event.get("sub_title"))
-    ]
-    titles = [str(event.get("title") or event.get("sub_title")) for event in usable]
-    rules = [venues.kalshi_event_rules(event) for event in usable]
-    scores = queries.fuzzy_best_many([query], titles, rules)
-    return _ranked_matches(
-        list(zip(scores, usable, strict=True)),
-        lambda score, event: venues.kalshi_event_match(event, match_confidence=score, channel="known_api"),
-    )
 
 
 def _predictit_matches(dump: list[dict[str, Any]], query: str) -> list[MarketMatch]:
@@ -386,10 +424,17 @@ def _predictit_matches(dump: list[dict[str, Any]], query: str) -> list[MarketMat
     usable = [market for market in dump if isinstance(market, dict) and (market.get("name") or market.get("shortName"))]
     names = [str(market.get("name") or market.get("shortName")) for market in usable]
     scores = queries.fuzzy_best_many([query], names, names)
-    return _ranked_matches(
+    return _predictit_ranked(
         list(zip(scores, usable, strict=True)),
         lambda score, market: venues.predictit_market_match(market, match_confidence=score, channel="known_api"),
     )
+
+
+def _search_matches(rows: list[MarketMatch] | None, venue: str) -> KnownApiResult:
+    """Adapt a venue search result: None is an outage (``error``), ``[]`` is a genuine no-match."""
+    if rows is None:
+        return KnownApiResult(status="error", content_markdown=f"{venue} search failed.", source_url="")
+    return _render_matches(rows, venue)
 
 
 def _render_matches(matches: list[MarketMatch], venue: str) -> KnownApiResult:
@@ -398,12 +443,12 @@ def _render_matches(matches: list[MarketMatch], venue: str) -> KnownApiResult:
     if not rows:
         return KnownApiResult(status="not_found", content_markdown=f"No {venue} market matched.", source_url="")
     snapshot = MarketSnapshot(matches=rows, pool_size=len(rows), forecast_time=datetime.now(tz=UTC))
-    source_url = next((row.market_url for row in rows if row.market_url), "")
+    links = [row.market_url for row in rows if row.market_url]
     return KnownApiResult(
         status="ok",
         content_markdown=rendering.render_snapshot(snapshot),
-        source_url=source_url,
-        links=[source_url] if source_url else [],
+        source_url=links[0] if links else "",
+        links=links,
     )
 
 
@@ -414,28 +459,26 @@ async def market_snapshot(
     session: Any,
     kalshi_catalogue: list[dict[str, Any]] | None = None,
     predictit_markets: list[dict[str, Any]] | None = None,
-    kalshi_detail_semaphore: asyncio.Semaphore | None = None,
+    kalshi_detail_budget: KalshiGetBudget | None = None,
 ) -> KnownApiResult:
     """One prediction-market snapshot for a venue + market, from a venue id or free text.
 
     Kalshi resolves a ticker through the event endpoint (falling to the market endpoint), bounded to
-    ``kalshi_detail_semaphore`` (a per-question semaphore the caller constructs, since the loop has
-    no per-question object yet), and free text over the run's already-pulled catalogue with zero new
-    requests. Polymarket and Manifold search; PredictIt reads the run's cached dump. Up to
+    ``kalshi_detail_budget`` (a per-question counting budget the caller constructs, since the loop
+    has no per-question object yet), and free text over the run's already-pulled catalogue with zero
+    new requests. Polymarket and Manifold search; PredictIt reads the run's cached dump. A venue
+    outage (search returns None) is ``error``, distinct from a genuine no-match. Up to
     :data:`MARKET_SNAPSHOT_ROWS` rows.
     """
     venue = venue.lower()
     if venue == "polymarket":
-        return _render_matches(
-            list(await venues.polymarket_search(session, market, width=MARKET_SNAPSHOT_ROWS) or []), venue
-        )
+        return _search_matches(await venues.polymarket_search(session, market, width=MARKET_SNAPSHOT_ROWS), venue)
     if venue == "manifold":
-        return _render_matches(
-            list(await venues.manifold_search(session, market, width=MARKET_SNAPSHOT_ROWS) or []), venue
-        )
+        return _search_matches(await venues.manifold_search(session, market, width=MARKET_SNAPSHOT_ROWS), venue)
     if venue == "kalshi":
         if _KALSHI_TICKER_SHAPE.match(market):
-            match = await _kalshi_by_ticker(session, market, kalshi_detail_semaphore)
+            budget = kalshi_detail_budget or KalshiGetBudget()
+            match = await _kalshi_by_ticker(session, market.upper(), budget)
             return _render_matches([match] if match is not None else [], venue)
         if not kalshi_catalogue:
             return KnownApiResult(
@@ -506,9 +549,12 @@ async def edgar(call: KnownApiCall) -> KnownApiResult | None:
                 return await _edgar_document(session, call.edgar_url)
     except sec_edgar.SecEdgarContactUnsetError:
         return None
-    except sec_edgar.SecEdgarError as exc:
+    # ValueError covers a malformed CIK from pad_cik; without it the never-raise contract breaks.
+    except (sec_edgar.SecEdgarError, ValueError) as exc:
+        logger.warning("known_api EDGAR %s failed (%s): %s", call.canonical_url, type(exc).__name__, exc)
         return KnownApiResult(status="error", content_markdown=f"SEC EDGAR error: {exc}", source_url=call.canonical_url)
     except (TimeoutError, aiohttp.ClientError) as exc:
+        logger.warning("known_api EDGAR %s failed (%s): %s", call.canonical_url, type(exc).__name__, exc)
         return KnownApiResult(
             status="error",
             content_markdown=f"SEC EDGAR fetch failed ({type(exc).__name__}): {exc}",

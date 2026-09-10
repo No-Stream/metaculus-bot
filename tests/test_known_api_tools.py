@@ -88,7 +88,7 @@ class TestHandlers:
         catalogue = [{"title": "x", "event_ticker": "KX", "markets": []}]
 
         async def _fake(
-            *, venue, market, session, kalshi_catalogue=None, predictit_markets=None, kalshi_detail_semaphore=None
+            *, venue, market, session, kalshi_catalogue=None, predictit_markets=None, kalshi_detail_budget=None
         ):
             seen.update(venue=venue, market=market, session=session, kalshi_catalogue=kalshi_catalogue)
             return KnownApiResult(status="ok", content_markdown="snap", source_url="u")

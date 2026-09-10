@@ -102,9 +102,14 @@ def build_known_api_tools(
     session: Any,
     kalshi_catalogue: list[dict[str, Any]] | None = None,
     predictit_markets: list[dict[str, Any]] | None = None,
-    kalshi_detail_semaphore: Any = None,
+    kalshi_detail_budget: backends.KalshiGetBudget | None = None,
 ) -> list[ToolSpec]:
-    """The three known-API ToolSpecs, with the per-question market dependencies bound in."""
+    """The three known-API ToolSpecs, with the per-question market dependencies bound in.
+
+    One :class:`KalshiGetBudget` is shared across every ``market_snapshot`` call these tools make,
+    so the per-question Kalshi detail-GET ceiling holds across the whole loop, not per call.
+    """
+    budget = kalshi_detail_budget or backends.KalshiGetBudget()
 
     async def _fred(
         *,
@@ -132,7 +137,7 @@ def build_known_api_tools(
             session=session,
             kalshi_catalogue=kalshi_catalogue,
             predictit_markets=predictit_markets,
-            kalshi_detail_semaphore=kalshi_detail_semaphore,
+            kalshi_detail_budget=budget,
         )
         return adapters.to_tool_outcome(result)
 
