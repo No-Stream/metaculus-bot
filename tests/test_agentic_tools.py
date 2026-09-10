@@ -3791,6 +3791,11 @@ class TestGapFillV2ImpersonatedRetry:
         (call,) = calls
         assert call["deadline_monotonic_s"] == pytest.approx(before + RESOLUTION_SOURCE_HTTP_TIMEOUT, abs=0.5)
 
+    def test_the_fetch_presets_wall_is_the_tools_own_ceiling(self) -> None:
+        """The two figures are spelled apart, so one moving without the other is a drift."""
+        fetch_tool = next(spec for spec in agentic_tools.build_gap_fill_tools("topic") if spec.name == "fetch")
+        assert GAP_FILL_FETCH_POLICY.total_wall_s == fetch_tool.timeout_s
+
     @pytest.mark.asyncio
     async def test_the_retry_dials_the_plain_rungs_final_url(self, monkeypatch) -> None:
         """`direct.url` is the last hop of the direct fetch's own guarded redirect loop, the host
