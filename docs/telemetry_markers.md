@@ -622,6 +622,18 @@ order, each emitted only when present, so an old parser and every archived line 
 line carrying a later field but not an earlier one cannot mis-claim a neighbour's value. `qid_kind`
 is `question_id` (`resolution_source.py` emits `question.id_of_question`).
 
+`passages_returned` / `passages_grounded` / `fallback_used` (all optional, 2026-09-09) are the page
+digest's counters (`research/page_digest.py`; docs/research.md "Page digest"): how many passages the
+`page_digest_extractor` model answered with, how many of those were literal substrings of the page
+after whitespace normalisation, and whether the passages served after the page's opening came from
+the BM25 fallback instead (`True` / `False`, harvested as a bool). The difference of the two counts
+is the model's fabrication count for that page, and both are `0` on a fallback where no call was made
+(the remaining wall was below the floor, or the page was empty). Keyed and tail-positioned after
+`server` in that fixed order, appended by the callers only on a fetch that ran the digest, so a page
+under the digest threshold and every archived line still parse with the three harvested as None.
+The spec was added ahead of its emitter: the fetch-ladder unification's callers append the three
+values off the `PageDigest` the digest returns.
+
 ### RESOLUTION_SOURCE_ESCALATION
 
 One line per escalated-URL rung attempt: the direct fetch could not read the page, so the ladder
