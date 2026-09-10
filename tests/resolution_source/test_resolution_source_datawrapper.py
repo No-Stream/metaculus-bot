@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
 from unittest.mock import AsyncMock
@@ -32,8 +33,8 @@ import aiohttp
 import pytest
 
 from metaculus_bot.research import resolution_datawrapper, resolution_source
-from metaculus_bot.research.fetch_ladder import context as ladder_context
 from metaculus_bot.research.fetch_ladder import guard
+from metaculus_bot.research.fetch_ladder import policy as ladder_policy
 from metaculus_bot.research.http_fetch import DatawrapperChartRef
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail
 from metaculus_bot.research.resolution_body_text import _truncate_csv_middle, _truncate_with_marker
@@ -548,7 +549,11 @@ class TestDatawrapperHop:
         before the outer wall) at test speed; the skip branch is tested separately."""
         monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
         monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_WALL_TIMEOUT", 0.4)
-        monkeypatch.setattr(ladder_context, "RESOLUTION_SOURCE_WALL_TIMEOUT", 0.4)
+        monkeypatch.setattr(
+            ladder_policy,
+            "RESOLUTION_SOURCE_POLICY",
+            replace(ladder_policy.RESOLUTION_SOURCE_POLICY, total_wall_s=0.4),
+        )
         monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_DATAWRAPPER_HOP_WALL_MARGIN_S", 0.3)
         monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_DATAWRAPPER_MIN_HOP_BUDGET_S", 0.0)
         events: list[str] = []
@@ -592,7 +597,11 @@ class TestDatawrapperHop:
         attempt that cannot land and could push the provider past its wall."""
         monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
         monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_WALL_TIMEOUT", 0.05)
-        monkeypatch.setattr(ladder_context, "RESOLUTION_SOURCE_WALL_TIMEOUT", 0.05)
+        monkeypatch.setattr(
+            ladder_policy,
+            "RESOLUTION_SOURCE_POLICY",
+            replace(ladder_policy.RESOLUTION_SOURCE_POLICY, total_wall_s=0.05),
+        )
         session = FakeSession(
             {
                 PAGE_URL: FakeResponse(200, body=_tracker_page_html(CHART_ID), content_type="text/html"),

@@ -145,7 +145,7 @@ from metaculus_bot.constants import (
     env_flag_enabled,
 )
 from metaculus_bot.research import resolution_datawrapper, resolution_presentation
-from metaculus_bot.research.fetch_ladder import classify, context, guard, ladder
+from metaculus_bot.research.fetch_ladder import classify, context, guard, ladder, policy
 from metaculus_bot.research.http_fetch import DatawrapperChartRef, datawrapper_live_data_url, host_semaphores
 from metaculus_bot.research.provider_diagnostics import record_provider_detail
 from metaculus_bot.research.providers import ResearchCallable
@@ -305,11 +305,17 @@ async def fetch_resolution_sources(urls: list[str], *, query: str = "", fast_pat
             shared_budget = context.QuestionRungBudget()
             page_tasks = [
                 asyncio.create_task(
-                    ladder._fetch_one(
-                        session,
+                    ladder.fetch_url(
                         u,
-                        host_sems,
-                        context.LadderContext(query=query, started=started, shared=shared_budget, fast_path=fast_path),
+                        policy=policy.RESOLUTION_SOURCE_POLICY,
+                        ctx=context.LadderContext(
+                            query=query,
+                            started=started,
+                            shared=shared_budget,
+                            fast_path=fast_path,
+                            session=session,
+                            host_sems=host_sems,
+                        ),
                     )
                 )
                 for u in urls

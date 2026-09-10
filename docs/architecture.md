@@ -651,6 +651,175 @@ Metaculus client, and mantic mode injects a `ManticClient` (see "Entry points" a
 `required_successful_predictions=0.0` disables the framework's own success-rate gate so the
 min-forecasters guard is the sole arbiter of a degraded publish (section 4 above).
 
+## The shared fetch ladder
+
+Two code paths fetch web pages: the resolution-source fetcher, which reads the URLs a question
+names as its grading source, and the gap-fill v2 agentic loop, which reads URLs a driver model
+picks itself. The ladder they run lives in `metaculus_bot/research/fetch_ladder/`, and each caller
+is an adapter over it. The fetcher is on it today; the loop still calls its own subset of the same
+transports and moves onto `fetch_url` over the remaining steps of the unification plan
+(`scratch_docs_and_planning/fetch_ladder_unification_plan_2026-09-09.md`), so the gap-fill column
+in the knob table below is the target rather than today's reading. The package's modules depend on
+each other in one direction:
+`guard.py` (the SSRF preflight, the vetted DNS resolve, the aiohttp session, the per-host
+politeness gate), then `digest.py`, `policy.py` and `context.py`, then `classify.py` (the one
+classification path for a body), then `direct_fetch.py` (the bounded redirect loop and the single
+hop), then `rungs.py` (the seven escalation rungs), then `ladder.py` (the dispatcher and the
+entry point). The status, reason, route and skip vocabularies stay in
+`research/resolution_fetch_result.py`, where they were, because every string in that module is a
+telemetry contract the archive matches on.
+
+The entry point is one coroutine, `ladder.fetch_url(url, policy=..., ctx=...)`. It consults
+`policy.known_api` first, since a public API that answers the URL exactly costs no page fetch at
+all, and then runs the ladder. The policy is bound onto the context there rather than threaded
+through the twenty rung functions that already take a context, so a rung reads `ctx.policy` and
+no rung signature carries a second argument. The session and the per-host semaphore map ride the
+context for a related reason: a session per URL would change the fetcher's connector limits, so a
+caller that already holds one passes it down, and a caller that holds none gets one opened and
+closed for that URL alone.
+
+### The policy knobs
+
+`LadderPolicy` (`policy.py`) is frozen and holds only what the two callers genuinely differ on.
+Everything they share stays a plain module constant read where it is used: the two byte caps
+(5 MiB for a page, 40 MiB for a declared PDF), the per-hop HTTP timeout and its floor, every
+per-rung wall floor, the chrome and JavaScript-wall thresholds, the robots pre-check, the
+platform self-reference refusal, and the per-question Wayback and paid-read caps. That line is
+drawn deliberately: a constant a test patches on the module that reads it goes inert the moment a
+rung reads it off a frozen dataclass instead, and it goes inert silently.
+
+The same rule decides when a declared knob starts being read. The wall pair is read off the policy
+today. The presentation knobs and the archive age bound carry the fetcher's values and stay module
+reads until the gap-fill preset arrives, because wiring either one now would kill a live patch site
+or add a branch only the second caller can take.
+
+| Knob | Resolution-source preset | Gap-fill preset |
+|---|---|---|
+| `total_wall_s`, `rung_wall_margin_s` | 45 s less a 2 s margin, the provider's own wall | 90 s for the `fetch` tool, 25 s for the document ladder |
+| `per_url_max_chars` | 6,000 per URL, applied at presentation | None: the loop windows a page at presentation instead |
+| `wayback_max_age_days` | 30 days, past which a capture is withheld | None: the capture date is surfaced and the driver judges |
+| `disclose_unreadable_embeds` | True: a page hiding figures in an embed leads with that note | False |
+| `thin_content_escalation_chars` | None: escalate to the browser on status alone | 500: a success that short with no chart block escalates |
+| `collect_links` | False | True: the driver is handed the page's outbound links |
+| `render_memo_scope` | `resolution_source` | `gap_fill_v2` |
+| `caller` | `resolution_source` | `gap_fill_v2` |
+| `known_api` | the known-API registry, or None | the same registry |
+| `digest` | `page_digest.digest_page`, or None for the free BM25 selection | the same |
+
+The Wayback row is the one genuine coupling rather than a preference. The 30-day bound is
+calibrated on a page a question cites as its grading source: a month-old capture of the page a
+question grades on is still evidence about that page, and a URL a driver chose carries no such
+guarantee, so the loop surfaces the age and lets the driver decide.
+
+### Why the rungs sit in this order
+
+Cheapest first, and each rung declines by returning nothing, in which case the previous outcome
+stands. `ladder._escalate_unresolved` is the order; `ladder._run_rung` is the bracket that closes
+each rung's attempts on that rung's own wall and outcome rather than the ladder's.
+
+The impersonated retry is first, and its position is a reading choice rather than a functional
+one. The trigger sets are disjoint (`rungs._rendered_rung_applies` fires only on `js_wall` and the
+`thin_page` shape of `no_resolving_content`, never on `blocked`), so this rung never contends for
+the browser escalation gate. First matches the `FetchRoute` order, meets a reader with the cheap
+free retry before the expensive ones, sits before the archive so a live page beats a stale
+capture, and sits before the paid reader so a rescue saves the read on that URL entirely.
+
+The derived feed and the browser run under one per-question per-host gate
+(`QuestionRungBudget.browser_escalation_gate`). The derived-API rung exists so a host with several
+cited URLs pays for one Chromium launch, but the provider fans one task out per cited URL, so
+every same-host URL asked `endpoint_for` before any render had finished, got None, queued on the
+per-host gate inside the render, and launched its own browser after the first had already recorded
+the endpoint. Holding the gate across the pair means the second URL re-asks once the first's
+escalation is over and takes the feed off an ordinary GET instead. Waiting there costs the second
+URL nothing it did not already pay queueing inside the render, and the rungs behind it re-read
+their wall budget after the wait.
+
+The fast-path decline sits in the dispatcher rather than inside the rung. The rung's own gates all
+cost something, a budget read, a memo lookup or a launch, and the question's time-budget fast path
+is a fact the dispatcher already holds.
+
+Wayback comes before the paid read. The two trigger sets are disjoint from the browser's by
+construction (`rungs._WAYBACK_TRIGGER_STATUSES`), so the order between the archive and the paid
+reader is again a reading choice: the free route whose egress is not ours first, then the one that
+spends money.
+
+The paid Gemini read is last, because it is the only rung that spends money and the only one whose
+product is a model's answer rather than the host's bytes. It is off by default in code and on in
+every bot workflow. It is asked about the DIRECT outcome, and an archive withhold does not stand
+in its way: a capture too old to serve is still a page we could not read fresh, which is exactly
+the population this rung exists for. The withhold stays the ladder's fallback, so with the flag
+off, or the reader declining, a stale capture still reports `stale_data`. The paid rung's own
+attempt closes on the direct status when it declines, like every other rung, because the archive's
+verdict is not an outcome a model read can produce and `rung=url_context outcome=stale_data` on
+an escalation line read as if it were.
+
+### What the dispatcher returns, and what it carries forward
+
+`_escalate_unresolved` returns the first rung's rescue, or the direct result unchanged when every
+rung declines or fails. A rung that fired and produced nothing still leaves its attempt on the
+context, which is what makes `route=rendered status=js_wall` readable in the archive as "we tried
+the browser and this is still the answer", the same convention the meta-refresh hop follows. The
+Wayback rung is the one rung whose non-rescue is a verdict rather than None (`stale_data`, a
+capture we read and will not serve), and it is kept as the fallback rather than as an early return
+so the paid rung below is still reachable for that page. The `session` argument is the aiohttp
+session the rungs that issue an ordinary GET use; the browser rung and the impersonated retry
+ignore it, because Chromium and libcurl each bring their own transport.
+
+Two facts travel out of `_fetch_one` with the result. The rungs that live inside the direct fetch,
+the meta-refresh hop and the local PDF read, are over by the time it returns, so its status is what
+they left standing and their attempts close on it. And `chrome_metric_withheld` is a fact about
+this URL's ladder rather than about one result, so it is carried onto whatever the ladder returns:
+a rung's rescue has its own extraction, which the metric never withheld, so summing off final
+results alone gave the `chrome_metric_withholds` counter no count at all for exactly the withholds
+the ladder then paid off, which is the policy's whole point.
+
+### The per-URL context and the per-question budget
+
+`LadderContext` (`context.py`) is one per fetched URL, so its `rungs` list belongs to that URL and
+can be stamped onto its result, while `query`, `started`, `now`, `shared`, `policy`, `session` and
+`host_sems` are the same for every URL in one provider call. Every field has a default, so the
+monkeypatched fetch surface can still be driven with three positional arguments, and a default
+context is simply "no question text, clock starts now", which gives a direct fetch exactly the
+behaviour it had before the ladder existed.
+
+Four of those fields carry a decision. `query` is the question's title plus its resolution
+criteria, and it decides which passages of a 220-page PDF a forecaster sees. `started` is the
+provider's own wall-clock origin, so every rung bounds itself against the same 45 s the outer
+`asyncio.wait_for` uses. `now` is the wall-clock counterpart the Wayback rung ages a capture
+against: a monotonic origin cannot date anything, and taking the clock inside the rung would make
+an archived snapshot's disclosure depend on when it happened to run rather than on the fetch it
+belongs to. `fast_path` is the question's time-budget thin-window mode (`time_budget.py`), handed
+down from the orchestrator through the provider factory; the two expensive rungs decline on it
+before any side effect and record a `fast_path` skip, while the cheap rungs run as they do off it.
+It only ever declines, so a question with no fast path is byte-identical to one before the gate
+existed.
+
+`QuestionRungBudget` is the per-question half, shared across a question's cited URLs so the capped
+rungs cannot be paid for once per URL. Its two counts are the Wayback snapshot cap and its
+analogue, the paid `url_context` read cap, which is what stops a question citing several dead
+sources from paying per source inside one provider wall. It is separate from the context because
+what is being bounded is per-question: every Wayback snapshot shares the netloc
+`web.archive.org`, so the loop-wide per-host `Semaphore(1)` would turn N cited URLs into N
+sequential archive fetches inside a wall that discards work already done when it fires.
+
+`browser_escalation_gate` is the `Semaphore(1)` that serializes one question's
+derived-feed-then-browser escalations on a host; why it is held across the pair is under "Why the
+rungs sit in this order" above. It is per question rather than loop-wide on purpose: the
+cross-question shape still serializes on the loop-wide host gate exactly as before, and a loop-wide
+gate here would be one more unbounded process-global acquire in front of a wall that discards
+finished work (`FUTURE.md` item 5, the operator's call).
+
+Two module-level tables in `context.py` are derived from each other rather than spelled twice.
+`_RUNG_WALL_SKIP_PHRASE` maps each route to the human phrase its wall-budget skip logs, so the one
+message template in `claim_rung_budget` reads the same as the six hand-copied lines it replaced.
+`_BUDGET_GATED_RUNGS` is every rung that can record a `wall_budget` skip, in ladder order, and
+`_rung_counts` breaks the aggregate `rung_budget_skips` out per member from it. It is derived from
+the phrase map because the two drifted in opposite directions: a rung phrased but not listed lost
+its `<rung>_budget_skips` key from the archive silently, and a rung listed but not phrased raised
+`KeyError` inside `claim_rung_budget`, which the provider's `gather(return_exceptions=False)` turns
+into losing every page of the question. Dict insertion order is the ladder order, so the keys are
+unchanged.
+
 ## Import conventions
 
 Imports go at module top, and `forecaster.py` has none inside functions. A
@@ -709,8 +878,9 @@ welcome.
 | Post-fan-out aggregation routing | `metaculus_bot/stacking_route.py` |
 | Drop attribution / degradation counters | `metaculus_bot/drop_telemetry.py`; `degradation_counters.py` formats immutable snapshots built by `forecaster.py` |
 | Research fan-out | `metaculus_bot/research/orchestrator.py`, `research/providers.py` |
-| Outbound fetch transports | `research/http_fetch.py` (plain HTTP, SSRF guards, redirects, per-host gates), `research/impersonated_fetch.py` (the `curl_cffi` TLS-impersonating retry of a 403, with its own DNS pin and per-hop re-guard), `research/rendered_fetch.py` (headless Chromium), `research/url_context_reader.py` (one paid Gemini `url_context` read), `research/robots_policy.py` (the `Google-Extended` pre-check in front of that read) |
-| Resolution-source fetcher and its escalation rungs | `research/resolution_source.py`, `research/resolution_fetch_result.py` (the status, reason and route vocabularies), `research/derived_api.py`, `research/wayback.py` |
+| Outbound fetch transports | `research/http_fetch.py` (plain HTTP, redirects, per-host gates), `research/fetch_ladder/guard.py` (the SSRF preflight, the vetted DNS resolve, the aiohttp session), `research/impersonated_fetch.py` (the `curl_cffi` TLS-impersonating retry of a 403, with its own DNS pin and per-hop re-guard), `research/rendered_fetch.py` (headless Chromium), `research/url_context_reader.py` (one paid Gemini `url_context` read), `research/robots_policy.py` (the `Google-Extended` pre-check in front of that read) |
+| The shared fetch ladder and its `fetch_url` entry point | `research/fetch_ladder/` (`policy.py` the per-caller knobs, `context.py` the per-URL and per-question bookkeeping, `classify.py` one body's classification, `direct_fetch.py` the redirect loop, `rungs.py` the seven rungs, `ladder.py` the dispatcher and the `fetch_url` entry point, `digest.py` the digest seat, `guard.py` the outbound guard), `research/resolution_fetch_result.py` (the status, reason and route vocabularies), `research/derived_api.py`, `research/wayback.py` |
+| Resolution-source fetcher: its adapter over that ladder | `research/resolution_source.py` (URL selection, the Datawrapper second phase, the provider factory, the telemetry emitter and the rung counts) |
 | Resolution-source text and section budgets | `research/resolution_presentation.py` |
 | Datawrapper response classification, freshness and dataset ordering | `research/resolution_datawrapper.py`; requests and question budgets remain in `research/resolution_source.py` |
 | Gap-fill v1 / v2 | `research/targeted.py`, `research/agentic/` |

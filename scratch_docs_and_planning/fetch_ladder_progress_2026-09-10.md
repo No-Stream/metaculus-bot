@@ -120,6 +120,92 @@ ask is per call while `LadderContext` is per question, so the adapter derives a 
 `dataclasses.replace(question_ctx, query=ask, rungs=[])`, which is structurally what `_aux_ctx`
 already does for a request a rung makes on a page's behalf.
 
+### Step 2: which knobs are WIRED, and which are only declared
+
+The plan and the step-2 brief list nine knobs plus two seats. Wiring all of them at once would
+have gone inert in places, so step 2 applies one rule: a knob is read from the policy in this step
+only when doing so is a value substitution with no new branch, no live test patch site on the
+constant it replaces, and no rung signature change. Everything else is declared on
+`LadderPolicy` with the fetcher's value and its read site left alone, so the step that
+needs the difference wires it.
+
+WIRED in step 2:
+
+- `total_wall_s` and `rung_wall_margin_s`. `LadderContext.rung_budget_s` and the paid rung's
+  client-side ceiling (`rungs._url_context_rung`) now read them off the policy, and the two
+  constant imports are gone from `context.py` and `rungs.py`, so a stale read raises rather than
+  going quiet. This is the knob the whole step exists for: without it step 3 cannot give the loop
+  its 90 s `fetch` wall or its 25 s document ladder.
+
+DECLARED, read site untouched, with the reason:
+
+- `per_url_max_chars`. Eleven live `monkeypatch.setattr` sites name
+  `RESOLUTION_SOURCE_PER_URL_MAX_CHARS` on `resolution_presentation` (nine) and on `classify`
+  (two). Reading the cap off a frozen dataclass would make all eleven inert while staying green.
+  Step 3 wires it together with those patch sites, by adding an optional cap parameter to
+  `_page_text_with_leads` and `_lead_then_capped_body` rather than writing second copies.
+- `wayback_max_age_days`, `disclose_unreadable_embeds`, `thin_content_escalation_chars`,
+  `collect_links`. Each one's wiring is a branch only the second caller can take (an unbounded
+  archive age, a suppressed embed lead, a thin-content escalation, link collection). Adding a
+  branch for a caller that does not exist yet is what this repo's proportion rule refuses, so
+  they arrive with the caller in step 3.
+- `render_memo_scope`. A pure substitution, but the only read that needs it sits in
+  `_render_or_record_the_skip`, which takes no context, and `_RENDER_MEMO_SCOPE`'s three-line
+  rationale comment would have to move into a new file, where it is no longer covered by the
+  operator's verbatim-move exemption. Step 3 or 4 takes it with the rendered rung it already
+  touches.
+- `caller`. The `caller=` marker field is step 3's, when a second caller exists to distinguish;
+  the field carries the token so the marker work is a one-line read.
+
+### Step 2: the two seats
+
+`known_api` is consulted inside `fetch_url` ahead of everything else, which is where the run
+cache will also sit once step 5 adds it (rung 0 stays in front of it). A non-None seat returning
+a `FetchResult` short-circuits the whole ladder, and rung 0's result is
+returned as it stands: `fetch_url` does not run it through `context._stamped_with_route`, so the
+registry's own result carries its `route` (a new `FetchRoute` token is an ADD, which the telemetry
+rules allow, and a rename never is).
+
+`digest` is the page-digest seat. `digest.py` holds `LadderDigest`, the `DigestFn` protocol and
+`bm25_digest`, the free deterministic default the seat's None means, wrapping `document_text`'s
+`digest_pdf` for a document and `digest_text` for a flat page. Nothing calls the seat yet, and
+that is deliberate rather than unfinished: today's only digest runs inside
+`classify._parse_and_digest`, which is ONE `asyncio.to_thread` hop for the pypdf parse and the
+BM25 selection together, precisely because the selection is 96-235 ms of CPU per document and
+additive across concurrent questions. An async seat cannot run inside that thread, so routing the
+PDF path through it splits the hop and moves measured CPU back onto the event loop inside the
+2 s rung margin. That is a deadline change, not a strictly-safer one, so step 5 (which turns the
+digest on for long HTML anyway) is where it belongs.
+
+There is no run cache in `fetch_url`: not an empty one, not a disabled one, not a flag. Step 5
+adds it.
+
+### Step 2: the session and the host-semaphore map ride the context
+
+`LadderContext` gains `policy`, `session` and `host_sems`, all defaulted, so every existing
+`LadderContext()` construction and every direct `_fetch_one(session, url, host_sems)` call is
+unchanged. `_fetch_one`'s signature does not move, which is what keeps the thirteen test modules
+that call it positionally working with no edit. `fetch_url` resolves `host_sems` None to the
+process-wide map (`http_fetch.host_semaphores`), binds the policy with
+`dataclasses.replace`, and opens a session only when the context carries none, which is the shape
+the loop's per-call plain fetch will need in step 3.
+
+### Step 2: the six test-side repoints, all mechanical
+
+Two were `monkeypatch.setattr` sites and four were dotted reads inside assertions. Both patches
+were on `fetch_ladder.context.RESOLUTION_SOURCE_WALL_TIMEOUT`
+(`test_resolution_source_datawrapper.py`, the hanging-dataset teardown and the below-floor hop
+skip); they now scale the preset itself, `monkeypatch.setattr(ladder_policy,
+"RESOLUTION_SOURCE_POLICY", replace(..., total_wall_s=0.4))`, which the adapter reads at call
+time, so the patch reaches the context (verified: with the preset at 0.4 s the context's remaining
+budget goes negative exactly as before). The four reads of `RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S`
+(two in `test_resolution_source_fetch.py`, one in `test_resolution_source_precision_budget.py`,
+one in `test_resolution_source_url_context_rung.py`) now read
+`RESOLUTION_SOURCE_POLICY.rung_wall_margin_s`, so they track the number the ladder actually uses.
+No test was weakened, skipped or deleted, and every one of the seven failures the move produced
+was an `AttributeError` at the patch or read site, which is the loud failure the removed imports
+were meant to cause.
+
 ## Commits
 
 Baseline at `6f2f051`: `make test` 9,759 passed, 41 skipped, 5 deselected, exit 0. Every commit
@@ -140,6 +226,48 @@ below holds that count, which is the evidence no test was added, removed or weak
   comments included, the only differences being formatter line-wrapping where a module qualifier
   pushed a call past 120 columns.
 
+- **step 2, the policy and the entry point.** New `policy.py` (76) with `LadderPolicy` and the
+  `RESOLUTION_SOURCE_POLICY` preset, new `digest.py` (78) with the digest seat, `ladder.fetch_url`
+  as the one public entry point, and `fetch_resolution_sources` pointed at it. `ladder.py` grows to
+  150 lines while its comment blocks shrink to one line each: the dispatcher's rung-ordering
+  rationale now lives in `docs/architecture.md` "The shared fetch ladder", which also carries the
+  policy knob table and replaces the stale ladder rows in "Where the pieces live". Equivalence
+  evidence beyond the suite: a throwaway harness drove `fetch_resolution_sources` over seven shapes
+  (a plain success, a 403 rescued by the impersonated retry, a JavaScript wall rescued by the
+  browser, a cited PDF, a blocked page rescued from the archive, a blocked page read by the paid
+  rung, and the Datawrapper second phase) and dumped every `FetchResult` field, every rung attempt
+  and every `RESOLUTION_SOURCE_FETCH` / `RESOLUTION_SOURCE_ESCALATION` line before and after; the
+  two dumps are identical once the harness's own generated `Last-Modified` stamp is normalised.
+  Six new tests in `tests/resolution_source/test_fetch_ladder_entry_point.py` cover the entry
+  point itself: the wall pair reaching a rung through the per-hop `ClientTimeout`, a context with
+  no session getting one opened and closed, a context with no host map contending on the
+  process-wide one, and rung 0 both short-circuiting and declining. Gates: test 9,765 passed /
+  41 skipped / 5 deselected exit 0 (9,759 at the baseline plus those six), lint clean, typecheck
+  0 errors, 6 import contracts kept, deptry clean, and each of the eight package modules plus
+  `resolution_source` and `rendered_fetch` imports first in a fresh interpreter. Committed after the
+  lead reshaped the digest seat (below) and pinned it: 9,766 passed with the seventh new test.
+
+  **The digest seat is the sibling's exact shape.** The step-2 draft gave `policy.digest` a richer
+  signature (`pdf`, `top_k`, `max_chars`, `source_url`) returning a rendered block, which would have
+  needed an adapter around `page_digest.digest_page`. The lead reshaped it so the sibling drops in
+  with no adapter: `DigestFn` is `async (text: str, query: str, *, budget_seconds: float) ->
+  DigestPassages`, and `DigestPassages` is a read-only Protocol with the five `PageDigest` fields
+  (`passages: list[str]`, `passages_returned`, `passages_grounded`, `fallback_used`, `method`). The
+  digest hands back ranked PASSAGES rather than a block because how many characters a reader sees
+  is the caller's knob, so the ladder renders the block at presentation. The BM25 default,
+  `digest.bm25_digest`, returns the top-K `select_passages` windows with both counters equal to the
+  selection size and `method="digest_local"`. A test in `test_fetch_ladder_entry_point.py` mirrors
+  the sibling's signature and result field for field and assigns it to `DigestFn`, so a drift in
+  either fails `make typecheck` on this branch rather than at the merge. Wiring, later:
+  `replace(GAP_FILL_POLICY, digest=page_digest.digest_page)`.
+
+  **The known-API seat needs a four-line adapter, by design.** `KnownApiFn` is
+  `Callable[[str], Awaitable[FetchResult | None]]`. The sibling exposes a sync
+  `translate(url) -> KnownApiCall | None`, the backends that run a call, and
+  `adapters.to_fetch_result(result, *, url, route="known_api")`; the wiring step composes those
+  three into one coroutine and assigns it to `known_api`. The seat is not shaped as `translate`
+  because the ladder must not know the backends exist.
+
 ### One real find in 1b, worth a reader's attention
 
 Eight tests failed on logger scoping, not on behaviour. `caplog.at_level(level, logger="...")`
@@ -154,16 +282,36 @@ message text and its own docstring says a spec is agnostic to the log-line prefi
 
 ## Next
 
-Step 2: introduce `policy.py` with `LadderPolicy` and the resolution-source preset, add
-`ladder.fetch_url`, and point `fetch_resolution_sources` at it. Then step 3 (the loop's preset),
-step 4 (turn on the rungs the loop lacked, one commit each), step 5 (the run cache, the throttle
-check, the digest), step 6 (fold the host-semaphore map, delete the loop's dead private fetch
-functions and its reaches into `resolution_source` privates).
+Step 3: point the loop at `fetch_url` with a preset that encodes today's gaps, and wire the knobs
+step 2 only declared, each with the patch sites or the branch that comes with it (the per-URL cap
+and its eleven patch sites first, then the archive age bound, the embed disclosure, the
+thin-content escalation, link collection, the render memo scope and the `caller=` marker field).
+Then step 4 (turn on the rungs the loop lacked, one commit each), step 5 (the run cache, the
+throttle check, the digest through the `policy.digest` seat), step 6 (fold the host-semaphore map,
+delete the loop's dead private fetch functions and its reaches into `resolution_source` privates).
 
-Known follow-ups, none blocking: `ladder.py` trips the comment-density ceiling because the
-dispatcher's rung-ordering rationale now sits in a small file, so that prose moves to
-`docs/architecture.md` with a one-line pointer; `resolution_source.py`'s module docstring still
-describes a ladder that has moved out from under it, best rewritten once step 2 makes it an
-adapter; seven tests inherited from 1a assert on records from a logger they never scoped and pass
-only because the root logger sits at WARNING; and `rungs.py` at 1,156 lines trips the advisory
-monolithic-file threshold, left as one module because the plan specifies it as one.
+### Step 2: the smell findings in the two files it edited are FIXED, not carried
+
+The 2026-09-09 operator ruling on the smell scanner (move the prose to documentation, keep one line
+of why with a pointer, never delete the why) applies to a pre-existing finding in a file you touch,
+and the Stop-hook gate enforces it. So the eight findings in `context.py` and `ladder.py` are gone:
+`QuestionRungBudget`'s per-question receipt, `browser_escalation_gate`'s two paragraphs, the paid-read
+cap comment, `LadderContext`'s field-by-field prose, the `_RUNG_WALL_SKIP_PHRASE` and
+`_BUDGET_GATED_RUNGS` derivation receipts, `_escalate_unresolved`'s conventions and `_fetch_one`'s
+two carry-forward comments all moved verbatim in substance into two new `docs/architecture.md`
+subsections, "What the dispatcher returns, and what it carries forward" and "The per-URL context and
+the per-question budget", each with a one-line pointer left at the code. Proof the trim touched no
+code: the docstring-stripped AST diff of both files against `2e97e1d` names only the intended
+identifiers (`Any`, `LadderPolicy`, `RESOLUTION_SOURCE_POLICY`, the three new fields, the two wall
+knobs; and in `ladder.py` only `fetch_url` and its imports). The other moved files (`rungs.py`,
+`resolution_source.py` and the three test modules this step barely touched) keep their findings for
+the scheduled repo-wide sweep, since nothing in them was rewritten here.
+
+Known follow-ups, none blocking: `resolution_source.py`'s 125-line module docstring still describes
+a ladder that has moved out from under it, and it is now purely the fetcher's adapter, so the
+rewrite is due and deliberately not bundled into step 2; seven tests inherited from 1a assert on
+records from a logger they never scoped and pass only because the root logger sits at WARNING;
+`rungs.py` at 1,155 lines trips the advisory monolithic-file threshold, left as one module because
+the plan specifies it as one; and every comment-density and long-docstring finding in the moved
+files is left verbatim under the operator's scheduled repo-wide comment sweep, which is its own
+change (the two files step 2 created carry no findings).

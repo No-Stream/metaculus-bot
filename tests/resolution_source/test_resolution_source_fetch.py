@@ -20,10 +20,11 @@ import aiohttp
 import pytest
 
 from metaculus_bot.research import impersonated_fetch, resolution_chart_data, resolution_presentation, resolution_source
-from metaculus_bot.research.fetch_ladder import classify, context, direct_fetch, guard, rungs
+from metaculus_bot.research.fetch_ladder import classify, direct_fetch, guard, rungs
 from metaculus_bot.research.fetch_ladder.classify import looks_like_js_wall, looks_like_page_chrome
 from metaculus_bot.research.fetch_ladder.context import LadderContext
 from metaculus_bot.research.fetch_ladder.ladder import _fetch_one
+from metaculus_bot.research.fetch_ladder.policy import RESOLUTION_SOURCE_POLICY
 from metaculus_bot.research.http_fetch import host_semaphores, pdf_parse_semaphore, semaphore_for_host
 from metaculus_bot.research.impersonated_fetch import IMPERSONATE_TRIGGER_STATUSES
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail
@@ -1760,7 +1761,7 @@ class TestPdfParseGate:
             started=time.monotonic()
             - (
                 resolution_source.RESOLUTION_SOURCE_WALL_TIMEOUT
-                - context.RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S
+                - RESOLUTION_SOURCE_POLICY.rung_wall_margin_s
                 - classify.RESOLUTION_SOURCE_PDF_MIN_BUDGET_S
                 - 0.05
             ),
@@ -1834,7 +1835,7 @@ class TestPerHopRequestTimeout:
         session = self._session(article_html)
         elapsed = 35.0
         expected = (
-            resolution_source.RESOLUTION_SOURCE_WALL_TIMEOUT - elapsed - context.RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S
+            resolution_source.RESOLUTION_SOURCE_WALL_TIMEOUT - elapsed - RESOLUTION_SOURCE_POLICY.rung_wall_margin_s
         )
 
         await _fetch_one(

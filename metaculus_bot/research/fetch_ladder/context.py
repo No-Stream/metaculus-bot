@@ -14,14 +14,14 @@ import logging
 import time
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from typing import Any
 from urllib.parse import urlparse
 
 from metaculus_bot.constants import (
-    RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S,
     RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS,
-    RESOLUTION_SOURCE_WALL_TIMEOUT,
     RESOLUTION_SOURCE_WAYBACK_MAX_ATTEMPTS,
 )
+from metaculus_bot.research.fetch_ladder.policy import RESOLUTION_SOURCE_POLICY, LadderPolicy
 from metaculus_bot.research.http_fetch import semaphore_for_host
 from metaculus_bot.research.resolution_fetch_result import (
     FetchResult,
@@ -38,16 +38,13 @@ logger = logging.getLogger(__name__)
 class QuestionRungBudget:
     """The rung allowances one QUESTION shares across its cited URLs.
 
-    Separate from :class:`LadderContext`, which is per-URL, because the thing being bounded is
-    per-question: every Wayback snapshot shares netloc ``web.archive.org``, so the loop-wide
-    per-host ``Semaphore(1)`` turns N cited URLs into N sequential archive fetches inside a wall
-    that discards work already done when it fires. Its default is a fresh budget, so a
-    monkeypatched fetch driven with one URL and no shared state behaves exactly as it did.
+    Per-question rather than per-URL because of what is being bounded; its default is a fresh
+    budget, so a monkeypatched fetch driven with one URL and no shared state behaves exactly as it
+    did. Receipts: ``docs/architecture.md`` "The per-URL context and the per-question budget".
     """
 
     wayback_attempts_left: int = RESOLUTION_SOURCE_WAYBACK_MAX_ATTEMPTS
-    # Paid url_context reads left for this question — the analogue of the Wayback cap, so a
-    # question citing several dead sources cannot pay per source inside one provider wall.
+    # The Wayback cap's analogue, so one question cannot pay per dead source inside one wall.
     url_context_attempts_left: int = RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS
     # One browser escalation per host at a time WITHIN the question, see `browser_escalation_gate`.
     browser_escalation_gates: dict[str, asyncio.Semaphore] = field(default_factory=dict)
@@ -70,25 +67,16 @@ class QuestionRungBudget:
         """The ``Semaphore(1)`` that serializes this question's derived-feed-then-browser
         escalations on ``url``'s host.
 
-        The derived-API rung exists so a host with several cited URLs pays for ONE Chromium
-        launch, but the provider fans one task out per cited URL, so every same-host URL asked
-        ``endpoint_for`` before any render had finished, got None, queued on the per-host gate
-        inside the render, and launched its own browser after the first had already recorded
-        the endpoint. Holding this gate across the pair means the second URL re-asks once the
-        first's escalation is over and takes the feed off an ordinary GET instead. Waiting here
-        costs the second URL nothing it did not already pay queueing on the host gate inside the
-        render, and the rungs behind it re-read their wall budget after the wait.
-
-        Per question rather than loop-wide on purpose: the cross-question shape still
-        serializes on the loop-wide host gate exactly as before, and a loop-wide gate here
-        would be one more unbounded process-global acquire in front of a wall that discards
-        finished work (FUTURE.md item 5, the operator's call).
+        Held across the PAIR so a same-host sibling re-asks ``endpoint_for`` once the first
+        escalation is over and takes the feed off an ordinary GET instead of launching its own
+        browser, and per question rather than loop-wide so no unbounded process-global acquire
+        sits in front of the provider's wall. Both receipts: ``docs/architecture.md`` "The per-URL
+        context and the per-question budget".
         """
         return semaphore_for_host(url, self.browser_escalation_gates)
 
 
-# The human phrase each rung's wall-budget skip logs, keyed by route so the one message template
-# in `LadderContext.claim_rung_budget` reads the same as the six hand-copied lines it replaced.
+# Keyed by route so `claim_rung_budget`'s one template reads as the six lines it replaced.
 _RUNG_WALL_SKIP_PHRASE: dict[FetchRoute, str] = {
     "meta_refresh": "the meta-refresh hop",
     "impersonate": "the impersonated retry",
@@ -104,26 +92,15 @@ _RUNG_WALL_SKIP_PHRASE: dict[FetchRoute, str] = {
 class LadderContext:
     """Per-URL inputs and rung bookkeeping for one :func:`_fetch_one` call.
 
-    ONE per fetched URL, so ``rungs`` belongs to that URL and can be stamped onto its
-    result; ``query``, ``started``, ``now`` and ``shared`` are the same for every URL in a
-    provider call. Every field has a default so the monkeypatched fetch surface can still be
-    driven with three positional arguments, and a default context is simply "no
-    question text, clock starts now" — which gives a direct fetch exactly the behaviour
-    it had before the ladder existed.
-
-    ``query`` is the question's title plus its resolution criteria, and it is what
-    decides WHICH passages of a 220-page PDF a forecaster sees. ``started`` is the
-    provider's own wall-clock origin, so every rung can bound itself against the same
-    45 s the outer ``asyncio.wait_for`` uses. ``now`` is the WALL-CLOCK counterpart, which the
-    Wayback rung ages a capture against — a monotonic origin cannot date anything, and taking
-    the clock inside the rung would make an archived snapshot's rendered disclosure depend on
-    when it happened to run rather than on the fetch it belongs to.
-
-    ``fast_path`` is the question's time-budget thin-window mode (``time_budget.py``), handed
-    down from the orchestrator through the provider factory. The two EXPENSIVE rungs — the
-    browser and the paid reader — decline on it before any side effect, recording a
-    ``fast_path`` skip; the cheap rungs run as they do off it. It only ever declines, so a
-    question with no fast path is byte-identical to one before the gate existed.
+    ONE per fetched URL, so ``rungs`` belongs to that URL and can be stamped onto its result,
+    while ``query`` (what a PDF's passages are ranked against), ``started`` (the monotonic wall
+    origin every rung bounds itself with), ``now`` (its wall-clock counterpart, which dates a
+    Wayback capture), ``shared``, ``policy``, ``session``, ``host_sems`` and ``fast_path`` are the
+    same for every URL in one provider call. Every field has a default, so the monkeypatched fetch
+    surface can still be driven with three positional arguments and a default context behaves as a
+    direct fetch did before the ladder existed. What each field decides, and why the clock is
+    taken here rather than inside a rung: ``docs/architecture.md`` "The per-URL context and the
+    per-question budget".
     """
 
     query: str = ""
@@ -132,6 +109,9 @@ class LadderContext:
     shared: QuestionRungBudget = field(default_factory=QuestionRungBudget)
     rungs: list[RungAttempt] = field(default_factory=list)
     fast_path: bool = False
+    policy: LadderPolicy = RESOLUTION_SOURCE_POLICY
+    session: Any = None
+    host_sems: dict[str, asyncio.Semaphore] | None = None
 
     def rung_budget_s(self) -> float:
         """Wall-clock seconds a rung may spend before the outer ``wait_for`` fires.
@@ -140,7 +120,7 @@ class LadderContext:
         discards every page that already fetched, so a rung that overruns costs the
         whole question's resolution evidence rather than just its own attempt.
         """
-        return RESOLUTION_SOURCE_WALL_TIMEOUT - (time.monotonic() - self.started) - RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S
+        return self.policy.total_wall_s - (time.monotonic() - self.started) - self.policy.rung_wall_margin_s
 
     def claim_rung_budget(
         self, rung: FetchRoute, from_status: FetchStatus, url: str, floor_s: float, *, note: str = ""
@@ -263,11 +243,5 @@ def _stamped_with_route(result: FetchResult, ctx: LadderContext) -> FetchResult:
     return result
 
 
-# Every rung with a wall-budget floor, i.e. every rung that can record a `wall_budget` skip, in
-# ladder order. `_rung_counts` breaks the aggregate `rung_budget_skips` out per member. Derived
-# from the skip-phrase map rather than spelled a second time, because the two drifted in
-# opposite directions: a rung phrased but not listed here silently lost its `<rung>_budget_skips`
-# key from the archive, and a rung listed but not phrased raised `KeyError` from inside
-# `claim_rung_budget`, which the provider's `gather(return_exceptions=False)` turns into losing
-# every page of the question. Dict insertion order is the ladder order, so the keys are unchanged.
+# Derived, never spelled twice: the two tables drifted in both directions (see the doc).
 _BUDGET_GATED_RUNGS: tuple[FetchRoute, ...] = tuple(_RUNG_WALL_SKIP_PHRASE)

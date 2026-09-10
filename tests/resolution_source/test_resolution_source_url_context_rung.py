@@ -14,6 +14,7 @@ from metaculus_bot.research import resolution_presentation
 from metaculus_bot.research.fetch_ladder import rungs
 from metaculus_bot.research.fetch_ladder.context import LadderContext, QuestionRungBudget
 from metaculus_bot.research.fetch_ladder.ladder import _fetch_one
+from metaculus_bot.research.fetch_ladder.policy import RESOLUTION_SOURCE_POLICY
 from metaculus_bot.research.resolution_presentation import format_resolution_sections
 from metaculus_bot.research.resolution_source import _rung_counts
 from tests.resolution_source_fakes import (
@@ -373,7 +374,7 @@ class TestUrlContextRung:
 
         assert result.status == "success"
         assert calls[0]["attempts"] == rungs.RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS
-        assert calls[0]["timeout_ms"] == int((16.0 - rungs.RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S) * 1000)
+        assert calls[0]["timeout_ms"] == int((16.0 - RESOLUTION_SOURCE_POLICY.rung_wall_margin_s) * 1000)
 
     async def test_a_pre_check_that_eats_the_room_skips_before_paying(self, monkeypatch):
         reader, calls = paid_reader()

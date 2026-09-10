@@ -26,7 +26,6 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_IMPERSONATE_MIN_BUDGET_S,
     RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
     RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S,
-    RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S,
     RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS,
     RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV,
     RESOLUTION_SOURCE_URL_CONTEXT_MAX_ATTEMPTS,
@@ -1074,7 +1073,7 @@ async def _url_context_rung(
                 # The client-side ceiling is what returns the worker: wait_for cancels this
                 # coroutine and not the thread it is waiting on. Sized off the remaining budget
                 # so the read cannot outlive the provider's own wall by more than the margin.
-                timeout_ms=int(max(0.0, budget_s - RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S) * 1000),
+                timeout_ms=int(max(0.0, budget_s - ctx.policy.rung_wall_margin_s) * 1000),
                 attempts=RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS,
             ),
             timeout=budget_s,

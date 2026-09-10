@@ -17,10 +17,11 @@ from __future__ import annotations
 import time
 
 from metaculus_bot.constants import RESOLUTION_SOURCE_PRECISION_RETRY_MIN_BUDGET_S
-from metaculus_bot.research.fetch_ladder import classify, context, rungs
+from metaculus_bot.research.fetch_ladder import classify, rungs
 from metaculus_bot.research.fetch_ladder.classify import _extract_page_text, content_share, looks_like_page_chrome
 from metaculus_bot.research.fetch_ladder.context import LadderContext
 from metaculus_bot.research.fetch_ladder.ladder import _fetch_one
+from metaculus_bot.research.fetch_ladder.policy import RESOLUTION_SOURCE_POLICY
 from metaculus_bot.research.fetch_ladder.rungs import _rendered_rung_applies
 from metaculus_bot.research.rendered_fetch import RenderedPage
 from metaculus_bot.research.resolution_source import RESOLUTION_SOURCE_WALL_TIMEOUT, FetchResult
@@ -45,7 +46,7 @@ _CARD = (
 
 def _spent_context(wall_left_s: float) -> LadderContext:
     """A per-URL context whose remaining wall (``rung_budget_s``) is about ``wall_left_s``."""
-    margin = context.RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S
+    margin = RESOLUTION_SOURCE_POLICY.rung_wall_margin_s
     return LadderContext(started=time.monotonic() - (RESOLUTION_SOURCE_WALL_TIMEOUT - margin - wall_left_s))
 
 
