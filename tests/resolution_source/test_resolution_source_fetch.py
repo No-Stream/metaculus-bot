@@ -889,6 +889,9 @@ class TestResolutionSourceFetchMarker:
             "failure_class": "http_403",
             "exc": None,
             "server": "apache/2.4.62_(debian)",
+            "passages_returned": None,
+            "passages_grounded": None,
+            "fallback_used": None,
             "caller": "resolution_source",
         }
 

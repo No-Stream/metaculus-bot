@@ -183,6 +183,8 @@ class HtmlRead:
             query,
             budget_seconds=digest_budget,
         )
+        if not passages.passages:
+            return ordinary
         rendered = await asyncio.to_thread(
             document_text.render_flat_passages, passages.passages, query=query, max_chars=None
         )

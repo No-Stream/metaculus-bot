@@ -185,6 +185,50 @@ async def test_short_html_does_not_invoke_digest_and_has_no_digest_marker_fields
 
 
 @pytest.mark.asyncio
+async def test_empty_html_digest_selection_keeps_the_capped_page() -> None:
+    """An empty digest selection must not replace a readable page with no-match prose."""
+    cap = 300
+
+    async def digest(text: str, query: str, *, budget_seconds: float) -> LadderDigest:
+        del text, query, budget_seconds
+        return LadderDigest(
+            passages=[],
+            passages_returned=0,
+            passages_grounded=0,
+            fallback_used=False,
+            method="bm25",
+        )
+
+    artifact = run_cache.HtmlRead(
+        url=_URL,
+        http_status=200,
+        content_type="text/html",
+        extraction=PageExtraction(text=_long_page()),
+        chart_block="",
+        datawrapper_charts=(),
+        unreadable_embeds=(),
+        links=(),
+        routing_body=b"<html>",
+    )
+    result = await artifact.present_html(
+        replace(RESOLUTION_SOURCE_POLICY, digest=digest, per_url_max_chars=cap),
+        query="",
+        route="direct",
+        now=datetime.now(UTC),
+        budget_seconds=RESOLUTION_SOURCE_POLICY.total_wall_s,
+    )
+
+    assert result is not None
+    assert result.status == "success"
+    assert "The tracker reports 917 admissions this week." in result.text
+    assert "No passage in this document matched the query." not in result.text
+    assert len(result.text) <= cap
+    assert result.passages_returned is None
+    assert result.passages_grounded is None
+    assert result.fallback_used is None
+
+
+@pytest.mark.asyncio
 async def test_wayback_html_cache_hit_uses_the_same_digest_seat_and_preserves_archive_lead() -> None:
     full_text = _long_page()
     calls: list[tuple[str, str, float]] = []
