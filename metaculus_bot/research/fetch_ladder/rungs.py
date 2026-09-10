@@ -13,6 +13,7 @@ import asyncio
 import logging
 import os
 import time
+from dataclasses import replace
 from typing import Any
 from urllib.parse import urlparse
 
@@ -353,7 +354,7 @@ async def _impersonate_rung(
     # The rung's own verdict, stamped before deciding: a body that classified as unreadable is a
     # fact about the page the escalation line has to keep even though the direct status stands.
     attempt.outcome = result.status
-    if result.status == "success":
+    if result.status in ("success", "throttled"):
         return result
     logger.info(
         "resolution_source: the impersonated retry of %s got a 200 that classified as %s; the direct result stands",
@@ -695,6 +696,8 @@ async def _derived_api_rung(
         f"(found on {endpoint.discovered_on}, direct read was {direct.status})"
     )
     feed = await direct_fetch._fetch_direct(session, endpoint.endpoint_url, host_sems, context._aux_ctx(ctx))
+    if feed.status == "throttled":
+        return replace(feed, url=url)
     if feed.status != "success":
         return None
     if not is_json_content_type(feed.content_type or ""):

@@ -34,7 +34,7 @@ async def test_harvested_derived_feed_applies_the_shared_throttle_verdict(monkey
     assert plain.throttle_method == "derived_api"
 
 
-async def test_remembered_derived_feed_does_not_publish_a_throttle_as_content() -> None:
+async def test_remembered_derived_feed_propagates_the_terminal_throttle(monkeypatch) -> None:
     derived_api.remember_endpoint(_URL, _FEED_URL)
     session = FakeSession(
         {
@@ -43,8 +43,16 @@ async def test_remembered_derived_feed_does_not_publish_a_throttle_as_content() 
         }
     )
 
+    async def _browser_must_not_run(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("a remembered feed throttle must stop escalation")
+
+    monkeypatch.setattr(rungs, "render_page", _browser_must_not_run)
+
     result = await _fetch_one(session, _URL, {})
 
-    assert result.status == "js_wall"
+    assert result.status == "throttled"
+    assert result.route == "derived_api"
+    assert result.url == _URL
     assert result.text == ""
+    assert result.throttle_phrase == "rate limit"
     assert _FEED_URL in session.requested

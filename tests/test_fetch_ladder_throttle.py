@@ -11,6 +11,7 @@ from metaculus_bot.research.agentic.ladder_adapter import as_plain_result
 from metaculus_bot.research.fetch_ladder import guard, ladder, run_cache, rungs
 from metaculus_bot.research.fetch_ladder.context import LadderContext
 from metaculus_bot.research.fetch_ladder.policy import GAP_FILL_DIRECT_POLICY, GAP_FILL_FETCH_POLICY
+from metaculus_bot.research.impersonated_fetch import ImpersonatedResponse
 from metaculus_bot.research.rendered_fetch import RenderedPage
 from tests.resolution_source_fakes import FakeResponse, FakeSession
 
@@ -139,6 +140,45 @@ async def test_http_429_behavior_remains_blocked(monkeypatch: pytest.MonkeyPatch
     assert plain.status == "blocked"
     assert plain.method == "plain"
     assert plain.text == "Fetch blocked with HTTP 429."
+
+
+@pytest.mark.asyncio
+async def test_impersonated_interstitial_is_terminal_before_archive_escalation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 403 rescued into a 200 throttle page must not spend an archive or paid rung."""
+    _public_urls(monkeypatch)
+    session = FakeSession({_URL: FakeResponse(403, body=b"denied", content_type="text/html")})
+
+    async def _impersonated(*_args: object, **_kwargs: object) -> ImpersonatedResponse:
+        return ImpersonatedResponse(
+            status=200,
+            url=_URL,
+            content_type="text/html",
+            server="edge",
+            body=_THROTTLE_HTML,
+            elapsed_s=0.1,
+            primary_ip="203.0.113.10",
+        )
+
+    async def _later_rung_must_not_run(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("an impersonated throttle must stop escalation")
+
+    monkeypatch.setattr(rungs.impersonated_fetch, "IMPERSONATE_TRIGGER_STATUSES", frozenset({403}))
+    monkeypatch.setattr(rungs.impersonated_fetch, "impersonation_enabled", lambda: True)
+    monkeypatch.setattr(rungs, "fetch_impersonated", _impersonated)
+    monkeypatch.setattr(rungs, "_wayback_rung", _later_rung_must_not_run)
+
+    result = await ladder.fetch_url(
+        _URL,
+        policy=GAP_FILL_FETCH_POLICY,
+        ctx=LadderContext(policy=GAP_FILL_FETCH_POLICY, session=session, host_sems={}),
+    )
+
+    assert result.status == "throttled"
+    assert result.text == ""
+    assert result.throttle_phrase == "rate limit"
+    assert result.route == "impersonate"
 
 
 @pytest.mark.asyncio
