@@ -355,12 +355,14 @@ MARKER_SPECS: list[MarkerSpec] = [
     ),
     MarkerSpec(
         "resolution_source_fetch",
-        # Why: reason/route/exc/caller are optional, tail-keyed. Receipt: docs/telemetry_markers.md "RESOLUTION_SOURCE_FETCH".
+        # Why: reason/route/exc/digest/caller are optional, tail-keyed. Receipt: docs/telemetry_markers.md "RESOLUTION_SOURCE_FETCH".
         re.compile(
             r"RESOLUTION_SOURCE_FETCH:\s*question=(?P<question>\S+)\s+url=(?P<url>\S+)"
             r"\s+status=(?P<status>\S+)\s+http=(?P<http>\S+)\s+embeds=(?P<embeds>\S+)"
             r"(?:\s+reason=(?P<reason>\S+))?(?:\s+route=(?P<route>\S+))?"
             r"(?:\s+failure_class=(?P<failure_class>\S+))?(?:\s+exc=(?P<exc>\S+))?(?:\s+server=(?P<server>\S+))?"
+            r"(?:\s+passages_returned=(?P<passages_returned>\S+))?(?:\s+passages_grounded=(?P<passages_grounded>\S+))?"
+            r"(?:\s+fallback_used=(?P<fallback_used>\S+))?"
             r"(?:\s+caller=(?P<caller>\S+))?"
         ),
         qid_kind=QID_KIND_QUESTION_ID,  # resolution_source.py emits question.id_of_question

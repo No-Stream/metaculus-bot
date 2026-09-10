@@ -9,6 +9,7 @@ windows), so the ladder renders the block at presentation with that cap.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -67,7 +68,7 @@ async def bm25_digest(text: str, query: str, *, budget_seconds: float) -> Ladder
     runs the PDF digest in. No model ran, so both counters are the selection's own size.
     """
     del budget_seconds
-    ranked = select_passages(text, query, top_k=DOCUMENT_DIGEST_TOP_K)
+    ranked = await asyncio.to_thread(select_passages, text, query, top_k=DOCUMENT_DIGEST_TOP_K)
     return LadderDigest(
         passages=[passage.text for passage in ranked],
         passages_returned=len(ranked),

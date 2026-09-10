@@ -262,6 +262,7 @@ async def _classify_html_body(
     content_type: str,
     *,
     http_status: int,
+    query: str = "",
     remaining_wall_s: float | None = None,
     pol: LadderPolicy = RESOLUTION_SOURCE_POLICY,
 ) -> _HtmlClassification:
@@ -302,7 +303,13 @@ async def _classify_html_body(
         links=tuple(links),
         routing_body=_routing_body(body),
     )
-    result = artifact.present(pol, query="", route="direct", now=datetime.now(UTC))
+    result = await artifact.present_html(
+        pol,
+        query=query,
+        route="direct",
+        now=datetime.now(UTC),
+        budget_seconds=max(0.0, remaining_wall_s or 0.0),
+    )
     if result is None:
         raise RuntimeError("fresh HTML artifact was rejected by the policy that classified it")
     return _HtmlClassification(
@@ -588,6 +595,7 @@ async def _classify_body(
             current_url,
             content_type,
             http_status=http_status,
+            query=ctx.query,
             remaining_wall_s=ctx.rung_budget_s(),
             pol=ctx.policy,
         )
@@ -619,7 +627,13 @@ async def _classify_body_or_hop(
     if ctx.policy.verdict.body_route(content_type, body) != "html":
         return await _classify_body(body, current_url, content_type, ctx, http_status=http_status)
     classified = await _classify_html_body(
-        body, current_url, content_type, http_status=http_status, remaining_wall_s=ctx.rung_budget_s(), pol=ctx.policy
+        body,
+        current_url,
+        content_type,
+        http_status=http_status,
+        query=ctx.query,
+        remaining_wall_s=ctx.rung_budget_s(),
+        pol=ctx.policy,
     )
     capture_html_read(ctx, classified)
     if classified.result.status in ("success", "throttled"):

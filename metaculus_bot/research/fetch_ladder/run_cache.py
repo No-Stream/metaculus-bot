@@ -8,10 +8,11 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Protocol
 
-from metaculus_bot.research import document_cache, resolution_presentation
+from metaculus_bot.research import document_cache, document_text, resolution_presentation
+from metaculus_bot.research.fetch_ladder.digest import DigestPassages, bm25_digest
 from metaculus_bot.research.fetch_ladder.policy import LadderPolicy
 from metaculus_bot.research.fetch_ladder.throttle import matched_throttle_phrase
-from metaculus_bot.research.fetch_ladder.verdict import PageExtraction
+from metaculus_bot.research.fetch_ladder.verdict import HtmlVerdict, PageExtraction
 from metaculus_bot.research.http_fetch import DatawrapperChartRef
 from metaculus_bot.research.resolution_body_text import _truncate_with_marker
 from metaculus_bot.research.resolution_fetch_result import FetchResult, FetchRoute
@@ -60,8 +61,7 @@ class HtmlRead:
     links: tuple[str, ...]
     routing_body: bytes
 
-    def present(self, policy: LadderPolicy, *, query: str, route: FetchRoute, now: datetime) -> FetchResult | None:
-        del query, now
+    def _prepare(self, policy: LadderPolicy, *, route: FetchRoute) -> tuple[HtmlVerdict, bool] | FetchResult | None:
         if policy.verdict.body_route(self.content_type or "", self.routing_body) != "html":
             return None
         candidate = _html_body_text(self.extraction, self.chart_block)
@@ -84,19 +84,32 @@ class HtmlRead:
             and not self.chart_block
             and (read.status != "success" or len(read.published_text.strip()) < floor)
         )
-        text = ""
-        if read.status == "success":
-            text = resolution_presentation._page_text_with_leads(
-                read.published_text,
-                self.url,
-                list(self.unreadable_embeds) if policy.disclose_unreadable_embeds else [],
-                self.chart_block,
-                cap=policy.per_url_max_chars,
-            )
+        return read, escalate
+
+    def _result(
+        self,
+        policy: LadderPolicy,
+        *,
+        read: HtmlVerdict,
+        escalate: bool,
+        route: FetchRoute,
+        text: str,
+        passages: DigestPassages | None = None,
+    ) -> FetchResult:
+        if passages is None:
+            passages_returned = None
+            passages_grounded = None
+            fallback_used = None
+        else:
+            passages_returned = passages.passages_returned
+            passages_grounded = passages.passages_grounded
+            fallback_used = passages.fallback_used
+        if read.status == "success" and not text.strip():
+            raise RuntimeError(f"successful HTML verdict rendered blank text for {self.url}")
         return FetchResult(
             url=self.url,
             status=read.status,
-            text=text,
+            text=text if read.status == "success" else "",
             http_status=self.http_status,
             content_type=self.content_type,
             datawrapper_charts=list(self.datawrapper_charts),
@@ -107,6 +120,82 @@ class HtmlRead:
             precision_rescued=self.extraction.precision_rescued,
             links=list(self.links) if policy.collect_links else [],
             escalate_rendered=escalate,
+            passages_returned=passages_returned,
+            passages_grounded=passages_grounded,
+            fallback_used=fallback_used,
+        )
+
+    def _ordinary_result(
+        self, policy: LadderPolicy, *, read: HtmlVerdict, escalate: bool, route: FetchRoute
+    ) -> FetchResult:
+        text = ""
+        if read.status == "success":
+            text = resolution_presentation._page_text_with_leads(
+                read.published_text,
+                self.url,
+                list(self.unreadable_embeds) if policy.disclose_unreadable_embeds else [],
+                self.chart_block,
+                cap=policy.per_url_max_chars,
+            )
+        return self._result(
+            policy,
+            read=read,
+            escalate=escalate,
+            route=route,
+            text=text,
+        )
+
+    def present(self, policy: LadderPolicy, *, query: str, route: FetchRoute, now: datetime) -> FetchResult | None:
+        del query, now
+        prepared = self._prepare(policy, route=route)
+        if prepared is None or isinstance(prepared, FetchResult):
+            return prepared
+        read, escalate = prepared
+        return self._ordinary_result(policy, read=read, escalate=escalate, route=route)
+
+    async def present_html(
+        self,
+        policy: LadderPolicy,
+        *,
+        query: str,
+        route: FetchRoute,
+        now: datetime,
+        budget_seconds: float,
+    ) -> FetchResult | None:
+        del now
+        prepared = await asyncio.to_thread(self._prepare, policy, route=route)
+        if prepared is None or isinstance(prepared, FetchResult):
+            return prepared
+        read, escalate = prepared
+        ordinary = await asyncio.to_thread(self._ordinary_result, policy, read=read, escalate=escalate, route=route)
+        if read.status != "success" or policy.per_url_max_chars is None:
+            return ordinary
+        if len(read.published_text.strip()) <= policy.per_url_max_chars:
+            return ordinary
+        digest = policy.digest or bm25_digest
+        passages = await digest(
+            read.published_text,
+            query,
+            budget_seconds=max(0.0, budget_seconds),
+        )
+        rendered = await asyncio.to_thread(
+            document_text.render_flat_passages, passages.passages, query=query, max_chars=None
+        )
+        text = await asyncio.to_thread(
+            resolution_presentation._page_text_with_leads,
+            rendered,
+            self.url,
+            list(self.unreadable_embeds) if policy.disclose_unreadable_embeds else [],
+            self.chart_block,
+            cap=policy.per_url_max_chars,
+        )
+        return self._result(
+            policy,
+            read=read,
+            escalate=escalate,
+            route=route,
+            text=text,
+            passages=passages,
         )
 
 
@@ -223,6 +312,59 @@ class WaybackRead:
             route="wayback",
         )
 
+    async def present_html(
+        self,
+        policy: LadderPolicy,
+        *,
+        query: str,
+        route: FetchRoute,
+        now: datetime,
+        budget_seconds: float,
+    ) -> FetchResult | None:
+        if isinstance(self.artifact, HtmlRead):
+            snapshot_read = await self.artifact.present_html(
+                policy,
+                query=query,
+                route=route,
+                now=now,
+                budget_seconds=budget_seconds,
+            )
+        else:
+            snapshot_read = await asyncio.to_thread(
+                self.artifact.present,
+                policy,
+                query=query,
+                route=route,
+                now=now,
+            )
+        if snapshot_read is None:
+            return None
+        if snapshot_read.status != "success":
+            return replace(snapshot_read, url=self.url, route="wayback")
+        age_days = snapshot_age_days(self.snapshot, now)
+        max_age_days = policy.wayback_max_age_days
+        if age_days is None or (max_age_days is not None and age_days > max_age_days):
+            return FetchResult(
+                url=self.url,
+                status="stale_data",
+                text="",
+                http_status=self.live_http_status,
+                content_type=self.live_content_type,
+                failure_class=self.live_failure_class,
+                exc=self.live_exc,
+                server=self.live_server,
+                route="wayback",
+            )
+        lead = wayback_lead(self.snapshot, age_days, self.live_status)
+        text = await asyncio.to_thread(
+            resolution_presentation._lead_then_capped_body,
+            lead,
+            snapshot_read.text,
+            self.url,
+            cap=policy.per_url_max_chars,
+        )
+        return replace(snapshot_read, url=self.url, text=text, route="wayback")
+
 
 @dataclass(frozen=True, slots=True)
 class _Entry:
@@ -237,10 +379,17 @@ async def get(url: str, *, policy: LadderPolicy, query: str, now: datetime, budg
     entry = _CACHE.get(url)
     if entry is None:
         return None
-    result = await asyncio.wait_for(
-        asyncio.to_thread(entry.artifact.present, policy, query=query, route=entry.route, now=now),
-        timeout=max(0.0, budget_s),
-    )
+    if isinstance(entry.artifact, (HtmlRead, WaybackRead)):
+        presentation = entry.artifact.present_html(
+            policy,
+            query=query,
+            route=entry.route,
+            now=now,
+            budget_seconds=budget_s,
+        )
+    else:
+        presentation = asyncio.to_thread(entry.artifact.present, policy, query=query, route=entry.route, now=now)
+    result = await asyncio.wait_for(presentation, timeout=max(0.0, budget_s))
     if result is None:
         if _CACHE.get(url) is entry:
             _CACHE.pop(url)

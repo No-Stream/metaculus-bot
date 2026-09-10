@@ -525,6 +525,10 @@ class FetchResult:
     # existing marker without carrying the refused body as fetch text.
     throttle_phrase: str | None = None
     throttle_chars: int | None = None
+    # Page-digest counts; absent on ordinary reads so old marker lines stay byte-identical.
+    passages_returned: int | None = None
+    passages_grounded: int | None = None
+    fallback_used: bool | None = None
 
     def __post_init__(self) -> None:
         """Enforce the ``text`` invariant the field comment states.

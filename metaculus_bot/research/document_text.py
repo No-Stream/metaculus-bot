@@ -432,6 +432,16 @@ def digest_text(text: str, *, query: str, top_k: int, max_chars: int | None, sou
     return DocumentDigest(block=block, passages=len(passages))
 
 
+def render_flat_passages(passages: Sequence[str], *, query: str, max_chars: int | None) -> str:
+    """Render selected page-less passages in the same compact form as a document digest."""
+    cleaned = [passage.strip() for passage in passages if passage.strip()]
+    block = _digest_passages(
+        [Passage(score=0.0, start=0, end=len(passage), text=passage, page=None) for passage in cleaned],
+        query=query,
+    )
+    return _truncate_digest(block, max_chars)
+
+
 # --- PDF reading -------------------------------------------------------------------------
 
 

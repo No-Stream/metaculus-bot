@@ -31,11 +31,19 @@ def fetch_marker_line(result: FetchResult, *, qid: int | None, caller: str) -> s
     failure_class = f" failure_class={result.failure_class}" if result.failure_class else ""
     exc = f" exc={result.exc}" if result.exc else ""
     server = f" server={result.server}" if result.server else ""
+    digest = ""
+    if result.passages_returned is not None:
+        if result.passages_grounded is None or result.fallback_used is None:
+            raise ValueError("digest marker fields must be provided together")
+        digest = (
+            f" passages_returned={result.passages_returned} passages_grounded={result.passages_grounded}"
+            f" fallback_used={result.fallback_used}"
+        )
     embeds = ",".join(result.unreadable_embeds) if result.unreadable_embeds else "none"
     return (
         f"RESOLUTION_SOURCE_FETCH: question={qid} url={result.url} status={fetch_outcome_token(result)} "
         f"http={result.http_status if result.http_status is not None else 'n/a'} "
-        f"embeds={embeds}{reason}{route}{failure_class}{exc}{server} caller={caller}"
+        f"embeds={embeds}{reason}{route}{failure_class}{exc}{server}{digest} caller={caller}"
     )
 
 
