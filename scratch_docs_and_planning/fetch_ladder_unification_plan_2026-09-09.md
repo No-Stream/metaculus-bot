@@ -20,8 +20,9 @@ first (both gitignored, both readable with `cat`). They are today's rung-by-rung
 file and line receipts, and every frequency number in this plan comes from them. Then read
 `docs/research.md` "Resolution-source fetcher" and `docs/agentic_gap_fill.md` "The fetch ladder"
 for the documented behaviour, and `scratch_docs_and_planning/fetch_ladder_plan_2026-09-03.md` with
-`impersonate_rung_plan_2026-09-04.md` for the decisions already taken. Nothing has been ported
-between the two ladders since; `git log --oneline -6` at `faf4581` carries no rung work.
+`impersonate_rung_plan_2026-09-04.md` for the decisions already taken. The inventory predates the
+five rung-port commits named under "What the split costs today", so read its loop column as the
+state before `21f3122`.
 
 ## What the split costs today
 
@@ -37,15 +38,13 @@ ARIA rewrite, chart read and harvested-feed check are built for. On question 439
 served about 80,000 characters with none of the resolving figures in them, while its annual series
 sat in a `data-chart` attribute the fetcher reads and the loop ignores.
 
-One caution before you start. When this plan was written, another agent had four of those ported
-rungs in the working tree uncommitted, and they may have landed since. That change teaches the
-loop's `_plain_html_outcome` to call Tier 1's `_extract_page_text` (the ARIA rewrite plus the
-two-pass policy), to read the inline chart configuration on every page, and to follow a
-meta-refresh stub as a next hop through its own re-guarded redirect loop. It also gives both hop
-shapes one vetting helper. Absorb that work rather than redoing it: those four calls become the
-shared classifier's, and step 4 below shrinks to the derived-feed reuse and Wayback. Diff
-`metaculus_bot/research/agentic/fetch_outcomes.py` and `tools.py` against `f120e23` before you
-plan a line of it.
+One caution before you start. On the same day this plan was written, five commits ported most of
+those rungs into the loop: `21f3122` (Tier 1's HTML extraction steps, the chart read and the
+meta-refresh hop), `8eba338` (Wayback with the capture date surfaced), `246fe68` (the harvested
+JSON feed when a render is empty), `924cfc2` (the tool description steering the driver off FRED,
+Kalshi and Yahoo Finance) and `8f1a56b` (docs). Absorb that work rather than redoing it: those
+calls become the shared classifier's, and step 4 below shrinks to the derived-feed REUSE half.
+Read the constraints section at the end before planning a line of the extraction.
 
 ## Module boundary and entry point
 
@@ -236,3 +235,47 @@ route token or skip reason. Each of the four is a rule this repo earned the hard
 3. **Wayback freshness for a driver-chosen URL.** Recommendation, and what this plan assumes:
    surface the capture date and let the driver judge. Say so if you would rather apply the 30-day
    bound calibrated on cited grading sources.
+
+## Constraints from the 2026-09-09 rung ports
+
+The agent that ported the rungs (`21f3122` through `8f1a56b`) reports five constraints the plan
+above states loosely or not at all. Treat each as a requirement of the extraction.
+
+First, a meta-refresh target is a classification OUTPUT that only a redirect-loop owner may
+consume. Today `_plain_body_outcome` and `_plain_html_outcome` return `PlainFetchResult | str`,
+and the impersonated rung needed an explicit decline when handed the `str`. In `classify.py` make
+the hop a typed `NextHop` so every consumer must handle it, with explicit decline branches in the
+impersonated and Wayback rungs, which own no redirect loop.
+
+Second, the loop's adapter must preserve five facts of its tool contract. A status of `ok` means
+content was read, and nothing else: `provenance._harvest_verification_tiers` grants the `fetched`
+tier on status alone, so `empty`, `blocked`, `error`, `throttled` and `document_needed` are never
+`ok` with text attached. `method` is a token in `provenance._METHOD_TO_TIER` for a real read
+(`wayback` and `derived_api` were added there, additively) and absent for a non-read. `http_status`
+is set only by a host's response and never by our own refusals, because it triggers the
+impersonated retry and Wayback, and a self-produced `blocked` carries `None` precisely so those
+rungs cannot be handed it. `escalate_rendered` is the thin-content signal, and a chart block pins
+it off, because a render loses client-side `data-chart` attributes (question 43949). Links resolve
+against the document URL after a client-side redirect.
+
+Third, the loop has no per-question object today. State in `tools.py` is module-global or per
+call, and `build_gap_fill_tools(question_topic)` is the only per-question closure, which is why the
+Wayback rung shipped without a per-question cap. Construct `LadderContext` once per question at the
+seam `agentic_gap_fill.run_gap_fill_v2` and capture it into the tool handlers, or the caps in the
+policy table have nothing to count on.
+
+Fourth, the derived-API rung has two halves. REUSE dials an endpoint a prior render on the host
+recorded, which is Tier 1's rung 4 and what step 4 still owes the loop. HARVEST serves the JSON the
+render just captured, costs no request, and belongs inside the rendered rung's empty-DOM
+classification, where `246fe68` put it. The two render memo scopes (`_RENDER_MEMO_SCOPE` is
+`gap_fill_v2` against Tier 1's `resolution_source`) may merge only after step 4 has the loop on the
+same classifier, because until then "rendered to nothing" means different things to each.
+
+Fifth, the test seams the migration must keep reachable, or move with every call site in one
+commit: `agentic_tools.render_page`, `_fetch_plain_with_impersonated_retry`, `_fetch_plain`,
+`_try_wayback_fetch`, `_try_rendered_fetch`, `_read_response_body`, `_get_session`,
+`is_public_http_url`, `fetch_impersonated`, and `resolution_source._extract_page_text` with
+`_extract_main_text`. Two housekeeping items ride the extraction commit: the 86 pre-existing
+receipt-comment findings across `tools.py`, `fetch_outcomes.py`, `provenance.py`, `derived_api.py`
+and `tests/test_agentic_tools.py` move into the docs in the same commit as the code they annotate,
+and the pending `tools.py` split is absorbed by the package layout rather than done separately.
