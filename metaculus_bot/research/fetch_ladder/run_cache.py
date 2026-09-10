@@ -20,6 +20,27 @@ from metaculus_bot.research.wayback import WaybackSnapshot, snapshot_age_days, w
 _MAX_ENTRIES = 50
 
 
+def _html_body_text(extraction: PageExtraction, chart_block: str) -> str:
+    """The uncapped text a caller would present before its verdict and URL cap."""
+    published = "" if extraction.chrome_metric_withheld else (extraction.text or "").strip()
+    return "\n\n".join(part for part in (chart_block, published) if part)
+
+
+def _throttled_result(
+    *, url: str, http_status: int | None, content_type: str | None, route: FetchRoute, candidate: str, phrase: str
+) -> FetchResult:
+    return FetchResult(
+        url=url,
+        status="throttled",
+        text="",
+        http_status=http_status,
+        content_type=content_type,
+        route=route,
+        throttle_phrase=phrase,
+        throttle_chars=len(candidate.strip()),
+    )
+
+
 class ReadArtifact(Protocol):
     @property
     def url(self) -> str: ...
@@ -43,6 +64,17 @@ class HtmlRead:
         del query, now
         if policy.verdict.body_route(self.content_type or "", self.routing_body) != "html":
             return None
+        candidate = _html_body_text(self.extraction, self.chart_block)
+        phrase = matched_throttle_phrase(candidate)
+        if phrase is not None:
+            return _throttled_result(
+                url=self.url,
+                http_status=self.http_status,
+                content_type=self.content_type,
+                route=route,
+                candidate=candidate,
+                phrase=phrase,
+            )
         read = policy.verdict.html(
             self.extraction, chart_block=self.chart_block, unreadable_embeds=list(self.unreadable_embeds)
         )
@@ -91,6 +123,16 @@ class TextRead:
         del query, now
         if policy.verdict.body_route(self.content_type or "", self.routing_body) != "text":
             return None
+        phrase = matched_throttle_phrase(self.text)
+        if phrase is not None:
+            return _throttled_result(
+                url=self.url,
+                http_status=self.http_status,
+                content_type=self.content_type,
+                route=route,
+                candidate=self.text,
+                phrase=phrase,
+            )
         if self.lead:
             body = resolution_presentation._lead_then_capped_body(
                 self.lead, self.text, self.url, cap=policy.per_url_max_chars
@@ -230,7 +272,7 @@ def clear() -> None:
 def cacheable(artifact: ReadArtifact) -> bool:
     """Whether the successful artifact is reusable; throttle interstitials stay retryable."""
     if isinstance(artifact, HtmlRead):
-        candidate = artifact.extraction.text or artifact.chart_block
+        candidate = _html_body_text(artifact.extraction, artifact.chart_block)
         return matched_throttle_phrase(candidate) is None
     if isinstance(artifact, TextRead):
         return matched_throttle_phrase(artifact.text) is None

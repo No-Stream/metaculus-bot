@@ -605,7 +605,7 @@ async def _rendered_rung(
     # feed rescues the page, the ladder's result is `success` and the closer would otherwise
     # credit the render with a rescue the DOM never delivered.
     attempt.outcome = classified.result.status
-    if classified.result.status == "success":
+    if classified.result.status in ("success", "throttled"):
         return classified.result
     derived = _derived_api_from_harvest(url, direct, page, ctx)
     if derived is not None:

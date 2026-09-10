@@ -78,7 +78,7 @@ ESCALATION_RUNGS: frozenset[str] = _FETCH_ROUTES - {"direct", "meta_refresh", "p
 # No trigger predicate reads the text; only FetchResult's success-implies-content invariant needs it.
 _REPLAY_TEXT_STANDIN = "[archived body not replayed; the ladder's rung triggers read only the status]"
 
-# Anchored on `agentic.fetch_outcomes._non_ok_status_result`, whose two templates are f-strings with no constant to import.
+# Anchored on the loop adapter's non-success messages, whose HTTP templates are f-strings with no constant to import.
 _LOOP_HTTP_STATUS_RE = re.compile(r"^Fetch (?:blocked|failed) with HTTP (\d{3})\.$", re.MULTILINE)
 _LOOP_HEADER_RE = re.compile(r"^(status|method): (.+)$", re.MULTILINE)
 
@@ -119,7 +119,7 @@ LOOP_STATUS_TO_FETCH_STATUS: dict[str, LoopStatusMapping] = {
         "js_wall", "ambiguous", "one loop token spans the fetcher's js_wall and its no_resolving_content verdicts"
     ),
     "throttled": LoopStatusMapping(
-        "js_wall", "ambiguous", "Tier 1 has no throttle-phrase check, so such a 200 classifies as js_wall or thin_page"
+        "throttled", "exact", "the shared 200-body detector preserves this status and the retryable refusal"
     ),
     "robots_disallowed": LoopStatusMapping(
         None,

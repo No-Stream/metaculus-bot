@@ -134,6 +134,8 @@ async def _escalate_unresolved(
     archive-readable convention behind an attempt with no rescue, and which rungs use ``session``
     at all: ``docs/architecture.md`` "What the dispatcher returns, and what it carries forward".
     """
+    if direct.status == "throttled":
+        return direct
     if direct.status == "success":
         if not direct.escalate_rendered:
             return direct
@@ -174,14 +176,14 @@ async def _fetch_one(
 
 
 def _store_successful_read(url: str, result: FetchResult, ctx: context.LadderContext) -> None:
-    artifact = ctx.artifact_for(result)
+    capture = ctx.read_capture_for(result)
     if (
         result.status == "success"
         and result.route != "url_context"
-        and artifact is not None
-        and run_cache.cacheable(artifact)
+        and capture is not None
+        and run_cache.cacheable(capture.artifact)
     ):
-        run_cache.put(url, artifact, route=result.route)
+        run_cache.put(url, capture.artifact, route=capture.route)
 
 
 async def fetch_url(url: str, *, policy: LadderPolicy, ctx: context.LadderContext) -> FetchResult:

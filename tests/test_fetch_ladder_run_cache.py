@@ -224,7 +224,8 @@ async def test_error_and_throttle_interstitial_are_not_cached() -> None:
     succeeded = await fetch_url(_URL, policy=direct_only, ctx=LadderContext(session=session, host_sems={}))
 
     assert failed.status == "error"
-    assert interstitial.status == "success"
+    assert interstitial.status == "throttled"
+    assert interstitial.text == ""
     assert succeeded.text == "actual report"
     assert session.requested == [_URL, _URL, _URL]
 

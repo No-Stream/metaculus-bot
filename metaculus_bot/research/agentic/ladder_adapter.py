@@ -35,6 +35,7 @@ from metaculus_bot.research.resolution_fetch_result import FetchResult, FetchRou
 # Total by construction, so a status the ladder gains is a type error rather than a silent `ok`.
 _LOOP_STATUS: dict[FetchStatus, str] = {
     "success": "ok",
+    "throttled": "throttled",
     "blocked": "blocked",
     "ssrf_blocked": "blocked",
     "not_found": "error",
@@ -88,6 +89,19 @@ def as_plain_result(result: FetchResult, *, requested_url: str) -> PlainFetchRes
             content_type=result.content_type,
             escalate_rendered=result.escalate_rendered,
             http_status=result.http_status,
+        )
+    if result.status == "throttled":
+        return PlainFetchResult(
+            status="throttled",
+            method="throttled",
+            text="",
+            links=[],
+            url=result.url,
+            content_type=result.content_type,
+            http_status=result.http_status,
+            throttle_phrase=result.throttle_phrase,
+            throttle_chars=result.throttle_chars,
+            throttle_method=_LOOP_METHOD[result.route],
         )
     if _needs_a_reader(result):
         return _document_needed_result(result.url, result.content_type or "")

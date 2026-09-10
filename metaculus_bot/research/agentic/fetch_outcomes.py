@@ -53,6 +53,11 @@ class PlainFetchResult:
     escalate_rendered: bool = False
     # Set only by a host's response, never by a refusal this ladder made itself (see the doc).
     http_status: int | None = None
+    # A throttled body is withheld from ``text``; these fields carry only the existing marker's
+    # evidence and the rung that obtained it.
+    throttle_phrase: str | None = None
+    throttle_chars: int | None = None
+    throttle_method: str | None = None
 
 
 class _LinkCollector(HTMLParser):

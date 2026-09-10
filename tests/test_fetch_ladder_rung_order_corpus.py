@@ -78,6 +78,7 @@ _CASES: tuple[_DirectCase, ...] = (
     _DirectCase("unreadable_encrypted", "unreadable_document", reason="encrypted", http_status=200),
     _DirectCase("unreadable_malformed", "unreadable_document", reason="malformed", http_status=200),
     _DirectCase("empty_body", "empty_body", http_status=200, escalate_rendered=True),
+    _DirectCase("throttled", "throttled", http_status=200),
     _DirectCase("ssrf_blocked", "ssrf_blocked"),
 )
 
@@ -86,11 +87,13 @@ def _direct_result(case: _DirectCase, *, escalate_rendered: bool) -> FetchResult
     return FetchResult(
         url=_URL,
         status=case.status,
-        text=case.text,
+        text="" if case.status == "throttled" else case.text,
         http_status=case.http_status,
         content_type="text/html",
         status_reason=case.reason,
         escalate_rendered=escalate_rendered,
+        throttle_phrase="rate limit" if case.status == "throttled" else None,
+        throttle_chars=42 if case.status == "throttled" else None,
     )
 
 
@@ -303,6 +306,10 @@ _EXPECTED: dict[str, dict[str, tuple[str, ...]]] = {
     "empty_body": {
         "resolution_source": ("route=direct", "status=empty_body"),
         "gap_fill_v2": ("derived_api", "rendered", "status=empty", "method=empty"),
+    },
+    "throttled": {
+        "resolution_source": ("route=direct", "status=throttled"),
+        "gap_fill_v2": ("status=throttled", "method=throttled"),
     },
     "ssrf_blocked": {
         "resolution_source": ("route=direct", "status=ssrf_blocked"),

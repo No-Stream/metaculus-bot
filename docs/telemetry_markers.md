@@ -269,7 +269,8 @@ archive as the `ghost_v1` key of the `gap_fill_v2` payload (None when the v1 gho
 ### AGENTIC_FETCH_THROTTLED
 
 Per-fetch: the gap-fill v2 fetch ladder read a 200-OK body that was the host's rate-limit
-interstitial rather than the page it asked for (`research/agentic/tools.py:_throttled_fetch_outcome`).
+interstitial rather than the page it asked for. The shared ladder detects the body; the tool handler
+emits the marker through `research/agentic/tools.py:_throttled_fetch_outcome`.
 Registered because the event had no trace at all before it, and its whole failure mode is looking
 like a success: on q45191, two throttled ogimet.com fetches were served to the driver as
 `status: ok`, cached, and replayed on its own retry, so the exact-date reference class it
@@ -277,7 +278,7 @@ published came to 4 years instead of 6. No `question=`: the tool handlers run be
 `log_prefix` and have no question id, exactly like the credit markers, so a join goes through the
 run id.
 
-`phrase` is the entry of `fetch_outcomes.FETCH_THROTTLE_PHRASES` that fired and is last in the
+`phrase` is the entry of `fetch_ladder.throttle.FETCH_THROTTLE_PHRASES` that fired and is last in the
 regex because it contains spaces; with `chars` (the body's length) it is what lets a prod fire be
 graded a true or false positive, and the phrase list and the `FETCH_THROTTLE_PAGE_MAX_CHARS` cap
 are retuned on evidence rather than taste.

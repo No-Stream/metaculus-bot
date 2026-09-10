@@ -161,15 +161,18 @@ def _direct(
     content_type: str | None = "text/html",
 ) -> FetchResult:
     """One canned outcome of the shared ladder's DIRECT fetch, as the gap-fill verdict would leave it."""
+    phrase = throttle.matched_throttle_phrase(text) if status == "success" else None
     return FetchResult(
         url=url,
-        status=status,
-        text=text,
+        status="throttled" if phrase is not None else status,
+        text="" if phrase is not None else text,
         http_status=http_status,
         content_type=content_type,
         status_reason=reason,
         links=list(links),
         escalate_rendered=escalate_rendered,
+        throttle_phrase=phrase,
+        throttle_chars=None if phrase is None else len(text.strip()),
     )
 
 

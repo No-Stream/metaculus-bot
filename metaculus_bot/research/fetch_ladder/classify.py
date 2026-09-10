@@ -321,7 +321,10 @@ class _TextClassification:
 def _raw_body_outcome(
     body: bytes, current_url: str, content_type: str, *, http_status: int, pol: LadderPolicy
 ) -> _TextClassification:
-    """Classify a raw JSON / plain-text / CSV body we already hold: the one copy of the rule.
+    """Classify a structured or plain-text body we already hold: the one copy of the rule.
+
+    Structured bodies include JSON and XML; XML tags are retained because they carry the data's
+    labels. Plain text and CSV keep the existing markup stripping rule.
 
     Reached from :func:`_classify_body`, so a body the impersonated retry read goes through the
     same charset-honouring decode, the same markup strip and the same vacuity refusal as a
@@ -619,7 +622,7 @@ async def _classify_body_or_hop(
         body, current_url, content_type, http_status=http_status, remaining_wall_s=ctx.rung_budget_s(), pol=ctx.policy
     )
     capture_html_read(ctx, classified)
-    if classified.result.status == "success":
+    if classified.result.status in ("success", "throttled"):
         return classified.result
     hop = await _meta_refresh_hop(
         classified.html_text, current_url, ctx, from_status=classified.result.status, content_type=content_type

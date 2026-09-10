@@ -99,7 +99,6 @@ from metaculus_bot.research.fetch_ladder.policy import (
     LADDER_CALLER_GAP_FILL_V2,
     LadderPolicy,
 )
-from metaculus_bot.research.fetch_ladder.throttle import matched_throttle_phrase
 from metaculus_bot.research.http_fetch import (
     MAX_REDIRECTS,
     REDIRECT_STATUSES,
@@ -185,7 +184,7 @@ _THROTTLED_FETCH_MSG = (
 )
 
 
-def _throttled_fetch_outcome(url: str, text: str, phrase: str, *, method: str) -> ToolOutcome:
+def _throttled_fetch_outcome(url: str, text: str, phrase: str, *, method: str, chars: int | None = None) -> ToolOutcome:
     """Outcome for a 200-OK body that is the host's rate-limit interstitial, not the page.
 
     Mirrors :func:`_empty_fetch_outcome` in both guards — a non-``"ok"`` status AND a method
@@ -195,7 +194,8 @@ def _throttled_fetch_outcome(url: str, text: str, phrase: str, *, method: str) -
     and served straight back when the driver retried the same URL, so its retry could not
     have succeeded however many slots it spent.
     """
-    logger.warning(f"AGENTIC_FETCH_THROTTLED: url={url} method={method} chars={len(text.strip())} phrase={phrase}")
+    marker_chars = len(text.strip()) if chars is None else chars
+    logger.warning(f"AGENTIC_FETCH_THROTTLED: url={url} method={method} chars={marker_chars} phrase={phrase}")
     return ToolOutcome(
         content_markdown=_THROTTLED_FETCH_MSG.format(url=url, phrase=phrase),
         method="throttled",
@@ -204,16 +204,7 @@ def _throttled_fetch_outcome(url: str, text: str, phrase: str, *, method: str) -
 
 
 def _read_content_outcome(url: str, text: str, links: list[str], *, method: str, start_char: int) -> ToolOutcome:
-    """Render a body the ladder read, unless it is a throttle interstitial standing in for it.
-
-    The one seam every successful ``fetch`` return goes through, so no success path can cache
-    or tier an interstitial. The ladder itself is untouched: a throttled plain body still
-    escalates to the rendered rung exactly as a thin one does, and only the outcome the
-    driver receives changes.
-    """
-    phrase = matched_throttle_phrase(text)
-    if phrase is not None:
-        return _throttled_fetch_outcome(url, text, phrase, method=method)
+    """Render a successful body the shared ladder has already classified."""
     return _render_fetch_outcome(url, text, links, method=method, start_char=start_char)
 
 
@@ -747,9 +738,6 @@ def _held_from_result(url: str, result: PlainFetchResult) -> local_document.Held
     else:
         # Reading the use-read_document placeholder as the page would digest our own instruction.
         return local_document.HeldDocument()
-    if held.has_text and matched_throttle_phrase(held.text) is not None:
-        # An interstitial is not the document (q45191), so the paid reader gets its turn.
-        return local_document.HeldDocument()
     return held
 
 
@@ -842,6 +830,16 @@ async def fetch(
     plain = await _fetch_via_ladder(url, query=question_topic, pol=GAP_FILL_FETCH_POLICY, ctx=ctx)
     if plain.status == "blocked":
         return _blocked_outcome(plain)
+    if plain.status == "throttled":
+        if plain.throttle_phrase is None or plain.throttle_chars is None or plain.throttle_method is None:
+            raise RuntimeError("throttled ladder result is missing marker metadata")
+        return _throttled_fetch_outcome(
+            url,
+            "",
+            plain.throttle_phrase,
+            method=plain.throttle_method,
+            chars=plain.throttle_chars,
+        )
     if plain.method == local_document.PDF_LOCAL_METHOD:
         return _pdf_local_outcome(url, plain, start_char=start_char)
     if plain.method == DOCUMENT_NEEDED_METHOD:
@@ -886,7 +884,7 @@ async def _fetch_robots_txt(robots_url: str, *, ctx: LadderContext | None = None
     except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except  # pre-check soft-fail boundary: a robots.txt we cannot read must degrade to paying, never to failing the read
         logger.debug("agentic robots.txt pre-check failed for %s: %s: %s", robots_url, type(exc).__name__, exc)
         return None
-    if result.status == "ok" and result.method == "plain":
+    if result.status == "ok" and result.method in ("plain", "cache"):
         return result.text
     return None
 

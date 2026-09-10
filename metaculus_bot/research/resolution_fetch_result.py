@@ -100,6 +100,7 @@ from metaculus_bot.research.http_fetch import MAX_UNDECODABLE_CHAR_RATIO, Datawr
 # grounding chunks produced a confident fabricated table with fake `[primary]` tags.
 FetchStatus = Literal[
     "success",
+    "throttled",
     "blocked",
     "not_found",
     "js_wall",
@@ -520,6 +521,10 @@ class FetchResult:
     # True only on a freshly presented process-run cache hit. The cached payload itself is a
     # separate policy-neutral artifact and never rides this archive-facing result.
     cache_hit: bool = False
+    # The shared 200-interstitial detector's evidence, retained so the loop can emit its
+    # existing marker without carrying the refused body as fetch text.
+    throttle_phrase: str | None = None
+    throttle_chars: int | None = None
 
     def __post_init__(self) -> None:
         """Enforce the ``text`` invariant the field comment states.

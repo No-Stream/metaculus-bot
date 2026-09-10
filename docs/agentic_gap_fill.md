@@ -187,16 +187,15 @@ shared ladder. Everything per call (the ask, the wall origin, the rung list) is 
 **What stays in `tools.py`.** The `start_char` window presentation over the ladder's complete
 process-run artifact; the question-platform refusal, which runs before the ladder because it is this caller's own
 policy and must refuse before anything is dialed (the resolution-source fetcher drops those URLs when
-it selects them); the throttle-phrase check on a body the ladder read
-(`fetch_ladder.throttle.matched_throttle_phrase`, also used to keep refusals out of the shared cache);
-the auto-escalation to
+it selects them); the throttle outcome and marker presentation after the shared ladder has classified
+the body; the auto-escalation to
 `read_document` for a document no local rung can turn into text; and the two shared fetch markers,
 emitted after each tool call with `question=None`.
 
 ### The shared fetch ladder, and the adapter over it
 
-The ladder speaks the resolution-source vocabulary — twelve `FetchStatus` values, eight `FetchRoute`
-values, a `status_reason` where a status has more than one rule behind it — and the driver reads six
+The ladder speaks the resolution-source vocabulary — thirteen `FetchStatus` values, eight `FetchRoute`
+values, a `status_reason` where a status has more than one rule behind it — and the driver reads seven
 statuses plus a `method` the verification-tier map keys on. `agentic/ladder_adapter.py` is the ONE
 place the two meet, so a status the ladder gains cannot silently become an `ok` the loop stamps
 `fetched`. Its table:
@@ -204,6 +203,7 @@ place the two meet, so a status the ladder gains cannot silently become an `ok` 
 | `FetchStatus` (and reason) | loop `status` | loop `method` | what the driver is told |
 |---|---|---|---|
 | `success` | `ok` | from the `route`: `direct`/`meta_refresh` → `plain`, `pdf_local`, `impersonate`, `derived_api`, `rendered`, `wayback` | the text the ladder read |
+| `throttled` | `throttled` | `throttled` | blank text; the original rung is retained in the throttle marker |
 | `js_wall`, `empty_body`, `no_resolving_content` | `empty` | `plain` | "Plain fetch returned no extractable text." |
 | `unsupported_type` + `undecodable_body` | `empty` | `plain` | "Plain fetch could not decode the body as text." |
 | `unsupported_type` (any other) | `error` | `plain` | "Unsupported content type: X" |
@@ -228,7 +228,7 @@ render whose Content-Type was a document to `read_document`, and the shared rung
 rendered DOM as HTML instead. A page whose client-side redirect lands on a PDF now reads as a
 JavaScript wall rather than escalating. `FUTURE.md` carries the entry.
 
-### The throttle-phrase check
+### The shared throttle check
 
 A host that is throttling us answers HTTP 200 with a short interstitial in place of the page it was
 asked for, so every status check on the ladder passes and the driver reads the refusal as the page's
@@ -239,14 +239,19 @@ summaries tripped that host's spacing rule and two came back as a 304-character 
 reference class it published came to 4 years instead of 6 and the forecast under-committed to the
 winner it had already named.
 
-Detection needs BOTH halves of `fetch_ladder.throttle.matched_throttle_phrase`, and the size half is why it
+The neutral `fetch_ladder.throttle.matched_throttle_phrase` predicate runs before either caller's
+verdict presents an HTML or raw-text body. The size half is why it
 is safe: the phrases alone would demote a real page that merely discusses rate limits, while a size
 floor alone would demote every legitimately short source (a one-line official statement), which the
 ladder deliberately keeps as `ok`. Bare "slow down" is left out on purpose, being ordinary English
 where the rest are throttle idiom, and missing a throttle only preserves today's behaviour whereas a
 false positive discards a page we really did read. `FETCH_THROTTLE_PAGE_MAX_CHARS` is 1,200 against
-the receipt's 304-character body (303 stripped, which is what the cap sees). An interstitial is
-deliberately NOT cached, which is the half question 45191 turned on: the body was cached under
+the receipt's 304-character body (303 stripped, which is what the cap sees). PDF bodies bypass this
+detector. A direct throttle is terminal, so it does not launch the browser, consult an offsite rung,
+or write a cache entry. A rendered throttle keeps `route=rendered` and the rendered attempt's
+`outcome=throttled`. The FetchResult carries blank text plus only the matching phrase and stripped
+character count needed for the existing marker. An interstitial is deliberately NOT cached, which
+is the half question 45191 turned on: the body was cached under
 `method="rendered"` and served straight back on the driver's retry, so that retry could not have
 succeeded however many slots it spent.
 
@@ -721,7 +726,7 @@ level up:
 | `agentic/tools.py` | `build_gap_fill_tools`, `question_ladder_context` and the four tool handlers, plus `_fetch_via_ladder`, the one seam onto the shared fetch ladder, and this caller's window presentation and throttle outcome. |
 | `agentic/ladder_adapter.py` | One `FetchResult` read as this ladder's own `PlainFetchResult`: the status and method tables, and the message the driver is told for every non-read. |
 | `agentic/local_document.py` | What the free ladder holds for one URL (`HeldDocument`), the passage digest `read_document` serves, the url_context size gate, and the `AGENTIC_FETCH_LOCAL_DOC` marker. The parses themselves are held in `research/document_cache.py`, shared with the ladder's document verdict. |
-| `agentic/fetch_outcomes.py` | This ladder's result type (`PlainFetchResult`), the question-platform self-reference refusal (metaculus.com and `competitions.mantic.com`), the escalate-to-a-reader outcome, and the throttle-interstitial check. Its per-body-shape builders are dead since the loop moved onto the shared classifier and are deleted with the rest of the loop's own rungs. |
+| `agentic/fetch_outcomes.py` | This ladder's result type (`PlainFetchResult`), the question-platform self-reference refusal (metaculus.com and `competitions.mantic.com`), and the escalate-to-a-reader outcome. Its per-body-shape builders are dead since the loop moved onto the shared classifier and are deleted with the rest of the loop's own rungs. |
 | `agentic/tool_backends.py` | The outbound half of the tools: the AskNews and Exa clients with their retry ladders and concurrency caps, the Gemini `url_context` document read and its fixed in-thread ceiling, and the markdown formatting of what comes back. |
 | `agentic/tool_descriptions.py` | The driver-facing tool descriptions and JSON parameter schemas: behavioral text, so a change here changes what the driver does. |
 | `research/robots_policy.py` (outside `agentic/`, shared with the Tier-1 url_context rung) | The `Google-Extended` robots.txt group parser and per-host cache behind the pre-check on every paid read, written because `urllib.robotparser` falls back to `User-agent: *`. |

@@ -662,3 +662,18 @@ trips the advisory monolithic-file threshold, left as one module because
 the plan specifies it as one; and every comment-density and long-docstring finding in the moved
 files is left verbatim under the operator's scheduled repo-wide comment sweep, which is its own
 change (the two files step 2 created carry no findings).
+
+## Step 5b: shared 200 interstitial throttle
+
+The throttle phrase predicate now runs in the shared read-artifact presentation path before either
+caller verdict, for HTML and structured/plain text bodies. PDF bodies bypass it. A match returns
+`FetchStatus="throttled"` with blank text and only the phrase plus stripped character count needed
+by the existing `AGENTIC_FETCH_THROTTLED` marker. Fresh and cached reads use the same `present()`
+function, and throttled artifacts are never captured or written to the process-run cache.
+
+Direct throttles terminate before browser and offsite escalation. A rendered throttle returns with
+`route=rendered` and the rendered attempt's `outcome=throttled`. The agentic adapter carries loop
+`status=throttled`, `method=throttled`, and blank text while retaining the source rung for the
+marker. HTTP 429 remains the existing `blocked` outcome. Focused real-body tests cover direct HTML,
+raw text, PDF exclusion, HTTP 429, rendered route/attempt metadata, marker fields, cache retry, and
+the replay corpus row.
