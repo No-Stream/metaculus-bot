@@ -35,6 +35,7 @@ import time
 from datetime import UTC, datetime
 from typing import Any
 
+import openai
 from forecasting_tools import (
     GeneralLlm,
     MetaculusQuestion,
@@ -64,6 +65,15 @@ from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribu
 from metaculus_bot.question_types import question_type_of
 
 logger = logging.getLogger(__name__)
+
+# An expected failure of an LLM call in this harness, as opposed to a bug (KeyError, AttributeError).
+EXPECTED_LLM_CALL_FAILURES: tuple[type[Exception], ...] = (
+    openai.APIError,  # the root of the whole litellm exception tree
+    TimeoutError,  # a soft deadline firing
+    RuntimeError,  # forecasting-tools raises this on an empty completion
+    ValueError,  # a rejected value; UnitMismatchError subclasses it
+    ValueExtractionError,  # every rung of the extraction ladder failed
+)
 
 # Maximum sleep duration for exponential backoff fallback when ``retry_after_seconds``
 # is missing from the 429 payload. OpenRouter docs recommend 1s/2s/4s/8s; this caps
@@ -490,7 +500,7 @@ async def _predict_with_rate_limit_retries(
             )
             errors = []
             break
-        except Exception as exc:  # noqa: BLE001  # soft-fail boundary: any forecaster failure is recorded in the payload, never raised into the batch
+        except EXPECTED_LLM_CALL_FAILURES as exc:
             errors.append(f"{type(exc).__name__}: {exc}")
             if not _is_rate_limit_error(exc):
                 # Not a rate limit — log with stage heuristic and stop. Original
@@ -588,7 +598,7 @@ def _serialize_prediction_or_record_error(
     try:
         qtype = question_type_for_serialization(question)
         return serialize_prediction_value(prediction.prediction_value, qtype), prediction.reasoning
-    except Exception as exc:  # noqa: BLE001  # soft-fail boundary: serialization failure must still persist a diagnostic payload for this forecaster
+    except (TypeError, ValueError) as exc:  # the serializer's own shape guards; a bug type propagates instead
         errors.append(f"{type(exc).__name__}: {exc}")
         # We know the stage here — no heuristic needed. The original tuple bug
         # surfaced as ``AttributeError: 'tuple' object has no attribute 'percentile'``
@@ -809,9 +819,9 @@ async def run_forecasters_batch(
 ) -> dict[int, dict[str, dict[str, Any]]]:
     """Run forecasters on a batch of (question, research_blob) pairs.
 
-    Returns ``{qid: {model_slug_filename: payload}}``. Per-question failures
-    (the runner itself raising, not individual forecasters) leave the qid
-    keyed to an empty dict — the batch continues.
+    Returns ``{qid: {model_slug_filename: payload}}``. A question whose runner
+    raises is logged at ERROR with its traceback and keyed to an empty dict, so
+    one bad question cannot abort a paid run; the other questions still complete.
     """
     if forecaster_llms is None:
         forecaster_llms = build_free_forecaster_llms()
@@ -823,33 +833,31 @@ async def run_forecasters_batch(
     # `run_forecasters_for_question` on the module and have it observed here.
     from metaculus_bot.ablation import forecasters as _self_module  # noqa: PLC0415, PLW0406  # deliberate; see above
 
-    async def _run_one(question: MetaculusQuestion, blob: str) -> tuple[int, dict[str, dict[str, Any]]]:
-        qid = question.id_of_question
-        assert qid is not None, "Question must have id_of_question for ablation forecasting"
+    async def _run_one(question: MetaculusQuestion, blob: str) -> dict[str, dict[str, Any]]:
         async with semaphore:
-            try:
-                per_model = await _self_module.run_forecasters_for_question(
-                    question,
-                    blob,
-                    cache,
-                    forecaster_llms=forecaster_llms,
-                    parser_llm=parser_llm,
-                    force=force,
-                    per_forecaster_concurrency=per_forecaster_concurrency,
-                    max_retries=max_retries,
-                )
-                return qid, per_model
-            except Exception as exc:  # noqa: BLE001  # soft-fail boundary: one question failing entirely must not abort the batch
-                logger.warning(
-                    "ablation forecaster batch | qid=%s failed entirely | %s: %s",
-                    qid,
-                    type(exc).__name__,
-                    exc,
-                )
-                return qid, {}
+            return await _self_module.run_forecasters_for_question(
+                question,
+                blob,
+                cache,
+                forecaster_llms=forecaster_llms,
+                parser_llm=parser_llm,
+                force=force,
+                per_forecaster_concurrency=per_forecaster_concurrency,
+                max_retries=max_retries,
+            )
 
     tasks = [_run_one(q, blob) for q, blob in questions_with_research]
+    outcomes = await asyncio.gather(*tasks, return_exceptions=True)
     results: dict[int, dict[str, dict[str, Any]]] = {}
-    for qid, per_model in await asyncio.gather(*tasks):
-        results[qid] = per_model
+    for (question, _blob), outcome in zip(questions_with_research, outcomes, strict=True):
+        qid = question.id_of_question
+        assert qid is not None, "Question must have id_of_question for ablation forecasting"
+        if isinstance(outcome, BaseException):
+            # Cancellation and operator interrupts are not per-question failures.
+            if not isinstance(outcome, Exception):
+                raise outcome
+            logger.error("ablation forecaster batch | qid=%s failed entirely", qid, exc_info=outcome)
+            results[qid] = {}
+        else:
+            results[qid] = outcome
     return results

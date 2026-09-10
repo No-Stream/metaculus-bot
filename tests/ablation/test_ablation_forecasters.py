@@ -8,6 +8,7 @@ populated, then calls ``_make_prediction`` directly under the window patch.
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -24,7 +25,9 @@ from forecasting_tools.data_models.multiple_choice_report import PredictedOption
 from forecasting_tools.data_models.numeric_report import Percentile
 
 from main import TemplateForecaster
+from metaculus_bot.ablation import forecasters as forecasters_module
 from metaculus_bot.ablation.cache import AblationCache, model_slug_to_filename
+from metaculus_bot.ablation.forecasters import run_forecasters_batch, run_forecasters_for_question
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 
 # ---------------------------------------------------------------------------
@@ -795,6 +798,60 @@ async def test_one_serialize_failure_does_not_drop_other_forecaster_payloads(
 
 
 @pytest.mark.asyncio
+async def test_forecaster_bug_propagates_out_of_the_question_runner(
+    cache: AblationCache,
+    parser_llm: GeneralLlm,
+) -> None:
+    """A bug class is no expected LLM-call failure: it propagates and caches nothing for that forecaster."""
+    q = _make_binary_question(qid=1015)
+    one_llm = _make_forecaster_llms(count=1)
+
+    with (
+        patch.object(TemplateForecaster, "_make_prediction", new=AsyncMock(side_effect=KeyError("forecaster bug"))),
+        pytest.raises(KeyError, match="forecaster bug"),
+    ):
+        await run_forecasters_for_question(
+            q,
+            "research blob",
+            cache,
+            forecaster_llms=one_llm,
+            parser_llm=parser_llm,
+        )
+
+    assert q.id_of_question is not None
+    slug = model_slug_to_filename(one_llm[0].model)
+    assert cache.read_forecaster_output(qid=q.id_of_question, model_slug=slug) is None
+
+
+@pytest.mark.asyncio
+async def test_serialize_bug_propagates_out_of_the_question_runner(
+    cache: AblationCache,
+    parser_llm: GeneralLlm,
+) -> None:
+    """The serializer's own shape guards land in ``errors``; a bug raised inside it propagates instead."""
+    q = _make_binary_question(qid=1016)
+    one_llm = _make_forecaster_llms(count=1)
+    canned = ReasonedPrediction(prediction_value=0.42, reasoning="r")
+
+    with (
+        patch.object(TemplateForecaster, "_make_prediction", new=AsyncMock(return_value=canned)),
+        patch.object(forecasters_module, "serialize_prediction_value", side_effect=KeyError("serializer bug")),
+        pytest.raises(KeyError, match="serializer bug"),
+    ):
+        await run_forecasters_for_question(
+            q,
+            "research blob",
+            cache,
+            forecaster_llms=one_llm,
+            parser_llm=parser_llm,
+        )
+
+    assert q.id_of_question is not None
+    slug = model_slug_to_filename(one_llm[0].model)
+    assert cache.read_forecaster_output(qid=q.id_of_question, model_slug=slug) is None
+
+
+@pytest.mark.asyncio
 async def test_runner_serializes_mc_prediction_value(
     cache: AblationCache,
     six_forecaster_llms: list[GeneralLlm],
@@ -896,6 +953,51 @@ async def test_batch_per_question_failure_does_not_kill_batch(
     assert result[2003] == {}
     # Q2 succeeded.
     assert len(result[2004]) == len(six_forecaster_llms)
+
+
+@pytest.mark.parametrize(
+    "raised",
+    [TimeoutError("provider stalled"), KeyError("runner bug")],
+    ids=["expected_timeout", "unexpected_bug"],
+)
+@pytest.mark.asyncio
+async def test_batch_logs_the_failed_question_at_error_with_its_exception(
+    cache: AblationCache,
+    six_forecaster_llms: list[GeneralLlm],
+    parser_llm: GeneralLlm,
+    caplog: pytest.LogCaptureFixture,
+    raised: Exception,
+) -> None:
+    """The batch is the failure boundary: either outcome is one ERROR record carrying the exception, sibling intact."""
+    q_broken = _make_binary_question(qid=2103)
+    q_healthy = _make_binary_question(qid=2104)
+    canned = ReasonedPrediction(prediction_value=0.42, reasoning="r")
+    real_runner = forecasters_module.run_forecasters_for_question
+
+    async def selective_runner(question, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if question.id_of_question == 2103:
+            raise raised
+        return await real_runner(question, *args, **kwargs)
+
+    with (
+        patch.object(forecasters_module, "run_forecasters_for_question", new=selective_runner),
+        patch.object(TemplateForecaster, "_make_prediction", new=AsyncMock(return_value=canned)),
+        caplog.at_level(logging.ERROR, logger="metaculus_bot.ablation.forecasters"),
+    ):
+        result = await run_forecasters_batch(
+            [(q_broken, "blob 1"), (q_healthy, "blob 2")],
+            cache,
+            forecaster_llms=six_forecaster_llms,
+            parser_llm=parser_llm,
+        )
+
+    assert result[2103] == {}
+    assert len(result[2104]) == len(six_forecaster_llms)
+
+    records = [r for r in caplog.records if r.levelno == logging.ERROR and "qid=2103" in r.getMessage()]
+    assert records, "the failed question must be logged at ERROR"
+    assert records[0].exc_info is not None
+    assert records[0].exc_info[1] is raised
 
 
 @pytest.mark.asyncio
