@@ -19,16 +19,28 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from collections.abc import Callable
 from datetime import UTC, date, datetime
 from typing import Any, cast
 from xml.etree.ElementTree import ParseError
 
+import aiohttp
 import pandas as pd
+import trafilatura
 
-from metaculus_bot.constants import FRED_API_KEY_ENV
-from metaculus_bot.research import fred_rendering, ts_fetch
+from metaculus_bot.constants import (
+    DOCUMENT_TEXT_MAX_PAGES,
+    DOCUMENT_TEXT_MAX_SECONDS,
+    FRED_API_KEY_ENV,
+    SEC_EDGAR_CONTACT_EMAIL_ENV,
+)
+from metaculus_bot.research import document_text, fred_rendering, sec_edgar, ts_fetch
 from metaculus_bot.research.known_api.result import KnownApiResult
+from metaculus_bot.research.known_api.translate import KnownApiCall
+from metaculus_bot.research.market_retrieval import queries, rendering, venues
+from metaculus_bot.research.market_retrieval.http import PLATFORM_HTTP_TIMEOUT, read_json_capped
+from metaculus_bot.research.market_retrieval.types import MarketMatch, MarketSnapshot
 from metaculus_bot.research.number_format import format_decimal_change, format_decimal_value
 
 logger = logging.getLogger(__name__)
@@ -41,6 +53,18 @@ DEFAULT_OBSERVATIONS = 30
 MAX_OBSERVATIONS = 400
 # FRED free-text search returns at most this many candidate series.
 FRED_SEARCH_LIMIT = 5
+# A market snapshot renders at most this many rows.
+MARKET_SNAPSHOT_ROWS = 5
+# The per-question ceiling on Kalshi detail GETs, enforced by a semaphore the caller passes in.
+MAX_KALSHI_DETAIL_GETS = 4
+# ".../trade-api/v2", derived off the catalogue URL so the base cannot drift from the venue's.
+KALSHI_API_BASE = venues.KALSHI_EVENTS_URL.rsplit("/", 1)[0]
+# A Kalshi market ticker: upper-case alphanumerics and dashes, no whitespace (free text is fuzzy-matched).
+_KALSHI_TICKER_SHAPE = re.compile(r"[A-Z0-9][A-Z0-9-]*\Z")
+# A filing document's extracted text is capped at the gap-fill loop's own per-result char budget.
+EDGAR_DOC_MAX_CHARS = 8000
+# A company page renders this many of its most recent filings (SEC serves them newest first).
+EDGAR_FILINGS_ROWS = 15
 
 
 def _today() -> date:
@@ -294,3 +318,200 @@ async def yahoo_history(
             )
 
     return await _bounded(_run, label=f"Yahoo {ticker}")
+
+
+async def _kalshi_fetch_json(session: Any, url: str, *, semaphore: asyncio.Semaphore | None = None) -> dict | None:
+    """One bounded Kalshi detail GET, gated by the per-question semaphore; None on any non-200 or failure."""
+    gate = semaphore or asyncio.Semaphore(MAX_KALSHI_DETAIL_GETS)
+    timeout = aiohttp.ClientTimeout(total=PLATFORM_HTTP_TIMEOUT, sock_read=PLATFORM_HTTP_TIMEOUT)
+    async with gate:
+        try:
+            async with session.get(url, timeout=timeout) as resp:
+                if resp.status != 200:
+                    return None
+                body = await read_json_capped(resp, label=f"kalshi {url}")
+        except (TimeoutError, aiohttp.ClientError):
+            return None
+    return body if isinstance(body, dict) else None
+
+
+async def _kalshi_by_ticker(session: Any, ticker: str, semaphore: asyncio.Semaphore | None) -> MarketMatch | None:
+    """One Kalshi event by ticker, from the event endpoint falling to the market endpoint."""
+    event_url = f"{KALSHI_API_BASE}/events/{ticker}?with_nested_markets=true"
+    data = await _kalshi_fetch_json(session, event_url, semaphore=semaphore)
+    if data:
+        event = dict(data.get("event") or data)
+        event["markets"] = event.get("markets") or data.get("markets") or []
+        match = venues.kalshi_event_match(event, match_confidence=1.0, channel="known_api")
+        if match is not None:
+            return match
+    market_data = await _kalshi_fetch_json(session, f"{KALSHI_API_BASE}/markets/{ticker}", semaphore=semaphore)
+    if not market_data:
+        return None
+    market = market_data.get("market") or market_data
+    single = {
+        "event_ticker": ticker,
+        "title": market.get("title") or market.get("yes_sub_title") or ticker,
+        "sub_title": "",
+        "settlement_sources": [],
+        "markets": [market],
+    }
+    return venues.kalshi_event_match(single, match_confidence=1.0, channel="known_api")
+
+
+def _ranked_matches(
+    scored: list[tuple[float, Any]], builder: Callable[[float, Any], MarketMatch | None]
+) -> list[MarketMatch]:
+    """The top rows a fuzzy score put first, built into MarketMatch rows, capped at the snapshot width."""
+    ordered = sorted(scored, key=lambda pair: pair[0], reverse=True)[:MARKET_SNAPSHOT_ROWS]
+    return [match for score, item in ordered if (match := builder(score, item)) is not None]
+
+
+def _kalshi_fuzzy(catalogue: list[dict[str, Any]], query: str) -> list[MarketMatch]:
+    """The catalogue's best matches for a free-text query, scored over titles and rules, zero requests."""
+    usable = [
+        event for event in catalogue if isinstance(event, dict) and (event.get("title") or event.get("sub_title"))
+    ]
+    titles = [str(event.get("title") or event.get("sub_title")) for event in usable]
+    rules = [venues.kalshi_event_rules(event) for event in usable]
+    scores = queries.fuzzy_best_many([query], titles, rules)
+    return _ranked_matches(
+        list(zip(scores, usable, strict=True)),
+        lambda score, event: venues.kalshi_event_match(event, match_confidence=score, channel="known_api"),
+    )
+
+
+def _predictit_matches(dump: list[dict[str, Any]], query: str) -> list[MarketMatch]:
+    """The cached PredictIt dump's best matches for a free-text query, scored over market names."""
+    usable = [market for market in dump if isinstance(market, dict) and (market.get("name") or market.get("shortName"))]
+    names = [str(market.get("name") or market.get("shortName")) for market in usable]
+    scores = queries.fuzzy_best_many([query], names, names)
+    return _ranked_matches(
+        list(zip(scores, usable, strict=True)),
+        lambda score, market: venues.predictit_market_match(market, match_confidence=score, channel="known_api"),
+    )
+
+
+def _render_matches(matches: list[MarketMatch], venue: str) -> KnownApiResult:
+    """A market snapshot rendered from the matched rows, or ``not_found`` when nothing matched."""
+    rows = matches[:MARKET_SNAPSHOT_ROWS]
+    if not rows:
+        return KnownApiResult(status="not_found", content_markdown=f"No {venue} market matched.", source_url="")
+    snapshot = MarketSnapshot(matches=rows, pool_size=len(rows), forecast_time=datetime.now(tz=UTC))
+    source_url = next((row.market_url for row in rows if row.market_url), "")
+    return KnownApiResult(
+        status="ok",
+        content_markdown=rendering.render_snapshot(snapshot),
+        source_url=source_url,
+        links=[source_url] if source_url else [],
+    )
+
+
+async def market_snapshot(
+    *,
+    venue: str,
+    market: str,
+    session: Any,
+    kalshi_catalogue: list[dict[str, Any]] | None = None,
+    predictit_markets: list[dict[str, Any]] | None = None,
+    kalshi_detail_semaphore: asyncio.Semaphore | None = None,
+) -> KnownApiResult:
+    """One prediction-market snapshot for a venue + market, from a venue id or free text.
+
+    Kalshi resolves a ticker through the event endpoint (falling to the market endpoint), bounded to
+    ``kalshi_detail_semaphore`` (a per-question semaphore the caller constructs, since the loop has
+    no per-question object yet), and free text over the run's already-pulled catalogue with zero new
+    requests. Polymarket and Manifold search; PredictIt reads the run's cached dump. Up to
+    :data:`MARKET_SNAPSHOT_ROWS` rows.
+    """
+    venue = venue.lower()
+    if venue == "polymarket":
+        return _render_matches(
+            list(await venues.polymarket_search(session, market, width=MARKET_SNAPSHOT_ROWS) or []), venue
+        )
+    if venue == "manifold":
+        return _render_matches(
+            list(await venues.manifold_search(session, market, width=MARKET_SNAPSHOT_ROWS) or []), venue
+        )
+    if venue == "kalshi":
+        if _KALSHI_TICKER_SHAPE.match(market):
+            match = await _kalshi_by_ticker(session, market, kalshi_detail_semaphore)
+            return _render_matches([match] if match is not None else [], venue)
+        if not kalshi_catalogue:
+            return KnownApiResult(
+                status="empty", content_markdown="Kalshi catalogue unavailable for a free-text lookup.", source_url=""
+            )
+        return _render_matches(_kalshi_fuzzy(kalshi_catalogue, market), venue)
+    if venue == "predictit":
+        if not predictit_markets:
+            return KnownApiResult(status="empty", content_markdown="PredictIt dump unavailable.", source_url="")
+        return _render_matches(_predictit_matches(predictit_markets, market), venue)
+    return KnownApiResult(status="error", content_markdown=f"Unknown venue {venue!r}.", source_url="")
+
+
+def _extract_filing_text(doc: sec_edgar.FilingDocument) -> str:
+    """A filing document's readable text: PDF via document_text, HTML via trafilatura, else decoded."""
+    if document_text.is_pdf_body(doc.body):
+        pdf = document_text.extract_pdf_text(
+            doc.body, max_pages=DOCUMENT_TEXT_MAX_PAGES, max_seconds=DOCUMENT_TEXT_MAX_SECONDS
+        )
+        text, _pages = document_text.joined_page_text(pdf)
+        return text[:EDGAR_DOC_MAX_CHARS]
+    decoded = doc.body.decode("utf-8", errors="replace")
+    if "html" in (doc.content_type or "").lower():
+        return (trafilatura.extract(decoded) or "")[:EDGAR_DOC_MAX_CHARS]
+    return decoded[:EDGAR_DOC_MAX_CHARS]
+
+
+async def _edgar_submissions(session: Any, cik: str) -> KnownApiResult:
+    subs = await sec_edgar.company_submissions(session, cik)
+    source_url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={subs.cik}"
+    lines = [
+        f"### {subs.name} (CIK {subs.cik})",
+        f"Source: {source_url}",
+        "Recent filings (form, filed, period, document):",
+    ]
+    lines += [
+        f"- {filing.form} filed {filing.filing_date} (period {filing.report_date}): {filing.primary_document_url}"
+        for filing in subs.filings[:EDGAR_FILINGS_ROWS]
+    ]
+    return KnownApiResult(status="ok", content_markdown="\n".join(lines), source_url=source_url, links=[source_url])
+
+
+async def _edgar_document(session: Any, url: str) -> KnownApiResult:
+    doc = await sec_edgar.filing_document(session, url)
+    text = await asyncio.to_thread(_extract_filing_text, doc)
+    if not text.strip():
+        return KnownApiResult(
+            status="empty", content_markdown=f"SEC EDGAR filing {url} carried no extractable text.", source_url=doc.url
+        )
+    return KnownApiResult(status="ok", content_markdown=text, source_url=doc.url, links=[doc.url])
+
+
+async def edgar(call: KnownApiCall) -> KnownApiResult | None:
+    """One SEC EDGAR read for a translated EDGAR URL, or None to decline (fall through to the ladder).
+
+    Declines (returns None) when ``SEC_EDGAR_CONTACT_EMAIL`` is unset, because the fair-access client
+    refuses to dial without a contact and the page fetch is the right fallback. With a contact, a
+    company page reads the filings table and an Archives document reads its extracted text. A reached
+    EDGAR error (an HTTP status, quota) is ``error`` naming it, not a decline.
+    """
+    if not os.getenv(SEC_EDGAR_CONTACT_EMAIL_ENV, "").strip():
+        return None
+    try:
+        async with sec_edgar.edgar_session() as session:
+            if call.edgar_kind == "company_submissions" and call.edgar_arg:
+                return await _edgar_submissions(session, call.edgar_arg)
+            if call.edgar_kind == "filing_document" and call.edgar_url:
+                return await _edgar_document(session, call.edgar_url)
+    except sec_edgar.SecEdgarContactUnsetError:
+        return None
+    except sec_edgar.SecEdgarError as exc:
+        return KnownApiResult(status="error", content_markdown=f"SEC EDGAR error: {exc}", source_url=call.canonical_url)
+    except (TimeoutError, aiohttp.ClientError) as exc:
+        return KnownApiResult(
+            status="error",
+            content_markdown=f"SEC EDGAR fetch failed ({type(exc).__name__}): {exc}",
+            source_url=call.canonical_url,
+        )
+    return None
