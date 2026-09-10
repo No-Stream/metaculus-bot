@@ -176,6 +176,8 @@ def should_route_via_donated_key(model: str) -> bool:
     the personal key. Why each rule exists, and why the switch is an environment variable rather
     than a runtime toggle: docs/operations.md "should_route_via_donated_key".
     """
+    if not isinstance(model, str):  # a non-slug routes to the personal key rather than crashing the key decision
+        return False
     if not donated_openrouter_key_enabled():
         return False
     if not model.startswith("openrouter/"):
