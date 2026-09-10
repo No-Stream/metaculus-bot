@@ -280,15 +280,80 @@ reason. The moved log lines do change their `%(name)s` prefix in production run 
 archive cannot see: `scripts/telemetry/markers.py` matches every marker with `re.search` on the
 message text and its own docstring says a spec is agnostic to the log-line prefix.
 
+## Step 3 cannot be a preset: the design, awaiting the lead's confirmation
+
+The plan makes step 3 "point the loop at `fetch_url` with a preset that encodes today's gaps". A
+preset cannot do it. The fetcher's classifier does not merely READ a body, it JUDGES it, and its
+judgment discards the text. Measured on this branch:
+
+| extraction | content share | classifier verdict | characters published |
+|--:|--:|---|--:|
+| 87 | 0.706 | `js_wall` | 0 |
+| 212 | 1.000 | `no_resolving_content` / `thin_page` | 0 |
+| 394 | 0.967 | `no_resolving_content` / `thin_page` | 0 |
+| 914 | 0.986 | `success` | 914 |
+
+The loop serves every one of those as `ok` with the text, and 27 of its test fixtures extract to
+under 100 characters with 6 more between 100 and 400. So a third of its pinned behaviour is text
+this classifier refuses to publish.
+
+**The seam is one predicate, not eight flags.** The READ survives the verdict: when the fetcher
+withholds a short page, `_extract_page_text` still holds the extracted text and only the verdict
+throws it away. The 0.38 content-share metric is NOT a divergence, because the loop adopted it in
+`21f3122` and already honours `chrome_metric_withheld`. On the HTML path the whole difference
+reduces to the 400-character chrome floor plus which of `embed_shell` / `js_wall` / `thin_page`
+an unreadable page earns. So `policy` gains ONE seat, the verdict: the fetcher's is today's
+`looks_like_page_chrome` and `_no_content_verdict` unchanged, the loop's is "any non-empty
+extraction is content, under `GAP_FILL_V2_MIN_CONTENT_CHARS` escalates".
+
+Five things ride with it, each independent of the verdict shape:
+
+- **`links` and `escalate_rendered` become additive `FetchResult` fields.** The loop's driver
+  contract needs both. `links` is JSON-native and a few KB per URL, so the research archive
+  absorbs it; `raw_log` serialises every field with `dataclasses.asdict` against a
+  200,000-character cap.
+- **The PDF parse must NOT ride `FetchResult`.** `PdfText.pages` is the whole document, and the
+  measured receipt file is 833,450 characters, so one such field truncates the entire question's
+  archived payload to a preview. The parse stays in the existing per-URL side channel
+  (`local_document._DOCUMENT_CACHE`), and the verdict decides what the text is: the digest block
+  for the fetcher, the full joined text plus its truncation note for the loop, whose pagination
+  and `[p.N]` label tests both need the latter.
+- **A non-matching ask must not withhold on the loop's `fetch` path.** Confirmed: a document read
+  in full whose digest matches no query term comes back with `passages=0` and its text absent
+  from the block. The fetcher withholds that as `no_matching_passage`; the loop serves the text
+  and lets its own three-condition rule decide.
+- **The self-reference refusal must have its `http_status` nulled.** The fetcher's hop refusal
+  carries the redirect's 301 or 302, and handing that to the loop would trigger the impersonated
+  retry and the Wayback rung on a URL we refused ourselves, which is the bypass two of the loop's
+  tests exist to prevent.
+- **The loop's robots.txt reads must not run the floors.** They are 33 to 45 characters and go
+  through the same plain fetch, so the floors would read every host as "no directives" and
+  quietly open the paid rung on hosts that disallow it.
+
+## Two later steps also diverge from the plan
+
+**Step 6's host-semaphore fold should be dropped.** `FUTURE.md` item 5 already ruled on this exact
+merge and blocked it: the loop's rendered rung holds its host gate across a Chromium launch of up
+to 35 s, and merging the maps puts that hold in front of a fetcher request whose 45 s wall
+discards every page already fetched, so the merge waits on either the bounded acquire or the
+wall-degradation fix and needs the queueing measured rather than assumed. Folding it as briefed
+makes the fetcher's deadline behaviour worse on the surface where missed deadlines cost real
+forecasts this quarter. Recommendation to the lead: leave both maps, record the re-look in
+`FUTURE.md`. The rest of step 6 is already done, since `1eca925` and `2e97e1d` repointed all five
+of the loop's reaches into `resolution_source` privates; one stale prose reference remains at
+`agentic/fetch_outcomes.py:227`.
+
+**Step 4 has almost nothing left.** The loop already has the inline chart read, the meta-refresh
+hop, the two-pass extraction, the ARIA rewrite (inside the extraction, which is why grepping
+`agentic/` for it finds nothing), the Wayback rung and the harvest half of the derived-API rung.
+Only the derived-feed REUSE half is genuinely absent, and most of that arrives with the shared
+read. Size it after step 3 rather than assuming now.
+
 ## Next
 
-Step 3: point the loop at `fetch_url` with a preset that encodes today's gaps, and wire the knobs
-step 2 only declared, each with the patch sites or the branch that comes with it (the per-URL cap
-and its eleven patch sites first, then the archive age bound, the embed disclosure, the
-thin-content escalation, link collection, the render memo scope and the `caller=` marker field).
-Then step 4 (turn on the rungs the loop lacked, one commit each), step 5 (the run cache, the
-throttle check, the digest through the `policy.digest` seat), step 6 (fold the host-semaphore map,
-delete the loop's dead private fetch functions and its reaches into `resolution_source` privates).
+Step 3 as designed above, once the lead confirms the verdict seat. Then step 4 (the derived-feed
+reuse half, sized after step 3), step 5 (the run cache, the throttle check, the digest through the
+`policy.digest` seat), step 6 (the deletions only, without the semaphore fold).
 
 ### Step 2: the smell findings in the two files it edited are FIXED, not carried
 
