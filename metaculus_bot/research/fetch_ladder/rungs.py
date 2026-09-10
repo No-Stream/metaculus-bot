@@ -649,18 +649,18 @@ def _derived_api_result(
     (:func:`resolution_presentation._lead_then_capped_body`),
     because a feed served with its provenance line trimmed off is a JSON blob nobody can check.
     """
-    lead = derived_api.derived_api_lead(endpoint, url)
-    result = FetchResult(
+    artifact = run_cache.TextRead(
         url=url,
-        status="success",
-        text=resolution_presentation._lead_then_capped_body(lead, raw, url, cap=ctx.policy.per_url_max_chars),
+        text=raw,
         http_status=http_status,
         content_type="application/json",
+        lead=derived_api.derived_api_lead(endpoint, url),
     )
-    ctx.capture_read(
-        result,
-        run_cache.TextRead(url=url, text=raw, http_status=http_status, content_type="application/json", lead=lead),
-    )
+    result = artifact.present(ctx.policy, query=ctx.query, route="direct", now=ctx.now)
+    if result is None:
+        raise RuntimeError("fresh derived-API artifact was rejected by the policy that classified it")
+    if result.status == "success":
+        ctx.capture_read(result, artifact)
     return result
 
 
