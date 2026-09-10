@@ -48,6 +48,7 @@ FETCH_DESCRIPTION = (
     "FRED economic series, Kalshi and Polymarket market prices, and Yahoo Finance quotes are\n"
     "already in the research briefing (its financial-data and prediction-market sections) via\n"
     "their APIs — cite those rather than fetching these hosts as web pages.\n"
+    "Use fred_series or yahoo_history for a different date window, and market_snapshot for current prices.\n"
     'Example: fetch(url="https://www.ons.gov.uk/releases/gdpquarterly")\n'
     'Example: fetch(url="https://example.gov/long-report", start_char=12000)'
 )

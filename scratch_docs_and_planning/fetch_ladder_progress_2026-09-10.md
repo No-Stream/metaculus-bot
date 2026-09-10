@@ -9,7 +9,13 @@ can resume from the current status below; the later sections retain the migratio
 Free gates only. Nothing in this work may spend money: no `main.py` run, no backtest, no probe, no
 GitHub Actions dispatch. `make test` is network-blocked by an autouse fixture and is always free.
 
-## Current status: migration complete, production wiring follows merge
+## Current status: merged and wired; final verification record
+
+The migration was merged into `mantic-competition` as `d41e43e`. Production page-digest and
+known-API wiring is complete through `8ec0f2c`; the Linux worktree has been removed. See
+`fall_merge_completion_2026-09-10.md` for the final integrated review, gates, full-archive replay
+limits, and the operator-controlled smoke command. The following records the intermediate
+ladder-only gate before that merge.
 
 The recovered branch completed steps 4, 5 and 6 on 2026-09-10. The verified code commit is
 `4b2a368d58acfeb25ee8c8ee7101e297a70b2f57`; HEAD was unchanged across the final gate.
@@ -38,10 +44,10 @@ unreadable impersonated response retains its original offsite fallback. A thrott
 declines that archive rung because it describes the archive host, not the cited host. The recorded
 rendered-document limitation remains accepted; it was not silently expanded or repaired.
 
-Next: finish the full archived trigger/order replay, merge into `mantic-competition`, then bind
-the existing known-API and `page_digest` implementations there. The digest seat intentionally
-remains injectable/default BM25 on this intermediate branch. Final production wiring needs its
-own offline integration and CI-equivalent gate before any paid smoke is proposed.
+The full archived trigger/order replay and merge are complete. The intermediate ladder branch
+used an injectable/default BM25 digest; the merged production policies now bind `page_digest`.
+The free diagnostic explicitly retains BM25. Final integrated evidence is in the completion
+record linked above.
 
 ## Design decisions taken before the first commit
 

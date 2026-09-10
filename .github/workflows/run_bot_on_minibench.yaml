@@ -154,7 +154,7 @@ jobs:
           # is_benchmarking=False in the prod path (this workflow), so the
           # provider's own benchmarking guard doesn't suppress it here.
           PREDICTION_MARKETS_ENABLED: 'true'
-          # Tier-1 resolution-source fetcher (plain HTTP + trafilatura, no LLM calls).
+          # Cited-source fetcher; long HTML uses the paid page-digest extractor.
           # Validated via live test_bot run 2026-07-10.
           RESOLUTION_SOURCE_ENABLED: 'true'
           # The ladder's one PAID rung: when every free rung has failed to read a

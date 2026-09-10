@@ -881,6 +881,13 @@ def test_fetch_description_redirects_data_endpoints_to_the_briefing() -> None:
     assert "financial-data and prediction-market sections" in FETCH_DESCRIPTION
 
 
+def test_fetch_description_names_available_api_tools() -> None:
+    for tool_name in ("fred_series", "yahoo_history", "market_snapshot"):
+        assert tool_name in FETCH_DESCRIPTION
+    assert "date window" in FETCH_DESCRIPTION
+    assert "current prices" in FETCH_DESCRIPTION
+
+
 @pytest.mark.asyncio
 async def test_fetch_direct_blocks_redirect_to_metaculus(monkeypatch: pytest.MonkeyPatch) -> None:
     session = _FakeSession(

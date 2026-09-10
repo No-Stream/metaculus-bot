@@ -60,7 +60,8 @@ jobs:
         # (the Gemini url_context read) is gated on RESOLUTION_SOURCE_URL_CONTEXT_ENABLED
         # and on GOOGLE_API_KEY; neither is set here, and the rung declines on the
         # flag before it ever looks for the key. Keep both absent. The only env var
-        # here controls stdout buffering.
+        # here controls stdout buffering. The script also replaces the paid
+        # page-digest extractor with deterministic BM25 passage selection.
         #
         # curl_cffi is a runtime dependency since 2026-09-04 (the impersonation rung
         # in metaculus_bot/research/impersonated_fetch.py drives it), so the plain

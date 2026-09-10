@@ -1,5 +1,9 @@
 # Fall 2026 merge: what landed on 2026-09-10, and what is left
 
+**Resume status:** the recovered ladder migration has since been merged and production wiring
+completed. See `fall_merge_completion_2026-09-10.md` for current verification and smoke readiness.
+The remainder of this file preserves the original handoff and decisions.
+
 **Date:** 2026-09-10, early afternoon Pacific. Supersedes `handoff-2026-09-09-fall-config.md`,
 whose "What's left to do" list is now mostly done (see "Status of the 09-09 list" below).
 **Branch:** `mantic-competition`, tip `6551ae1`, 64 commits past the 09-09 handoff tip `6f2f051`.

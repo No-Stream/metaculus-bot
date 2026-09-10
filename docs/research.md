@@ -1081,7 +1081,8 @@ render their market-reading rules at all.
 Fetches the exact URL(s) a question cites as its grading source
 (`research/resolution_source.py`), so forecasters read the ground truth the
 question resolves against. The page fetch is Tier-1: plain HTTP with browser-like
-headers, no LLM calls, no retries. One narrow Tier-2 hop sits beside it (the
+headers; long successful HTML then uses the paid page-digest extractor described below.
+One narrow Tier-2 hop sits beside it (the
 embedded Datawrapper dataset, below). When the direct fetch cannot read a page an
 escalation ladder runs (`_escalate_unresolved`), each rung self-bounded against the same
 provider wall and each returning a result that went through the same classification path,
