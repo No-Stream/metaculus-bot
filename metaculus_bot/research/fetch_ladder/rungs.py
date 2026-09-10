@@ -289,13 +289,10 @@ async def _impersonate_rung(
     host when the status is block-shaped (``impersonated_fetch.IMPERSONATE_BLOCK_STATUSES``: the
     three ``blocked`` rows of the status table plus 401 and 503, which stamp ``error`` here and
     still switch the host off), and returns None. A 200 goes through
-    :func:`_impersonated_body_outcome`, the same classification a direct 200 gets, and is returned
-    ONLY when it is ``success``. An impersonated 200 that classified as unreadable stamps its
-    verdict on the attempt (``outcome=js_wall``) and leaves ``blocked`` standing, because
-    replacing it would change the fetch line's status without giving any later rung a way to act
-    on it (the dispatcher's browser block keys on ``direct``, not on a rung's result), and
-    ``blocked`` is what keeps the paid rung reachable for that URL. FUTURE.md carries letting the
-    dispatcher escalate on a rung's result.
+    :func:`_impersonated_body_outcome`, the same classification a direct 200 gets. A success or
+    throttle is returned, as is an unreadable result that gives the browser a concrete reason to
+    run. The dispatcher applies the caller's browser policy to that result while retaining the
+    original direct refusal for the later off-site rungs if the browser does not rescue it.
     """
     if not _impersonate_rung_applies(direct):
         return None
@@ -354,7 +351,7 @@ async def _impersonate_rung(
     # The rung's own verdict, stamped before deciding: a body that classified as unreadable is a
     # fact about the page the escalation line has to keep even though the direct status stands.
     attempt.outcome = result.status
-    if result.status in ("success", "throttled"):
+    if result.status in ("success", "throttled") or _rendered_rung_applies(result):
         return result
     logger.info(
         "resolution_source: the impersonated retry of %s got a 200 that classified as %s; the direct result stands",

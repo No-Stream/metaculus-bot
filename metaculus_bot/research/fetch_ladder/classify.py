@@ -511,8 +511,8 @@ async def _finish_document(pending: _PendingDocument, ctx: context.LadderContext
         content_type=pending.content_type or None,
         status_reason=read.status_reason,
     )
+    document_cache.cache_document(pending.url, pdf)
     if result.status == "success":
-        document_cache.cache_document(pending.url, pdf)
         ctx.capture_read(result, run_cache.PdfRead(pending.url, pending.http_status, pending.content_type or None))
     return result
 

@@ -95,6 +95,26 @@ async def _escalate_thin_success(
     return rendered if rendered is not None else direct
 
 
+async def _escalate_impersonated(
+    session: Any,
+    url: str,
+    impersonated: FetchResult,
+    *,
+    host_sems: dict[str, asyncio.Semaphore],
+    ctx: context.LadderContext,
+) -> FetchResult | None:
+    """Apply this caller's browser policy to a body recovered by impersonation."""
+    if impersonated.status == "throttled":
+        return impersonated
+    if impersonated.status == "success":
+        if impersonated.escalate_rendered:
+            return await _escalate_thin_success(url, impersonated, host_sems=host_sems, ctx=ctx)
+        return impersonated
+    if rungs._rendered_rung_applies(impersonated):
+        return await _escalate_via_browser(session, url, impersonated, host_sems=host_sems, ctx=ctx)
+    return None
+
+
 async def _escalate_offsite(
     session: Any, url: str, direct: FetchResult, *, host_sems: dict[str, asyncio.Semaphore], ctx: context.LadderContext
 ) -> FetchResult:
@@ -146,7 +166,9 @@ async def _escalate_unresolved(
             ctx, direct.status, rungs._impersonate_rung(url, direct, host_sems=host_sems, ctx=ctx)
         )
         if impersonated is not None:
-            return impersonated
+            escalated = await _escalate_impersonated(session, url, impersonated, host_sems=host_sems, ctx=ctx)
+            if escalated is not None:
+                return escalated
     if rungs._rendered_rung_applies(direct):
         escalated = await _escalate_via_browser(session, url, direct, host_sems=host_sems, ctx=ctx)
         if escalated is not None:
