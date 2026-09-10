@@ -2250,6 +2250,23 @@ removal still carry real values in that field, so
 `ensemble_analysis/ensemble_simulator.py` keeps reading it for its binary
 baseline score: on fresh data it simply finds nothing and skips the question.
 
+## Comment privacy
+
+Every rationale comment the bot posts is private: the framework's `post_question_comment` sends
+`is_private: true` and the repo never overrides it. That is by Metaculus's request, not an
+accident. The FutureEval Bot Tournament Resources Page (Metaculus notebook 38928, read 2026-09-10)
+says bots "should only leave private comments on questions. These will automatically be made public
+at regular intervals for FutureEval tournaments. Though comments will stay private for any questions
+on the main site, unless specific permission is given", and its rules section asks bots to "use
+private notes as their comment type" and says Metaculus converts them to public comments after
+questions close weekly. So a summer tournament comment reads public in the API while a fresh fall or
+Metaculus Cup comment reads private, and a comment missing from the bot's default author listing is
+expected until that weekly flip, not a publish failure. Do not pass `is_private=False`. Analysis
+tooling reads both listings (`fetch_bot_comments` in `performance_analysis/collector.py` and
+`scripts/backfill_research_from_comments.py`), so a private comment is still visible to the residual
+round. Receipt: the six 2026-09-07 fall comments were private and invisible to the collector until
+367b67c; the operator confirmed keeping them private on 2026-09-10.
+
 ## Performance analysis and the width monitor (read-only, free)
 
 This section is the runbook: the commands, and what each one prints. The
