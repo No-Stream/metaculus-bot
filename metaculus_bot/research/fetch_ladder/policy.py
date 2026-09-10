@@ -106,7 +106,7 @@ GAP_FILL_FETCH_POLICY = LadderPolicy(
     caller=LADDER_CALLER_GAP_FILL_V2,
     render_memo_scope="gap_fill_v2",
     verdict=GAP_FILL_VERDICT,
-    rungs_enabled=frozenset({"impersonate", "rendered", "wayback"}),
+    rungs_enabled=frozenset({"impersonate", "derived_api", "rendered", "wayback"}),
     total_wall_s=90.0,
     # No margin: the loop's own outer bounds are the cut (see the doc).
     rung_wall_margin_s=0.0,

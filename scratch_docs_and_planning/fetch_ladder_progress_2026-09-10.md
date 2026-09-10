@@ -520,13 +520,21 @@ calibrated two-pass extraction with its line-shape metric, the inline chart read
 hop, the local document read with its parse gate, the Wayback rung with its per-question cap, the
 `+json` and empty-Content-Type admission, and per-rung wall floors on everything.
 
-What remains for step 4, and it is one line: add `derived_api` to
-`GAP_FILL_FETCH_POLICY.rungs_enabled`, which turns the REUSE half on for the loop (a feed an earlier
-render on the host recorded). The rung, its per-host memo and its budget gate all already run for the
-fetcher; the loop's `rung_not_enabled` skip is the only thing keeping it off. Worth one commit with a
-test that a remembered endpoint is GET-ed for a second URL on the host, and with the render memo
-scopes still separate (the plan's fourth constraint), because "rendered to nothing" still means
-different things to the two verdicts.
+Step 4 is complete. `GAP_FILL_FETCH_POLICY.rungs_enabled` now includes `derived_api`, so a feed an
+earlier render remembered for a host can be reused by the gap-fill loop. The rung, its per-host memo
+and its budget gate were already live; the policy's `rung_not_enabled` skip was the only thing that
+kept reuse off. The regression in
+`tests/test_agentic_tools.py::TestGapFillV2DerivedApiOnEmptyRender::test_a_remembered_endpoint_is_gotten_for_a_second_same_host_url_before_render`
+renders the first dashboard URL, then verifies the second same-host URL GETs the remembered endpoint
+and does not launch a second render. Its companion test drives both caller presets through the real
+rendered rung and pins their separate `gap_fill_v2` and `resolution_source` memo scopes. The rung
+order corpus now includes the enabled derived-feed attempt for the four gap-fill cases that reach
+the browser ladder.
+
+Free verification on 2026-09-10: 273 focused ladder and agentic tests passed, including all 21 rung
+order cases; the shared rendered/derived suites added 152 passes. Repository Ruff and basedpyright
+(`make lint`, `make typecheck`) passed with zero findings. No paid run, network dispatch or push was
+performed.
 
 The Datawrapper dataset hop stays a second phase of the fetcher's provider, as the plan says.
 
@@ -613,9 +621,8 @@ those counts is unchanged from the baseline at `6169965`; step 3 added no findin
 
 ## Next
 
-Step 4 (the one-line derived-feed REUSE enable, plus its test), step 5 (the run cache, the throttle
-check shared with the fetcher, the digest through the `policy.digest` seat), step 6 (the deletions
-above, without the host-semaphore fold).
+Step 5 (the run cache, the throttle check shared with the fetcher, the digest through the
+`policy.digest` seat), step 6 (the deletions above, without the host-semaphore fold).
 
 ### Step 2: the smell findings in the two files it edited are FIXED, not carried
 

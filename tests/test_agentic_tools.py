@@ -53,6 +53,7 @@ from metaculus_bot.research.fetch_ladder.policy import (
     GAP_FILL_DIRECT_POLICY,
     GAP_FILL_DOCUMENT_POLICY,
     GAP_FILL_FETCH_POLICY,
+    RESOLUTION_SOURCE_POLICY,
     LadderPolicy,
 )
 from metaculus_bot.research.gemini_client_config import gemini_retry_sleep_allowance_s
@@ -4324,3 +4325,84 @@ class TestGapFillV2DerivedApiOnEmptyRender:
 
         assert outcome.method == "derived_api"
         assert '{"cases": 1240}' in outcome.content_markdown
+
+    @pytest.mark.asyncio
+    async def test_a_remembered_endpoint_is_gotten_for_a_second_same_host_url_before_render(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A render on one dashboard page supplies the free feed for its host's next page."""
+        first_url = self._URL
+        second_url = "https://dashboard.example.gov/detail"
+        endpoint_url = "https://dashboard.example.gov/api/data"
+        self._empty_dom(monkeypatch)
+
+        feeds = (rendered_fetch.HarvestedJson(url=endpoint_url, body=b'{"cases": 1240, "as_of": "2026-08-31"}'),)
+        renders: list[dict[str, object]] = []
+        monkeypatch.setattr(rungs, "render_page", _fake_render(self._page(feeds), renders))
+        asked = _serve_direct(
+            monkeypatch,
+            {
+                first_url: replace(self._walled(), url=first_url),
+                second_url: replace(self._walled(), url=second_url),
+                endpoint_url: _direct(
+                    "success",
+                    url=endpoint_url,
+                    text='{"cases": 1240, "as_of": "2026-08-31"}',
+                    http_status=200,
+                    content_type="application/json",
+                ),
+            },
+        )
+
+        first = await agentic_tools.fetch(first_url)
+        second = await agentic_tools.fetch(second_url)
+
+        assert first.method == "derived_api"
+        assert second.method == "derived_api"
+        assert asked == [first_url, second_url, endpoint_url]
+        assert [call["url"] for call in renders] == [first_url]
+
+    @pytest.mark.asyncio
+    async def test_render_memo_scopes_stay_separate_between_caller_presets(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A gap-fill empty render cannot suppress the resolution-source render for the same URL."""
+        self._empty_dom(monkeypatch)
+        scopes: list[str] = []
+        page = self._page(())
+
+        async def _recording_render(
+            url: str,
+            *,
+            memo_scope: str,
+            host_gate: Any,
+            goto_timeout_ms: int,
+            deadline_monotonic_s: float | None = None,
+            harvest_json: bool = False,
+        ) -> rendered_fetch.RenderedPage:
+            del url, host_gate, goto_timeout_ms, deadline_monotonic_s, harvest_json
+            scopes.append(memo_scope)
+            return page
+
+        monkeypatch.setattr(rungs, "render_page", _recording_render)
+        direct = self._walled()
+
+        gap_fill = await rungs._rendered_rung(
+            self._URL,
+            direct,
+            agentic_tools._FETCH_HOST_SEMAPHORES,
+            context.LadderContext(policy=GAP_FILL_FETCH_POLICY),
+        )
+        resolution_source = await rungs._rendered_rung(
+            self._URL,
+            direct,
+            agentic_tools._FETCH_HOST_SEMAPHORES,
+            context.LadderContext(policy=RESOLUTION_SOURCE_POLICY),
+        )
+
+        assert gap_fill is None
+        assert resolution_source is None
+        assert scopes == ["gap_fill_v2", "resolution_source"]
+        assert GAP_FILL_FETCH_POLICY.render_memo_scope != RESOLUTION_SOURCE_POLICY.render_memo_scope
+        assert rendered_fetch.rendered_to_nothing(self._URL, memo_scope="gap_fill_v2") is True
+        assert rendered_fetch.rendered_to_nothing(self._URL, memo_scope="resolution_source") is True

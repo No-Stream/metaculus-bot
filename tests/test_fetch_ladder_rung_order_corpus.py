@@ -257,11 +257,11 @@ _EXPECTED: dict[str, dict[str, tuple[str, ...]]] = {
     },
     "js_wall": {
         "resolution_source": ("derived_api", "rendered", "url_context", "route=url_context", "status=js_wall"),
-        "gap_fill_v2": ("rendered", "status=empty", "method=empty"),
+        "gap_fill_v2": ("derived_api", "rendered", "status=empty", "method=empty"),
     },
     "embed_shell": {
         "resolution_source": ("url_context", "route=url_context", "status=no_resolving_content"),
-        "gap_fill_v2": ("rendered", "status=empty", "method=empty"),
+        "gap_fill_v2": ("derived_api", "rendered", "status=empty", "method=empty"),
     },
     "thin_page": {
         "resolution_source": (
@@ -271,7 +271,7 @@ _EXPECTED: dict[str, dict[str, tuple[str, ...]]] = {
             "route=url_context",
             "status=no_resolving_content",
         ),
-        "gap_fill_v2": ("rendered", "status=empty", "method=empty"),
+        "gap_fill_v2": ("derived_api", "rendered", "status=empty", "method=empty"),
     },
     "no_matching_passage": {
         "resolution_source": ("route=direct", "status=no_resolving_content"),
@@ -304,7 +304,7 @@ _EXPECTED: dict[str, dict[str, tuple[str, ...]]] = {
     },
     "empty_body": {
         "resolution_source": ("route=direct", "status=empty_body"),
-        "gap_fill_v2": ("rendered", "status=empty", "method=empty"),
+        "gap_fill_v2": ("derived_api", "rendered", "status=empty", "method=empty"),
     },
     "ssrf_blocked": {
         "resolution_source": ("route=direct", "status=ssrf_blocked"),
