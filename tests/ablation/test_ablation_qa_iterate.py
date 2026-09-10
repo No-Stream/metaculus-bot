@@ -506,9 +506,6 @@ def test_write_manual_rejects_is_atomic(tmp_path: Path, monkeypatch: pytest.Monk
     )
     original_contents = rejects_path.read_text(encoding="utf-8")
 
-    _qa_os = getattr(qa_iterate, "os", None)  # cache helper uses os.replace
-    real_replace = _qa_os.replace if _qa_os is not None else None
-
     def boom_replace(*args: Any, **kwargs: Any) -> None:
         raise RuntimeError("simulated kernel reboot during commit")
 
@@ -533,7 +530,6 @@ def test_write_manual_rejects_is_atomic(tmp_path: Path, monkeypatch: pytest.Monk
     # No tempfile leak: only the original file should remain in the parent dir.
     leftover = [p for p in rejects_path.parent.iterdir() if p.name.startswith(f".{rejects_path.name}.")]
     assert leftover == []
-    _ = real_replace  # silence unused
 
 
 def test_render_qa_summary_uses_atomic_write(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
