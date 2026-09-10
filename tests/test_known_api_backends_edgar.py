@@ -99,7 +99,7 @@ class TestFilingDocument:
             b"<p>Delivery Hero received BaFin approval for the acquisition on 2026-01-05.</p>"
             b"</article></body></html>"
         )
-        doc = sec_edgar.FilingDocument(url=_document_call().edgar_url, content_type="text/html", body=html)
+        doc = sec_edgar.FilingDocument(url=_document_call().canonical_url, content_type="text/html", body=html)
 
         async def _fake(session, url):
             return doc
