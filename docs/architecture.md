@@ -735,8 +735,10 @@ bytes say. The driver routes on the bytes first, because a mislabeled document i
 hosts it reaches: PDF magic or a declared PDF goes to the document branch, image magic or a
 declared image is refused as `unsupported_type` with the `image_needs_reader` reason (its own
 token, so the loop's adapter can escalate it to a model read), and an `<html` substring anywhere in
-the body routes to HTML even under an odd content type. A declared image is the one body the driver
-refuses WITHOUT reading, which is what `verdict.unread_route` exists for.
+the body routes to HTML even under an odd content type. Both callers route `application/xml`,
+`text/xml` and structured `+xml` media types to the raw-text reader, which preserves the XML tags.
+A declared image is the one body the driver refuses WITHOUT reading, which is what
+`verdict.unread_route` exists for.
 
 Whether an HTML extraction counts as CONTENT. The fetcher publishes only text that clears the
 400-character chrome floor and the line-shape metric (`looks_like_page_chrome`,

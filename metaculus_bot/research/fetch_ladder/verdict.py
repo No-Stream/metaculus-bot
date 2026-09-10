@@ -182,7 +182,11 @@ class ResolutionSourceVerdict:
         del body
         if any(ct in content_type for ct in _HTML_CONTENT_TYPES):
             return "html"
-        if is_json_content_type(content_type) or any(ct in content_type for ct in _RAW_TEXT_CONTENT_TYPES):
+        if (
+            is_json_content_type(content_type)
+            or _is_xml_content_type(content_type)
+            or any(ct in content_type for ct in _RAW_TEXT_CONTENT_TYPES)
+        ):
             return "text"
         # Everything else goes to the document branch, whose `%PDF-` sniff decides what these bytes are.
         return "document"
@@ -225,6 +229,7 @@ class GapFillVerdict:
             return "html"
         if (
             is_json_content_type(content_type)
+            or _is_xml_content_type(content_type)
             or any(ct in content_type for ct in _RAW_TEXT_CONTENT_TYPES)
             or not content_type
         ):
@@ -250,6 +255,11 @@ class GapFillVerdict:
 
 def _is_pdf_content_type(content_type: str) -> bool:
     return any(token in content_type for token in PDF_CONTENT_TYPES)
+
+
+def _is_xml_content_type(content_type: str) -> bool:
+    media_type = content_type.partition(";")[0].strip().lower()
+    return media_type in ("application/xml", "text/xml") or media_type.endswith("+xml")
 
 
 def _is_image_content_type(content_type: str) -> bool:

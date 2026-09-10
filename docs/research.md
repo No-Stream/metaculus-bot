@@ -1656,7 +1656,7 @@ is the paid reader's, a page Gemini retrieved whose answer said it does not disc
 of them live in `research/resolution_fetch_result.py` with the rest of the vocabulary.
 
 `vacuous_body_status` (`research/resolution_fetch_result.py`) is the one place that
-decision is made, on every raw-body branch, Tier-1 JSON/text/CSV and the Tier-2
+decision is made, on every raw-body branch, Tier-1 JSON/XML/text/CSV and the Tier-2
 dataset alike. Three ways a 200 carries nothing. It could not be DECODED: the body is
 decoded BOM-first, then by its declared charset, and an undecodable-character ratio
 above `MAX_UNDECODABLE_CHAR_RATIO` is refused as `unsupported_type`, because mojibake
