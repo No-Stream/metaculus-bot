@@ -672,6 +672,19 @@ MARKER_SPECS: list[MarkerSpec] = [
         qid_kind=QID_KIND_QUESTION_ID,  # targeted.py passes question.id_of_question
     ),
     MarkerSpec(
+        "gap_fill_v1_triage",
+        # Why: emitted only when the analyzer answered, so listed=0 is "no gaps", not a dead analyzer. Receipt: docs/telemetry_markers.md "GAP_FILL_V1_TRIAGE".
+        re.compile(
+            r"GAP_FILL_V1_TRIAGE:\s*question=(?P<question>\S+)\s+listed=(?P<listed>\d+)\s+kept=(?P<kept>\d+)"
+            r"\s+dropped_not_answerable=(?P<dropped_not_answerable>\d+)"
+            r"\s+dropped_in_first_pass=(?P<dropped_in_first_pass>\d+)"
+            r"\s+dropped_same_need=(?P<dropped_same_need>\d+)"
+            r"\s+dropped_schema=(?P<dropped_schema>\d+)"
+            r"\s+dropped_over_cap=(?P<dropped_over_cap>\d+)"
+        ),
+        qid_kind=QID_KIND_QUESTION_ID,  # targeted.py passes question.id_of_question
+    ),
+    MarkerSpec(
         "credit_balance",
         re.compile(
             r"CREDIT_BALANCE:\s*key=(?P<key>\S+)\s+phase=(?P<phase>\S+)"

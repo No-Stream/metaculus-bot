@@ -932,3 +932,63 @@ class TestAskNewsSummarizerPrompt:
         assert "organize by recency and relevance to the question" in collapsed
         # The old input-mirroring instruction it replaced must be gone.
         assert "Maintains the section structure" not in collapsed
+
+
+class TestGapFillAnalyzerGradeFields:
+    """The grade-based lean-out of gap-fill v1 (operator ruling, 2026-09-09). Three structured fields
+    beside each gap make the prompt's own discipline rules checkable by code: ``answerable_now`` for the
+    ANSWERABLE NOW rule (future-dated asks were 18% of gaps and a third of gap-one slots),
+    ``already_in_first_pass`` for its dated-reading carve-out (47% of the forced current-reading gaps
+    re-bought a reading the briefing held), and ``same_need_as`` for paraphrase repeats (one question in
+    three). ``research/targeted.py`` ``triage_gaps`` drops a failing gap before its resolver call; a
+    positional cap was rejected because it dropped the useful gap on 4 of 6 traced questions. Receipt:
+    scratch/cost_pass_2026-09-09/v1_gap_redundancy/REDUNDANCY.md."""
+
+    def _analyzer(self) -> str:
+        return gap_fill_analyzer_prompt(
+            "Will the tracker read above 50 on 2026-09-30?",
+            "Resolves YES if the tracker's published reading exceeds 50.",
+            "The tracker is updated weekly.",
+            "First pass: the tracker read 48 as of 2026-09-02.",
+            is_benchmarking=False,
+            max_gaps=4,
+        )
+
+    def test_schema_carries_the_three_grade_fields(self) -> None:
+        flat = _flat(self._analyzer())
+        schema_at = flat.index('{"gaps": [')
+        for field in ('"answerable_now":', '"already_in_first_pass":', '"same_need_as":'):
+            assert flat.index(field) > schema_at, field
+        # The three grades keep the analyzer's own ordering rule intact: still no rank fields.
+        assert "do not add rank fields or scores" in flat
+
+    def test_grade_rule_states_that_code_reads_the_grades_and_why(self) -> None:
+        flat = _flat(self._analyzer())
+        assert "grade every gap" in flat
+        assert "code reads them and drops a failing gap before its search is paid for" in flat
+
+    def test_answerable_now_is_defined_against_todays_date(self) -> None:
+        flat = _flat(self._analyzer())
+        assert "answerable_now is false when the answer is a reading, result or event dated after today" in flat
+
+    def test_already_in_first_pass_requires_the_dated_value(self) -> None:
+        flat = _flat(self._analyzer())
+        assert (
+            "already_in_first_pass is true when the first-pass research already states the value or fact with its date"
+            in flat
+        )
+
+    def test_same_need_as_is_a_one_based_position_of_an_earlier_gap_else_null(self) -> None:
+        flat = _flat(self._analyzer())
+        assert "same_need_as is the position (1 = the first gap) of an earlier gap in this list" in flat
+        assert "the same fact from the same source would answer, else null" in flat
+
+    def test_same_need_as_names_the_two_commonest_repeat_shapes(self) -> None:
+        """The archive's paraphrase pairs are the dashboard and its monthly summary, and official versus
+        preliminary results (45088, 44880); naming them is what makes the field fire on the real repeats."""
+        flat = _flat(self._analyzer())
+        assert "a dashboard and its monthly summary, or official and preliminary results, are one need" in flat
+
+    def test_grade_rule_sits_beside_the_schema_it_defines(self) -> None:
+        flat = _flat(self._analyzer())
+        assert flat.index("null results are search outcomes") < flat.index("grade every gap") < flat.index('{"gaps": [')

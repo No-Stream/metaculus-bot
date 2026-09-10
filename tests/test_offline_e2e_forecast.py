@@ -186,9 +186,20 @@ def _canned_ranking(prompt: str) -> str:
     return json.dumps(picks)
 
 
-# gap-fill v1 analyzer: a single-gap JSON payload (parse_gap_list).
+# gap-fill v1 analyzer: a single-gap JSON payload, graded to pass triage so the resolver path runs.
 _CANNED_GAP_ANALYZER = json.dumps(
-    {"gaps": [{"gap": "Latest BLS release date", "why_matters": "Anchors the level", "search_query": "BLS release"}]}
+    {
+        "gaps": [
+            {
+                "gap": "Latest BLS release date",
+                "why_matters": "Anchors the level",
+                "search_query": "BLS release",
+                "answerable_now": True,
+                "already_in_first_pass": False,
+                "same_need_as": None,
+            }
+        ]
+    }
 )
 
 # Providers that MUST report `ok` in the diagnostics block for these questions.
