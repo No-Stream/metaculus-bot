@@ -7,7 +7,7 @@ import pytest
 from metaculus_bot.research import impersonated_fetch
 from metaculus_bot.research.fetch_ladder import guard, ladder, rungs
 from metaculus_bot.research.fetch_ladder.context import LadderContext
-from metaculus_bot.research.fetch_ladder.policy import GAP_FILL_FETCH_POLICY, RESOLUTION_SOURCE_POLICY
+from metaculus_bot.research.fetch_ladder.policy import GAP_FILL_FETCH_POLICY
 from metaculus_bot.research.impersonated_fetch import ImpersonatedResponse
 from metaculus_bot.research.rendered_fetch import RenderedPage
 from tests.resolution_source_fakes import FakeResponse, FakeSession
@@ -73,42 +73,4 @@ async def test_gap_fill_renders_an_impersonated_body_that_still_needs_a_browser(
     assert [(attempt.rung, attempt.outcome) for attempt in result.rung_attempts] == [
         ("impersonate", impersonated_outcome),
         ("rendered", "success"),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_resolution_source_renders_an_impersonated_javascript_shell(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def _public(_url: str) -> bool:
-        return True
-
-    async def _impersonated(*_args: object, **_kwargs: object) -> ImpersonatedResponse:
-        return ImpersonatedResponse(
-            status=200,
-            url=_URL,
-            content_type="text/html",
-            server="edge",
-            body=_JS_SHELL,
-            elapsed_s=0.1,
-            primary_ip="203.0.113.10",
-        )
-
-    async def _render(url: str, **_kwargs: object) -> RenderedPage:
-        return RenderedPage(url=url, content_type="text/html", html=_RENDERED_HTML, http_status=200)
-
-    monkeypatch.setattr(guard, "is_public_http_url", _public)
-    monkeypatch.setattr(rungs, "fetch_impersonated", _impersonated)
-    monkeypatch.setattr(rungs, "render_page", _render)
-    session = FakeSession({_URL: FakeResponse(403, body=b"denied", content_type="text/html")})
-
-    result = await ladder.fetch_url(
-        _URL,
-        policy=RESOLUTION_SOURCE_POLICY,
-        ctx=LadderContext(session=session, host_sems={}),
-    )
-
-    assert result.status == "success"
-    assert result.route == "rendered"
-    assert [(attempt.rung, attempt.from_status, attempt.outcome) for attempt in result.rung_attempts] == [
-        ("impersonate", "blocked", "js_wall"),
-        ("rendered", "js_wall", "success"),
     ]

@@ -358,9 +358,13 @@ class TestImpersonateRungStillRefused:
         assert second.route == "impersonate"
 
     async def test_a_200_that_classifies_as_unreadable_declines_and_leaves_the_paid_rung_reachable(self, monkeypatch):
-        """The browser gets one chance at the impersonated shell before the original refusal
-        keeps the paid rung reachable."""
+        """Resolution-source keeps its original off-site fallback after an unreadable retry."""
         _transport(monkeypatch, _impersonated(200, body=_JS_SHELL))
+
+        async def _browser_must_not_run(*_args, **_kwargs):
+            raise AssertionError("resolution-source does not render an unreadable impersonated retry")
+
+        monkeypatch.setattr(rungs, "render_page", _browser_must_not_run)
         reader, reads = paid_reader()
         arm_paid_rung(monkeypatch, reader)
         session = FakeSession(
@@ -377,7 +381,6 @@ class TestImpersonateRungStillRefused:
         assert result.route == "url_context"
         assert [(a.rung, a.from_status, a.outcome) for a in result.rung_attempts] == [
             ("impersonate", "blocked", "js_wall"),
-            ("rendered", "js_wall", None),
             ("url_context", "blocked", "success"),
         ]
         assert impersonation_refused(_URL) is False
@@ -389,7 +392,7 @@ class TestImpersonateRungStillRefused:
 
         assert result.status == "blocked"
         assert result.route == "impersonate"
-        assert [a.outcome for a in result.rung_attempts] == ["js_wall", None]
+        assert [a.outcome for a in result.rung_attempts] == ["js_wall"]
 
     async def test_a_withheld_impersonated_body_is_counted_on_the_direct_result(self, monkeypatch):
         """`chrome_metric_withholds` counts a withhold anywhere on the URL's ladder, and a 403 direct
@@ -404,10 +407,7 @@ class TestImpersonateRungStillRefused:
 
         assert result.status == "blocked"
         assert result.route == "impersonate"
-        assert [(a.outcome, a.skipped_reason) for a in result.rung_attempts] == [
-            ("no_resolving_content", ""),
-            (None, "renderer_unavailable"),
-        ]
+        assert [(a.outcome, a.skipped_reason) for a in result.rung_attempts] == [("no_resolving_content", "")]
         assert result.chrome_metric_withheld is True
         counts = _rung_counts([result])
         assert counts["chrome_metric_withholds"] == 1

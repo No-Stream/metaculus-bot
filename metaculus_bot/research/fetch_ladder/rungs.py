@@ -290,9 +290,9 @@ async def _impersonate_rung(
     three ``blocked`` rows of the status table plus 401 and 503, which stamp ``error`` here and
     still switch the host off), and returns None. A 200 goes through
     :func:`_impersonated_body_outcome`, the same classification a direct 200 gets. A success or
-    throttle is returned, as is an unreadable result that gives the browser a concrete reason to
-    run. The dispatcher applies the caller's browser policy to that result while retaining the
-    original direct refusal for the later off-site rungs if the browser does not rescue it.
+    throttle is returned. An unreadable result is returned only when the caller's verdict sets
+    ``escalate_rendered``; this restores gap-fill's browser follow-up while resolution-source
+    retains its original direct refusal for the off-site rungs.
     """
     if not _impersonate_rung_applies(direct):
         return None
@@ -351,7 +351,7 @@ async def _impersonate_rung(
     # The rung's own verdict, stamped before deciding: a body that classified as unreadable is a
     # fact about the page the escalation line has to keep even though the direct status stands.
     attempt.outcome = result.status
-    if result.status in ("success", "throttled") or _rendered_rung_applies(result):
+    if result.status in ("success", "throttled") or result.escalate_rendered:
         return result
     logger.info(
         "resolution_source: the impersonated retry of %s got a 200 that classified as %s; the direct result stands",
