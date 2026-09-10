@@ -10,8 +10,8 @@ transport or quota failure is ``error`` naming the exception class. Detail: docs
 The bounds are the ones the 2026-09-09 cost pass measured a need for: a windowed read capped at
 400 observations newest-kept, 15 s per FRED or Yahoo call (fredapi's ``urlopen`` carries no
 timeout of its own, so the whole worker is bounded by :func:`asyncio.wait_for`), five market rows,
-and at most four Kalshi detail GETs per question (a semaphore the caller constructs per question,
-since the loop has no per-question object yet -- see :func:`market_snapshot`).
+and at most four Kalshi detail GETs per question (a :class:`KalshiGetBudget` the caller constructs
+per question, since the loop has no per-question object yet -- see :func:`market_snapshot`).
 """
 
 from __future__ import annotations

@@ -171,8 +171,9 @@ ladder's rung 0, so the driver can still just `fetch` the URL and get the API an
 
 Each handler adapts its backend's result to a `ToolOutcome` with method `known_api`; the market
 handler binds the per-question session, the run's Kalshi catalogue and PredictIt dump, and the
-Kalshi detail semaphore. The bounds (window cap, per-call timeouts, five market rows, four Kalshi
-GETs) live with the backends, documented in `docs/research.md` "Known-API registry".
+per-question Kalshi detail-GET budget. The bounds (window cap, per-call timeouts, five market
+rows, four Kalshi GETs) live with the backends, documented in `docs/research.md`
+"Known-API registry".
 
 ### The fetch ladder
 

@@ -4,8 +4,8 @@
 and ``market_snapshot`` -- each pairing a driver-facing description and JSON schema with a handler
 that parses the ISO date window off the model's arguments, calls the backend, and adapts the
 result to the loop's ``ToolOutcome``. The market handler binds the per-question session, the run's
-already-pulled Kalshi catalogue and PredictIt dump, and the Kalshi detail semaphore (the seam the
-loop wiring fills, since the loop has no per-question object yet). Detail:
+already-pulled Kalshi catalogue and PredictIt dump, and the per-question Kalshi detail-GET budget
+(the seam the loop wiring fills, since the loop has no per-question object yet). Detail:
 docs/agentic_gap_fill.md "The known-API tools".
 
 The descriptions steer: these tools return a date window on demand, and the same FRED/Yahoo/Kalshi

@@ -1921,8 +1921,9 @@ failure is `error` naming the exception class.
 capped at 400 observations, newest kept, with a line saying so, and a 30-observation default;
 15 s per FRED or Yahoo call, because fredapi's `urlopen` carries no timeout of its own so
 `asyncio.wait_for` bounds the await; five market rows; at most four Kalshi detail GETs per
-question, through a semaphore the caller constructs per question (the seam the loop wiring fills,
-since the loop has no per-question object yet); `PLATFORM_HTTP_TIMEOUT` per venue call.
+question, through a `KalshiGetBudget` counting budget the caller constructs per question (a
+semaphore would cap concurrency, not the sequential total; the seam the loop wiring fills, since
+the loop has no per-question object yet); `PLATFORM_HTTP_TIMEOUT` per venue call.
 
 **The two adapters** (`known_api/adapters.py`) are the whole coupling to the two callers:
 `to_tool_outcome` returns the gap-fill loop's `ToolOutcome` with method `known_api`, and
