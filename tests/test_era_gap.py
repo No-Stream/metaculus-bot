@@ -21,6 +21,7 @@ from metaculus_bot.performance_analysis.era_gap import (
     RESOLUTION_DAY_CONVENTION,
     Arm,
     ClusterMap,
+    EmptyArmError,
     EraGapReport,
     Verdict,
     build_arm,
@@ -345,7 +346,7 @@ class TestReport:
 
     def test_empty_arm_fails_shut(self):
         treated, _ = _horizon_confounded_arms()
-        with pytest.raises(ValueError, match="no scoreable records"):
+        with pytest.raises(EmptyArmError, match="no scoreable records"):
             compute_era_gap_report(treated, build_arm("empty", []), draws=FAST_DRAWS, seed=1)
 
     def test_render_names_the_rule_and_the_watch_verdict(self):
@@ -419,10 +420,16 @@ class TestCli:
         assert "(all records" in text
         assert "| post_flip | 9 |" in text
 
-    def test_unknown_era_fails_shut(self, tmp_path):
+    def test_unknown_era_exits_with_a_message_naming_what_the_field_holds(self, tmp_path, capsys):
+        """An arm the field never carries is a clean exit, not a traceback, and the message lists the
+        values the field does hold so a mistyped era name is diagnosed on the spot."""
         path = self._write(tmp_path, self._records())
-        with pytest.raises(ValueError, match="no scoreable records"):
+        with pytest.raises(SystemExit) as exc_info:
             main(["--dataset", path, "--treated-era", "fall_config", "--comparison-era", "post_flip"])
+        message = str(exc_info.value)
+        assert "era arm 'fall_config' has no scoreable records" in message
+        assert f"`{ERA_FIELD}` values in the dataset: post_flip 9, triple_era 6, pre_flip 1" in message
+        assert capsys.readouterr().out == ""
 
     def test_era_field_selects_arms_on_a_sub_era_field(self, tmp_path, capsys):
         """The tagging pass writes coarse eras to config_era and sub-eras to their own fields, so the
@@ -452,8 +459,38 @@ class TestCli:
         assert "| triple_pre_market | 5 |" in text
         assert "selected on `triple_subera`" in text
         assert json.loads(out_json.read_text())["era_field"] == "triple_subera"
-        with pytest.raises(ValueError, match="no scoreable records"):
+        with pytest.raises(SystemExit, match="no scoreable records"):
             main(["--dataset", path, "--treated-era", "triple_ranked_market", "--comparison-era", "triple_pre_market"])
+
+    def test_fall_read_before_its_first_resolution_exits_cleanly(self, tmp_path, capsys):
+        """The preregistered fall invocation, run while every `fall_config` question is still open: the
+        treated arm selects nothing, and the module must say so rather than bootstrap an empty array."""
+        records = [_record(i, spot=20.0 + i, lag_days=2 + i % 5, era="triple_era") for i in range(8)]
+        for record in records:
+            record["triple_subera_fine"] = "ranked_markets"
+        path = self._write(tmp_path, records)
+        clusters = tmp_path / "cluster_structure.json"
+        clusters.write_text(json.dumps(_cluster_structure(strong={"c": [0, 1]}, weak={})))
+        with pytest.raises(SystemExit) as exc_info:
+            main(
+                [
+                    "--dataset",
+                    path,
+                    "--era-field",
+                    "triple_subera_fine",
+                    "--treated-era",
+                    "fall_config",
+                    "--comparison-era",
+                    "ranked_markets",
+                    "--strict",
+                    "--clusters",
+                    str(clusters),
+                ]
+            )
+        message = str(exc_info.value)
+        assert "era arm 'fall_config' has no scoreable records; nothing to compare yet" in message
+        assert "`triple_subera_fine` values in the dataset: ranked_markets 8." in message
+        assert capsys.readouterr().out == ""
 
     def test_clusters_argument_names_the_convention_and_the_labelled_counts(self, tmp_path, capsys):
         path = self._write(tmp_path, self._records())

@@ -249,9 +249,13 @@ def summarize_arm(arm: Arm) -> ArmSummary:
     )
 
 
+class EmptyArmError(ValueError):
+    """An era arm with no scoreable records: the read has nothing to compare and fails shut."""
+
+
 def _require_records(arm: Arm) -> None:
     if not arm.records:
-        raise ValueError(f"era arm {arm.label!r} has no scoreable records")
+        raise EmptyArmError(f"era arm {arm.label!r} has no scoreable records")
 
 
 @dataclass(frozen=True, slots=True)
@@ -790,9 +794,14 @@ def main(argv: list[str] | None = None) -> None:
         strict=args.strict,
         clusters=cluster_map,
     )
-    report = compute_era_gap_report(
-        treated, comparison, strict=args.strict, cluster_convention=convention, era_field=args.era_field
-    )
+    try:
+        report = compute_era_gap_report(
+            treated, comparison, strict=args.strict, cluster_convention=convention, era_field=args.era_field
+        )
+    except EmptyArmError as exc:
+        # The fall read is run before its first treated question resolves; name what the field does hold.
+        present = dict(Counter(str(r.get(args.era_field)) for r in data).most_common())
+        sys.exit(f"{exc}; nothing to compare yet. `{args.era_field}` values in the dataset: {_fmt_counts(present)}.")
 
     # Logging is pinned to stderr above so the rendered report can be piped on its own.
     print(render_report(report))  # noqa: T201
