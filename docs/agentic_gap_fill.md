@@ -303,9 +303,9 @@ than traded away.
 ### The robots pre-check on the paid read
 
 Before the paid `url_context` read (and only there; the free rungs are unaffected),
-`read_document` fetches `<scheme>://<host>/robots.txt` once per host through the same
-SSRF-guarded plain fetch (`_fetch_plain`, under `robots_policy.ROBOTS_FETCH_TIMEOUT_S`, the
-bound the Tier-1 resolution-source reader shares), with the verdict cached process-wide and
+`read_document` fetches `<scheme>://<host>/robots.txt` once per host through the shared direct
+fetch in the ladder (`fetch_ladder.direct_fetch._fetch_direct`, under
+`robots_policy.ROBOTS_FETCH_TIMEOUT_S`, the bound the Tier-1 resolution-source reader shares), with the verdict cached process-wide and
 filled single-flight, so concurrent callers on one host share one read. Only the
 `Google-Extended` group is honoured,
 because that is the product token Gemini's retrieval obeys: a host disallowing it refuses

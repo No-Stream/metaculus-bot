@@ -2015,8 +2015,8 @@ auto-escalating ladder: plain → local PDF extraction → headless Chromium →
 `read_document`), and `read_document` (acquisition-first: the free rungs, then
 `GAP_FILL_V2_READER_MODEL` via Gemini url_context). Two of those rungs are transports shared
 with the Tier-1 resolution-source ladder rather than copies of it: the Chromium render
-(`research/rendered_fetch.py`, over which `tools._try_rendered_fetch` is now a thin mapping onto
-this ladder's own result type) and the url_context read
+(`research/rendered_fetch.py`, called by the shared `fetch_ladder.rungs._rendered_rung`) and the
+url_context read
 (`research/url_context_reader.py`, with the `Google-Extended` pre-check in
 `research/robots_policy.py`, moved out of `research/agentic/` when the second caller arrived).
 It runs under a wall deadline

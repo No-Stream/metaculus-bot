@@ -675,7 +675,8 @@ through the twenty rung functions that already take a context, so a rung reads `
 no rung signature carries a second argument. The session and the per-host semaphore map ride the
 context for a related reason: a session per URL would change the fetcher's connector limits, so a
 caller that already holds one passes it down, and a caller that holds none gets one opened and
-closed for that URL alone.
+closed for that URL alone. The gap-fill adapter keeps its own host map separate from the Tier-1
+caller because the browser rung can hold its gate through a long Chromium launch.
 
 The process-run cache sits after known-API rung 0 and before caller verdict and presentation. It
 holds at most 50 URL keys in LRU order. HTML entries retain the full extraction, chart and embed
