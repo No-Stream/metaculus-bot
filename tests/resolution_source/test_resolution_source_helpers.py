@@ -351,6 +351,12 @@ class TestSkipPredicates:
         # Port must not bypass (.hostname fix).
         assert is_yahoo_ticker_url("https://finance.yahoo.com:443/quote/AAPL") is True
 
+    def test_is_yahoo_ticker_url_accepts_regional_hosts(self):
+        """A regional quote page overlaps the provider's extraction, so the fetcher skips it too."""
+        assert is_yahoo_ticker_url("https://uk.finance.yahoo.com/quote/%5EGSPC/history/") is True
+        assert is_yahoo_ticker_url("https://ca.finance.yahoo.com/quote/SPCX/history/") is True
+        assert is_yahoo_ticker_url("https://uk.finance.yahoo.com/news/politics") is False
+
 
 class TestSelectFetchableUrls:
     def test_none_fields_are_safe(self):
