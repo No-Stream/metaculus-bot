@@ -39,10 +39,11 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class ReadCapture:
-    """A result and the complete read it was presented from, tied by object identity."""
+    """A result and its complete read plus acquisition route, tied by object identity."""
 
     result: FetchResult
     artifact: ReadArtifact
+    route: FetchRoute
 
 
 @dataclass
@@ -126,10 +127,16 @@ class LadderContext:
     read_captures: list[ReadCapture] = field(default_factory=list, repr=False)
 
     def capture_read(self, result: FetchResult, artifact: ReadArtifact) -> None:
-        self.read_captures.append(ReadCapture(result=result, artifact=artifact))
+        fired: list[FetchRoute] = [attempt.rung for attempt in self.rungs if not attempt.skipped_reason]
+        route = fired[-1] if fired and result.route == "direct" else result.route
+        self.read_captures.append(ReadCapture(result=result, artifact=artifact, route=route))
+
+    def read_capture_for(self, result: FetchResult) -> ReadCapture | None:
+        return next((capture for capture in reversed(self.read_captures) if capture.result is result), None)
 
     def artifact_for(self, result: FetchResult) -> ReadArtifact | None:
-        return next((capture.artifact for capture in reversed(self.read_captures) if capture.result is result), None)
+        capture = self.read_capture_for(result)
+        return None if capture is None else capture.artifact
 
     def rung_budget_s(self) -> float:
         """Wall-clock seconds a rung may spend before the outer ``wait_for`` fires.

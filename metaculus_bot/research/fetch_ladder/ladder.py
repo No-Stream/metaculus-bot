@@ -222,7 +222,9 @@ async def fetch_url(url: str, *, policy: LadderPolicy, ctx: context.LadderContex
             cache_hit=True,
         )
     if cached is not None:
-        if cached.route != "direct" or (cached.status == "success" and not cached.escalate_rendered):
+        if cached.route not in ("direct", "meta_refresh") or (
+            cached.status == "success" and not cached.escalate_rendered
+        ):
             return cached
         host_sems = ctx.host_sems if ctx.host_sems is not None else host_semaphores()
         bound = replace(ctx, policy=policy, host_sems=host_sems)
