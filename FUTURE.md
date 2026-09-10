@@ -2560,16 +2560,25 @@ them OUT of feature work, land as their own PRs.
   1,927-line file was then split into the `tests/cli/` package in `0f4ffa3` (eight themed
   modules, fixtures in its `conftest.py`, the shared harness in `tests/cli_test_helpers.py`;
   `tests/test_cli_run_summary.py` joined the package as the ninth module in `9479084`).
-- **Remaining broad excepts in `metaculus_bot/ablation/` (added 2026-09-10).** The 2026-09-09
-  housekeeping pass converted only `ablation/research.py` (its brief named those two sites). Still
-  carrying a blanket `except Exception`: `run_stacker.py` lines 617, 639 and 670 (three
-  `HARNESS-SCAN-EXEMPT-broad-except` markers, each translating a stacker failure into a cached
-  error payload), `forecasters.py` lines 493, 591 and 842 (`# noqa: BLE001`), `prune.py` line 597
-  and `qa_iterate.py` line 497. Each is a per-question or per-arm soft-fail boundary in the paid
-  harness, so convert them in one pass on the shape `research.py` now has (`asyncio.gather` with
-  `return_exceptions=True`, non-`Exception` outcomes re-raised, the rest logged with the traceback
-  and mapped to the failure payload), with the operator's say, since each moves where a paid run
-  stops.
+- **~~Remaining broad excepts in `metaculus_bot/ablation/`~~ (added 2026-09-10; DONE 2026-09-10).**
+  The package now carries no blanket `except Exception` and no `HARNESS-SCAN-EXEMPT-broad-except` or
+  `# noqa: BLE001` marker. The eight sites resolved three ways. The two batch boundaries took the
+  shape `research.py` has (`asyncio.gather(..., return_exceptions=True)`, a non-`Exception` outcome
+  re-raised, the rest logged at ERROR with the traceback and mapped to that item's failure value):
+  `forecasters.run_forecasters_batch`, where a question maps to an empty per-model dict, and
+  `qa_iterate.run_qa_iterate_batch`, where a qid maps to an auto-rejected `IterateOutcome` and
+  `MemoryError` keeps its carve-out. The five call sites narrowed to what the call actually raises:
+  the forecaster retry loop and both stacker rungs catch `EXPECTED_LLM_CALL_FAILURES`, a new tuple
+  in `ablation/forecasters.py` (`openai.APIError` roots the litellm tree, plus `TimeoutError`,
+  `RuntimeError`, `ValueError` and `ValueExtractionError`), while the prediction serializer and the
+  tertiary median fallback catch `(TypeError, ValueError)`, their own shape guards. `prune`'s third
+  handler was deleted outright: `CalledProcessError` and `TimeoutError` above it already cover every
+  expected redactor failure, and it was masking an exhausted test mock. Where a paid run stops moved
+  in three places, all deliberate: a bug in a stacker or median call now aborts the stacker batch
+  (which resumes from cache, and `--no-stacker-fallback` already aborted this way), a bug in the
+  prune stage stops the stage instead of nulling every batch, and a bug in one forecaster loses that
+  question's in-flight siblings rather than the run. `run_stacker_batch` deliberately still gathers
+  without `return_exceptions`.
 
 ## Medium-term (requires more exploration)
 
