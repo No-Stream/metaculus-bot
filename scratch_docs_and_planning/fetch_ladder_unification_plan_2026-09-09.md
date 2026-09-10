@@ -279,3 +279,14 @@ commit: `agentic_tools.render_page`, `_fetch_plain_with_impersonated_retry`, `_f
 receipt-comment findings across `tools.py`, `fetch_outcomes.py`, `provenance.py`, `derived_api.py`
 and `tests/test_agentic_tools.py` move into the docs in the same commit as the code they annotate,
 and the pending `tools.py` split is absorbed by the package layout rather than done separately.
+
+Sixth, added after the EDGAR agent's archive read: three archived "unsupported content type"
+refusals were the loop's own allowlist and not the hosts. `fetch_outcomes._TEXTUAL_CONTENT_TYPE_TOKENS`
+admits exactly `text/plain`, `text/csv` and `application/json`, so api.weather.gov answering
+`application/geo+json`, Treasury's yield-curve feed answering XML, and the mass-shooting tracker's S3
+bucket answering JSON under an unlisted type were all refused at HTTP 200 with the resolving data in
+the body. The unified classifier must treat structured-data types (JSON and every `+json` suffix,
+XML, CSV) as readable content routed to the harvested-JSON and derived-feed path, the way Tier 1's
+`is_json_content_type` already admits `+json`; neither path reads XML today. One item outside this
+plan for the prediction-market provider's owner: the repo dials `api.elections.kalshi.com` while
+Kalshi's current docs name `external-api.kalshi.com`, so that venue's host may have drifted.
