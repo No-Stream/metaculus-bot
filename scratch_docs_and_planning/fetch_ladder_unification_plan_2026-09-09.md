@@ -95,8 +95,9 @@ Four knobs are the same for both callers and stay plain constants. Those are the
 (5 MiB for a page, 40 MiB for a declared PDF), the robots pre-check before the paid read, the
 platform self-reference refusal, and the shared run cache. Three rows above carry the design work. The
 digest query becomes a policy field, which is what lets the fetcher digest a long cited HTML page
-it would otherwise read head-first. The per-question paid-read cap is new for the loop and lowers
-its spend. The Wayback row is the one genuine coupling, and it needs a paragraph.
+it would otherwise read head-first; the digest itself is the LLM-extractive one under "Decisions,
+resolved". The per-question paid-read cap is new for the loop and lowers its spend. The Wayback row
+is the one genuine coupling, and it needs a paragraph.
 
 That 30-day bound is calibrated on a page a question cites as its grading source. A month-old
 capture of the page a question grades on is still evidence about that page, and a URL the driver
@@ -169,7 +170,7 @@ shrinks the surface the next has to reason about.
    only ever add content to a page the loop already read, and Wayback only turns a failure into a
    read.
 5. Turn on, one per commit, what the fetcher lacked: the shared run cache, the throttle check, then
-   the ask-directed digest for long cited HTML.
+   the LLM-extractive digest for long cited HTML, which replaces the BM25 digest on both callers.
 6. Delete the duplicates. The loop's module-global `_FETCH_HOST_SEMAPHORES` folds into
    `http_fetch.host_semaphores()`, which closes a defect the 2026-09-03 plan flagged: the two paths
    share the politeness helper and not the map, so six concurrent questions can still hit one host
@@ -218,23 +219,40 @@ leakage guards returning an empty string when `is_benchmarking` is true. Re-spel
 route token or skip reason. Each of the four is a rule this repo earned the hard way, and
 `AGENTS.md` carries all four under "Guards and safety" and "Proportion".
 
-## Decisions for the operator
+## Decisions, resolved 2026-09-09
 
-1. **The throttle-phrase check on cited pages.** The loop classifies a 200 whose body is a
+The operator resolved all three the day the plan was written, so none of them blocks the build.
+
+1. **The throttle-phrase check on cited pages: ship it.** The loop classifies a 200 whose body is a
    rate-limit interstitial as throttled. The resolution fetcher has no such check, calls the same
    page a JavaScript wall, and then spends a Chromium launch on it. Sharing the check gives the
-   fetcher a new `FetchStatus` member and a new escalation seam. Recommendation: ship it. A refusal
-   published under the "primary grading evidence" caption is the failure the chrome floor exists to
-   prevent, and the receipt already exists in question 45191, where two throttled ogimet.com reads
-   reached the driver as successes.
-2. **The digest replacing head-first truncation on long cited pages.** Today a cited HTML page over
-   6,000 characters is read from the top and its tail is unreachable. Under one ladder it could be
-   digested against the question's title and resolution criteria, as cited PDFs already are.
-   Recommendation: ship it, because the resolving number is as often mid-page as at the top. This
-   changes what every forecaster reads on a long cited page, which is why it is your call.
-3. **Wayback freshness for a driver-chosen URL.** Recommendation, and what this plan assumes:
-   surface the capture date and let the driver judge. Say so if you would rather apply the 30-day
-   bound calibrated on cited grading sources.
+   fetcher a new `FetchStatus` member and a new escalation seam. The receipt is question 45191,
+   where two throttled ogimet.com reads reached the driver as successes.
+2. **A digest replaces head-first truncation on long cited pages: ship it, with an LLM doing the
+   extraction and BM25 demoted.** Today a cited HTML page over 6,000 characters is read from the
+   top and its tail is unreachable. The operator does not trust the deterministic BM25 digest as
+   the primary mechanism and prefers a cheap model with a grounding check. The design is below.
+3. **Wayback freshness for a driver-chosen URL: surface the capture date and let the driver
+   judge.** The 30-day bound stays on cited grading sources only, as the policy table says.
+
+The page digest, as agreed. A new paid support role, `page_digest_extractor`, reads a long page's
+text plus the question (and, in the loop, the driver's ask) and returns the verbatim passages that
+bear on the question, in ranked order. Its slug lives in a support-role constant,
+`PAGE_DIGEST_EXTRACTOR_MODEL` in `constants.py`, one of the two files
+`tests/test_model_name_locations.py` allows a model id in; the candidates are
+`google/gemini-3.8-flash` and `openai/gpt-5.6-luna`, and the roster rule says pick the live one at
+build time. Every call is tagged `role=page_digest_extractor`, so it lands in the
+`CREDIT_ROLE_SPEND` ledger like every other role. The grounding check is literal: a returned
+passage is accepted only when it is a substring of the page text after whitespace normalisation,
+and a passage that fails is dropped and counted. The page's opening passage is always kept ahead of
+the ranked ones, so a reader still sees what the page is.
+
+BM25 keeps two jobs. It is the free pre-filter that cuts a very long page to a few thousand tokens
+before the model reads it, and it is the fallback when the call fails, returns nothing grounded, or
+exceeds its per-call budget inside the 45 s wall. That fallback path is today's behaviour, which is
+what makes the timing change strictly safer. Cost is fractions of a cent per long page, and about
+28 percent of the loop's plain reads hit the length window per the inventory. Three optional
+tail-keyed fields ride the fetch marker: `passages_returned`, `passages_grounded`, `fallback_used`.
 
 ## Constraints from the 2026-09-09 rung ports
 
