@@ -2244,6 +2244,12 @@ The old `community_benchmark.py` path is deprecated: Metaculus removed the
 `aggregations` field from the list API, so baseline scoring is broken.
 `make benchmark_display` still views old results.
 
+The same API removal is why `question.community_prediction_at_access_time` is
+always `None` on a newly-fetched question. Benchmark files written before the
+removal still carry real values in that field, so
+`ensemble_analysis/ensemble_simulator.py` keeps reading it for its binary
+baseline score: on fresh data it simply finds nothing and skips the question.
+
 ## Performance analysis and the width monitor (read-only, free)
 
 This section is the runbook: the commands, and what each one prints. The
