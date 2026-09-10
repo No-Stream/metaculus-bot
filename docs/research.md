@@ -45,6 +45,148 @@ which decode section headers for both the log and comment backfill scripts. The
 scripts share detection rules while retaining their separate archive record builders
 and provenance.
 
+### Orchestrator implementation notes (`research/orchestrator.py`)
+
+The prose below was carried as comment blocks and long docstrings inside
+`metaculus_bot/research/orchestrator.py` until 2026-09-09, when the AST smell scanner's comment
+rules were applied to that module. Each block left one line of why in the code plus a pointer to
+this section, and the entries here are in file order, each naming the attribute or function it came
+from. No executable code changed in that pass.
+
+**The `__all__` re-export (module level).** `_demote_inner_headings` moved to
+`research/section_format.py` but is still imported from this module path by callers outside the
+package, and the re-export is what keeps that working. It also keeps the auto-formatter from
+stripping an otherwise-unused import.
+
+**`_comment_diagnostics` (in `__init__`).** Comment-bound provider-diagnostics blocks, keyed by
+question id. `run_research` returns forecaster-clean text; `TemplateForecaster` pops the block via
+`pop_provider_diagnostics` when assembling the published comment.
+
+**`provider_failure_count`.** A per-run count of research-provider calls that FAILED, meaning any
+exception rather than only timeouts: the generic failure branch in `_run_one` never inspects the
+exception type. It excludes the expected off-season AskNews subscription error, which reports
+`status="inactive"` and is not alertable.
+
+**`summarizer_failure_count`.** A per-run count of AskNews summarizer soft-fails, either a transient
+LLM error or blank output, each of which ships raw unscreened articles in place of the analyst
+briefing. Alertable by operator decision 2026-07-26 on quality grounds: provider status is computed
+from POST-summarizer text, so a permanently dead summarizer would otherwise degrade every briefing
+while AskNews keeps reporting `status="ok"`.
+
+**`gap_fill_v2_error_count`.** Genuine gap-fill-v2 CRASHES only, not idle "driver found nothing"
+runs and not deadline hits. It mirrors `provider_failure_count`: surfaced to the forecaster as
+`_gap_fill_v2_error_count` and folded into `alertable_count`, so a dead v2 feature reddens CI. A
+dead-on-arrival bug, the fastapi eager-import defect being the worked example, bumps this on EVERY
+question and reddens CI immediately, while a one-off transient provider 500 bumps it once and gives
+an accepted rare false alarm, because investigating that beats silently missing a dead feature.
+`run_research` holds the three mutually exclusive bump points.
+
+**`research_budget_cut_count`.** A per-QUESTION count of research thinned by the time budget OFF the
+fast path: a provider cancelled at the research-phase deadline, or gap-fill cut or skipped for
+budget, on a question whose window was wide enough that `fast_path` never fired. The fast path has
+its own alertable counter (`_time_budget_fast_path_count`, forecaster-side); without this second one
+the band just above the threshold, where the research window can still sit under research's
+configured worst case, degraded silently and the end-of-run census read all-clear. It is
+deduplicated per question through the `_research_budget_cut_seen` set, so a question losing a
+provider AND both gap-fill passes counts once, and fast-path questions are excluded so nothing
+double-charges.
+
+**`run_research`: the deadline-cancelled provider.** A provider cancelled at the research-phase
+deadline is budget-driven degradation, and off the fast path nothing else counts it, which is why
+`_record_research_budget_cut` is called there.
+
+**`run_research`: the diagnostics seam.** The provider-diagnostics block is deliberately NOT
+appended to the returned research, because forecasters and the gap-fill v2 driver brief consume that
+text verbatim and must never see it. It still reaches its three destinations: the INFO log line just
+below its construction, the research archive via the sink's `provider_diagnostics_block` kwarg, and
+the published comment, stashed per question id in `run_research` and popped by
+`TemplateForecaster.pop_provider_diagnostics` at comment-build time.
+
+**`run_research`: the sink's two provider lists.** `provider_results` is the authoritative
+per-provider outcome; `providers_used` is kept only for legacy archive readers.
+
+**`_select_research_provider`: the two Perplexity callbacks.** Each rung gets the vendor its env var
+pays for. Binding the bare `_call_perplexity` here would hand priority 3 the method's
+OpenRouter-first default, which is deliberate on the AskNews-fallback path (where
+`_attempt_research_fallback` prefers the cheap route) and wrong here, because it collapses the
+ladder's two Perplexity rungs into one and passes `api_key=None` whenever only `PERPLEXITY_API_KEY`
+is set.
+
+**`_select_research_providers`: what the fast path can and cannot shed.** The optional providers all
+run CONCURRENTLY with the primary, whose own worst case (AskNews 300 s plus summarizer 300 s,
+sequential inside one provider) is the phase's longest configured pole. Dropping the cheap
+hard-capped providers (`resolution_source` 45 s, `prediction_market` 150 s, `ts_anchor` 20 s, the
+financial classifier 30 s) therefore cannot shorten the phase and only discards the resolution
+ground truth. What the fast path CAN shed is the measured tail: `native_search` is the phase's
+slowest provider on 51.5% of questions and reached 292 s against the primary's 110 s measured worst
+case (`scratch/residual_2026-08-24/time_budget_design.md`).
+
+**`_select_research_providers`: `resolution_source` stays on the fast path.** It is cheap and hard
+capped at 45 s, so it stays in; the flag is handed to it so its two EXPENSIVE ladder rungs, the
+Chromium launch and the paid reader, decline instead, while its direct fetch and cheap rungs run.
+
+**`_run_providers_parallel`: the raw AskNews capture.** `asknews_raw_holder` carries the raw
+pre-summarization AskNews article text for the research archive, added as 2026-07-18 audit hygiene:
+the archive otherwise stores only the post-summarization briefing, so FETCH-versus-SUMMARIZE
+attribution and summarizer replays required fresh paid pulls. It stays empty when AskNews did not
+run, errored, or fell back to an already-prose provider.
+
+**`_run_one`: draining the provider-detail registry.** A multi-source provider records its
+per-source outcome into the (question id, provider) registry during the call, so the question id is
+read up front and the entry drained here. That is what makes partial upstream loss, Kalshi dropped
+over the size cap being the worked example, ride into `ProviderResult.details` instead of vanishing
+behind a healthy `ok`.
+
+**`_run_one`: which providers are summarized.** AskNews returns raw article markdown with no LLM
+prose, so it is summarized into an analyst briefing. Every other provider already emits LLM-written
+prose (native search, Gemini, Perplexity, Exa) or deterministic tables (financial data, prediction
+markets), so they pass through raw and take no lossy second-pass summarization. When AskNews fails
+and the run falls back to Perplexity or Exa, that fallback is already prose, so summarization is
+skipped there too.
+
+**`_run_one`: empty raw skips the summarizer entirely.** There is nothing to brief from, and asking
+anyway spends a call to get either a refusal or an invented briefing, since the summarizer prompt
+has no no-data escape. AskNews has already recorded an `articles: empty(no_articles)` loss token, so
+the `empty` status stays distinguishable from a skipped run.
+
+**`_run_one`: the `CancelledError` branch.** A deadline-cancelled provider must drain its registry
+entry too. `CancelledError` is a `BaseException` and would otherwise skip both drain paths, leaving
+exactly the stale same-key entry the `except Exception` below it exists to prevent. It is re-raised
+so the caller still records the cancellation as `status="deadline"`.
+
+**`_run_one`: the `except Exception` drain.** Drain and discard any partial detail the provider
+recorded before raising: an errored result carries the error, not source detail, and a stale entry
+must not leak into a later same-key call.
+
+**`_fetch_research_with_fallback`: a vendor swap is degradation.** A swap on the PRIMARY provider is
+real degradation rather than a success: a different index, a different recency profile, and, because
+the fallback is already prose, no AskNews summarizer pass, so the briefing loses the per-article
+relevance gate, the `[PRE-WINDOW]` labeling and the recency reordering that the 2026-07-18 audit
+made load-bearing. It used to bump no counter and record no detail, so it read as healthy; a
+per-source loss token is now recorded so the diagnostics line and the schema-v2 archive carry it.
+Deliberately NOT a new alertable counter: folding one into `alertable_count` changes what CI treats
+as red, which is the operator's call.
+
+**`_attempt_research_fallback`: the ordering and the header keys.** The cost-ordered fallback list
+and why it diverges from the primary ladder are in "AskNews fallback (primary-only)" above. One
+further detail: the names this function returns are the same keys `provider_header` maps, so the
+section header follows the vendor that actually answered, automatically.
+
+**`_call_perplexity`: the market-odds policy.** This prompt carries the same narrowed market-odds
+policy as `web_research_prompt` and the direct-Perplexity provider, interpolated from the one
+definition in `prompts` rather than restated, because this copy kept the retired blanket "briefly
+research prediction markets" ask after that policy had been narrowed to the venues the live snapshot
+cannot cover. The no-speculation tail is this prompt's own and stays: it is an anti-fabrication rule
+about an empty result, not a second opinion on which venues to read.
+
+**`_call_perplexity`: explicit credential routing.** Keep this call site's routing explicit. Direct
+Perplexity passes `None`, while the OpenRouter route resolves its key before construction.
+
+**The degradation-counter property surface.** The research side's degradation counters live in
+`degradation_views`, along with their long "why is this alertable" rationales. The five one-line
+members at the bottom of `ResearchOrchestrator` are the orchestrator-attribute surface that
+`forecaster.py`, `cli.py` and `degradation_counters.py` read them through.
+
 ## Primary provider: a priority ladder
 
 There is always exactly one primary provider, chosen by

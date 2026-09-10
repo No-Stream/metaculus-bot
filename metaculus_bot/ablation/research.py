@@ -181,8 +181,8 @@ async def run_gemini_only_research(
                 )
             gap_fill_used = bool(gap_fill_blob)
             logger.info(f"Gap-fill returned {len(gap_fill_blob)} chars for qid {qid}")
-        except Exception as exc:
-            logger.warning(f"Gap-fill failed for qid {qid}: {exc}", exc_info=True)
+        except Exception:  # HARNESS-SCAN-EXEMPT-broad-except — optional stage; the first-pass blob still caches
+            logger.exception(f"Gap-fill failed for qid {qid}")
             gap_fill_blob = ""
             gap_fill_used = False
 
@@ -234,8 +234,8 @@ async def run_gemini_research_for_qids(
                     gemini_model=gemini_model,
                     enable_gap_fill=enable_gap_fill,
                 )
-            except Exception as exc:
-                logger.warning(f"Research failed for qid {qid}: {exc}", exc_info=True)
+            except Exception:  # HARNESS-SCAN-EXEMPT-broad-except — one bad question must not abort a paid run
+                logger.exception(f"Research failed for qid {qid}")
                 return qid, None
             return qid, result
 

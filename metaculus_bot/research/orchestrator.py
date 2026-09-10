@@ -69,9 +69,7 @@ from metaculus_bot.research.providers import (
 from metaculus_bot.research.section_format import _demote_inner_headings, assemble_provider_sections
 from metaculus_bot.time_budget import QuestionTimeBudget
 
-# ``_demote_inner_headings`` moved to section_format but is still imported from this
-# module path by callers outside the package; the re-export keeps that working (and
-# keeps the auto-formatter from stripping an otherwise-unused import).
+# Re-export for out-of-package callers. See docs/research.md "Orchestrator implementation notes".
 __all__ = ["ResearchOrchestrator", "_demote_inner_headings"]
 
 _PROVIDER_ERROR_MESSAGE_MAX_CHARS = 300
@@ -102,41 +100,15 @@ class ResearchOrchestrator:
         self._allow_research_fallback = allow_research_fallback
         self._concurrency_limiter = asyncio.Semaphore(max_concurrent_research)
         self._research_sink = research_sink
-        # Comment-bound provider-diagnostics blocks, keyed by qid. run_research
-        # returns forecaster-clean text; TemplateForecaster pops the block via
-        # pop_provider_diagnostics when assembling the published comment.
+        # Withheld from the forecaster-facing text. See docs/research.md "Orchestrator implementation notes".
         self._comment_diagnostics: dict[int, str] = {}
-        # Per-run count of research-provider calls that FAILED — any exception, not
-        # just timeouts (the generic failure branch in _run_one never inspects the
-        # exception type). Excludes the expected off-season AskNews subscription
-        # error, which reports status="inactive" and is not alertable.
+        # Any exception, not just timeouts. See docs/research.md "Orchestrator implementation notes".
         self.provider_failure_count: int = 0
-        # Per-run count of AskNews summarizer soft-fails (transient LLM error or
-        # blank output), each of which ships raw unscreened articles in place of the
-        # analyst briefing. Alertable by operator decision 2026-07-26 on quality
-        # grounds: provider status is computed from POST-summarizer text, so a
-        # permanently dead summarizer otherwise degrades every briefing while
-        # AskNews keeps reporting status="ok".
+        # Alertable: ships raw articles as the briefing. See docs/research.md "Orchestrator implementation notes".
         self.summarizer_failure_count: int = 0
-        # Genuine gap-fill-v2 CRASHES (not idle "driver found nothing" runs, not
-        # deadline hits). Mirrors provider_failure_count: surfaced to the forecaster as
-        # _gap_fill_v2_error_count and folded into alertable_count so a dead v2
-        # feature reddens CI. A dead-on-arrival bug (the fastapi eager-import
-        # defect) bumps this on EVERY question -> CI reddens immediately; a
-        # one-off transient provider 500 bumps it once -> an accepted rare false
-        # alarm (investigating that beats silently missing a dead feature). See
-        # run_research for the three mutually-exclusive bump points.
+        # Genuine v2 crashes only, and alertable. See docs/research.md "Orchestrator implementation notes".
         self.gap_fill_v2_error_count: int = 0
-        # Per-QUESTION count of research thinned by the time budget OFF the fast
-        # path: a provider cancelled at the research-phase deadline, or gap-fill
-        # cut/skipped for budget, on a question whose window was wide enough that
-        # fast_path never fired. The fast path has its own alertable counter
-        # (_time_budget_fast_path_count, forecaster-side); without this one the
-        # band just above the threshold — where the research window can still sit
-        # under research's configured worst case — degraded silently and the
-        # end-of-run census read all-clear. Deduplicated per question (the seen
-        # set), so a question losing a provider AND both gap-fill passes counts
-        # once, and fast-path questions are excluded so nothing double-charges.
+        # Off-fast-path budget thinning, deduped. See docs/research.md "Orchestrator implementation notes".
         self.research_budget_cut_count: int = 0
         self._research_budget_cut_seen: set[object] = set()
 
@@ -180,9 +152,7 @@ class ResearchOrchestrator:
                 question, providers, time_budget=time_budget
             )
             if any(pr.status == "deadline" for pr in provider_results):
-                # A provider cancelled at the research-phase deadline is budget-driven
-                # degradation; off the fast path nothing else counts it (see
-                # _record_research_budget_cut).
+                # Off the fast path nothing else counts this. See docs/research.md "Orchestrator implementation notes".
                 self._record_research_budget_cut(question, fast_path=fast_path)
 
             research, gap_fill_v2_payload = await self._run_gap_fill_passes(
@@ -191,13 +161,7 @@ class ResearchOrchestrator:
 
             gap_fill_used = "## Targeted Gap-Fill (second pass)" in research
 
-            # Diagnostics seam: the block is deliberately NOT appended to the
-            # returned research — forecasters (and the gap-fill v2 driver brief)
-            # consume that text verbatim and must never see it. It still reaches
-            # its three destinations: (a) the INFO log line just below, (b) the
-            # research archive via the sink's provider_diagnostics_block kwarg,
-            # and (c) the published comment — stashed per-qid here and popped by
-            # TemplateForecaster.pop_provider_diagnostics at comment-build time.
+            # Deliberately kept out of the returned research. See docs/research.md "Orchestrator implementation notes".
             diagnostics_block = format_provider_diagnostics_block(provider_results)
             qid = getattr(question, "id_of_question", None)
             if diagnostics_block:
@@ -210,8 +174,7 @@ class ResearchOrchestrator:
 
             if self._research_sink is not None and qid is not None:
                 try:
-                    # provider_results is the authoritative per-provider outcome;
-                    # providers_used is kept only for legacy archive readers.
+                    # providers_used is legacy. See docs/research.md "Orchestrator implementation notes".
                     self._research_sink(
                         qid=qid,
                         post_id=getattr(question, "id_of_post", None),
@@ -266,12 +229,7 @@ class ResearchOrchestrator:
         provider, provider_name = choose_provider_with_name(
             self._default_llm,
             exa_callback=self._call_exa_smart_searcher,
-            # Each rung gets the vendor its env var pays for. Binding the bare
-            # ``_call_perplexity`` here would hand priority 3 the method's
-            # OpenRouter-first default — deliberate on the AskNews-fallback path
-            # (_attempt_research_fallback prefers the cheap route), wrong here,
-            # where it collapses the ladder's two Perplexity rungs into one and
-            # passes api_key=None whenever only PERPLEXITY_API_KEY is set.
+            # Each rung gets the vendor its env var pays for. See docs/research.md "Orchestrator implementation notes".
             perplexity_callback=self._call_perplexity_direct,
             openrouter_callback=self._call_perplexity_openrouter,
             is_benchmarking=self._is_benchmarking,
@@ -282,20 +240,14 @@ class ResearchOrchestrator:
         """Assemble the enabled providers for one question.
 
         ``fast_path`` is the time-budget thin-window mode: drop the two SLOW search
-        providers (native_search, gemini_search) and keep everything else. The
-        optional providers all run CONCURRENTLY with the primary, whose own worst
-        case (AskNews 300 s + summarizer 300 s, sequential inside one provider) is
-        the phase's longest configured pole — so dropping the cheap hard-capped
-        providers (resolution_source 45 s, prediction_market 150 s, ts_anchor 20 s,
-        financial classifier 30 s) cannot shorten the phase and only discards the
-        resolution ground truth. The flag is still handed to ``resolution_source``, whose
-        two expensive escalation rungs (a Chromium launch, the paid reader) decline on it
-        while its direct fetch and cheap rungs run. What the fast path CAN shed is the measured tail:
-        native_search is the phase's slowest provider on 51.5% of questions and
-        reached 292 s against the primary's 110 s measured worst case
-        (scratch/residual_2026-08-24/time_budget_design.md). Anything still
-        straggling past the research window is cancelled by
-        ``await_providers_within_deadline`` with its partial bundle kept.
+        providers (native_search, gemini_search) and keep everything else. The cheap
+        hard-capped providers stay, because they run CONCURRENTLY with the primary and
+        so cannot shorten the phase; ``resolution_source`` is handed the flag instead, so
+        its two expensive escalation rungs decline while its cheap rungs run. Anything
+        still straggling past the research window is cancelled by
+        ``await_providers_within_deadline`` with its partial bundle kept. The measured
+        provenance for what the fast path sheds is in docs/research.md "Orchestrator
+        implementation notes".
         """
         providers: list[tuple[ResearchCallable, str]] = []
 
@@ -351,9 +303,7 @@ class ResearchOrchestrator:
                 resolution_source_provider,
             )
 
-            # Stays on the fast path (cheap, hard-capped at 45 s — see the docstring above);
-            # the flag makes its two EXPENSIVE ladder rungs, the browser and the paid reader,
-            # decline instead.
+            # Stays on the fast path; the flag makes only its two expensive rungs decline.
             providers.append(
                 (
                     resolution_source_provider(is_benchmarking=self._is_benchmarking, fast_path=fast_path),
@@ -401,19 +351,18 @@ class ResearchOrchestrator:
         providers: list[tuple[ResearchCallable, str]],
         time_budget: QuestionTimeBudget | None = None,
     ) -> tuple[str, list[ProviderResult], str]:
-        # Raw pre-summarization AskNews article text, captured for the research
-        # archive (2026-07-18 audit hygiene: the archive otherwise stores only the
-        # post-summarization briefing, so FETCH-vs-SUMMARIZE attribution and
-        # summarizer replays required fresh paid pulls). Empty when AskNews didn't
-        # run, errored, or fell back to already-prose providers.
+        """Run the selected providers concurrently and assemble their sections.
+
+        Returns the assembled bundle, one ``ProviderResult`` per provider, and the raw
+        pre-summarization AskNews articles for the archive (``""`` when AskNews did not
+        run, errored, or fell back to an already-prose provider). See docs/research.md
+        "Orchestrator implementation notes" for why that raw text is captured.
+        """
         asknews_raw_holder: dict[str, str] = {}
 
         async def _run_one(provider: ResearchCallable, name: str) -> tuple[str, ProviderResult]:
             started = time.monotonic()
-            # A multi-source provider records its per-source outcome into the
-            # (qid, provider) registry during the call; drain it here so partial
-            # upstream loss (e.g. Kalshi dropped over the size cap) rides into
-            # ProviderResult.details instead of vanishing behind a healthy `ok`.
+            # Needed to drain the per-source registry. See docs/research.md "Orchestrator implementation notes".
             qid = getattr(question, "id_of_question", None)
             try:
                 fallback_provider: str | None = None
@@ -422,19 +371,9 @@ class ResearchOrchestrator:
                 else:
                     raw = await provider(question)
                 used_fallback = fallback_provider is not None
-                # AskNews returns raw article markdown (no LLM prose); summarize it
-                # into an analyst briefing. Every other provider already emits
-                # LLM-written prose (native search, Gemini, Perplexity, Exa) or
-                # deterministic tables (financial, prediction markets), so they
-                # pass through raw — no lossy second-pass summarization. When
-                # AskNews fails and we fall back to Perplexity/Exa, that fallback
-                # is already prose, so skip summarization too.
+                # AskNews alone returns raw markdown. See docs/research.md "Orchestrator implementation notes".
                 if name == "asknews" and not used_fallback and raw and raw.strip():
-                    # Empty raw skips the summarizer entirely: there is nothing to brief
-                    # from, and asking anyway spends a call to get either a refusal or an
-                    # invented briefing (the summarizer prompt has no no-data escape).
-                    # AskNews already recorded an `articles: empty(no_articles)` loss token,
-                    # so the `empty` status below stays distinguishable from a skipped run.
+                    # Empty raw must skip the summarizer. See docs/research.md "Orchestrator implementation notes".
                     asknews_raw_holder["text"] = raw
                     raw = await self._summarize_asknews(question, raw)
                 latency_ms = int((time.monotonic() - started) * 1000)
@@ -455,17 +394,11 @@ class ResearchOrchestrator:
                 )
                 return (raw, result)
             except asyncio.CancelledError:
-                # A deadline-cancelled provider must drain its registry entry too:
-                # CancelledError is a BaseException and would otherwise skip both
-                # drain paths, leaving exactly the stale same-key entry the except
-                # below exists to prevent. Re-raised so the caller still records
-                # the cancellation as status="deadline".
+                # BaseException skips the drain below. See docs/research.md "Orchestrator implementation notes".
                 pop_provider_detail(qid, name)
                 raise
             except Exception as e:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except — converted to a ProviderResult(status=errored/inactive); one provider failing never kills the research phase
-                # Drain-and-discard any partial detail the provider recorded before
-                # raising: an errored result carries the error, not source detail,
-                # and a stale entry must not leak into a later same-key call.
+                # No stale entry may leak into a later call. See docs/research.md "Orchestrator implementation notes".
                 pop_provider_detail(qid, name)
                 latency_ms = int((time.monotonic() - started) * 1000)
                 return ("", self._failed_provider_result(name, e, latency_ms))
@@ -526,14 +459,10 @@ class ResearchOrchestrator:
         uses it for two things: to skip AskNews summarization on already-prose output, and
         to label the research section with the source that produced it.
 
-        A vendor swap on the PRIMARY provider is real degradation, not a success: a
-        different index, a different recency profile, and — because the fallback is already
-        prose — no AskNews summarizer pass, so the briefing loses the per-article relevance
-        gate, [PRE-WINDOW] labeling, and recency reordering that the 2026-07-18 audit made
-        load-bearing. It used to bump no counter and record no detail, so it read as
-        healthy. We record a per-source loss token here so the diagnostics line and the
-        schema-v2 archive carry it. Deliberately NOT a new alertable counter: folding one
-        into alertable_count changes what CI treats as red, which is the operator's call.
+        A vendor swap on the PRIMARY provider is real degradation, not a success, so a
+        per-source loss token is recorded here for the diagnostics line and the schema-v2
+        archive. See docs/research.md "Orchestrator implementation notes" for what the swap
+        costs and why it is deliberately not a new alertable counter.
         """
         try:
             return (await provider(question), None)
@@ -562,18 +491,7 @@ class ResearchOrchestrator:
         that actually answered; rendering it as AskNews mislabeled the source in the
         published comment and in the archive.
         """
-        # Ordering intentionally differs from the primary selector
-        # (choose_provider_with_name: AskNews -> Exa -> Perplexity -> OpenRouter).
-        # This fallback only fires when AskNews (always the primary in prod) has
-        # already failed, so AskNews is excluded. Among the remaining options we
-        # prefer the Perplexity-via-OpenRouter route first (cheap, prose-returning,
-        # using the resolved OpenRouter key), then direct Perplexity, then
-        # Exa last (SmartSearcher spins up its own multi-search/LLM loop, the most
-        # expensive path). The primary selector orders by index quality, not cost,
-        # which is why the two lists diverge by design.
-        #
-        # The names returned here are the same keys ``provider_header`` maps, so the
-        # section header follows the vendor automatically.
+        # Ordered by cost, not index quality. See docs/research.md "AskNews fallback (primary-only)".
         try:
             if os.getenv(OPENROUTER_API_KEY_ENV):
                 logger.info("Falling back to openrouter/perplexity for research")
@@ -591,12 +509,7 @@ class ResearchOrchestrator:
     async def _call_perplexity(self, question: MetaculusQuestion | str, use_open_router: bool = True) -> str:
         question_text = question.question_text if isinstance(question, MetaculusQuestion) else question
 
-        # Same narrowed market-odds policy as `web_research_prompt` and the direct-Perplexity
-        # provider, interpolated from the one definition in `prompts` rather than restated —
-        # this prompt carried the retired blanket "briefly research prediction markets" ask after
-        # that policy was narrowed to the venues the live snapshot cannot cover.
-        # The no-speculation tail is this prompt's own and stays: it is an anti-fabrication rule
-        # about an empty result, not a second opinion on which venues to read.
+        # Interpolated from the one definition in `prompts`. See docs/research.md "Orchestrator implementation notes".
         prediction_markets_instruction = (
             ""
             if self._is_benchmarking
@@ -619,8 +532,7 @@ class ResearchOrchestrator:
             {question_text}
             """
         )
-        # Keep this call site's explicit credential routing: direct Perplexity passes
-        # None, while the OpenRouter route resolves its key before construction.
+        # Explicit credential routing: direct Perplexity passes None, OpenRouter resolves its key first.
         api_key = get_openrouter_api_key(PERPLEXITY_RESEARCH_MODEL_VIA_OPENROUTER) if use_open_router else None
         return await _invoke_perplexity_research(
             prompt,
@@ -645,10 +557,7 @@ class ResearchOrchestrator:
         )
         return await _invoke_exa_research(self._default_llm, prompt)
 
-    # The research side's degradation counters live in ``degradation_views``, along with
-    # their long "why is this alertable" rationales; these five one-liners are the
-    # orchestrator-attribute surface forecaster.py / cli.py / degradation_counters.py
-    # read them through.
+    # The attribute surface over ``degradation_views``. See docs/research.md "Orchestrator implementation notes".
     @property
     def prediction_market_degraded_count(self) -> int:
         return degradation_views.prediction_market_degraded_count()

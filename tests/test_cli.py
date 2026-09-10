@@ -90,15 +90,12 @@ from metaculus_bot.research.provider_health import (
 )
 from scripts.telemetry.markers import MARKER_SPECS
 
-# Dates on either side of the suppression boundary. Injected instead of read from
-# the clock so these tests keep exercising both branches forever.
+# Injected rather than read from the clock, so both suppression branches keep running forever.
 DURING_SUPPRESSION = date(2026, 7, 25)
 ON_RESUME_DATE = CREDIT_ALERT_RESUME_DATE
 AFTER_RESUME_DATE = date(2026, 10, 1)
 
-# Provider-degradation suppression takes no injected date on the property path
-# (``alertable_count`` is a plain sum), so its two branches are pinned by choosing
-# resume dates that can never fall on the wrong side of the real clock.
+# Provider-degradation suppression has nowhere to inject a date, so pin its branches beyond the clock's reach.
 PERMANENTLY_FUTURE_RESUME = date(2099, 1, 1)
 PERMANENTLY_PAST_RESUME = date(2000, 1, 1)
 
@@ -160,35 +157,18 @@ def _cli_main_test_mode(
     mode: str = "test_questions",
     only_posts: str | None = None,
 ) -> Iterator[MagicMock]:
-    """Run ``cli.main`` with all external dependencies stubbed; yields the
-    CreditTelemetry stub for call assertions.
+    """Run ``cli.main`` with every external dependency stubbed; yields the CreditTelemetry stub.
 
-    Stubs TemplateForecaster with a MagicMock whose ``alertable_count`` is
-    controlled and whose ``forecast_questions`` returns an empty list (so no
-    downstream ``log_report_summary`` formatting is needed). Also stubs
-    CreditTelemetry so tests never hit the real OpenRouter balance endpoint
-    (a local ``.env`` would otherwise supply real keys); its floor-check
-    result is controlled via ``donated_below_floor``. sys.argv is pinned to
-    test_questions mode and restored afterwards.
+    TemplateForecaster becomes a MagicMock with the given ``alertable_count`` whose
+    ``forecast_questions`` returns []; CreditTelemetry is stubbed so no test reaches the real
+    OpenRouter balance endpoint, with ``donated_below_floor`` as its floor verdict; argv is pinned.
 
-    ``today`` pins the credit-suppression window: cli reads it through
-    ``credit_alerts_active``, which we re-bind to evaluate against the injected
-    date. ``None`` leaves the real system clock in place (the production path),
-    which is what the tests that don't care about credit state want.
-
-    ``stub_bot`` overrides the whole bot object, for tests that need
-    ``alertable_count`` COMPUTED through the real property chain rather than
-    pinned to a literal (see ``_bot_with_real_alertable_count``). ``alertable_count``
-    is ignored when it is supplied.
-
-    ``mode`` is the ``--mode`` value put on the pinned argv. It defaults to
-    ``test_questions`` because that is the cheapest path through ``_question_source``;
-    the run-mode-dependent tests (the research archive's ``tournament_id`` label) pass
-    the mode they are about. ``only_posts`` is the raw ``--only-posts`` value, when a test
-    puts that flag on argv too.
-
-    ``tournament_stale`` is the verdict of the stale-slug check, which reads the real clock in
-    prod and whose verdict reddens a Mantic run; pinned the way the fall-cup reminder is.
+    ``today`` pins the credit-suppression window through cli's own ``credit_alerts_active``
+    reference, and ``None`` leaves the real clock (the production path). ``stub_bot`` replaces the
+    whole bot, for tests needing ``alertable_count`` COMPUTED through the real property chain (see
+    ``_bot_with_real_alertable_count``), and makes the ``alertable_count`` argument moot. ``mode``
+    (default ``test_questions``, the cheapest path through ``_question_source``) and ``only_posts``
+    go onto argv; ``fall_cup_reminder`` and ``tournament_stale`` pin verdicts read off the prod clock.
     """
     if stub_bot is None:
         stub_bot = MagicMock()
@@ -199,8 +179,7 @@ def _cli_main_test_mode(
     stub_telemetry = MagicMock()
     stub_telemetry.log_end_and_check_floor.return_value = donated_below_floor
 
-    # Re-bind cli's own reference so only the injected date decides the window;
-    # patching with the real function when today is None keeps one `with` shape.
+    # Re-bind cli's own reference so only the injected date decides the window (the real function when None).
     pinned_clock = patch(
         "metaculus_bot.cli.credit_alerts_active",
         credit_alerts_active if today is None else lambda: credit_alerts_active(today),
@@ -213,44 +192,23 @@ def _cli_main_test_mode(
             pinned_clock,
             # TemplateForecaster(...) call returns our stub
             patch("metaculus_bot.cli.TemplateForecaster", return_value=stub_bot),
-            # MetaculusApi.get_question_by_url returns a dummy question object; we
-            # pass through a Mock so list construction doesn't explode.
+            # ``get_question_by_url`` hands back a Mock so list construction doesn't explode.
             patch("metaculus_bot.cli.MetaculusApi", MagicMock()),
-            # cli.main() applies fetch/publish hardening at startup, which globally
-            # and permanently mutates MetaculusClient (patches post_*/_get_questions_from_api,
-            # sets a sentinel). Left un-stubbed those mutations leak into every later
-            # test in the session — a randomly-ordered run then poisons the publish/fetch
-            # seam tests' un-hardened negative controls. Stub them: this test pins the
-            # exit-status wiring, not the hardening install (covered by its own tests).
+            # The real hardening permanently mutates MetaculusClient, leaking into every later test in the session.
             patch("metaculus_bot.cli.apply_publish_hardening"),
             patch("metaculus_bot.cli.apply_fetch_hardening"),
             patch("metaculus_bot.cli.check_tournament_dates", return_value=tournament_stale),
-            # Pin the fall-cup reminder the same way as credit_alerts_active: it reads
-            # the real clock in prod, and left unpinned it would flip this whole suite
-            # red from FALL_CUP_REMINDER_DATE. The one test allowed to read the real
-            # clock is the deliberate time bomb in test_tournament_dates.py.
+            # Left unpinned, FALL_CUP_REMINDER_DATE would flip this whole suite red off the real clock.
             patch("metaculus_bot.cli.check_fall_cup_reminder", return_value=fall_cup_reminder),
-            # The API identity preflights make a real unauthenticated GET to the
-            # platform host (metaculus.com, or competitions.mantic.com in mantic
-            # mode); stub both so these exit-status/telemetry tests stay hermetic
-            # (their own behavior is covered in test_api_preflight.py).
+            # Both preflights make a real unauthenticated GET to the platform host; stub them to stay hermetic.
             patch("metaculus_bot.cli.verify_metaculus_api_identity"),
             patch("metaculus_bot.cli.verify_api_identity"),
-            # The Mantic tournament preflight is an authenticated GET on the real client main
-            # builds in mantic mode; its own behavior is covered in test_mantic_robustness.py.
+            # The Mantic tournament preflight is an authenticated GET on the real client main builds.
             patch("metaculus_bot.cli.preflight_mantic_tournaments"),
-            # Patch log_report_summary: a classmethod on TemplateForecaster that
-            # iterates forecast_reports. Our stub returns []; patch the method
-            # anyway to keep the test surface small.
+            # A classmethod that iterates forecast_reports; our stub returns [], so keep the surface small.
             patch.object(type(stub_bot), "log_report_summary", create=True, return_value=None),
             patch("metaculus_bot.cli.CreditTelemetry", return_value=stub_telemetry),
-            # The real install appends a RoleSpendTracker to litellm's process-global
-            # callbacks list, and nothing here would remove it — so every test driving
-            # cli_main used to leak one into the rest of the session. That breaks the
-            # invariant test_credit_telemetry's clean_role_ledger fixture states, and it
-            # made that file's test_install_is_idempotent pass on the leaked instance
-            # instead of on one it installed itself. The tests that assert the install
-            # HAPPENED patch this same name again, one layer in (TestCliRoleSpendWiring).
+            # The real install leaks a RoleSpendTracker into litellm's process-global callbacks for the session.
             patch("metaculus_bot.cli.install_role_spend_tracker"),
         ):
             yield stub_telemetry
@@ -291,8 +249,7 @@ class TestCliExitStatus:
         (via the paid key), but a call that should have hit the free donated
         key billed to the operator instead, and the operator deserves an email.
         """
-        # Simulate the wrapper having fired a generic (non-404) donated->personal
-        # fallback during the run. cli.main reads this AFTER forecast returns.
+        # cli.main reads this generic (non-404) fallback AFTER the forecast returns.
         import metaculus_bot.fallback_openrouter as fb_module  # HARNESS-SCAN-EXEMPT-function-level-import
 
         fb_module._generic_key_fallback_count = 1
@@ -302,8 +259,7 @@ class TestCliExitStatus:
                     cli_main()
                 assert exc_info.value.code == 1
         finally:
-            # autouse fixture already resets, but be explicit on the path
-            # that bypasses normal flow.
+            # The autouse fixture resets too; explicit here because this path bypasses normal flow.
             fb_module._generic_key_fallback_count = 0
 
     def test_donated_404_fallback_triggers_sys_exit_without_double_counting(
@@ -324,8 +280,7 @@ class TestCliExitStatus:
         """
         import metaculus_bot.fallback_openrouter as fb_module  # HARNESS-SCAN-EXEMPT-function-level-import
 
-        # Mirror FallbackOpenRouterLlm.invoke: a 404 fallback bumps the generic
-        # counter AND the 404 subset.
+        # Mirror FallbackOpenRouterLlm.invoke: a 404 bumps the generic counter AND the 404 subset.
         fb_module._generic_key_fallback_count = 1
         fb_module._donated_404_fallback_count = 1
         try:
@@ -336,8 +291,7 @@ class TestCliExitStatus:
                 with pytest.raises(SystemExit) as exc_info:
                     cli_main()
                 assert exc_info.value.code == 1
-                # Pins alertable == 1 (not 2): the count is the first %d in the
-                # end-of-run warning. A double-count regression renders "with 2".
+                # Pins alertable == 1 (not 2): the count is the first %d in the end-of-run warning.
                 assert any("with 1 alertable" in record.getMessage() for record in caplog.records), (
                     f"expected 'with 1 alertable' in warnings; got: {[r.getMessage() for r in caplog.records]}"
                 )
@@ -560,8 +514,7 @@ class TestCliFallCupReminderExit:
             # Forecasting/telemetry completed before the exit — reminder, not abort.
             telemetry.log_start.assert_called_once()
             telemetry.log_end_and_check_floor.assert_called_once()
-        # run_clean must be the exact complement of every non-zero exit path, so a
-        # reminder run must not stamp the archive's summary with the clean token.
+        # run_clean is the exact complement of every non-zero exit, so a reminder run must not stamp it.
         assert "Run completed clean" not in caplog.text
 
     def test_no_reminder_returns_normally(self) -> None:
@@ -661,8 +614,7 @@ class TestCliResearchFlush:
         forecaster_class = self._forecaster_class()
 
         def _record_then_crash(*_args: object, **_kwargs: object) -> None:
-            # Two questions researched, then the run dies before returning — the shape
-            # that used to lose the whole batch.
+            """Two questions researched, then the run dies before returning: the shape that lost the batch."""
             self._record_two(forecaster_class.call_args.kwargs["research_sink"])
             raise RuntimeError("forecast loop blew up")
 
@@ -672,8 +624,7 @@ class TestCliResearchFlush:
             patch("metaculus_bot.cli.asyncio.run", side_effect=asyncio_run_stub(_record_then_crash)),
             pytest.raises(RuntimeError, match="forecast loop blew up"),
         ):
-            # The original exception must still propagate: the flush is a rescue,
-            # not a swallow.
+            # The original exception must still propagate: the flush is a rescue, not a swallow.
             cli_main()
 
         assert [r["qid"] for r in self._flushed_records(tmp_path)] == [43613, 50001]
@@ -698,8 +649,7 @@ class TestCliResearchFlush:
         assert [r["qid"] for r in self._flushed_records(tmp_path)] == [43613, 50001]
 
     def test_nothing_is_written_when_the_flag_is_off(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        # No writer, no sink: the forecaster is handed None and the run leaves no
-        # research_outputs/ at all. Pins that the finally-block flush is guarded.
+        """No writer, no sink: the forecaster is handed None, so the finally-block flush stays guarded."""
         monkeypatch.delenv(PERSIST_RESEARCH_ENABLED_ENV, raising=False)
         monkeypatch.chdir(tmp_path)
 
@@ -736,14 +686,12 @@ class TestPersistedTournamentId:
         "quarterly_cup": METACULUS_CUP_ID,
         "metaculus_cup": METACULUS_CUP_ID,
         "mantic": MANTIC_TOURNAMENT_ID,
-        # No label is right for the evergreen example set (it belongs to no tournament);
-        # this one is retained so the archive's existing test-run records stay comparable.
+        # No label fits the evergreen set; retained so the archive's existing test-run records stay comparable.
         "test_questions": TOURNAMENT_ID,
     }
 
     def test_every_run_mode_has_a_decided_label(self) -> None:
-        # Derived from RunMode itself, so a mode added to the Literal without a decision
-        # here fails this test instead of quietly inheriting the tournament's slug.
+        """Derived from RunMode, so a mode added without a decision fails here instead of inheriting a slug."""
         assert set(get_args(RunMode)) == set(self.EXPECTED_LABEL)
 
     @pytest.mark.parametrize(("run_mode", "expected"), sorted(EXPECTED_LABEL.items()))
@@ -751,8 +699,7 @@ class TestPersistedTournamentId:
         assert persisted_tournament_id(run_mode) == expected
 
     def test_the_competitions_do_not_share_a_label(self) -> None:
-        # The whole point: the bot tournament, the cup and the Mantic tournament must be
-        # distinguishable in the archive.
+        """The bot tournament, the cup and the Mantic tournament must stay distinguishable in the archive."""
         labels = {persisted_tournament_id(run_mode) for run_mode in ("tournament", "metaculus_cup", "mantic")}
         assert len(labels) == 3, labels
 
@@ -910,8 +857,7 @@ class TestConfigureProcess:
 
     @pytest.mark.parametrize("run_mode", METACULUS_MODES)
     def test_metaculus_modes_preflight_metaculus_only(self, run_mode: RunMode, monkeypatch: pytest.MonkeyPatch) -> None:
-        # The switch is irrelevant outside mantic mode: its default (donated key on) IS the
-        # Metaculus production state and must not raise here.
+        """The switch's default (donated key on) IS the Metaculus production state, so it must not raise."""
         monkeypatch.delenv(DONATED_OPENROUTER_KEY_ENABLED_ENV, raising=False)
         with _configure_process_stubs() as stubs:
             _configure_process(run_mode)
@@ -1047,7 +993,7 @@ class TestOnlyPostsFilter:
     }
 
     def test_every_tournament_shaped_mode_is_covered(self) -> None:
-        # Derived from RunMode, so a new tournament-shaped mode fails here until it is listed.
+        """Derived from RunMode, so a new tournament-shaped mode fails here until it is listed."""
         assert set(self.TOURNAMENT_SLUGS) == set(get_args(RunMode)) - {"test_questions"}
 
     @pytest.mark.parametrize("run_mode", sorted(TOURNAMENT_SLUGS))
@@ -1211,8 +1157,7 @@ class TestManticClientWiring:
         assert forecaster_class.call_args.kwargs["metaculus_client"] is None
 
     def test_fail_shut_runs_before_the_token_is_read_or_the_host_vetted(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # The switch left at its default: the guard raises and nothing downstream of it runs —
-        # no preflight GET, no token read, no forecaster, no spend.
+        """The switch at its default: the guard raises, so no preflight GET, token read, forecaster or spend."""
         monkeypatch.delenv(DONATED_OPENROUTER_KEY_ENABLED_ENV, raising=False)
         monkeypatch.setenv(MANTIC_TOKEN_ENV, _FAKE_MANTIC_TOKEN)
         forecaster_class = self._forecaster_class()
@@ -1473,8 +1418,7 @@ class TestCliCreditAlertSuppression:
                 assert exc_info.value.code == 1
                 messages = [record.getMessage() for record in caplog.records]
                 assert any("with 1 alertable" in msg for msg in messages), messages
-                # The breakdown stays informative: both subsets and the suppressed
-                # share are rendered for whoever greps this line.
+                # The breakdown stays informative: both subsets and the suppressed share are rendered.
                 assert any("donated_404=1, credit=1 with 1 credit event(s) suppressed" in msg for msg in messages), (
                     messages
                 )
@@ -1549,8 +1493,7 @@ class TestCliCreditAlertSuppression:
                 assert exc_info.value.code == 1
                 messages = [record.getMessage() for record in caplog.records]
                 assert any("with 7 alertable" in msg for msg in messages), messages
-                # The summary names the verdict so a reader knows why nothing was
-                # suppressed on a run full of credit-shaped failures.
+                # The verdict says why nothing was suppressed on a run full of credit-shaped failures.
                 assert any("donated_key=revoked" in msg for msg in messages), messages
         finally:
             fb_module._generic_key_fallback_count = 0
@@ -1574,15 +1517,12 @@ class TestCliCreditAlertSuppression:
         messages = [record.getMessage() for record in caplog.records]
         summary = [msg for msg in messages if "alertable degradation event" in msg]
         assert len(summary) == 1, messages
-        # The whole point is that the harvester can tell this run apart from a
-        # degraded one whose counters happen to read zero, so pin the phrase.
+        # Pin the phrase: the harvester tells this run from a degraded one whose counters read zero.
         assert summary[0].startswith("Run completed clean with 0 alertable degradation event(s)"), summary
         assert "bot=0, personal_key_fallback=0 of which donated_404=0, credit=0" in summary[0], summary
         # Nothing probed the donated key, so the verdict clause stays absent.
         assert "donated_key=" not in summary[0], summary
-        # Seam pin: the harvester must recognise the line this code actually emits,
-        # and stamp it ``outcome=clean`` — an all-zero record alone is ambiguous
-        # (a run that lost a question reads all zeros too).
+        # Seam pin: the harvester must stamp ``outcome=clean``, since an all-zero record alone is ambiguous.
         spec = next(s for s in MARKER_SPECS if s.name == "run_alertable_summary")
         match = spec.regex.search(summary[0])
         assert match is not None, summary
@@ -1760,22 +1700,17 @@ class TestCliCreditAlertSuppression:
 class _RealAlertableCountBot(MagicMock):
     """A cli stub whose ``alertable_count`` is COMPUTED, not pinned to a literal.
 
-    The provider-degradation summand has to travel the whole real chain — module
-    observation store, then ``ResearchOrchestrator.provider_degradation_count``, then
-    ``TemplateForecaster._provider_degradation_count``, then ``alertable_count``, then
-    the ``sys.exit`` in cli — or the test proves only that cli exits on a number the
-    test handed it. A plain ``MagicMock`` attribute set to an int proves exactly that,
-    which is how a broken summand ships green.
+    The provider-degradation summand has to travel the whole real chain — the observation store,
+    ``ResearchOrchestrator.provider_degradation_count``, ``TemplateForecaster._provider_degradation_count``,
+    ``alertable_count``, then the ``sys.exit`` in cli — or the test proves only that cli exits on a number
+    the test handed it, which is how a broken summand ships green.
 
-    A dedicated SUBCLASS rather than assignments onto ``type(mock)``: for a
-    ``MagicMock`` instance that expression is ``MagicMock`` itself, so binding the
-    properties there would mutate the class for every mock in the session and leak
-    into unrelated tests.
+    A dedicated SUBCLASS rather than assignments onto ``type(mock)``, which for a ``MagicMock`` instance
+    is ``MagicMock`` itself and would leak the properties into every mock in the session.
 
-    EVERY adapter property used by the snapshot has to be listed below. Aggregation
-    counters come from the real pipeline installed by the fixture. A missing owner
-    leaves a ``MagicMock`` in the sum, so ``alertable_count`` stops being an int and
-    every test in this file that reads the exit code or summary line fails at once.
+    EVERY adapter property used by the snapshot has to be listed below (aggregation counters come from
+    the real pipeline the fixture installs): a missing owner leaves a ``MagicMock`` in the sum, so
+    ``alertable_count`` stops being an int and every exit-code test in this file fails at once.
     """
 
     alertable_count = TemplateForecaster.alertable_count
@@ -1903,8 +1838,7 @@ class TestCliProviderDegradationExit:
         forecaster_class.log_report_summary.side_effect = lambda *a, **k: events.append("report_summary")
 
         with _cli_main_test_mode(alertable_count=0, stub_bot=bot, today=AFTER_RESUME_DATE):
-            # Set INSIDE the context: the helper installs its own forecast stub while
-            # entering, so an assignment made beforehand is silently clobbered.
+            # Set INSIDE the context: the helper installs its own forecast stub on entry.
             async def _record_forecast(*_args: object, **_kwargs: object) -> list[object]:
                 events.append("forecast")
                 return []
@@ -1931,8 +1865,7 @@ class TestCliProviderDegradationExit:
         bot = _bot_with_real_alertable_count()
         for venue in ("kalshi", "predictit", "polymarket"):
             _observe_venue(venue, candidates=3, rows=3, fields=frozenset(VENUE_EXPECTED_LIQUIDITY_FIELDS[venue]))
-        # Manifold's declared field (`num_bettors`) absent from every pool row: one
-        # `market_field_contract` finding on the venue whose acceptance is under test.
+        # Manifold's declared `num_bettors` absent from every row: one finding, on the venue under test.
         _observe_venue("manifold", candidates=3, rows=3, fields=frozenset())
 
         with patch.dict(PROVIDER_DEGRADATION_SUPPRESSED_UNTIL, {"manifold": PERMANENTLY_FUTURE_RESUME}):
@@ -1943,10 +1876,7 @@ class TestCliProviderDegradationExit:
             ):
                 # Must NOT raise SystemExit.
                 cli_main()
-                # The marker is emitted by the REAL forecast_questions, which this
-                # helper stubs out (it pins cli's exit wiring, not the forecast loop),
-                # so drive the orchestrator seam cli's bot exposes. That the forecaster
-                # calls it per run is pinned in test_template_forecaster.py.
+                # The helper stubs out the REAL forecast_questions that emits the marker, so drive the seam here.
                 bot._research.log_provider_degradation_summary()
 
             messages = [record.getMessage() for record in caplog.records]
@@ -1956,8 +1886,7 @@ class TestCliProviderDegradationExit:
             assert "run stays green" in marker
 
         with patch.dict(PROVIDER_DEGRADATION_SUPPRESSED_UNTIL, {"manifold": PERMANENTLY_PAST_RESUME}):
-            # Past the resume date, the same state is alertable again — a stale
-            # acceptance cannot outlive its date unnoticed.
+            # Past the resume date the same state is alertable again: a stale acceptance cannot outlive it.
             assert bot.alertable_count == 1
 
     def test_a_snapshot_timeout_is_not_double_counted(self) -> None:
@@ -2007,8 +1936,7 @@ class TestAlertableSummarySurvivesForecastFailure:
         breakdown_lines = [m for m in caplog.messages if m.startswith("Run completed with")]
         assert len(breakdown_lines) == 1
         assert "re-raising the forecasting failure" in breakdown_lines[0]
-        # All three counters read zero on this run, but it lost a question — so it
-        # must NOT pick up the all-clear phrase that a genuinely clean run carries.
+        # All three counters read zero, but the run lost a question, so it must not carry the all-clear phrase.
         assert "clean" not in breakdown_lines[0]
 
     def test_failure_outranks_the_alertable_exit_and_keeps_the_count(self, caplog: pytest.LogCaptureFixture) -> None:

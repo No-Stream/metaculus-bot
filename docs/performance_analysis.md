@@ -166,6 +166,57 @@ Reading rules that follow from this:
 - `make backtest_with_cache` logs the source split it replays, so pre- and
   post-2026-08-03 cached-backtest numbers are not comparable.
 
+### The research record's fields
+
+`ResearchPersistenceWriter.record` (`metaculus_bot/research/persistence.py`) writes one
+JSONL record per question. Several of its fields exist to answer a question the obvious
+field cannot, and the reasons are below.
+
+**`qid` versus `post_id`.** `qid` is the Metaculus QUESTION id (`id_of_question`), and
+the archive keys `latest/<qid>.json` on it. `post_id` is the separate POST id, the one
+that appears in `page_url`, and it diverges from `qid` on newer posts. It is written as
+an explicit field so residual analysis can join a research record to telemetry markers
+keyed on the post id (`GAP_FILL_V2` and `GHOST_FORECAST`) and to the perf dataset
+without re-parsing the page URL. The field is additive: it defaults to None, and older
+readers plus the URL itself still carry the post id, so nothing breaks.
+
+**`providers_used` is legacy and ambiguous.** In live-capture records it meant
+"attempted"; in comment-backfill records it meant "succeeded-with-output". It is kept
+only for back-compat with old archive readers. `provider_results` is the authoritative
+per-provider outcome, with `providers_attempted` and `providers_succeeded` as the
+unambiguous derived lists. Those three arguments default to None so older callers, and
+the backfill paths, keep working.
+
+**`gap_fill_v2`** carries the agentic loop's trace when the v2 loop ran, and the key is
+written only in that case so records stay compact when the flag is off. It holds four
+keys: `transcript`, `telemetry`, `ghost` (nullable), and, since 2026-09-09, `ghost_v1`,
+the v1 ghost forecast, also nullable. `_stamp_v1_ghost` in
+`metaculus_bot/research/gap_fill_stages.py` writes `ghost_v1`, and writes None when the
+v1 ghost did not run or did not survive its budget.
+
+**`provider_diagnostics_block`** is the rendered `## Provider Diagnostics` markdown.
+Since the diagnostics seam landed (2026-07) it is no longer embedded in `research_text`,
+because forecasters must not see it, so it is archived as its own field to keep records
+self-contained for grep-based triage.
+
+**`platform`** (`PLATFORM_METACULUS` or `PLATFORM_MANTIC`) says which question platform
+`qid`, `post_id` and `page_url` belong to. Filenames stay un-namespaced and the archive
+builder groups on the bare qid, so this field is what separates the two platforms'
+records inside a group, and what a cross-platform analysis filters on. It does not stop
+a Mantic id and a Metaculus id that meet from sharing one `by_qid` or `latest` entry.
+The margin is the gap from the Mantic counter, whose open posts sit in the 650s, up to
+14333, the next Metaculus key above it: the evergreen test-question set puts 578, 14333
+and 20683 in the archive, and every other Metaculus key is 38,000 and up. The field is
+additive with passthrough readers, and records older than the field are all Metaculus.
+
+**`asknews_raw`** is the raw pre-summarization AskNews article markdown, added for
+2026-07-18 audit hygiene. `research_text` carries only the summarizer's briefing, so
+without this field a FETCH-versus-SUMMARIZE attribution read or a summarizer replay
+needs a fresh paid AskNews pull. It is written only when AskNews actually ran and
+returned articles, and stays empty on the fallback and prose paths. Like
+`provider_diagnostics_block` it is additive with passthrough readers, so it needed no
+schema-version bump.
+
 ## Two treatment tags read as TERNARY, and two archived fields are historically unreadable
 
 `research_tags.gfv2_loop_ran` is None on any record whose WRITER could not carry the
