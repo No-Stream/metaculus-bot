@@ -21,7 +21,7 @@ from forecasting_tools.data_models.questions import DiscreteQuestion, MetaculusQ
 from metaculus_bot.performance_analysis.research_tags import GFV2_SECTION_TITLE
 from scripts.probes.section_strip_bench.scoring import Resolution, score_published
 
-# The two appended sections, as gap_fill_stages.py writes them (line 246) and artifact.render_findings heads its own.
+# The two appended sections as research/gap_fill_stages.run_gap_fill_passes writes them; v2 heads its own (agentic/artifact.render_findings).
 V1_SECTION_HEADER = "## Targeted Gap-Fill (second pass)"
 V2_SECTION_HEADER = f"## {GFV2_SECTION_TITLE}"
 SECTION_SEPARATOR = "\n\n---\n\n"
@@ -157,7 +157,7 @@ def build_question(pair: dict[str, Any], perf: dict[str, Any]) -> MetaculusQuest
         "id_of_post": int(pair["post_id"]),
         "page_url": f"https://www.metaculus.com/questions/{pair['post_id']}/",
         "background_info": "",
-        "resolution_criteria": pair["resolution_criteria"] or "",
+        "resolution_criteria": pair["resolution_criteria"],
         "fine_print": pair["fine_print"] or "",
         "open_time": datetime.fromisoformat(metadata["open_time"]),
         "scheduled_resolution_time": datetime.fromisoformat(metadata["scheduled_resolve_time"]),
@@ -178,8 +178,8 @@ def build_question(pair: dict[str, Any], perf: dict[str, Any]) -> MetaculusQuest
         "open_upper_bound": bool(perf["open_upper_bound"]),
         "zero_point": scaling["zero_point"],
         "cdf_size": int(scaling["inbound_outcome_count"]) + 1,
-        "nominal_lower_bound": scaling.get("nominal_min"),
-        "nominal_upper_bound": scaling.get("nominal_max"),
+        "nominal_lower_bound": scaling["nominal_min"],
+        "nominal_upper_bound": scaling["nominal_max"],
         "unit_of_measure": _unit_from_header(pair["question_header"]),
     }
     cls = DiscreteQuestion if qtype == "discrete" else NumericQuestion

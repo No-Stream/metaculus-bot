@@ -887,7 +887,7 @@ class TestPerBinBranch:
             patch("metaculus_bot.forecaster_runners.extract_pmf", new=never),
             patch.object(forecaster_llm, "invoke", new=AsyncMock(return_value="date reasoning")),
             patch("metaculus_bot.forecaster_runners.extract_date") as extract_date,
-            patch("metaculus_bot.forecaster_runners._build_guarded_numeric_distribution") as build,
+            patch("metaculus_bot.forecaster_runners.build_guarded_numeric_distribution") as build,
         ):
             extract_date.return_value = ExtractionOutcome(value=_STANDARD_PERCENTILES, rung="block", block_present=True)
             await run_date_forecast(question, "research", forecaster_llm, parser_llm)

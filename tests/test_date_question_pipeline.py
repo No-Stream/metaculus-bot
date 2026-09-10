@@ -34,8 +34,8 @@ from metaculus_bot.constants import (
 )
 from metaculus_bot.exceptions import UnitMismatchError
 from metaculus_bot.forecaster_runners import (
-    _build_guarded_numeric_distribution,
     build_date_parse_notes,
+    build_guarded_numeric_distribution,
     run_date_forecast,
 )
 from metaculus_bot.numeric.config import STANDARD_PERCENTILES, elicit_per_bin
@@ -202,7 +202,7 @@ class TestTheRunner:
             for key, value in declared.items()
         ]
 
-        prediction = _build_guarded_numeric_distribution(percentiles, epoch, test_llm)
+        prediction = build_guarded_numeric_distribution(percentiles, epoch, model_name=test_llm.model)
 
         assert prediction.is_date is True
         heights = cdf_heights(prediction)
@@ -227,7 +227,7 @@ class TestTheRunner:
         september_16 = to_epoch(parse_forecast_date("2026-09-16"))
         percentiles = [Percentile(percentile=p, value=september_16) for p in STANDARD_PERCENTILES]
 
-        prediction = _build_guarded_numeric_distribution(percentiles, epoch, test_llm)
+        prediction = build_guarded_numeric_distribution(percentiles, epoch, model_name=test_llm.model)
 
         heights = cdf_heights(prediction)
         mass = np.diff(heights)
@@ -260,7 +260,7 @@ class TestTheRunner:
         bound = epoch.lower_bound if open_edge == "lower" else epoch.upper_bound
         percentiles = [Percentile(percentile=p, value=bound) for p in STANDARD_PERCENTILES]
 
-        prediction = _build_guarded_numeric_distribution(percentiles, epoch, test_llm)
+        prediction = build_guarded_numeric_distribution(percentiles, epoch, model_name=test_llm.model)
 
         heights = cdf_heights(prediction)
         mass = np.diff(heights)
@@ -286,7 +286,7 @@ class TestTheRunner:
         percentiles = [Percentile(percentile=p, value=epoch.lower_bound - 86_400.0) for p in STANDARD_PERCENTILES]
 
         with pytest.raises(UnitMismatchError, match="tiny span"):
-            _build_guarded_numeric_distribution(percentiles, epoch, test_llm)
+            build_guarded_numeric_distribution(percentiles, epoch, model_name=test_llm.model)
 
         clamped = [r for r in caplog.records if r.getMessage().startswith("Clamped lower for Q")]
         assert len(clamped) == len(STANDARD_PERCENTILES)
@@ -301,7 +301,7 @@ class TestTheRunner:
         percentiles = [Percentile(percentile=p, value=epoch.lower_bound - 2 * 86_400.0) for p in STANDARD_PERCENTILES]
 
         with pytest.raises(ValueError, match="too far below lower bound"):
-            _build_guarded_numeric_distribution(percentiles, epoch, test_llm)
+            build_guarded_numeric_distribution(percentiles, epoch, model_name=test_llm.model)
 
     def test_a_plateau_declared_before_an_open_lower_bound_keeps_its_below_range_mass(
         self, test_llm: GeneralLlm
@@ -321,7 +321,7 @@ class TestTheRunner:
         ]
         percentiles = [Percentile(percentile=p, value=v) for p, v in zip(STANDARD_PERCENTILES, values, strict=True)]
 
-        prediction = _build_guarded_numeric_distribution(percentiles, epoch, test_llm)
+        prediction = build_guarded_numeric_distribution(percentiles, epoch, model_name=test_llm.model)
 
         heights = cdf_heights(prediction)
         assert heights[0] == pytest.approx(0.57, abs=0.01), heights[0]
@@ -344,7 +344,7 @@ class TestTheRunner:
         ]
         percentiles = [Percentile(percentile=p, value=v) for p, v in zip(STANDARD_PERCENTILES, values, strict=True)]
 
-        prediction = _build_guarded_numeric_distribution(percentiles, epoch, test_llm)
+        prediction = build_guarded_numeric_distribution(percentiles, epoch, model_name=test_llm.model)
 
         heights = cdf_heights(prediction)
         mass = np.diff(heights)

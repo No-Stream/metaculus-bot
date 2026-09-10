@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 from collections import Counter
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -43,6 +44,28 @@ DEFAULT_OUTPUT_TOKENS = 800
 DEFAULT_CONCURRENCY = 6
 
 
+def _positive_int(text: str) -> int:
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {text}")
+    return value
+
+
+def _non_negative_int(text: str) -> int:
+    value = int(text)
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"must be at least 0, got {text}")
+    return value
+
+
+def _positive_finite_float(text: str) -> float:
+    """A cap that a NaN or a non-positive value would silently disable, so both are refused at parse time."""
+    value = float(text)
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive finite number, got {text}")
+    return value
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Paired section-strip bench over the archived gap-fill bundles. SPENDS MONEY on the personal key."
@@ -56,14 +79,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--model", default=DEFAULT_MODEL, help=f"OpenRouter slug without the prefix (default {DEFAULT_MODEL})."
     )
     parser.add_argument("--parser-model", default=None, help="Salvage-parser slug (default: the same as --model).")
-    parser.add_argument("--seeds", type=int, default=DEFAULT_SEEDS, help="Replicates per (question, arm).")
+    parser.add_argument("--seeds", type=_positive_int, default=DEFAULT_SEEDS, help="Replicates per (question, arm).")
     parser.add_argument(
         "--questions", type=int, nargs="+", help="Question ids to bench (default: every resolved pair)."
     )
     parser.add_argument("--arms", nargs="+", choices=ARMS, default=list(ARMS), help="Arms to run; full is required.")
-    parser.add_argument("--max-spend-usd", type=float, default=DEFAULT_MAX_SPEND_USD)
+    parser.add_argument("--max-spend-usd", type=_positive_finite_float, default=DEFAULT_MAX_SPEND_USD)
     parser.add_argument(
-        "--output-tokens", type=int, default=DEFAULT_OUTPUT_TOKENS, help="Estimate's completion tokens per call."
+        "--output-tokens",
+        type=_positive_int,
+        default=DEFAULT_OUTPUT_TOKENS,
+        help="Estimate's completion tokens per call.",
     )
     parser.add_argument(
         "--price-in", type=float, default=DEFAULT_PRICE_IN_USD_PER_M, help="USD per million prompt tokens."
@@ -74,8 +100,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--reasoning-effort", default=None, help="OpenRouter reasoning effort; unset keeps the model default."
     )
-    parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
-    parser.add_argument("--bootstrap-seed", type=int, default=0)
+    parser.add_argument("--concurrency", type=_positive_int, default=DEFAULT_CONCURRENCY)
+    parser.add_argument("--bootstrap-seed", type=_non_negative_int, default=0)
     parser.add_argument("--pairs", type=Path, default=DEFAULT_PAIRS)
     parser.add_argument("--perf-json", type=Path, default=DEFAULT_PERF_JSON)
     parser.add_argument("--archive-dir", type=Path, default=DEFAULT_ARCHIVE_DIR)
@@ -172,13 +198,14 @@ async def run_bench(args: argparse.Namespace, plan: Sequence[PlanItem], estimate
         forecaster_usd=meter.forecaster_usd,
         parser_usd=parser_usd,
         measured_usd=meter.forecaster_usd + parser_usd,
-        cap_hit=meter.exhausted,
+        unpriced_calls=meter.unpriced_calls,
+        stop_reason=meter.stop_reason,
     )
     (run_dir / "run.json").write_text(json.dumps(run_meta, indent=2), encoding="utf-8")
     write_results(run_dir, rows, run_meta)
-    cap_note = " (CAP HIT, remaining calls skipped)" if meter.exhausted else ""
+    stop_note = f" (STOPPED EARLY: {meter.stop_reason})" if meter.stop_reason else ""
     print(
-        f"Done: {dict(Counter(row.status for row in rows))}; measured spend ${run_meta['measured_usd']:.4f}{cap_note}"
+        f"Done: {dict(Counter(row.status for row in rows))}; measured spend ${run_meta['measured_usd']:.4f}{stop_note}"
     )
     print(f"Results: {run_dir / 'SUMMARY.md'}")
 

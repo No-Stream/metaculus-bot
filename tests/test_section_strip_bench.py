@@ -6,9 +6,9 @@ whole section and nothing else), the question each pair is scored as is the one 
 build, the prompt is the production template for the type with the clock anchored to the archived
 run date, the scoring plumbing turns a canned reply into the platform score through the real
 extraction ladder and CDF build, the spend gates refuse and abort where the estimate says they must,
-and the donated key is unreachable on the paid path. The model call is a fake returning canned
-replies with real ``STRUCTURED FORECAST`` blocks; ``tests/conftest.py``'s egress guard has nothing
-to block.
+the meter fails shut on a reply with no charge, and the donated key is unreachable on the paid path.
+The model call is a fake returning canned replies with real ``STRUCTURED FORECAST`` blocks;
+``tests/conftest.py``'s egress guard has nothing to block.
 """
 
 from __future__ import annotations
@@ -16,10 +16,12 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
+from collections.abc import Awaitable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import litellm
 import pytest
@@ -28,11 +30,10 @@ from forecasting_tools.data_models.questions import DiscreteQuestion, OutOfBound
 
 from metaculus_bot import prompts as prompts_module
 from metaculus_bot import value_extraction
-from metaculus_bot.credit_telemetry import reset_role_spend
+from metaculus_bot.credit_telemetry import PERSONAL_KEY_ALIAS, TokenCounts, record_llm_call_spend, reset_role_spend
 from metaculus_bot.numeric.config import STANDARD_PERCENTILES
 from metaculus_bot.scoring_common import binary_log_score, mc_log_score
-from scripts.probes import section_strip_bench as bench
-from scripts.probes.section_strip_bench import cli, plan, run
+from scripts.probes.section_strip_bench import bundle, cli, plan, report, run
 
 pytestmark = pytest.mark.usefixtures("_clean_ledger")
 
@@ -56,11 +57,12 @@ V1_BODY = "### Gap 1: What is the latest count?\n*Why it matters:* it decides th
 V2_BODY = '### ⚠ Corrections to the briefing\nClaim: none.\n\n### Latest count\n- [fetched] 4,173 cases. "quote"'
 OPTIONS = ["Texas", "Arizona", "Nevada", "Other"]
 METADATA = {"open_time": "2026-07-01T12:00:00Z", "scheduled_resolve_time": "2026-08-31T16:00:00Z"}
+SEP, V1H, V2H = bundle.SECTION_SEPARATOR, bundle.V1_SECTION_HEADER, bundle.V2_SECTION_HEADER
 
 
 def bundle_text(first: str = FIRST_PASS, v1: str = V1_BODY, v2: str = V2_BODY) -> str:
     """A bundle as gap_fill_stages appends it: separator, header, blank line, body, twice."""
-    return f"{first}{bench.SECTION_SEPARATOR}{bench.V1_SECTION_HEADER}\n\n{v1}{bench.SECTION_SEPARATOR}{bench.V2_SECTION_HEADER}\n\n{v2}"
+    return f"{first}{SEP}{V1H}\n\n{v1}{SEP}{V2H}\n\n{v2}"
 
 
 def _header(qtype: str, title: str) -> str:
@@ -172,6 +174,10 @@ def _dataset_args(dataset: dict[str, Path]) -> list[str]:
     ]
 
 
+def _load(dataset: dict[str, Path], **kwargs: Any) -> list[bundle.BenchQuestion]:
+    return bundle.load_bench_questions(dataset["pairs"], dataset["perf"], dataset["archive"], **kwargs)
+
+
 BINARY_REPLY = 'Reasoning.\n\n```json\n{"question_type": "binary", "posterior_prob": 0.22}\n```\n'
 MC_REPLY = (
     "Reasoning.\n\n```json\n"
@@ -191,7 +197,6 @@ def numeric_reply(values: list[float]) -> str:
 
 NUMERIC_REPLY = numeric_reply([7500 + 500 * i for i in range(len(STANDARD_PERCENTILES))])
 NO_BLOCK_REPLY = "I think about 22 percent but I forgot the block."
-
 REPLY_BY_TITLE = {
     BINARY_YES["title"]: BINARY_REPLY,
     BINARY_NO["title"]: BINARY_REPLY,
@@ -199,23 +204,22 @@ REPLY_BY_TITLE = {
     NUMERIC["title"]: NUMERIC_REPLY,
     DISCRETE["title"]: NUMERIC_REPLY,
 }
+FAKE_TOKENS = TokenCounts(prompt=1000, completion=300, cached=50, reasoning=200)
 
 
 class FakeModel:
-    """A ``ModelCall`` answering from the question title it finds in the prompt, at a fixed cost per call."""
+    """A ``ModelCall`` answering from the question title it finds in the prompt, at a fixed charge per call."""
 
-    def __init__(self, replies: dict[str, str] | None = None, *, cost_usd: float = 0.001) -> None:
+    def __init__(self, replies: dict[str, str] | None = None, *, charged_usd: float | None = 0.001) -> None:
         self.replies = replies or REPLY_BY_TITLE
-        self.cost_usd = cost_usd
+        self.charged_usd = charged_usd
         self.prompts: list[str] = []
 
     async def __call__(self, prompt: str) -> run.ModelReply:
         await asyncio.sleep(0)
         self.prompts.append(prompt)
         text = next(reply for title, reply in self.replies.items() if title in prompt)
-        return run.ModelReply(
-            text=text, prompt_tokens=1000, completion_tokens=300, reasoning_tokens=200, cost_usd=self.cost_usd
-        )
+        return run.ModelReply(text=text, tokens=FAKE_TOKENS, charged_usd=self.charged_usd)
 
 
 def parser_stub() -> MagicMock:
@@ -227,103 +231,99 @@ def parser_stub() -> MagicMock:
 
 def _run(
     plan_items: list[plan.PlanItem], call: Any, *, cap_usd: float = 10.0, concurrency: int = 2
-) -> list[bench.CallRow]:
-    meter = run.SpendMeter(cap_usd=cap_usd, extra_usd=lambda: 0.0)
+) -> list[report.CallRow]:
     return asyncio.run(
         run.run_plan(
             plan_items,
             call=call,
             parser_llm=parser_stub(),
             model_name="fake",
-            meter=meter,
+            meter=run.SpendMeter(cap_usd=cap_usd),
             concurrency=concurrency,
             on_row=lambda _row: None,
         )
     )
 
 
+def _completion(usage: dict[str, Any], text: str = "hello") -> litellm.ModelResponse:
+    return litellm.ModelResponse(choices=[{"message": {"role": "assistant", "content": text}}], usage=usage)
+
+
+def _awaited(awaitable: Awaitable[run.ModelReply]) -> run.ModelReply:
+    async def _wait() -> run.ModelReply:
+        return await awaitable
+
+    return asyncio.run(_wait())
+
+
 class TestSectionStripping:
     def test_each_arm_loses_exactly_the_named_section(self) -> None:
-        sections = bench.split_bundle(bundle_text())
-        arms = bench.arm_texts(sections)
+        sections = bundle.split_bundle(bundle_text())
+        arms = bundle.arm_texts(sections)
 
         assert arms["full"] == bundle_text()
         assert arms["minus_both"] == FIRST_PASS
         assert arms["minus_v1"] == FIRST_PASS + sections.v2_block
         assert arms["minus_v2"] == FIRST_PASS + sections.v1_block
-        assert bench.V1_SECTION_HEADER not in arms["minus_v1"]
+        assert V1H not in arms["minus_v1"]
         assert V1_BODY not in arms["minus_v1"]
-        assert bench.V2_SECTION_HEADER not in arms["minus_v2"]
+        assert V2H not in arms["minus_v2"]
         assert V2_BODY not in arms["minus_v2"]
         # The separator also sits between first-pass providers, so the cut keys on the headers, never on it.
-        assert bench.SECTION_SEPARATOR in arms["minus_both"]
-        assert list(arms) == list(bench.ARMS)
+        assert SEP in arms["minus_both"]
+        assert list(arms) == list(bundle.ARMS)
 
     def test_the_blocks_carry_their_own_separator_and_header(self) -> None:
-        sections = bench.split_bundle(bundle_text())
+        sections = bundle.split_bundle(bundle_text())
 
-        assert sections.v1_block.startswith(bench.SECTION_SEPARATOR + bench.V1_SECTION_HEADER)
-        assert sections.v2_block.startswith(bench.SECTION_SEPARATOR + bench.V2_SECTION_HEADER)
+        assert sections.v1_block.startswith(SEP + V1H)
+        assert sections.v2_block.startswith(SEP + V2H)
         assert sections.v2_block.endswith(V2_BODY)
 
     @pytest.mark.parametrize(
-        ("bundle", "reason"),
+        ("text", "reason"),
         [
-            (bundle_text(v1=V1_BODY + "\n" + bench.V2_SECTION_HEADER), "exactly one"),
-            (FIRST_PASS + bench.SECTION_SEPARATOR + bench.V2_SECTION_HEADER + "\n\n" + V2_BODY, "exactly one"),
-            (
-                bundle_text().replace(
-                    bench.SECTION_SEPARATOR + bench.V1_SECTION_HEADER, "\n" + bench.V1_SECTION_HEADER
-                ),
-                "separator",
-            ),
+            (bundle_text(v1=V1_BODY + "\n" + V2H), "exactly one"),
+            (FIRST_PASS + SEP + V2H + "\n\n" + V2_BODY, "exactly one"),
+            (bundle_text().replace(SEP + V1H, "\n" + V1H), "separator"),
+            (f"{FIRST_PASS}{SEP}{V2H}\n\n{V2_BODY}{SEP}{V1H}\n\n{V1_BODY}", "precede"),
         ],
-        ids=["duplicate-v2-header", "missing-v1", "v1-without-separator"],
+        ids=["duplicate-v2-header", "missing-v1", "v1-without-separator", "v2-before-v1"],
     )
-    def test_a_malformed_bundle_is_refused(self, bundle: str, reason: str) -> None:
+    def test_a_malformed_bundle_is_refused(self, text: str, reason: str) -> None:
         with pytest.raises(ValueError, match=reason):
-            bench.split_bundle(bundle)
-
-    def test_v2_before_v1_is_refused(self) -> None:
-        swapped = (
-            f"{FIRST_PASS}{bench.SECTION_SEPARATOR}{bench.V2_SECTION_HEADER}\n\n{V2_BODY}"
-            f"{bench.SECTION_SEPARATOR}{bench.V1_SECTION_HEADER}\n\n{V1_BODY}"
-        )
-        with pytest.raises(ValueError, match="precede"):
-            bench.split_bundle(swapped)
+            bundle.split_bundle(text)
 
 
 class TestQuestionConstruction:
     def test_binary(self) -> None:
-        question = bench.build_question(BINARY_YES, make_perf(101, "binary"))
+        question = bundle.build_question(BINARY_YES, make_perf(101, "binary"))
 
         assert isinstance(question, BinaryQuestion)
-        assert question.id_of_question == 101
-        assert question.id_of_post == 201
+        assert (question.id_of_question, question.id_of_post) == (101, 201)
         assert question.page_url == "https://www.metaculus.com/questions/201/"
         assert question.open_time == datetime(2026, 7, 1, 12, tzinfo=UTC)
         assert question.fine_print == ""
 
     def test_multiple_choice_carries_the_tagged_options(self) -> None:
-        question = bench.build_question(MC, make_perf(103, "multiple_choice"))
+        question = bundle.build_question(MC, make_perf(103, "multiple_choice"))
 
         assert isinstance(question, MultipleChoiceQuestion)
         assert question.options == OPTIONS
 
     def test_numeric_reads_bounds_grid_and_unit(self) -> None:
-        question = bench.build_question(NUMERIC, make_perf(104, "numeric"))
+        question = bundle.build_question(NUMERIC, make_perf(104, "numeric"))
 
         assert isinstance(question, NumericQuestion)
         assert not isinstance(question, DiscreteQuestion)
         assert (question.lower_bound, question.upper_bound) == (7000.0, 14000.0)
-        assert question.open_lower_bound
-        assert question.open_upper_bound
+        assert (question.open_lower_bound, question.open_upper_bound) == (True, True)
         assert question.cdf_size == 201
         assert question.unit_of_measure == "Cases"
         assert question.nominal_upper_bound == 14000
 
     def test_discrete_is_a_discrete_question_on_its_own_grid(self) -> None:
-        question = bench.build_question(DISCRETE, make_perf(105, "discrete", inbound=81))
+        question = bundle.build_question(DISCRETE, make_perf(105, "discrete", inbound=81))
 
         assert isinstance(question, DiscreteQuestion)
         assert question.cdf_size == 82
@@ -333,34 +333,33 @@ class TestQuestionConstruction:
             **NUMERIC,
             "question_header": NUMERIC["question_header"].replace("Cases", "unspecified (assume unitless)"),
         }
-        question = bench.build_question(pair, make_perf(104, "numeric"))
+        question = bundle.build_question(pair, make_perf(104, "numeric"))
 
         assert question.unit_of_measure is None
 
     def test_resolutions_per_type(self) -> None:
-        binary = bench.build_question(BINARY_NO, make_perf(102, "binary"))
-        mc = bench.build_question(MC, make_perf(103, "multiple_choice"))
-        numeric = bench.build_question(NUMERIC, make_perf(104, "numeric"))
-        discrete = bench.build_question(DISCRETE, make_perf(105, "discrete", inbound=81))
+        binary = bundle.build_question(BINARY_NO, make_perf(102, "binary"))
+        mc = bundle.build_question(MC, make_perf(103, "multiple_choice"))
+        numeric = bundle.build_question(NUMERIC, make_perf(104, "numeric"))
+        discrete = bundle.build_question(DISCRETE, make_perf(105, "discrete", inbound=81))
 
         # A NO is False, and stays a scoreable resolution: the pair file's own caveat.
-        assert bench.typed_resolution(BINARY_NO, binary) is False
-        assert bench.typed_resolution(MC, mc) == "Arizona"
-        assert bench.typed_resolution(NUMERIC, numeric) == 9500.0
-        assert bench.typed_resolution(DISCRETE, discrete) is OutOfBoundsResolution.ABOVE_UPPER_BOUND
+        assert bundle.typed_resolution(BINARY_NO, binary) is False
+        assert bundle.typed_resolution(MC, mc) == "Arizona"
+        assert bundle.typed_resolution(NUMERIC, numeric) == 9500.0
+        assert bundle.typed_resolution(DISCRETE, discrete) is OutOfBoundsResolution.ABOVE_UPPER_BOUND
 
     def test_a_resolution_off_the_option_list_is_refused(self) -> None:
-        mc = bench.build_question(MC, make_perf(103, "multiple_choice"))
+        mc = bundle.build_question(MC, make_perf(103, "multiple_choice"))
         with pytest.raises(ValueError, match="not one of"):
-            bench.typed_resolution({**MC, "resolution_parsed": "Utah"}, mc)
+            bundle.typed_resolution({**MC, "resolution_parsed": "Utah"}, mc)
 
     def test_load_keeps_every_resolved_pair_including_a_no_and_skips_the_unresolved(
         self, dataset: dict[str, Path]
     ) -> None:
-        questions = bench.load_bench_questions(dataset["pairs"], dataset["perf"], dataset["archive"])
+        by_id = {q.question_id: q for q in _load(dataset)}
 
-        assert [q.question_id for q in questions] == RESOLVED_IDS
-        by_id = {q.question_id: q for q in questions}
+        assert list(by_id) == RESOLVED_IDS
         assert by_id[102].resolution is False
         assert by_id[101].today == RUN_DAY
         assert by_id[101].arms["minus_both"] == FIRST_PASS
@@ -371,30 +370,24 @@ class TestQuestionConstruction:
         assert math.isfinite(numeric_published)
 
     def test_load_narrows_to_the_requested_ids_and_names_a_miss(self, dataset: dict[str, Path]) -> None:
-        questions = bench.load_bench_questions(dataset["pairs"], dataset["perf"], dataset["archive"], only={101, 104})
-        assert [q.question_id for q in questions] == [101, 104]
+        assert [q.question_id for q in _load(dataset, only={101, 104})] == [101, 104]
 
         with pytest.raises(ValueError, match=r"\[106, 999\]"):
-            bench.load_bench_questions(dataset["pairs"], dataset["perf"], dataset["archive"], only={101, 106, 999})
+            _load(dataset, only={101, 106, 999})
 
     def test_load_refuses_an_archive_that_disagrees_with_the_pair(self, dataset: dict[str, Path]) -> None:
         record = {"qid": 101, "source": "artifact", "research_text": bundle_text(first="## Something else entirely")}
         (dataset["archive"] / "101.json").write_text(json.dumps(record), encoding="utf-8")
 
         with pytest.raises(ValueError, match="disagrees"):
-            bench.load_bench_questions(dataset["pairs"], dataset["perf"], dataset["archive"])
+            _load(dataset)
 
 
 class TestPromptSelection:
-    def _questions(self, dataset: dict[str, Path]) -> dict[int, bench.BenchQuestion]:
-        return {
-            q.question_id: q for q in bench.load_bench_questions(dataset["pairs"], dataset["perf"], dataset["archive"])
-        }
-
     def test_binary_prompt_is_anchored_to_the_archived_run_date(self, dataset: dict[str, Path]) -> None:
-        question = self._questions(dataset)[101]
-        with bench.anchored_clock(question.forecasting_window, question.today):
-            prompt = bench.render_prompt(question.question, question.arms["full"])
+        question = {q.question_id: q for q in _load(dataset)}[101]
+        with plan.anchored_clock(question.forecasting_window, question.today):
+            prompt = plan.render_prompt(question.question, question.arms["full"])
 
         assert WINDOW in prompt
         assert f"as of {RUN_DAY}" in prompt
@@ -403,20 +396,19 @@ class TestPromptSelection:
         assert V2_BODY in prompt
         assert "posterior_prob" in prompt
 
-    def test_the_clock_is_restored_after_the_build(self, dataset: dict[str, Path]) -> None:
+    def test_the_clock_is_restored_after_the_build(self) -> None:
         original_window, original_today = prompts_module._forecasting_window_str, prompts_module._today_str
-        question = self._questions(dataset)[101]
-        with bench.anchored_clock(question.forecasting_window, question.today):
+        with plan.anchored_clock(WINDOW, RUN_DAY):
             assert prompts_module._today_str() == RUN_DAY
         assert prompts_module._forecasting_window_str is original_window
         assert prompts_module._today_str is original_today
 
     def test_multiple_choice_and_numeric_pick_their_own_templates(self, dataset: dict[str, Path]) -> None:
-        questions = self._questions(dataset)
-        with bench.anchored_clock(WINDOW, RUN_DAY):
-            mc_prompt = bench.render_prompt(questions[103].question, questions[103].arms["minus_v1"])
-            numeric_prompt = bench.render_prompt(questions[104].question, questions[104].arms["minus_both"])
-            discrete_prompt = bench.render_prompt(questions[105].question, questions[105].arms["full"])
+        questions = {q.question_id: q for q in _load(dataset)}
+        with plan.anchored_clock(WINDOW, RUN_DAY):
+            mc_prompt = plan.render_prompt(questions[103].question, questions[103].arms["minus_v1"])
+            numeric_prompt = plan.render_prompt(questions[104].question, questions[104].arms["minus_both"])
+            discrete_prompt = plan.render_prompt(questions[105].question, questions[105].arms["full"])
 
         assert "option_probs" in mc_prompt
         assert all(option in mc_prompt for option in OPTIONS)
@@ -430,38 +422,30 @@ class TestPromptSelection:
         assert "declared_percentiles" in discrete_prompt
 
     def test_the_plan_has_one_prompt_per_question_arm_replicate(self, dataset: dict[str, Path]) -> None:
-        questions = bench.load_bench_questions(dataset["pairs"], dataset["perf"], dataset["archive"])
-        items = bench.build_plan(questions, ["full", "minus_v1"], 2, model="fake/model")
+        items = plan.build_plan(_load(dataset), ["full", "minus_v1"], 2, model="fake/model")
 
         assert len(items) == 5 * 2 * 2
         first, second = (item for item in items if item.question.question_id == 101 and item.arm == "full")
-        assert first.prompt.endswith(bench.replicate_nonce(1))
-        assert second.prompt.endswith(bench.replicate_nonce(2))
-        assert first.prompt.removesuffix(bench.replicate_nonce(1)) == second.prompt.removesuffix(
-            bench.replicate_nonce(2)
-        )
-        assert all(item.prompt_tokens > 0 for item in items)
-        full_tokens = next(i.prompt_tokens for i in items if i.question.question_id == 101 and i.arm == "full")
-        minus_tokens = next(i.prompt_tokens for i in items if i.question.question_id == 101 and i.arm == "minus_v1")
-        assert full_tokens > minus_tokens
+        assert first.prompt.endswith(plan.replicate_nonce(1))
+        assert second.prompt.endswith(plan.replicate_nonce(2))
+        assert first.prompt.removesuffix(plan.replicate_nonce(1)) == second.prompt.removesuffix(plan.replicate_nonce(2))
+        assert first.prompt_tokens == plan.count_tokens("fake/model", first.prompt)
+        minus = next(i for i in items if i.question.question_id == 101 and i.arm == "minus_v1")
+        assert first.prompt_tokens > minus.prompt_tokens > 0
 
 
 class TestScoringPlumbing:
     def _plan(self, dataset: dict[str, Path], arms: list[str], seeds: int = 1) -> list[plan.PlanItem]:
-        questions = bench.load_bench_questions(dataset["pairs"], dataset["perf"], dataset["archive"])
-        return bench.build_plan(questions, arms, seeds, model="fake/model")
+        return plan.build_plan(_load(dataset), arms, seeds, model="fake/model")
 
     def test_canned_replies_score_through_the_ladder_and_the_cdf_build(self, dataset: dict[str, Path]) -> None:
         rows = _run(self._plan(dataset, ["full", "minus_v1"]), FakeModel())
 
-        assert {row.status for row in rows} == {bench.STATUS_SCORED}
+        assert {row.status for row in rows} == {report.STATUS_SCORED}
         by_key = {(row.question_id, row.arm): row for row in rows}
-        # The block rung read the value; the binary clamp (0.22 is inside it) leaves the raw value published.
         yes = by_key[(101, "full")]
         assert yes.score == pytest.approx(binary_log_score(0.22, True))
-        assert yes.rung == "block"
-        assert yes.block_present is True
-        assert yes.forecast == 0.22
+        assert (yes.rung, yes.block_present, yes.forecast) == ("block", True, 0.22)
         assert by_key[(102, "full")].score == pytest.approx(binary_log_score(0.22, False))
         mc = by_key[(103, "full")]
         assert mc.forecast == pytest.approx([0.1, 0.5, 0.3, 0.1])
@@ -476,8 +460,23 @@ class TestScoringPlumbing:
         assert math.isfinite(discrete_score)
         # The same reply in two arms scores identically: the arm text changes the prompt, never the scorer.
         assert by_key[(104, "minus_v1")].score == numeric.score
-        assert all((row.prompt_tokens, row.completion_tokens, row.reasoning_tokens) == (1000, 300, 200) for row in rows)
-        assert all(row.cost_usd == 0.001 and row.rationale for row in rows)
+        for row in rows:
+            assert (row.prompt_tokens, row.completion_tokens, row.reasoning_tokens, row.cached_tokens) == (
+                1000,
+                300,
+                200,
+                50,
+            )
+            assert row.cost_usd == 0.001
+            assert row.rationale
+
+    def test_a_binary_value_outside_the_clamp_is_recorded_as_published(self, dataset: dict[str, Path]) -> None:
+        items = [item for item in self._plan(dataset, ["full"]) if item.question.question_id == 101]
+        extreme = 'Sure.\n\n```json\n{"question_type": "binary", "posterior_prob": 0.005}\n```\n'
+        rows = _run(items, FakeModel({BINARY_YES["title"]: extreme}))
+
+        assert rows[0].forecast == 0.02
+        assert rows[0].score == pytest.approx(binary_log_score(0.02, True))
 
     def test_a_reply_without_a_block_is_an_extraction_failure_row(
         self, dataset: dict[str, Path], monkeypatch: pytest.MonkeyPatch
@@ -490,9 +489,9 @@ class TestScoringPlumbing:
         items = [item for item in self._plan(dataset, ["full"]) if item.question.question_id == 101]
         rows = _run(items, FakeModel({BINARY_YES["title"]: NO_BLOCK_REPLY}))
 
-        assert [row.status for row in rows] == [bench.STATUS_EXTRACTION_FAILED]
+        assert [row.status for row in rows] == [report.STATUS_EXTRACTION_FAILED]
         assert rows[0].score is None
-        assert rows[0].error
+        assert rows[0].error is not None
         assert "no parser LLM" in rows[0].error
         assert rows[0].rationale == NO_BLOCK_REPLY
         assert rows[0].cost_usd == 0.001
@@ -502,9 +501,9 @@ class TestScoringPlumbing:
         tiny = numeric_reply([0.0075 + 0.0005 * i for i in range(len(STANDARD_PERCENTILES))])
         rows = _run(items, FakeModel({NUMERIC["title"]: tiny}))
 
-        assert [row.status for row in rows] == [bench.STATUS_UNIT_MISMATCH]
-        assert rows[0].error
-        assert "unit mismatch" in rows[0].error
+        assert [row.status for row in rows] == [report.STATUS_UNIT_MISMATCH]
+        assert rows[0].error is not None
+        assert "Unit mismatch" in rows[0].error
 
     def test_a_provider_error_is_a_row_not_a_crash(self, dataset: dict[str, Path]) -> None:
         async def _timeout(_prompt: str) -> run.ModelReply:
@@ -514,57 +513,111 @@ class TestScoringPlumbing:
         items = [item for item in self._plan(dataset, ["full"]) if item.question.question_id == 101]
         rows = _run(items, _timeout)
 
-        assert [row.status for row in rows] == [bench.STATUS_API_ERROR]
-        assert rows[0].error
+        assert [row.status for row in rows] == [report.STATUS_API_ERROR]
+        assert rows[0].error is not None
         assert rows[0].error.startswith("Timeout")
         assert rows[0].cost_usd is None
 
-    def test_peer_scale_factor_per_type(self) -> None:
-        assert bench.peer_scale_factor("binary", None) == pytest.approx(math.log(2))
-        assert bench.peer_scale_factor("multiple_choice", 4) == pytest.approx(math.log(4))
-        assert bench.peer_scale_factor("numeric", None) == 1.0
-        assert bench.peer_scale_factor("discrete", None) == 1.0
-        with pytest.raises(ValueError, match="option count"):
-            bench.peer_scale_factor("multiple_choice", None)
 
-    def test_reply_from_response_reads_openrouter_cost_and_reasoning_tokens(self) -> None:
-        response = litellm.ModelResponse(
-            choices=[{"message": {"role": "assistant", "content": "hello"}}],
-            usage={
-                "prompt_tokens": 12,
-                "completion_tokens": 9,
-                "total_tokens": 21,
-                "completion_tokens_details": {"reasoning_tokens": 4},
-                "cost": 0.00042,
-            },
+class TestTheModelCall:
+    def test_the_request_is_the_prompt_alone_on_the_personal_key_with_no_tools(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        acompletion = AsyncMock(
+            return_value=_completion(
+                {
+                    "prompt_tokens": 12,
+                    "completion_tokens": 9,
+                    "total_tokens": 21,
+                    "completion_tokens_details": {"reasoning_tokens": 4},
+                    "cost": 0.00042,
+                }
+            )
         )
-        reply = bench.reply_from_response(response)
+        monkeypatch.setattr(run.litellm, "acompletion", acompletion)
 
+        reply = _awaited(run.build_model_call("vendor/cheap", "sk-personal", reasoning_effort="low")("the prompt"))
+
+        assert acompletion.await_args is not None
+        kwargs = acompletion.await_args.kwargs
+        assert kwargs["model"] == "openrouter/vendor/cheap"
+        assert kwargs["api_key"] == "sk-personal"
+        assert kwargs["messages"] == [{"role": "user", "content": "the prompt"}]
+        assert "tools" not in kwargs
+        assert kwargs["metadata"] == {"role": run.FORECASTER_ROLE, "key_alias": PERSONAL_KEY_ALIAS}
+        assert (kwargs["max_tokens"], kwargs["timeout"], kwargs["num_retries"]) == (64_000, 480.0, 2)
+        assert kwargs["reasoning_effort"] == "low"
         assert reply == run.ModelReply(
-            text="hello", prompt_tokens=12, completion_tokens=9, reasoning_tokens=4, cost_usd=0.00042
+            text="hello", tokens=TokenCounts(prompt=12, completion=9, cached=0, reasoning=4), charged_usd=0.00042
         )
+
+    def test_an_unset_effort_is_not_sent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        acompletion = AsyncMock(return_value=_completion({"prompt_tokens": 1, "completion_tokens": 1, "cost": 0.0}))
+        monkeypatch.setattr(run.litellm, "acompletion", acompletion)
+
+        _awaited(run.build_model_call("vendor/cheap", "sk-personal", reasoning_effort=None)("p"))
+
+        assert acompletion.await_args is not None
+        assert "reasoning_effort" not in acompletion.await_args.kwargs
+
+    def test_the_charge_follows_the_ledger_rule(self) -> None:
+        """Off BYOK the upstream figure is an echo of the same money; on BYOK it is the real bill."""
+        echoed = _completion(
+            {"prompt_tokens": 1, "completion_tokens": 1, "cost": 0.3, "cost_details": {"upstream_inference_cost": 0.3}}
+        )
+        byok = _completion(
+            {
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "cost": 0.0,
+                "is_byok": True,
+                "cost_details": {"upstream_inference_cost": 0.5},
+            }
+        )
+        unpriced = _completion({"prompt_tokens": 1, "completion_tokens": 1})
+
+        assert run.reply_from_response(echoed).charged_usd == pytest.approx(0.3)
+        assert run.reply_from_response(byok).charged_usd == pytest.approx(0.5)
+        assert run.reply_from_response(unpriced).charged_usd is None
 
 
 class TestSpendGates:
     def test_the_meter_stops_the_run_once_measured_spend_reaches_the_cap(self, dataset: dict[str, Path]) -> None:
-        questions = bench.load_bench_questions(dataset["pairs"], dataset["perf"], dataset["archive"])
-        items = bench.build_plan(questions, ["full"], 2, model="fake/model")
-        model = FakeModel(cost_usd=3.0)
+        items = plan.build_plan(_load(dataset), ["full"], 2, model="fake/model")
+        model = FakeModel(charged_usd=3.0)
         rows = _run(items, model, cap_usd=5.0, concurrency=1)
 
         statuses = [row.status for row in rows]
         # Two calls ($6) pass the $5 cap; every later call is skipped before it is made.
-        assert statuses.count(bench.STATUS_SCORED) == 2
-        assert statuses.count(bench.STATUS_SKIPPED_SPEND_CAP) == len(items) - 2
+        assert statuses.count(report.STATUS_SCORED) == 2
+        assert statuses.count(report.STATUS_SKIPPED_SPEND_CAP) == len(items) - 2
         assert len(model.prompts) == 2
+        skipped = next(row for row in rows if row.status == report.STATUS_SKIPPED_SPEND_CAP)
+        assert skipped.error is not None
+        assert "reached the cap" in skipped.error
+
+    def test_a_reply_with_no_charge_stops_the_run_instead_of_reading_as_free(self, dataset: dict[str, Path]) -> None:
+        items = plan.build_plan(_load(dataset), ["full"], 1, model="fake/model")
+        model = FakeModel(charged_usd=None)
+        rows = _run(items, model, cap_usd=10.0, concurrency=1)
+
+        statuses = [row.status for row in rows]
+        assert statuses.count(report.STATUS_SCORED) == 1
+        assert statuses.count(report.STATUS_SKIPPED_SPEND_CAP) == len(items) - 1
+        assert len(model.prompts) == 1
+        skipped = next(row for row in rows if row.status == report.STATUS_SKIPPED_SPEND_CAP)
+        assert skipped.error is not None
+        assert "no charge" in skipped.error
 
     def test_the_meter_counts_the_parser_ledger_too(self) -> None:
-        meter = run.SpendMeter(cap_usd=1.0, extra_usd=lambda: 0.75)
+        meter = run.SpendMeter(cap_usd=1.0)
+        record_llm_call_spend(run.PARSER_ROLE, PERSONAL_KEY_ALIAS, cost_usd=0.75, byok_upstream_usd=0.75)
         meter.add(0.2)
-        assert not meter.exhausted
+        assert meter.stop_reason is None
         meter.add(0.1)
-        assert meter.exhausted
+        # The ledger's ``charged_usd`` is read, so the echoed upstream figure is not double counted.
         assert meter.measured_usd == pytest.approx(1.05)
+        assert meter.stop_reason is not None
 
     def test_a_bare_invocation_prints_the_estimate_and_refuses(
         self, dataset: dict[str, Path], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -589,6 +642,7 @@ class TestSpendGates:
         assert "calls: 20;" in out
         assert "Estimated cost of this run" in out
         assert "replicates of the full 5 x 2 set" in out
+        assert "salvage call to the parser model" in out
 
     def test_an_estimate_over_the_cap_aborts_before_the_first_call(
         self, dataset: dict[str, Path], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -601,22 +655,51 @@ class TestSpendGates:
         assert "Aborting before the first call" in capsys.readouterr().out
         assert not dataset["out"].exists()
 
-    def test_the_estimate_arithmetic(self, dataset: dict[str, Path]) -> None:
-        questions = bench.load_bench_questions(dataset["pairs"], dataset["perf"], dataset["archive"])
-        items = bench.build_plan(questions, list(bench.ARMS), 3, model="fake/model")
-        estimate = bench.estimate_spend(items, output_tokens=800, price_in=0.10, price_out=0.20)
+    def test_the_estimate_arithmetic_on_known_counts(self) -> None:
+        estimate = plan.Estimate(
+            n_questions=2,
+            n_arms=2,
+            n_seeds=1,
+            n_calls=4,
+            prompt_tokens_total=40_000,
+            median_prompt_tokens=10_000,
+            output_tokens_per_call=800,
+            price_in_usd_per_m=0.10,
+            price_out_usd_per_m=0.20,
+        )
+        # 40,000 prompt tokens at $0.10/M is $0.004; 4 x 800 completion tokens at $0.20/M is $0.00064.
+        assert estimate.prompt_usd == pytest.approx(0.004)
+        assert estimate.completion_usd == pytest.approx(0.00064)
+        assert estimate.total_usd == pytest.approx(0.00464)
+        assert estimate.usd_per_call == pytest.approx(0.00116)
+        assert estimate.calls_under(10.0) == 8620
+        assert estimate.seeds_under(10.0) == 2155
+
+    def test_the_estimate_reads_the_plan(self, dataset: dict[str, Path]) -> None:
+        items = plan.build_plan(_load(dataset), list(bundle.ARMS), 3, model="fake/model")
+        estimate = plan.estimate_spend(items, output_tokens=800, price_in=0.10, price_out=0.20)
 
         assert (estimate.n_questions, estimate.n_arms, estimate.n_seeds, estimate.n_calls) == (5, 4, 3, 60)
         assert estimate.prompt_tokens_total == sum(item.prompt_tokens for item in items)
-        assert estimate.prompt_usd == pytest.approx(estimate.prompt_tokens_total * 0.10 / 1e6)
-        assert estimate.completion_usd == pytest.approx(60 * 800 * 0.20 / 1e6)
-        assert estimate.total_usd == pytest.approx(estimate.prompt_usd + estimate.completion_usd)
-        assert estimate.calls_under(10.0) == int(10.0 / estimate.usd_per_call)
-        assert estimate.seeds_under(10.0) == estimate.calls_under(10.0) // 20
+        assert estimate.median_prompt_tokens > 0
 
-    def test_arms_must_include_full(self, dataset: dict[str, Path]) -> None:
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["--dry-run", "--arms", "minus_v1"],
+            ["--dry-run", "--max-spend-usd", "nan"],
+            ["--dry-run", "--max-spend-usd", "0"],
+            ["--dry-run", "--seeds", "0"],
+            ["--dry-run", "--concurrency", "0"],
+            ["--dry-run", "--bootstrap-seed", "-1"],
+        ],
+        ids=["no-full-arm", "nan-cap", "zero-cap", "zero-seeds", "zero-concurrency", "negative-bootstrap-seed"],
+    )
+    def test_arguments_that_would_disable_or_wedge_the_run_are_refused(
+        self, dataset: dict[str, Path], argv: list[str]
+    ) -> None:
         with pytest.raises(SystemExit):
-            cli.parse_args(["--dry-run", "--arms", "minus_v1", *_dataset_args(dataset)])
+            cli.parse_args([*argv, *_dataset_args(dataset)])
 
 
 class TestPersonalKeyOnly:
@@ -626,21 +709,21 @@ class TestPersonalKeyOnly:
         monkeypatch.setenv("OPENROUTER_API_KEY", "sk-personal")
         monkeypatch.delenv("DONATED_OPENROUTER_KEY_ENABLED", raising=False)
 
-        assert bench.personal_key_only_environment() == "sk-personal"
-        assert "OAI_ANTH_OPENROUTER_KEY" not in __import__("os").environ
-        assert __import__("os").environ["DONATED_OPENROUTER_KEY_ENABLED"] == "false"
+        assert run.personal_key_only_environment() == "sk-personal"
+        assert "OAI_ANTH_OPENROUTER_KEY" not in os.environ
+        assert os.environ["DONATED_OPENROUTER_KEY_ENABLED"] == "false"
 
     def test_no_personal_key_refuses(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(run, "load_environment", lambda: None)
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
 
         with pytest.raises(ValueError, match="OPENROUTER_API_KEY"):
-            bench.personal_key_only_environment()
+            run.personal_key_only_environment()
 
 
-def _row(qid: int, qtype: str, arm: str, seed: int, score: float, *, n_options: int | None = None) -> bench.CallRow:
-    return bench.CallRow(
-        question_id=qid, qtype=qtype, n_options=n_options, arm=arm, seed=seed, status=bench.STATUS_SCORED, score=score
+def _row(qid: int, qtype: str, arm: str, seed: int, score: float, *, n_options: int | None = None) -> report.CallRow:
+    return report.CallRow(
+        question_id=qid, qtype=qtype, n_options=n_options, arm=arm, seed=seed, status=report.STATUS_SCORED, score=score
     )
 
 
@@ -685,16 +768,16 @@ class TestAggregation:
             _row(2, "multiple_choice", "minus_v1", 1, 30.0, n_options=3),
             _row(3, "numeric", "full", 1, 15.0),
             _row(3, "numeric", "minus_v1", 1, 5.0),
-            bench.CallRow(
+            report.CallRow(
                 question_id=3,
                 qtype="numeric",
                 n_options=None,
                 arm="minus_v1",
                 seed=2,
-                status=bench.STATUS_EXTRACTION_FAILED,
+                status=report.STATUS_EXTRACTION_FAILED,
             ),
         ]
-        results = bench.aggregate(rows, SUMMARIES, arms=["full", "minus_v1"], bootstrap_seed=7)
+        results = report.aggregate(rows, SUMMARIES, arms=["full", "minus_v1"], bootstrap_seed=7)
 
         deltas = results["paired_deltas"]["minus_v1"]
         assert deltas["binary"]["mean_delta"] == pytest.approx(50.0 - 30.0)
@@ -709,76 +792,74 @@ class TestAggregation:
         assert peer["ci95_low"] == peer["ci95_high"] == peer["mean_delta"]
 
         summary = results["arm_summary"]
-        assert summary["full"]["all"] == {"n": 3, "mean": pytest.approx((50 + 20 + 15) / 3), "median": 20.0}
+        assert summary["full"]["binary"] == {"n": 1, "mean": 50.0, "median": 50.0}
+        assert "all" not in summary["full"]
         assert summary["published"]["binary"]["mean"] == 40.0
-        assert results["call_status_by_arm"]["minus_v1"] == {bench.STATUS_SCORED: 3, bench.STATUS_EXTRACTION_FAILED: 1}
+        assert results["replicate_spread"] == {"full": {"n_questions": 1, "mean_std": pytest.approx(math.sqrt(200.0))}}
+        assert results["call_status_by_arm"]["minus_v1"] == {
+            report.STATUS_SCORED: 3,
+            report.STATUS_EXTRACTION_FAILED: 1,
+        }
         per_question = {row["question_id"]: row for row in results["per_question"]}
         assert per_question[1]["deltas"] == {"minus_v1": pytest.approx(20.0)}
         assert per_question[1]["arm_scores"] == {"full": 50.0, "minus_v1": 30.0}
 
     def test_the_markdown_leads_with_the_deltas(self) -> None:
         rows = [_row(1, "binary", "full", 1, 60.0), _row(1, "binary", "minus_v1", 1, 30.0)]
-        results = bench.aggregate(rows, SUMMARIES[:1], arms=["full", "minus_v1"], bootstrap_seed=0)
-        text = bench.render_markdown(results, model="fake/model", seeds=1)
+        results = report.aggregate(rows, SUMMARIES[:1], arms=["full", "minus_v1"], bootstrap_seed=0)
+        text = report.render_markdown(results, model="fake/model", seeds=1)
 
         assert text.startswith("# Section-strip bench")
         assert "## Paired deltas, full minus arm" in text
         assert "| minus_v1 | binary | 1 | +30.00 |" in text
         assert "| published | binary | 1 | 40.00 | 40.00 |" in text
-
-    def test_rescore_rebuilds_the_results_from_the_run_dir(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        run_dir = tmp_path / "section_strip_bench_x"
-        run_dir.mkdir()
-        run_meta = {
-            "model": "fake/model",
-            "seeds": 1,
-            "arms": ["full", "minus_v1"],
-            "bootstrap_seed": 0,
-            "questions": SUMMARIES[:1],
-        }
-        (run_dir / "run.json").write_text(json.dumps(run_meta), encoding="utf-8")
-        rows = [_row(1, "binary", "full", 1, 60.0), _row(1, "binary", "minus_v1", 1, 30.0)]
-        (run_dir / "calls.jsonl").write_text("".join(json.dumps(r.__dict__) + "\n" for r in rows), encoding="utf-8")
-
-        assert cli.main(["--rescore", str(run_dir)]) == 0
-
-        results = json.loads((run_dir / "results.json").read_text(encoding="utf-8"))
-        assert results["paired_deltas"]["minus_v1"]["binary"]["mean_delta"] == 30.0
-        assert (run_dir / "SUMMARY.md").exists()
-        assert "Rescored 2 calls" in capsys.readouterr().out
+        assert "reference level" in text
+        assert "fewer than two scored replicates" in text
 
 
 class TestPaidPathWithFakes:
-    def test_the_whole_run_writes_every_artifact(
-        self, dataset: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+    def test_the_whole_run_writes_every_artifact_and_rescores_identically(
+        self, dataset: dict[str, Path], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
         model = FakeModel()
+        order: list[str] = []
+
+        def _record(name: str, value: Any) -> Any:
+            def _factory(*_a: Any, **_k: Any) -> Any:
+                order.append(name)
+                return value
+
+            return _factory
 
         async def _drained() -> None:
             await asyncio.sleep(0)
 
-        monkeypatch.setattr(cli, "personal_key_only_environment", lambda: "sk-personal")
+        monkeypatch.setattr(cli, "personal_key_only_environment", _record("environment", "sk-personal"))
         monkeypatch.setattr(cli, "install_role_spend_tracker", lambda: None)
         monkeypatch.setattr(cli, "drain_litellm_callbacks", _drained)
-        monkeypatch.setattr(cli, "parser_ledger_usd", lambda: 0.0)
-        monkeypatch.setattr(cli, "build_model_call", lambda *_a, **_k: model)
-        monkeypatch.setattr(cli, "build_parser_llm", lambda _m: parser_stub())
+        monkeypatch.setattr(cli, "build_model_call", _record("model", model))
+        monkeypatch.setattr(cli, "build_parser_llm", _record("parser", parser_stub()))
 
         code = cli.main(["--i-accept-spend", "--seeds", "1", "--concurrency", "3", *_dataset_args(dataset)])
 
         assert code == 0
+        # The donated key is scrubbed before any client exists, which is what makes it unreachable.
+        assert order[0] == "environment"
+        assert set(order[1:]) == {"model", "parser"}
         (run_dir,) = list(dataset["out"].iterdir())
         rows = [json.loads(line) for line in (run_dir / "calls.jsonl").read_text(encoding="utf-8").splitlines()]
         assert len(rows) == 5 * 4 == len(model.prompts)
-        assert {row["status"] for row in rows} == {bench.STATUS_SCORED}
+        assert {row["status"] for row in rows} == {report.STATUS_SCORED}
         run_meta = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
         assert run_meta["measured_usd"] == pytest.approx(20 * 0.001)
-        assert run_meta["cap_hit"] is False
+        assert run_meta["stop_reason"] is None
         assert [q["question_id"] for q in run_meta["questions"]] == RESOLVED_IDS
-        results = json.loads((run_dir / "results.json").read_text(encoding="utf-8"))
-        assert set(results["paired_deltas"]) == set(bench.STRIPPED_ARMS)
-        assert results["spend"]["forecaster_usd"] == pytest.approx(0.02)
+        results_text = (run_dir / "results.json").read_text(encoding="utf-8")
+        assert set(json.loads(results_text)["paired_deltas"]) == set(bundle.STRIPPED_ARMS)
+        assert json.loads(results_text)["spend"]["forecaster_usd"] == pytest.approx(0.02)
         assert (run_dir / "SUMMARY.md").read_text(encoding="utf-8").startswith("# Section-strip bench")
         assert (run_dir / "bench.log").exists()
+
+        assert cli.main(["--rescore", str(run_dir)]) == 0
+        assert (run_dir / "results.json").read_text(encoding="utf-8") == results_text
+        assert "Rescored 20 calls" in capsys.readouterr().out

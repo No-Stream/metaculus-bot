@@ -1,15 +1,14 @@
 """Scoring a bench reply the production way: the extraction ladder, the CDF build, the platform log score.
 
-The three per-type paths mirror ``forecaster_runners`` minus its retries and markers: the ladder reads the
-fenced block (salvaging through the parser LLM when it must), a binary value is clamped as published, a
-ballot is clamped and renormalized, and a percentile set goes through ``sanitize_percentiles``,
-``build_numeric_distribution`` and the fail-shut unit-mismatch guard before its CDF is scored.
+The three per-type paths mirror ``forecaster_runners`` minus its retries: the ladder reads the fenced block
+(salvaging through the parser LLM when it must), a binary value is clamped as published, a ballot is
+clamped and renormalized, and a percentile set goes through the runners' own guarded build (sanitizer,
+CDF build, fail-shut unit-mismatch guard) before its CDF is scored.
 """
 
 from __future__ import annotations
 
 import logging
-import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -18,13 +17,15 @@ from forecasting_tools import BinaryQuestion, GeneralLlm, MultipleChoiceQuestion
 from forecasting_tools.data_models.questions import MetaculusQuestion, OutOfBoundsResolution
 
 from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN
-from metaculus_bot.exceptions import UnitMismatchError
-from metaculus_bot.forecaster_runners import BINARY_PARSE_NOTES, build_mc_parse_notes, build_parse_notes
+from metaculus_bot.forecaster_runners import (
+    BINARY_PARSE_NOTES,
+    build_guarded_numeric_distribution,
+    build_mc_parse_notes,
+    build_parse_notes,
+)
 from metaculus_bot.member_forecast import option_vector
-from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
 from metaculus_bot.numeric.utils import clamp_and_renormalize_mc
-from metaculus_bot.numeric.validation import detect_unit_mismatch
-from metaculus_bot.scoring_common import CONTINUOUS_QUESTION_TYPES, binary_log_score, mc_log_score, numeric_log_score
+from metaculus_bot.scoring_common import binary_log_score, mc_log_score, numeric_log_score
 from metaculus_bot.value_extraction import extract_binary, extract_mc, extract_numeric
 
 logger = logging.getLogger(__name__)
@@ -41,9 +42,13 @@ def _resolution_float(question: NumericQuestion, resolution: float | OutOfBounds
     return float(resolution)
 
 
+def publish_binary(prob: float) -> float:
+    """The probability as the runner publishes it: clamped to the platform's binary range."""
+    return max(BINARY_PROB_MIN, min(BINARY_PROB_MAX, prob))
+
+
 def score_binary(prob: float, outcome: bool) -> float:
-    published = max(BINARY_PROB_MIN, min(BINARY_PROB_MAX, prob))
-    return binary_log_score(published, outcome)
+    return binary_log_score(publish_binary(prob), outcome)
 
 
 def score_mc(vector: Sequence[float], options: Sequence[str], correct: str) -> float:
@@ -63,7 +68,7 @@ def score_numeric(cdf: Sequence[float], question: NumericQuestion, resolution: f
 
 
 def score_published(published: dict[str, Any], question: MetaculusQuestion, resolution: Resolution) -> float:
-    """The score of the forecast the bot actually published, the reference column beside the bench arms."""
+    """The score of the forecast the bot actually published, the reference level beside the bench arms."""
     if isinstance(question, BinaryQuestion):
         assert isinstance(resolution, bool)
         return score_binary(float(published["prob_yes"]), resolution)
@@ -74,24 +79,6 @@ def score_published(published: dict[str, Any], question: MetaculusQuestion, reso
     assert isinstance(question, NumericQuestion)
     assert not isinstance(resolution, (bool, str))
     return score_numeric(values, question, resolution)
-
-
-def peer_scale_factor(qtype: str, n_options: int | None) -> float:
-    """Multiply a native log-score delta by this to reach spot-peer points, so the types pool on one scale.
-
-    ``binary_log_score`` and ``mc_log_score`` are log-base-K baseline scores, so their differences are in
-    ``log_K`` units and reach peer points times ``ln K``; ``numeric_log_score`` already returns the platform's
-    halved ``50 ln`` form, so a continuous delta is a peer delta as it stands (``scoring_common.spot_peer_delta``).
-    """
-    if qtype in CONTINUOUS_QUESTION_TYPES:
-        return 1.0
-    if qtype == "binary":
-        return math.log(2.0)
-    if qtype == "multiple_choice":
-        if n_options is None or n_options < 2:
-            raise ValueError(f"a multiple-choice delta needs its option count, got {n_options!r}")
-        return math.log(n_options)
-    raise ValueError(f"unrecognized question type {qtype!r}")
 
 
 @dataclass(frozen=True)
@@ -110,7 +97,8 @@ async def _score_binary_reply(
     extracted = await extract_binary(
         text, parser_llm, prompt_notes=BINARY_PARSE_NOTES, question_id=question.id_of_question, model_name=model_name
     )
-    return Scored(score_binary(extracted.value, outcome), extracted.value, extracted.rung, extracted.block_present)
+    published = publish_binary(extracted.value)
+    return Scored(binary_log_score(published, outcome), published, extracted.rung, extracted.block_present)
 
 
 async def _score_mc_reply(
@@ -144,6 +132,8 @@ async def _score_numeric_reply(
     *,
     model_name: str,
 ) -> Scored:
+    """The ``forecast`` recorded is the distribution's own declaration: the sanitized percentiles on the
+    201-point grid, the value-axis CDF on a coarser one (``numeric.pipeline._build_discrete_distribution``)."""
     extracted = await extract_numeric(
         text,
         parser_llm,
@@ -151,13 +141,9 @@ async def _score_numeric_reply(
         question_id=question.id_of_question,
         model_name=model_name,
     )
-    sanitized, zero_point = sanitize_percentiles(extracted.value, question, model_name=model_name)
-    prediction = build_numeric_distribution(sanitized, question, zero_point, model_name=model_name)
-    mismatch, reason = detect_unit_mismatch(sanitized, question)
-    if mismatch:
-        raise UnitMismatchError(f"unit mismatch likely; {reason}")
+    prediction = build_guarded_numeric_distribution(extracted.value, question, model_name=model_name)
     cdf = [float(point.percentile) for point in prediction.get_cdf()]
-    declared = [[float(p.percentile), float(p.value)] for p in sanitized]
+    declared = [[float(p.percentile), float(p.value)] for p in prediction.declared_percentiles]
     return Scored(score_numeric(cdf, question, resolution), declared, extracted.rung, extracted.block_present)
 
 

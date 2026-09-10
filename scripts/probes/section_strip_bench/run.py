@@ -1,16 +1,17 @@
 """The paid half: the model call on the personal key, the spend meter, and the per-call runner.
 
-The forecaster call goes straight through ``litellm.acompletion`` with OpenRouter asked to report its
-charge in ``usage``, so every row carries the money it cost the moment it returns; the ladder's salvage
-parser is built through the repo's own builder, which after ``personal_key_only_environment`` can only
-reach the personal key, and its charges arrive through the litellm success-callback ledger.
+The forecaster call goes straight through ``litellm.acompletion``, whose OpenRouter transformer asks for
+usage accounting on every request, so each reply carries the charge OpenRouter made and is read by the
+same reader the production ledger uses. The ladder's salvage parser is built through the repo's own
+builder, which after ``personal_key_only_environment`` can only reach the personal key, and its charges
+arrive through the litellm success-callback ledger. A charge OpenRouter did not report stops the run:
+the meter fails shut rather than reading an unmeasurable call as free.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import math
 import os
 import time
 from collections.abc import Awaitable, Callable, Sequence
@@ -27,7 +28,14 @@ from metaculus_bot.constants import (
     OAI_ANTH_OPENROUTER_KEY_ENV,
     OPENROUTER_API_KEY_ENV,
 )
-from metaculus_bot.credit_telemetry import PERSONAL_KEY_ALIAS, llm_call_metadata, role_spend_rows
+from metaculus_bot.credit_telemetry import (
+    PERSONAL_KEY_ALIAS,
+    TokenCounts,
+    _CallUsage,  # the ledger's own usage reader and its record; one reader in the repo, so the bench shares it
+    _openrouter_call_usage,
+    llm_call_metadata,
+    role_spend_rows,
+)
 from metaculus_bot.exceptions import UnitMismatchError, ValueExtractionError
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from scripts.probes.section_strip_bench.plan import PlanItem
@@ -55,45 +63,40 @@ ERROR_TEXT_LIMIT = 500
 
 @dataclass(frozen=True)
 class ModelReply:
+    """One completion: its text, its token counts, and what OpenRouter charged for it (None when unreported)."""
+
     text: str
-    prompt_tokens: int
-    completion_tokens: int
-    reasoning_tokens: int
-    cost_usd: float | None
+    tokens: TokenCounts
+    charged_usd: float | None
+
+
+def charged_usd(usage: _CallUsage) -> float | None:
+    """The money one call cost, by the ledger's rule (``record_llm_call_spend``): the cost, plus the
+    upstream charge only on a BYOK route, where OpenRouter reports the real bill there and ``cost`` as 0."""
+    if usage.cost_usd is None and usage.byok_upstream_usd is None:
+        return None
+    upstream = (usage.byok_upstream_usd or 0.0) if usage.is_byok else 0.0
+    return (usage.cost_usd or 0.0) + upstream
+
+
+def reply_from_response(response: Any) -> ModelReply:
+    usage = _openrouter_call_usage(response)
+    return ModelReply(
+        text=response.choices[0].message.content or "", tokens=usage.tokens, charged_usd=charged_usd(usage)
+    )
 
 
 ModelCall = Callable[[str], Awaitable[ModelReply]]
 
 
-def _as_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    number = float(value)
-    return number if math.isfinite(number) else None
-
-
-def reply_from_response(response: Any) -> ModelReply:
-    """The text and the accounting off one litellm completion; ``usage.cost`` is OpenRouter's own charge."""
-    usage = response.usage
-    details = usage.completion_tokens_details
-    return ModelReply(
-        text=response.choices[0].message.content or "",
-        prompt_tokens=usage.prompt_tokens or 0,
-        completion_tokens=usage.completion_tokens or 0,
-        reasoning_tokens=(details.reasoning_tokens if details is not None else None) or 0,
-        cost_usd=_as_float(usage.get("cost")),
-    )
-
-
 def build_model_call(model: str, api_key: str, *, reasoning_effort: str | None) -> ModelCall:
-    """One completion per prompt on the personal key, asking OpenRouter to report the charge in ``usage``."""
+    """One completion per prompt on the personal key: the prompt as the only message, no tools."""
     kwargs: dict[str, Any] = {
         "model": f"openrouter/{model}",
         "api_key": api_key,
         "max_tokens": MAX_COMPLETION_TOKENS,
         "timeout": CALL_TIMEOUT_S,
         "num_retries": CALL_RETRIES,
-        "extra_body": {"usage": {"include": True}},
         "metadata": llm_call_metadata(FORECASTER_ROLE, PERSONAL_KEY_ALIAS),
     }
     if reasoning_effort is not None:
@@ -137,28 +140,39 @@ def build_parser_llm(parser_model: str) -> GeneralLlm:
 
 
 def parser_ledger_usd() -> float:
-    """What the parser salvage calls have cost so far, off the litellm success-callback ledger."""
-    return sum(row.usd or 0.0 for row in role_spend_rows() if row.role == PARSER_ROLE)
+    """What the parser salvage calls have been charged so far, off the litellm success-callback ledger."""
+    return sum(row.charged_usd or 0.0 for row in role_spend_rows() if row.role == PARSER_ROLE)
 
 
 @dataclass
 class SpendMeter:
-    """Measured spend against the cap: forecaster charges as they return, plus the parser ledger."""
+    """Measured spend against the cap: forecaster charges as they return, plus the parser ledger.
+
+    ``stop_reason`` is set once the cap is reached or once any reply came back without a charge, since an
+    unmeasured call cannot be held under a cap; the runner skips every later call while it is set.
+    """
 
     cap_usd: float
-    extra_usd: Callable[[], float] = parser_ledger_usd
     forecaster_usd: float = 0.0
+    unpriced_calls: int = 0
 
-    def add(self, cost_usd: float | None) -> None:
-        self.forecaster_usd += cost_usd or 0.0
+    def add(self, reply_charged_usd: float | None) -> None:
+        if reply_charged_usd is None:
+            self.unpriced_calls += 1
+        else:
+            self.forecaster_usd += reply_charged_usd
 
     @property
     def measured_usd(self) -> float:
-        return self.forecaster_usd + self.extra_usd()
+        return self.forecaster_usd + parser_ledger_usd()
 
     @property
-    def exhausted(self) -> bool:
-        return self.measured_usd >= self.cap_usd
+    def stop_reason(self) -> str | None:
+        if self.unpriced_calls:
+            return f"{self.unpriced_calls} reply(ies) carried no charge, so spend cannot be measured against the cap"
+        if self.measured_usd >= self.cap_usd:
+            return f"measured spend ${self.measured_usd:.4f} reached the cap ${self.cap_usd:.2f}"
+        return None
 
 
 def _row_for(item: PlanItem, status: str) -> CallRow:
@@ -176,8 +190,9 @@ async def _score_into(
     row: CallRow, item: PlanItem, reply: ModelReply, parser_llm: GeneralLlm, *, model_name: str
 ) -> None:
     """Fill the row from the reply: the score when the ladder and the build succeed, a status otherwise."""
-    row.prompt_tokens, row.completion_tokens = reply.prompt_tokens, reply.completion_tokens
-    row.reasoning_tokens, row.cost_usd, row.rationale = reply.reasoning_tokens, reply.cost_usd, reply.text
+    row.prompt_tokens, row.completion_tokens = reply.tokens.prompt, reply.tokens.completion
+    row.reasoning_tokens, row.cached_tokens = reply.tokens.reasoning, reply.tokens.cached
+    row.cost_usd, row.rationale = reply.charged_usd, reply.text
     question = item.question
     try:
         scored = await score_reply(
@@ -205,8 +220,10 @@ async def run_item(
 ) -> CallRow:
     """One call: forecast, extract, score. Every failure mode is a row status, never the end of the run."""
     async with semaphore:
-        if meter.exhausted:
-            return _row_for(item, STATUS_SKIPPED_SPEND_CAP)
+        if (stop_reason := meter.stop_reason) is not None:
+            row = _row_for(item, STATUS_SKIPPED_SPEND_CAP)
+            row.error = stop_reason
+            return row
         started = time.monotonic()
         row = _row_for(item, STATUS_API_ERROR)
         try:
@@ -214,7 +231,7 @@ async def run_item(
         except openai.OpenAIError as exc:  # litellm's whole exception family derives from openai's
             row.error = f"{type(exc).__name__}: {exc}"[:ERROR_TEXT_LIMIT]
         else:
-            meter.add(reply.cost_usd)
+            meter.add(reply.charged_usd)
             await _score_into(row, item, reply, parser_llm, model_name=model_name)
         row.elapsed_s = time.monotonic() - started
         return row

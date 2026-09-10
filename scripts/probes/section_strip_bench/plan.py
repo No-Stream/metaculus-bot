@@ -34,7 +34,8 @@ def anchored_clock(forecasting_window: str, today: str) -> Iterator[None]:
     original_window = prompts_module._forecasting_window_str
     original_today = prompts_module._today_str
 
-    def _recorded_window(_question: Any) -> str:
+    def _recorded_window(question: MetaculusQuestion) -> str:
+        del question
         return forecasting_window
 
     def _recorded_today() -> str:
@@ -87,9 +88,9 @@ def build_plan(questions: Sequence[BenchQuestion], arms: Sequence[str], seeds: i
         with anchored_clock(bench_question.forecasting_window, bench_question.today):
             base_prompts = {arm: render_prompt(bench_question.question, bench_question.arms[arm]) for arm in arms}
         for arm, base in base_prompts.items():
-            tokens = count_tokens(model, base)
             for seed in range(1, seeds + 1):
-                plan.append(PlanItem(bench_question, arm, seed, base + replicate_nonce(seed), tokens))
+                prompt = base + replicate_nonce(seed)
+                plan.append(PlanItem(bench_question, arm, seed, prompt, count_tokens(model, prompt)))
     return plan
 
 
@@ -174,6 +175,10 @@ def print_plan(plan: Sequence[PlanItem], estimate: Estimate, *, model: str, cap_
         f"  completion: {estimate.n_calls} x {estimate.output_tokens_per_call} tokens at "
         f"${estimate.price_out_usd_per_m}/M = ${estimate.completion_usd:.2f} "
         f"(reasoning tokens bill as completion; at 5x the assumption this line is ${5 * estimate.completion_usd:.2f})"
+    )
+    print(
+        "  not priced here: a reply whose fenced block fails to parse triggers one salvage call to the parser model,"
+        " billed to the same key and counted against the cap"
     )
     print(f"  total: ${estimate.total_usd:.2f}; cap ${cap_usd:.2f} fits {estimate.calls_under(cap_usd)} calls,")
     print(

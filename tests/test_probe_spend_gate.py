@@ -2,7 +2,7 @@
 
 Every credit spend in this repo goes through the operator (AGENTS.md, "Cost discipline"), so a
 script anyone may run must be structurally incapable of spending. Two probes have a gate worth
-pinning, one class each below.
+pinning, one class each below; the section-strip bench pins its own in tests/test_section_strip_bench.py.
 
 `gemini_verify.py` is the one script whose whole purpose is to spend: three live calls on the
 operator's personal Google AI Studio key, which is why it sits in the PAID list. Between a bare
@@ -108,18 +108,16 @@ class TestGeminiVerifyRefusesWithoutTheFlag:
         with pytest.raises(SystemExit) as exc:
             gemini_verify.main()
 
-        # Exit 2, not 1: the same code argparse uses for a usage error, because that is what this
-        # is — the flag is required and was not given.
+        # Exit 2 is argparse's usage-error code, and that is what a missing required flag is.
         assert exc.value.code == 2
-        # The client construction reads GOOGLE_API_KEY. Refusing BEFORE it runs is what makes the
-        # gate independent of whether a key happens to be in the environment.
+        # Refusing BEFORE the client reads GOOGLE_API_KEY keeps the gate independent of the environment.
         assert built == [], "the refusal path built a client, so the gate sits after the spend decision"
 
     def test_the_cost_estimate_prints_before_the_refusal(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        # The operator's "go" is given against a stated price, so the refusal has to say what the
-        # run would cost rather than only that it declined.
+        """The operator's "go" is given against a stated price, so the refusal has to say what the
+        run would cost rather than only that it declined."""
         monkeypatch.setattr(gemini_verify, "build_probe_client", lambda: pytest.fail("client built"))
         monkeypatch.setattr("sys.argv", ["gemini_verify.py"])
 
@@ -148,8 +146,7 @@ class TestGeminiVerifySpendsExactlyThreeCalls:
             "AGENTS.md's paid list both say three, and the operator's approval is given against "
             "that number"
         )
-        # Call 1 is the grounded search; calls 2 and 3 are the matched robots pair, and the ONLY
-        # difference between them is the target host — that is what makes the comparison a control.
+        # Calls 2 and 3 are the matched robots pair; only the target host differs, which is what makes it a control.
         urls = [c["contents"] for c in client.models.calls[1:]]
         assert gemini_verify.ROBOTS_ALLOWED_URL in str(urls[0])
         assert gemini_verify.ROBOTS_DISALLOWED_URL in str(urls[1])
@@ -205,9 +202,9 @@ class TestFetchDiagnosticForcesThePaidRungOff:
         session = refused_page_with_robots()
         monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
 
-        # The impersonated retry fires on the 403; make it decline without a network dial. The
-        # ``**kwargs`` swallows ``document_max_bytes`` whether or not the caller passes it yet.
         async def _still_refused(url: str, **kwargs: Any) -> Any:
+            """The impersonated retry fires on the 403; decline without a network dial (``**kwargs`` absorbs
+            ``document_max_bytes`` whether or not the caller passes it yet)."""
             del kwargs
             await asyncio.sleep(0)  # a real yield point, so the stub schedules like the transport
             return _impersonated(403, url=url)
@@ -334,8 +331,7 @@ class TestFetchDiagnosticVerdict:
         impersonated=200,
         ladder=_ladder("success", "impersonate", _attempt("impersonate", "success")),
     )
-    # The bls.gov PDF: the impersonated fetch worked, the local read fired after it and, with no
-    # query to select passages, digested to no_resolving_content, so the direct blocked stood.
+    # The bls.gov PDF: impersonation worked, the local read digested to no_resolving_content, so the direct blocked stood.
     RESCUED_PDF_ENDING_BLOCKED = _row(
         "https://www.bls.gov/news.release/pdf/wkstp.pdf",
         bot=403,
@@ -370,8 +366,7 @@ class TestFetchDiagnosticVerdict:
         impersonated=200,
         ladder=_ladder("blocked", "impersonate", _attempt("impersonate", "error")),
     )
-    # A genuine ImpersonatePinNotHeld decline: the rung fired and closed on the direct blocked,
-    # then Wayback served the page, so the FINAL status is success with the attempt still blocked.
+    # An ImpersonatePinNotHeld decline that Wayback then served: FINAL status success, the attempt still blocked.
     PIN_NOT_HELD_THEN_ARCHIVED = _row(
         "https://www.congress.gov/bill/119th-congress/house-bill/2913",
         bot=403,
@@ -396,8 +391,7 @@ class TestFetchDiagnosticVerdict:
         impersonated=200,
         ladder=_ladder("success", "direct"),
     )
-    # Not in the recovered population either (B was refused), yet the shipped rung got through:
-    # column B and column D diverging is itself a finding, so it is counted on its own.
+    # B was refused yet the shipped rung got through: columns B and D diverging is its own finding, counted apart.
     DIVERGENT = _row(
         "https://www.trueup.io/big-tech-hiring",
         bot=403,

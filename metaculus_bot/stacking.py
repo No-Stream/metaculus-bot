@@ -15,7 +15,7 @@ from forecasting_tools.data_models.numeric_report import Percentile
 
 from metaculus_bot.comment.markers import STACKED_BASE_REASONING_HEADER, STACKER_META_ANALYSIS_HEADER
 from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN, STACKER_SOFT_DEADLINE
-from metaculus_bot.forecaster_runners import build_parse_notes
+from metaculus_bot.forecaster_runners import BINARY_PARSE_NOTES, build_parse_notes
 from metaculus_bot.llm_retry import invoke_with_transient_retry
 from metaculus_bot.member_forecast import MEMBER_FORECAST_ROLE_STACKER, format_member_forecast_marker, option_vector
 from metaculus_bot.numeric.utils import clamp_and_renormalize_mc
@@ -98,15 +98,10 @@ async def run_stacking_binary(
         lambda: stacker_llm.invoke(prompt), wall_timeout=stacker_wall_timeout, label="stacker"
     )
 
-    parse_instructions = (
-        "Return a single JSON object only. Set `prediction_in_decimal` strictly as a decimal in [0,1] "
-        "(e.g., 0.17 for 17%). If the text contains 'Probability: NN%' or 'NN %', set `prediction_in_decimal` to NN/100. "
-        "Do not return percentages, strings, or any extra fields."
-    )
     outcome = await extract_binary(
         meta_reasoning,
         parser_llm,
-        prompt_notes=parse_instructions,
+        prompt_notes=BINARY_PARSE_NOTES,
         question_id=question.id_of_question,
         model_name=stacker_llm.model,
     )

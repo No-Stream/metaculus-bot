@@ -365,7 +365,7 @@ async def run_numeric_forecast(
         question_id=qid,
         model_name=forecaster_llm.model,
     )
-    prediction = _build_guarded_numeric_distribution(outcome.value, question, forecaster_llm)
+    prediction = build_guarded_numeric_distribution(outcome.value, question, model_name=forecaster_llm.model)
     return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning), discrete_vote
 
 
@@ -410,7 +410,7 @@ async def run_date_forecast(
         question_id=question.id_of_question,
         model_name=forecaster_llm.model,
     )
-    prediction = _build_guarded_numeric_distribution(outcome.value, epoch_question, forecaster_llm)
+    prediction = build_guarded_numeric_distribution(outcome.value, epoch_question, model_name=forecaster_llm.model)
     return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
 
 
@@ -519,29 +519,26 @@ async def _resolve_discrete_vote(
     return discrete_vote
 
 
-def _build_guarded_numeric_distribution(
-    declared_percentiles: list[Percentile], question: NumericQuestion, forecaster_llm: GeneralLlm
+def build_guarded_numeric_distribution(
+    declared_percentiles: list[Percentile], question: NumericQuestion, *, model_name: str
 ) -> NumericDistribution:
     """Sanitize -> build the PCHIP CDF -> withhold on a unit mismatch.
 
-    Shared by the numeric and date runners: on a date question ``question`` is the epoch-seconds
-    adapter, which is what makes the MEMBER_FORECAST line read ``qtype=date`` and the built
-    distribution carry ``is_date``. The line is emitted after the build so it can report the
-    CDF's out-of-range mass, and before the guard so a withheld member still leaves it.
+    Shared by the numeric and date runners, and by the offline section-strip bench: on a date question
+    ``question`` is the epoch-seconds adapter, which is what makes the MEMBER_FORECAST line read
+    ``qtype=date`` and the built distribution carry ``is_date``. The line is emitted after the build so
+    it can report the CDF's out-of-range mass, and before the guard so a withheld member still leaves
+    it. ``model_name`` labels the markers.
 
     The unit-mismatch guard fails SHUT: it raises rather than returning a distribution, so an
     order-of-magnitude error can never reach publish.
     """
-    sanitized_percentiles, zero_point = sanitize_percentiles(
-        declared_percentiles, question, model_name=forecaster_llm.model
-    )
-    prediction = build_numeric_distribution(
-        sanitized_percentiles, question, zero_point, model_name=forecaster_llm.model
-    )
+    sanitized_percentiles, zero_point = sanitize_percentiles(declared_percentiles, question, model_name=model_name)
+    prediction = build_numeric_distribution(sanitized_percentiles, question, zero_point, model_name=model_name)
     logger.info(
         format_member_forecast_marker(
             question_id=question.id_of_question,
-            model=forecaster_llm.model,
+            model=model_name,
             role=MEMBER_FORECAST_ROLE_MEMBER,
             qtype=numeric_qtype(question),
             raw=percentile_pairs(declared_percentiles),
@@ -561,5 +558,5 @@ def _build_guarded_numeric_distribution(
         )
 
     log_final_prediction(prediction, question)
-    log_open_bound_piling_diagnostics(prediction, question, forecaster_llm.model, sanitized_percentiles)
+    log_open_bound_piling_diagnostics(prediction, question, model_name, sanitized_percentiles)
     return prediction
