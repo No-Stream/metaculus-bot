@@ -28,7 +28,7 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
     URL_CONTEXT_SIZE_GATE_TOKENS,
 )
-from metaculus_bot.research import http_fetch, impersonated_fetch, rendered_fetch, robots_policy
+from metaculus_bot.research import http_fetch, impersonated_fetch, rendered_fetch, resolution_source, robots_policy
 from metaculus_bot.research import providers as research_providers
 from metaculus_bot.research.agentic import fetch_outcomes, local_document, provenance, tool_backends
 from metaculus_bot.research.agentic import tools as agentic_tools
@@ -50,7 +50,7 @@ from metaculus_bot.research.impersonated_fetch import (
     reset_impersonation_memo,
 )
 from tests.playwright_fakes import FakeBrowser, FakeChromium, FakePage, FakePlaywrightManager, install_fake_playwright
-from tests.resolution_source_fakes import _impersonated, fake_impersonated_fetch
+from tests.resolution_source_fakes import _escape_config, _impersonated, fake_impersonated_fetch
 from tests.test_document_text import build_text_pdf
 
 
@@ -3955,3 +3955,128 @@ class TestGapFillV2ImpersonatedRetry:
         via_body = await agentic_tools._plain_body_outcome(body, content_type, url)
 
         assert via_aiohttp == via_body
+
+
+class TestPlainHtmlExtractionPolicy:
+    """Item A: the loop's HTML path now runs Tier 1's free extraction steps.
+
+    `_plain_html_outcome` routes an HTML body through `resolution_source._extract_page_text`
+    (the ARIA-table rewrite plus the two-pass default/precision policy) and prepends the inline
+    chart-data read, and follows a `<meta http-equiv=refresh>` stub as a hop. Ported from the
+    resolution-source fetcher, where 33 of 80 rendered reads served under 500 chars because the
+    loop lacked these steps (fetch-gap inventory, 2026-09-09)."""
+
+    @staticmethod
+    def _serve_html(monkeypatch: pytest.MonkeyPatch, body: bytes) -> None:
+        session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/html"}))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+        monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=body))
+        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+
+    @pytest.mark.asyncio
+    async def test_the_html_path_runs_the_two_pass_extraction_policy(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The extraction is now `_extract_page_text` (which contains the ARIA rewrite and the
+        precision fallback), not a single default `_extract_main_text` call."""
+        body = b"<html><body><p>page</p></body></html>"
+        self._serve_html(monkeypatch, body)
+        spy = MagicMock(
+            return_value=resolution_source._PageExtraction(text="A calibrated extraction of the page body. " * 3)
+        )
+        monkeypatch.setattr("metaculus_bot.research.resolution_source._extract_page_text", spy)
+
+        result = await agentic_tools._fetch_plain("https://example.com/page")
+
+        assert result.status == "ok"
+        assert "A calibrated extraction of the page body." in result.text
+        # Called with the decoded html, the raw bytes, the url, and the undecodable ratio (0.0 here).
+        (call_args,) = spy.call_args_list
+        assert call_args.args[1] == body
+        assert call_args.args[2] == "https://example.com/page"
+        assert call_args.args[3] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_a_chrome_default_extraction_is_rescued_by_the_precision_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A default extraction that is a navigation tree (over the floor, chrome-shaped) is
+        re-extracted under precision, and the precision text publishes."""
+        chrome = "\n".join(["Home", "About us", "Contact", "Products", "Services", "Careers", "Blog"] * 12)
+        content = (
+            "The unemployment rate for May 2026 was reported at 4.1 percent, a revision from April's 4.0 "
+            "that the Bureau of Labor Statistics published in its monthly employment situation release "
+            "covering both the payroll survey and the household survey for the reference period. " * 2
+        )
+        self._serve_html(monkeypatch, b"<html><body><nav>menu</nav></body></html>")
+
+        def fake_extract(source: Any, url: str, *, favor_precision: bool = False) -> str:
+            return content if favor_precision else chrome
+
+        monkeypatch.setattr("metaculus_bot.research.resolution_source._extract_main_text", fake_extract)
+
+        result = await agentic_tools._fetch_plain("https://example.com/report")
+
+        assert result.status == "ok"
+        assert "unemployment rate for May 2026" in result.text
+        assert "About us" not in result.text
+
+    @pytest.mark.asyncio
+    async def test_inline_chart_data_is_read_and_leads_the_page(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A page whose prose carries none of the resolving figures still serves the series from
+        its inline chart config (q43949), and a page carrying a chart never escalates to render."""
+        config = {"series": [{"name": "Cases", "data": [["2024", 10], ["2025", 25], ["2026", 1240]]}]}
+        body = (
+            f"<html><body><nav>menu</nav>"
+            f'<div class="charts-highchart" data-chart="{_escape_config(config)}"></div></body></html>'
+        ).encode()
+        self._serve_html(monkeypatch, body)
+        monkeypatch.setattr("metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value=None))
+
+        result = await agentic_tools._fetch_plain("https://example.com/tracker")
+
+        assert result.status == "ok"
+        assert "2026=1240" in result.text
+        assert result.escalate_rendered is False
+
+    @pytest.mark.asyncio
+    async def test_an_aria_table_becomes_readable_content(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A `<div role="table">` stat block is rewritten to a real table before extraction, so
+        its cell value survives (real trafilatura, no `_extract_main_text` patch)."""
+        body = (
+            b"<html><body><div role='table'>"
+            b"<div role='row'><div role='columnheader'>Metric</div><div role='columnheader'>Value</div></div>"
+            b"<div role='row'><div role='cell'>Hospitalizations</div><div role='cell'>922</div></div>"
+            b"</div></body></html>"
+        )
+        self._serve_html(monkeypatch, body)
+
+        result = await agentic_tools._fetch_plain("https://www.cdc.gov/outbreak")
+
+        assert "Hospitalizations" in result.text
+        assert "922" in result.text
+
+    @pytest.mark.asyncio
+    async def test_a_meta_refresh_stub_is_followed_as_one_hop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A 200 whose only content is a `<meta http-equiv=refresh>` stub (a cdc.gov surveillance
+        page) hops once to the target through this ladder's own re-guarded redirect loop."""
+        stub = b"<html><head><meta http-equiv='refresh' content='0; url=/real/page'></head><body></body></html>"
+        target = b"<html><body><p>resolving content</p></body></html>"
+        session = _FakeSession(
+            _FakeResponse(status=200, headers={"Content-Type": "text/html"}),
+            _FakeResponse(status=200, headers={"Content-Type": "text/html"}),
+        )
+        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+        monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(side_effect=[stub, target]))
+        monkeypatch.setattr(
+            "metaculus_bot.research.resolution_source._extract_main_text",
+            MagicMock(side_effect=[None, "Resolving content read from the refresh target. " * 3]),
+        )
+        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+
+        result = await agentic_tools._fetch_plain("https://example.com/stub")
+
+        assert result.status == "ok"
+        assert result.url == "https://example.com/real/page"
+        assert "Resolving content read from the refresh target." in result.text
+        assert session.calls == [("https://example.com/stub", False), ("https://example.com/real/page", False)]

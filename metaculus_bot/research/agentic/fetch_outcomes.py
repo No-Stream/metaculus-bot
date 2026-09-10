@@ -32,7 +32,8 @@ import aiohttp
 
 from metaculus_bot.constants import GAP_FILL_V2_MIN_CONTENT_CHARS, MANTIC_HOST, METACULUS_HOST
 from metaculus_bot.research import resolution_source
-from metaculus_bot.research.http_fetch import MAX_UNDECODABLE_CHAR_RATIO
+from metaculus_bot.research.http_fetch import MAX_UNDECODABLE_CHAR_RATIO, meta_refresh_target
+from metaculus_bot.research.resolution_chart_data import render_inline_chart_data
 from metaculus_bot.research.resolution_fetch_result import PDF_CONTENT_TYPES
 
 _FETCH_LINK_CAP = 25
@@ -276,7 +277,14 @@ async def _plain_redirect_outcome(
             url=current_url,
             content_type=content_type or None,
         )
-    next_url = urljoin(current_url, location)
+    return await _vet_hop_target(location, current_url, content_type)
+
+
+async def _vet_hop_target(target: str, current_url: str, content_type: str) -> PlainFetchResult | str:
+    """The absolute next URL for a derived hop (a ``Location`` header or a meta-refresh tag), or
+    the terminal refusal it earns — one home for the SSRF + platform re-guard every derived hop
+    owes before the redirect loop dials it, mirroring ``resolution_source._vetted_hop_target``."""
+    next_url = urljoin(current_url, target)
     if not await resolution_source.is_public_http_url(next_url):
         return PlainFetchResult(
             status="blocked",
@@ -286,8 +294,6 @@ async def _plain_redirect_outcome(
             url=next_url,
             content_type=content_type or None,
         )
-    # A 3xx to a question-platform host must not be followed either (same
-    # our-IP / no-new-info rationale as the initial-URL block).
     blocked = _fetch_plain_url_block(next_url)
     if blocked is not None:
         return PlainFetchResult(
@@ -301,34 +307,49 @@ async def _plain_redirect_outcome(
     return next_url
 
 
-async def _plain_html_outcome(body: bytes, html: str, content_type: str, current_url: str) -> PlainFetchResult:
-    """Outcome for an HTML body: trafilatura main text plus the page's links."""
-    extracted = await asyncio.to_thread(resolution_source._extract_main_text, body, current_url)
-    text = extracted or ""
+async def _plain_html_outcome(
+    body: bytes, html: str, content_type: str, current_url: str, *, undecodable_ratio: float
+) -> PlainFetchResult | str:
+    """Outcome for an HTML body: Tier 1's calibrated extraction plus the page's links.
+
+    The extraction is ``resolution_source._extract_page_text`` (ARIA-role tables rewritten to
+    real tables first, default recall then a precision fallback scored by line shape), and the
+    page's inline chart configuration is read on every page (``render_inline_chart_data``, led,
+    the resolving series lives only there on some dashboards). A page the policy judges chrome
+    with no chart block to carry its numbers is ``empty`` and escalates to the rendered rung; a
+    ``<meta http-equiv=refresh>`` stub with nothing else is followed as a next hop through this
+    ladder's own re-guarded redirect loop (a ``str``), the cdc.gov surveillance-stub rescue.
+    """
+    extraction = await asyncio.to_thread(
+        resolution_source._extract_page_text, html, body, current_url, undecodable_ratio
+    )
+    chart_block = await asyncio.to_thread(render_inline_chart_data, html)
     links = _extract_links_from_html(html, current_url)
-    if not text.strip():
-        # No extractable text on a 200 OK (JS wall, consent
-        # gate, empty body). A distinct "empty" status keeps
-        # the ladder escalating to the rendered rung while
-        # barring this outcome from the status=="ok" tier
-        # grant — an unread page must never be "fetched".
+    published = "" if extraction.chrome_metric_withheld else (extraction.text or "").strip()
+    text = "\n\n".join(part for part in (chart_block, published) if part)
+    if text:
         return PlainFetchResult(
-            status="empty",
+            status="ok",
             method="plain",
-            text="Plain fetch returned no extractable text.",
+            text=text,
             links=links,
             url=current_url,
             content_type=content_type or None,
-            escalate_rendered=True,
+            # A chart block never escalates: a render would replace the client-side series with a DOM lacking it (q43949).
+            escalate_rendered=len(text) < _FETCH_MIN_CONTENT_CHARS and not chart_block,
         )
+    refresh_target = meta_refresh_target(html)
+    if refresh_target is not None:
+        return await _vet_hop_target(refresh_target, current_url, content_type)
+    # "empty" (not "ok") keeps the ladder escalating to the rendered rung while barring the tier grant on an unread page.
     return PlainFetchResult(
-        status="ok",
+        status="empty",
         method="plain",
-        text=text,
+        text="Plain fetch returned no extractable text.",
         links=links,
         url=current_url,
         content_type=content_type or None,
-        escalate_rendered=len(text.strip()) < _FETCH_MIN_CONTENT_CHARS,
+        escalate_rendered=True,
     )
 
 

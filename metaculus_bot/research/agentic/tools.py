@@ -303,7 +303,7 @@ async def _plain_response_outcome(resp: aiohttp.ClientResponse, current_url: str
     return await _plain_body_outcome(body, content_type, current_url)
 
 
-async def _plain_body_outcome(body: bytes, content_type: str, current_url: str) -> PlainFetchResult:
+async def _plain_body_outcome(body: bytes, content_type: str, current_url: str) -> PlainFetchResult | str:
     """Classify a body this ladder already holds, whichever transport read it.
 
     The bytes-level tail of :func:`_plain_response_outcome`, split from the read so the
@@ -314,6 +314,9 @@ async def _plain_body_outcome(body: bytes, content_type: str, current_url: str) 
     ``image/webp`` or ``image/svg+xml`` has no magic bytes the sniff below knows, and without the
     header clause the impersonated path reported it as an unsupported type where the aiohttp path
     escalated it to ``read_document``.
+
+    Returns a ``str`` on one shape only: an HTML body whose sole content is a meta-refresh stub,
+    the vetted next URL the redirect loop follows (:func:`fetch_outcomes._plain_html_outcome`).
     """
     if _content_type_is_pdf(content_type) or is_pdf_body(body):
         # Local extraction first, whether the header said PDF or only the magic bytes did.
@@ -329,7 +332,7 @@ async def _plain_body_outcome(body: bytes, content_type: str, current_url: str) 
     # from `_extract_main_text`, which decodes the raw bytes itself.
     html, undecodable_ratio = decode_text_body(body, content_type)
     if any(token in content_type for token in _HTML_CONTENT_TYPE_TOKENS) or "<html" in html.lower():
-        return await _plain_html_outcome(body, html, content_type, current_url)
+        return await _plain_html_outcome(body, html, content_type, current_url, undecodable_ratio=undecodable_ratio)
     if any(token in content_type for token in _TEXTUAL_CONTENT_TYPE_TOKENS) or not content_type:
         return _plain_textual_outcome(html, undecodable_ratio, content_type, current_url)
     return PlainFetchResult(
@@ -525,6 +528,9 @@ async def _try_impersonated_fetch(url: str, *, deadline_monotonic_s: float | Non
         )
         return None
     result = await _plain_body_outcome(response.body, response.content_type, response.url)
+    if isinstance(result, str):
+        # A meta-refresh stub reached the impersonated 200; this retry has no redirect loop to follow it, so decline.
+        return None
     if result.method == "plain":
         result.method = "impersonate"
     return result
