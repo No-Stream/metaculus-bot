@@ -1702,15 +1702,22 @@ class TestCredit:
 CREDIT_ROLE_SPEND_LINE = (
     PFX + "CREDIT_ROLE_SPEND: role=forecaster:openai key=donated usd=0.2030 calls=2 costed_calls=2 byok_usd=0.2000"
     " prompt_tokens=104000 completion_tokens=12500 cached_tokens=0 reasoning_tokens=11000"
-    " charged_usd=0.2030 byok_calls=2"
+    " charged_usd=0.2030 byok_calls=2 max_prompt_tokens=52000"
 )
 CREDIT_ROLE_SPEND_NA_LINE = (
     PFX + "CREDIT_ROLE_SPEND: role=perplexity_research key=direct usd=n/a calls=2 costed_calls=0 byok_usd=n/a"
     " prompt_tokens=0 completion_tokens=0 cached_tokens=0 reasoning_tokens=0 charged_usd=n/a byok_calls=0"
+    " max_prompt_tokens=0"
 )
 # The pre-2026-09-09 shape, still in the archive: neither the token tail nor the charged tail.
 CREDIT_ROLE_SPEND_PRE_TOKENS_LINE = (
     PFX + "CREDIT_ROLE_SPEND: role=forecaster:google key=personal usd=1.1433 calls=4 costed_calls=4 byok_usd=0.5716"
+)
+# The 2026-09-09 morning shape (commits 292b340 and f4fa773): both tails but no max_prompt_tokens yet.
+CREDIT_ROLE_SPEND_PRE_MAX_PROMPT_LINE = (
+    PFX + "CREDIT_ROLE_SPEND: role=forecaster:openai key=donated usd=0.2030 calls=2 costed_calls=2 byok_usd=0.2000"
+    " prompt_tokens=104000 completion_tokens=12500 cached_tokens=0 reasoning_tokens=11000"
+    " charged_usd=0.2030 byok_calls=2"
 )
 CREDIT_ROLE_SPEND_EMPTY_LEDGER_LINE = (
     PFX + "CREDIT_ROLE_SPEND: no successful LLM completions reached the litellm success callback this run"
@@ -1731,6 +1738,14 @@ class TestCreditRoleSpend:
         assert (rec["prompt_tokens"], rec["completion_tokens"]) == (104000, 12500)
         assert (rec["cached_tokens"], rec["reasoning_tokens"]) == (0, 11000)
         assert (rec["charged_usd"], rec["byok_calls"]) == (0.2030, 2)
+        assert rec["max_prompt_tokens"] == 52000
+
+    def test_row_without_max_prompt_tokens_reads_none_for_it(self):
+        """The first 2026-09-09 shape carried the token and charged tails but not the packet-size
+        maximum; those rows keep harvesting with ``max_prompt_tokens`` None, never a fake zero."""
+        rec = _parse_one(CREDIT_ROLE_SPEND_PRE_MAX_PROMPT_LINE)
+        assert (rec["charged_usd"], rec["byok_calls"]) == (0.2030, 2)
+        assert rec["max_prompt_tokens"] is None
 
     def test_pre_token_rows_still_parse_with_the_new_fields_absent(self):
         """Both 2026-09-09 tails are optional; the 44 archived rows before them must keep harvesting,
@@ -1748,6 +1763,7 @@ class TestCreditRoleSpend:
             assert rec[field] is None, field
         assert rec["charged_usd"] is None
         assert rec["byok_calls"] is None
+        assert rec["max_prompt_tokens"] is None
 
     def test_uncosted_row_reads_none_not_zero(self):
         """``n/a`` is the whole point of ``costed_calls``: the calls happened, the dollars are unknown, and a
@@ -1777,6 +1793,41 @@ class TestCreditRoleSpend:
         file."""
         harvested = parse_log_text("\n".join([CREDIT_SPEND_LINE, CREDIT_ROLE_SPEND_LINE]) + "\n", **_META)
         assert len(harvested["credit_spend"]) == 1
+        assert len(harvested["credit_role_spend"]) == 1
+
+
+# Verbatim from credit_telemetry.py:_alert_on_oversized_prompt; the v2 driver stamps a question, every other role reads n/a.
+PROMPT_SIZE_ALERT_LINE = (
+    PFX_WARN + "PROMPT_SIZE_ALERT: role=gap_fill_v2_driver question=https://www.metaculus.com/questions/38975/"
+    " prompt_tokens=160000 threshold=150000"
+)
+PROMPT_SIZE_ALERT_NO_QUESTION_LINE = (
+    PFX_WARN + "PROMPT_SIZE_ALERT: role=forecaster:anthropic question=n/a prompt_tokens=512000 threshold=150000"
+)
+
+
+class TestPromptSizeAlert:
+    def test_fields_and_post_id_question_ref(self):
+        rec = _parse_one(PROMPT_SIZE_ALERT_LINE)
+        assert rec["marker"] == "prompt_size_alert"
+        assert rec["role"] == "gap_fill_v2_driver"
+        assert (rec["prompt_tokens"], rec["threshold"]) == (160000, 150000)
+        # Same log_prefix ref as the ghost markers: a Metaculus post id off page_url.
+        assert rec["qid"] == 38975
+        assert rec["qid_kind"] == "post_id"
+
+    def test_roster_call_without_a_question_keeps_the_field_as_none(self):
+        """A roster LLM cannot stamp its question; the emitter writes ``n/a`` rather than dropping
+        the field, and the sentinel harvests as None with no qid."""
+        rec = _parse_one(PROMPT_SIZE_ALERT_NO_QUESTION_LINE)
+        assert rec["role"] == "forecaster:anthropic"
+        assert rec["question"] == "n/a"
+        assert rec["qid"] is None
+        assert rec["prompt_tokens"] == 512000
+
+    def test_does_not_steal_the_credit_markers_beside_it(self):
+        harvested = parse_log_text("\n".join([PROMPT_SIZE_ALERT_LINE, CREDIT_ROLE_SPEND_LINE]) + "\n", **_META)
+        assert len(harvested["prompt_size_alert"]) == 1
         assert len(harvested["credit_role_spend"]) == 1
 
 

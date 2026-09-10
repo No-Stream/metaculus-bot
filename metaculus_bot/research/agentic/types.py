@@ -145,6 +145,8 @@ class LoopConfig:
     # forever on conclude attempts. Budget-exhaustion conclusions bypass the gate
     # entirely and never count against this cap.
     max_conclude_gate_rejections: int = 2
+    # The question ref the transport stamps on each call's ledger metadata, so PROMPT_SIZE_ALERT can name it.
+    question_ref: str | None = None
 
 
 @dataclass(slots=True)

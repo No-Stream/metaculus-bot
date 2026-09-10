@@ -285,6 +285,9 @@ OPENROUTER_CREDIT_FLOOR_USD: float = _float_env("OPENROUTER_CREDIT_FLOOR_USD", 1
 # Suppresses the ALERTS, never the CREDIT_* logs. Receipt: docs/constants.md "CREDIT_ALERT_RESUME_DATE".
 CREDIT_ALERT_RESUME_DATE: date = _date_env("OPENROUTER_CREDIT_ALERT_RESUME_DATE", date(2026, 9, 3))
 
+# Well above the 41k gap-fill v2 peak, so a fire is a blow-up. Receipt: docs/constants.md "PROMPT_TOKENS_ALERT_THRESHOLD".
+PROMPT_TOKENS_ALERT_THRESHOLD: int = 150_000
+
 
 def credit_alerts_active(today: date | None = None) -> bool:
     """Whether credit shortfalls should still exit non-zero.

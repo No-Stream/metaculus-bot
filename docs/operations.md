@@ -1509,6 +1509,13 @@ How the number is produced, because it decides how to read it:
 - Dollar figures on these lines render at four decimals, not the balance lines'
   two, because a per-role figure is a fraction of a cent per call: the parser
   costs about $0.0005 a question.
+- `max_prompt_tokens` on each row is the largest single prompt that role sent
+  this run, the packet-size read a summed `prompt_tokens` hides, and the same
+  callback logs `PROMPT_SIZE_ALERT` (WARNING) for any one call whose prompt
+  exceeds `PROMPT_TOKENS_ALERT_THRESHOLD` (150k; the forecaster prompt is about
+  17k and the v2 loop peaks near 41k). The alert names the question only when the
+  call site stamped one, which today is the v2 driver alone; it reads, never gates.
+  Field detail: `docs/telemetry_markers.md` "PROMPT_SIZE_ALERT".
 - Not on OpenRouter, so never in this ledger: Gemini grounded search and gap-fill
   v2's `read_document` (google-genai on the personal Google AI Studio key), the
   AskNews subscription, Exa. The ledger is therefore an OpenRouter-only figure,

@@ -201,6 +201,24 @@ class TestKeyRouting:
         )
 
     @pytest.mark.asyncio
+    async def test_question_ref_on_the_config_is_stamped_on_every_call(
+        self, acompletion: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The driver is the one transport built per question, so it is the one that can name the
+        question a PROMPT_SIZE_ALERT fired on."""
+        _set_keys(monkeypatch, donated=None, personal=_PERSONAL)
+        monkeypatch.setattr(agentic_llm, "should_route_via_donated_key", lambda model: False)
+        config = LoopConfig(model="openai/gpt-5.6-luna", question_ref="https://www.metaculus.com/questions/650/")
+
+        await agentic_llm.build_default_llm_call(config)(_messages(), None)
+
+        assert _last_kwargs(acompletion)["metadata"] == llm_call_metadata(
+            agentic_llm.GAP_FILL_V2_DRIVER_ROLE,
+            PERSONAL_KEY_ALIAS,
+            question_ref="https://www.metaculus.com/questions/650/",
+        )
+
+    @pytest.mark.asyncio
     async def test_fallback_is_counted_and_logged_like_the_wrapper(
         self, acompletion: AsyncMock, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:

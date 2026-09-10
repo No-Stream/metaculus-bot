@@ -83,6 +83,7 @@ incidents behind the design.
 | `AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED` | `research/agentic/tools.py:read_document` | The `read_document` twin of `GEMINI_UNGROUNDED_SUPPRESSED`. |
 | `GAP_FILL_ANALYZER_FAILED` | `research/targeted.py:run_gap_fill_pass` | Gap-fill v1's analyzer died. |
 | `CREDIT_BALANCE` / `CREDIT_SPEND` / `CREDIT_ROLE_SPEND` / `CREDIT_FLOOR_BREACH` | `credit_telemetry.py` | OpenRouter credit balance, spend, per-role spend, and floor-breach markers. |
+| `PROMPT_SIZE_ALERT` | `credit_telemetry.py:_alert_on_oversized_prompt` | Per-call WARN: one LLM call's prompt exceeded `PROMPT_TOKENS_ALERT_THRESHOLD`. |
 | `DONATED_KEY_STATE` | `credit_telemetry.py:classify_donated_key_state` | Per-run, at most once: the `/auth/key` probe's verdict on the donated key. |
 | `LITELLM_CALLBACK_DRAIN_TIMEOUT` | `credit_telemetry.py:drain_litellm_callbacks` | Per-run completeness flag on that run's `CREDIT_ROLE_SPEND` rows. |
 | `STACKER_OUTCOME` / `STACKER_SKIP_REASON` / `TOOLS_USED` / `FORECASTERS_USED` | `comment/markers.py` | HTML-comment markers injected into the published Metaculus comment; see "HTML-comment markers" below. |
@@ -1233,6 +1234,28 @@ pass had to FIT the gap-fill v2 driver's output tokens and could only infer that
 was active (`scratch/cost_pass_2026-09-09/v2_cost_anatomy.md`); with these fields both are read
 straight off the ledger. The tail is one optional regex group, so the 44 rows archived before it
 still harvest, with the four token fields coerced to None ("this run predates the field").
+
+`max_prompt_tokens`, added later on 2026-09-09 as a third optional tail, is the largest single
+prompt among the row's calls. It exists because `prompt_tokens` is a sum: the gap-fill v2 driver's
+41k-token last research turn is invisible inside its 300k-token row total, and the packet-size
+question ("is any single prompt approaching the size that degrades the model?") needs the maximum,
+not the sum. `PROMPT_SIZE_ALERT` below is the same measurement fired per call when it crosses the
+threshold; this field is how a run that never fired still reports how close it came.
+
+### PROMPT_SIZE_ALERT
+
+Per-call WARNING from `credit_telemetry.py:_alert_on_oversized_prompt`, called by the
+`RoleSpendTracker` success callback whenever one completion's `usage.prompt_tokens` exceeds
+`PROMPT_TOKENS_ALERT_THRESHOLD` (150k; docs/constants.md has the sizing against the measured 17k
+forecaster prompt and 41k v2 peak). `role` is the ledger role of the call; `question` is the
+question ref when the call site stamped one and `n/a` otherwise. Today only the gap-fill v2 driver
+stamps it (`llm_call_metadata(..., question_ref=)` through `LoopConfig.question_ref`, the same
+`page_url` ref its `log_prefix` carries, so `qid_kind` is `post_id`); the roster `GeneralLlm`
+objects are built once per process and cannot know their question, so a forecaster alert reads
+`question=n/a` and is placed by the log lines around it. `prompt_tokens` and `threshold` are both
+on the line so the archive records what the bar was when it fired. Non-alertable: the call has
+already been billed, so the line reads and never gates, and it enters no degradation counter.
+Registered 2026-09-09 and has never fired; a first record is itself the finding.
 
 ### CREDIT_FLOOR_BREACH
 

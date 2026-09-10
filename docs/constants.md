@@ -297,6 +297,19 @@ only once the key was already dry.
 The floor is meaningless for the personal key, which has no `limit_remaining`, so it is only checked
 against the donated key. See `metaculus_bot/credit_telemetry.py`.
 
+### PROMPT_TOKENS_ALERT_THRESHOLD
+
+The prompt size above which one LLM call logs a `PROMPT_SIZE_ALERT` WARNING from the role-ledger
+callback (`credit_telemetry.py`, `RoleSpendTracker`). The 2026-09-09 cost pass measured the largest
+prompts any role sends: the forecaster prompt at about 17k tokens and the gap-fill v2 loop peaking near
+41k on its last research turn (`scratch/cost_pass_2026-09-09/v2_cost_anatomy.md`). 150k is well above
+both, so a fire means a packet blew up (a runaway bundle, a tool-result loop) rather than normal
+variance, and it sits below the 500k the operator named as the size that would degrade model
+performance. It reads, never gates: the call is already billed when the callback sees its usage, so the
+alert is a log line and enters no degradation counter. The per-role `max_prompt_tokens` field on
+`CREDIT_ROLE_SPEND` is the same measurement summarised per run, so the threshold can be re-sized from
+the archive.
+
 ### CREDIT_ALERT_RESUME_DATE
 
 Dated suppression of the credit alerts, not of the logs. Before this date the two paths that turn a

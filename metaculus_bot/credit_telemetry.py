@@ -48,6 +48,7 @@ from metaculus_bot.check_openrouter_credits import KEY_SPECS, fetch_auth_key
 from metaculus_bot.constants import (
     CREDIT_ALERT_RESUME_DATE,
     OPENROUTER_CREDIT_FLOOR_USD,
+    PROMPT_TOKENS_ALERT_THRESHOLD,
     donated_openrouter_key_enabled,
 )
 
@@ -357,6 +358,8 @@ def classify_donated_key_state() -> DonatedKeyState:
 # These name litellm ``metadata=`` FIELDS; the ``KEY_SPECS`` aliases below name KEYS.
 ROLE_METADATA_KEY: str = "role"
 KEY_ALIAS_METADATA_KEY: str = "key_alias"
+# Stamped per call by the one builder that knows its question (the v2 driver); absent on the roster LLMs.
+QUESTION_METADATA_KEY: str = "question"
 
 # The ``KEY_SPECS`` aliases verbatim, so ``CREDIT_ROLE_SPEND key=`` joins onto ``CREDIT_SPEND key=``.
 DONATED_KEY_ALIAS: str = "donated"
@@ -371,24 +374,20 @@ UNTAGGED_ROLE: str = "untagged"
 LITELLM_CALLBACK_DRAIN_TIMEOUT_S: float = 10.0
 
 
-def llm_call_metadata(role: str | None, key_alias: str) -> dict[str, str]:
+def llm_call_metadata(role: str | None, key_alias: str, *, question_ref: str | None = None) -> dict[str, str]:
     """The litellm ``metadata=`` payload that tags every completion for the role ledger.
 
-    Roles in use (descriptive, one per spend line; ``forecaster:<vendor>`` for the
-    roster slots, derived from the slug by ``llm_configs.forecaster_role`` so a roster
-    swap cannot mislabel a slot): ``forecaster:openai`` / ``forecaster:anthropic`` / ``forecaster:google``,
-    ``stacker``, ``stacker_fallback``, ``parser``, ``summarizer``, ``crux_analyzer``,
-    ``native_search``, ``targeted_search``, ``gap_fill_analyzer``, ``gap_fill_resolver``,
-    ``gap_fill_v2_driver``, ``market_query_author``, ``market_ranker``,
-    ``financial_classifier``, ``perplexity_research``. ``role=None`` tags ``untagged`` HERE,
-    at construction, so every metaculus_bot-built LLM carries an explicit token and an
-    ``untagged`` row in a run log means one builder call site forgot its ``role=``.
-
-    Not on OpenRouter, so never in this ledger: the Gemini grounded-search provider and
-    gap-fill v2's ``read_document`` (google-genai on the personal Google AI Studio key),
-    AskNews (subscription), Exa (``search_web``).
+    ``role=None`` tags ``untagged`` HERE, at construction, so an ``untagged`` row in a run
+    log means one builder call site forgot its ``role=``. ``question_ref`` rides a third key
+    when the caller knows it (the v2 driver builds its call per question; the roster
+    ``GeneralLlm`` objects are built once per process and cannot) and ``PROMPT_SIZE_ALERT``
+    reads it back. The role vocabulary and what never reaches this ledger:
+    docs/operations.md "Per-role spend".
     """
-    return {ROLE_METADATA_KEY: role or UNTAGGED_ROLE, KEY_ALIAS_METADATA_KEY: key_alias}
+    metadata = {ROLE_METADATA_KEY: role or UNTAGGED_ROLE, KEY_ALIAS_METADATA_KEY: key_alias}
+    if question_ref is not None:
+        metadata[QUESTION_METADATA_KEY] = question_ref
+    return metadata
 
 
 def plain_llm_key_alias(model: str) -> str:
@@ -436,6 +435,7 @@ class _RoleSpendAccumulator:
     byok_usd: float = 0.0
     charged_usd: float = 0.0
     tokens: TokenCounts = field(default_factory=TokenCounts)
+    max_prompt_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -447,7 +447,8 @@ class RoleSpendRow:
     2026-09-09 ``charged_usd`` is the money actually charged (``cost`` plus, on a BYOK call only,
     the upstream cost) and ``byok_calls`` says how many of ``calls`` routed BYOK. The three
     dollar fields are ``None`` when no call carried cost data (rendered ``n/a``), never a
-    fabricated zero.
+    fabricated zero. ``max_prompt_tokens`` is the largest single prompt among the row's calls,
+    the packet-size read that a summed ``tokens.prompt`` hides.
     """
 
     role: str
@@ -459,6 +460,7 @@ class RoleSpendRow:
     tokens: TokenCounts
     charged_usd: float | None
     byok_calls: int
+    max_prompt_tokens: int
 
 
 _role_spend: dict[tuple[str, str], _RoleSpendAccumulator] = {}
@@ -485,6 +487,7 @@ def record_llm_call_spend(
     accumulator.calls += 1
     accumulator.byok_calls += is_byok
     accumulator.tokens = accumulator.tokens + tokens
+    accumulator.max_prompt_tokens = max(accumulator.max_prompt_tokens, tokens.prompt)
     if cost_usd is None and byok_upstream_usd is None:
         return
     accumulator.costed_calls += 1
@@ -507,6 +510,7 @@ def role_spend_rows() -> list[RoleSpendRow]:
             tokens=acc.tokens,
             charged_usd=acc.charged_usd if acc.costed_calls else None,
             byok_calls=acc.byok_calls,
+            max_prompt_tokens=acc.max_prompt_tokens,
         )
         for (role, key_alias), acc in _role_spend.items()
     ]
@@ -538,7 +542,7 @@ def log_role_spend() -> None:
         logger.info(
             "CREDIT_ROLE_SPEND: role=%s key=%s usd=%s calls=%d costed_calls=%d byok_usd=%s"
             " prompt_tokens=%d completion_tokens=%d cached_tokens=%d reasoning_tokens=%d"
-            " charged_usd=%s byok_calls=%d",
+            " charged_usd=%s byok_calls=%d max_prompt_tokens=%d",
             row.role,
             row.key_alias,
             _fmt_usd(row.usd),
@@ -551,6 +555,7 @@ def log_role_spend() -> None:
             row.tokens.reasoning,
             _fmt_usd(row.charged_usd),
             row.byok_calls,
+            row.max_prompt_tokens,
         )
 
 
@@ -591,6 +596,19 @@ def _openrouter_call_usage(response_obj: Any) -> _CallUsage:
     )
 
 
+def _alert_on_oversized_prompt(role: str, question_ref: str | None, prompt_tokens: int) -> None:
+    """WARN once per call whose prompt exceeds the threshold; the call is already billed, so this reads, never gates."""
+    if prompt_tokens <= PROMPT_TOKENS_ALERT_THRESHOLD:
+        return
+    logger.warning(
+        "PROMPT_SIZE_ALERT: role=%s question=%s prompt_tokens=%d threshold=%d",
+        role,
+        question_ref or "n/a",
+        prompt_tokens,
+        PROMPT_TOKENS_ALERT_THRESHOLD,
+    )
+
+
 class RoleSpendTracker(CustomLogger):
     """litellm success callback feeding the role ledger. Install once via
     :func:`install_role_spend_tracker`."""
@@ -600,15 +618,17 @@ class RoleSpendTracker(CustomLogger):
     ) -> None:
         del start_time, end_time  # CustomLogger hook signature; the ledger is not timed
         metadata = (kwargs.get("litellm_params") or {}).get("metadata") or {}
+        role = metadata.get(ROLE_METADATA_KEY, UNTAGGED_ROLE)
         usage = _openrouter_call_usage(response_obj)
         record_llm_call_spend(
-            metadata.get(ROLE_METADATA_KEY, UNTAGGED_ROLE),
+            role,
             metadata.get(KEY_ALIAS_METADATA_KEY, UNKNOWN_KEY_ALIAS),
             cost_usd=usage.cost_usd,
             byok_upstream_usd=usage.byok_upstream_usd,
             is_byok=usage.is_byok,
             tokens=usage.tokens,
         )
+        _alert_on_oversized_prompt(role, metadata.get(QUESTION_METADATA_KEY), usage.tokens.prompt)
 
 
 def install_role_spend_tracker() -> None:
@@ -621,20 +641,12 @@ def install_role_spend_tracker() -> None:
 async def drain_litellm_callbacks(timeout_s: float = LITELLM_CALLBACK_DRAIN_TIMEOUT_S) -> None:
     """Wait for litellm's logging worker to deliver every pending success callback.
 
-    Must run INSIDE the event loop the completions ran on: the worker's queue is bound to
-    that loop and is reset (dropping whatever is queued) when a different loop shows up.
-    litellm enqueues each callback from a ``create_task``, so yield to the loop first —
-    otherwise ``flush`` can find an empty queue with the enqueue still a tick away — then
-    join the queue, bounded so telemetry can never hold the end of a run hostage.
-
-    The bound is caught HERE, not at the call site, so every caller inherits the promise
-    this docstring makes. Its one caller awaits this from a ``finally``
-    (``cli._forecast_with_callback_drain``) and nothing between there and process exit
-    catches, so a raise would discard a fully published run's reports and skip
-    ``log_report_summary`` plus the whole degradation/exit block — the q45085 failure
-    shape, on a run where every question published — or, on a run that was already
-    failing, demote the real forecast error to ``__context__``. ``CancelledError`` is a
-    ``BaseException`` and still propagates, so the GHA SIGTERM path is unaffected.
+    Must run INSIDE the event loop the completions ran on (the worker's queue is bound to
+    it), after yielding twice so the ``create_task`` enqueue has landed, and bounded so
+    telemetry can never hold the end of a run hostage. The timeout is swallowed HERE, not
+    at the call site: the one caller awaits this from ``cli._forecast_with_callback_drain``'s
+    ``finally``, where a raise would discard a fully published run's reports (the q45085
+    shape). ``CancelledError`` still propagates. Detail: docs/operations.md "Per-role spend".
     """
     for _ in range(2):
         await asyncio.sleep(0)

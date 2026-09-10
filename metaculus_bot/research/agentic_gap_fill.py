@@ -105,6 +105,7 @@ async def run_gap_fill_v2(
         system_prompt = build_system_prompt(today)
         user_brief = build_user_brief(question, bundle_markdown)
         tools = build_gap_fill_tools(question.question_text)
+        question_ref = question.page_url or str(question.id_of_question)
         config = LoopConfig(
             model=GAP_FILL_V2_DRIVER_MODEL,
             reasoning_effort=GAP_FILL_V2_DRIVER_EFFORT,
@@ -112,8 +113,8 @@ async def run_gap_fill_v2(
             wall_deadline_s=GAP_FILL_V2_WALL_DEADLINE,
             conclude_threshold_s=GAP_FILL_V2_CONCLUDE_THRESHOLD,
             max_gaps=GAP_FILL_V2_MAX_GAPS,
+            question_ref=question_ref,
         )
-        question_ref = question.page_url or str(question.id_of_question)
         result = await run_agentic_loop(
             system_prompt,
             user_brief,

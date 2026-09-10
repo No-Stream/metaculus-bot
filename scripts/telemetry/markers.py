@@ -675,14 +675,24 @@ MARKER_SPECS: list[MarkerSpec] = [
     ),
     MarkerSpec(
         "credit_role_spend",
-        # Why: both 2026-09-09 tails are optional so older rows parse. Receipt: docs/telemetry_markers.md "CREDIT_ROLE_SPEND".
+        # Why: the three 2026-09-09 tails are optional so older rows parse. Receipt: docs/telemetry_markers.md "CREDIT_ROLE_SPEND".
         re.compile(
             r"CREDIT_ROLE_SPEND:\s*role=(?P<role>\S+)\s+key=(?P<key>\S+)\s+usd=(?P<usd>\S+)\s+calls=(?P<calls>\d+)"
             r"\s+costed_calls=(?P<costed_calls>\d+)\s+byok_usd=(?P<byok_usd>\S+)"
             r"(?:\s+prompt_tokens=(?P<prompt_tokens>\d+)\s+completion_tokens=(?P<completion_tokens>\d+)"
             r"\s+cached_tokens=(?P<cached_tokens>\d+)\s+reasoning_tokens=(?P<reasoning_tokens>\d+))?"
             r"(?:\s+charged_usd=(?P<charged_usd>\S+)\s+byok_calls=(?P<byok_calls>\d+))?"
+            r"(?:\s+max_prompt_tokens=(?P<max_prompt_tokens>\d+))?"
         ),
+    ),
+    MarkerSpec(
+        "prompt_size_alert",
+        # Why: question= is n/a off the v2 driver, the one call site that stamps it. Receipt: docs/telemetry_markers.md "PROMPT_SIZE_ALERT".
+        re.compile(
+            r"PROMPT_SIZE_ALERT:\s*role=(?P<role>\S+)\s+question=(?P<question>\S+)"
+            r"\s+prompt_tokens=(?P<prompt_tokens>\d+)\s+threshold=(?P<threshold>\d+)"
+        ),
+        qid_kind=QID_KIND_POST_ID,  # the v2 driver stamps question.page_url (post id); every other role reads n/a
     ),
     MarkerSpec(
         "credit_floor_breach",

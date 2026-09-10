@@ -209,6 +209,22 @@ class TestRunGapFillV2Seam:
         assert "The upper bound is open" in brief
 
     @pytest.mark.asyncio
+    async def test_driver_config_carries_the_question_ref_the_log_prefix_uses(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The transport stamps ``LoopConfig.question_ref`` on each call's ledger metadata so a
+        PROMPT_SIZE_ALERT names its question in the same ref space as the ghost markers."""
+        monkeypatch.setenv("GAP_FILL_V2_ENABLED", "true")
+        question = make_real_binary_question()
+        fake_llm = _happy_path_llm()
+        llm_patch, tools_patch = _patch_loop_internals(fake_llm)
+        with llm_patch as build_llm_call, tools_patch:
+            await run_gap_fill_v2(question, BUNDLE, is_benchmarking=False)
+
+        (config,) = build_llm_call.call_args.args
+        assert config.question_ref == question.page_url
+
+    @pytest.mark.asyncio
     async def test_seam_exception_soft_fails_to_empty(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:

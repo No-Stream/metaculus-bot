@@ -58,7 +58,7 @@ def build_default_llm_call(config: LoopConfig) -> LlmCall:
             # Shallow copy: litellm may mutate the caller's list, and dict identity must survive for caching.
             "messages": list(messages),
             # CREDIT_ROLE_SPEND tag, stamped per call because the alias names the key this attempt bills.
-            "metadata": llm_call_metadata(GAP_FILL_V2_DRIVER_ROLE, key_alias),
+            "metadata": llm_call_metadata(GAP_FILL_V2_DRIVER_ROLE, key_alias, question_ref=config.question_ref),
             "parallel_tool_calls": True,
             "reasoning_effort": config.reasoning_effort,
             # Without this whitelist litellm drops reasoning_effort; see docs/agentic_gap_fill.md.

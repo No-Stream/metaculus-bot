@@ -23,11 +23,13 @@ from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 from litellm.types.utils import ModelResponse, Usage
 
 from metaculus_bot.check_openrouter_credits import KEY_SPECS
+from metaculus_bot.constants import PROMPT_TOKENS_ALERT_THRESHOLD
 from metaculus_bot.credit_telemetry import (
     DIRECT_KEY_ALIAS,
     DONATED_KEY_ALIAS,
     KEY_ALIAS_METADATA_KEY,
     PERSONAL_KEY_ALIAS,
+    QUESTION_METADATA_KEY,
     ROLE_METADATA_KEY,
     UNKNOWN_KEY_ALIAS,
     UNTAGGED_ROLE,
@@ -57,7 +59,8 @@ from metaculus_bot.llm_configs import (
 from scripts.telemetry.markers import MARKER_SPECS
 
 NO_TOKENS_TAIL = " prompt_tokens=0 completion_tokens=0 cached_tokens=0 reasoning_tokens=0"
-UNCOSTED_TAIL = NO_TOKENS_TAIL + " charged_usd=n/a byok_calls=0"
+NO_MAX_PROMPT_TAIL = " max_prompt_tokens=0"
+UNCOSTED_TAIL = NO_TOKENS_TAIL + " charged_usd=n/a byok_calls=0" + NO_MAX_PROMPT_TAIL
 
 
 @pytest.fixture
@@ -121,10 +124,12 @@ class TestRoleSpendLedger:
         assert _role_lines(caplog) == [
             "CREDIT_ROLE_SPEND: role=forecaster:openai key=personal usd=0.2500 calls=1 costed_calls=1 byok_usd=0.0000"
             + NO_TOKENS_TAIL
-            + " charged_usd=0.2500 byok_calls=0",
+            + " charged_usd=0.2500 byok_calls=0"
+            + NO_MAX_PROMPT_TAIL,
             "CREDIT_ROLE_SPEND: role=forecaster:openai key=donated usd=0.2030 calls=2 costed_calls=2 byok_usd=0.2000"
             + NO_TOKENS_TAIL
-            + " charged_usd=0.2030 byok_calls=2",
+            + " charged_usd=0.2030 byok_calls=2"
+            + NO_MAX_PROMPT_TAIL,
         ]
 
     def test_charged_usd_counts_the_upstream_cost_only_on_byok_calls(self, caplog) -> None:
@@ -147,10 +152,12 @@ class TestRoleSpendLedger:
         assert _role_lines(caplog) == [
             "CREDIT_ROLE_SPEND: role=forecaster:google key=personal usd=1.1432 calls=1 costed_calls=1 byok_usd=0.5716"
             + NO_TOKENS_TAIL
-            + " charged_usd=0.5716 byok_calls=0",
+            + " charged_usd=0.5716 byok_calls=0"
+            + NO_MAX_PROMPT_TAIL,
             "CREDIT_ROLE_SPEND: role=forecaster:openai key=donated usd=1.1409 calls=2 costed_calls=1 byok_usd=1.1409"
             + NO_TOKENS_TAIL
-            + " charged_usd=1.1409 byok_calls=2",
+            + " charged_usd=1.1409 byok_calls=2"
+            + NO_MAX_PROMPT_TAIL,
         ]
 
     def test_token_counts_sum_per_row_including_uncosted_calls(self, caplog) -> None:
@@ -179,8 +186,25 @@ class TestRoleSpendLedger:
         assert _role_lines(caplog) == [
             "CREDIT_ROLE_SPEND: role=gap_fill_v2_driver key=donated usd=0.0300 calls=2 costed_calls=1 byok_usd=0.0300"
             " prompt_tokens=41000 completion_tokens=1000 cached_tokens=38000 reasoning_tokens=750"
-            " charged_usd=0.0300 byok_calls=2",
+            " charged_usd=0.0300 byok_calls=2 max_prompt_tokens=40000",
         ]
+
+    def test_max_prompt_tokens_is_the_largest_single_prompt_not_the_sum(self) -> None:
+        """The packet-size read: ``prompt_tokens`` sums a row's calls, so a 41k loop peak is invisible
+        in a 300k total; ``max_prompt_tokens`` keeps the largest single prompt the row ever sent."""
+        for prompt in (2_800, 41_176, 15_900):
+            record_llm_call_spend(
+                "gap_fill_v2_driver",
+                DONATED_KEY_ALIAS,
+                cost_usd=0.0,
+                byok_upstream_usd=0.01,
+                is_byok=True,
+                tokens=TokenCounts(prompt=prompt, completion=100),
+            )
+
+        (row,) = role_spend_rows()
+        assert row.tokens.prompt == 59_876
+        assert row.max_prompt_tokens == 41_176
 
     def test_uncosted_calls_render_na_not_zero(self, caplog) -> None:
         """A completion that carried no usage.cost is still a call, but its dollars are UNKNOWN;
@@ -207,7 +231,8 @@ class TestRoleSpendLedger:
         assert _role_lines(caplog) == [
             "CREDIT_ROLE_SPEND: role=parser key=donated usd=0.0100 calls=2 costed_calls=1 byok_usd=0.0000"
             + NO_TOKENS_TAIL
-            + " charged_usd=0.0100 byok_calls=0",
+            + " charged_usd=0.0100 byok_calls=0"
+            + NO_MAX_PROMPT_TAIL,
         ]
 
     def test_rows_sort_by_usd_descending_with_uncosted_last(self) -> None:
@@ -260,9 +285,11 @@ class TestRoleSpendLedger:
             "0.5700",
             "0",
         )
+        assert costed.group("max_prompt_tokens") == "52000"
         assert uncosted.group("usd") == "n/a"
         assert uncosted.group("prompt_tokens") == "0"
         assert (uncosted.group("charged_usd"), uncosted.group("byok_calls")) == ("n/a", "0")
+        assert uncosted.group("max_prompt_tokens") == "0"
 
     def test_key_aliases_are_the_credit_spend_key_names(self) -> None:
         """``CREDIT_ROLE_SPEND key=`` must join onto ``CREDIT_SPEND key=`` / ``CREDIT_BALANCE key=``,
@@ -284,6 +311,13 @@ class TestLlmCallMetadata:
         carries an explicit role token, so an ``untagged`` row in a run log means a builder
         call site forgot its ``role=``."""
         assert llm_call_metadata(None, PERSONAL_KEY_ALIAS)[ROLE_METADATA_KEY] == UNTAGGED_ROLE
+
+    def test_question_ref_rides_a_third_key_only_when_given(self) -> None:
+        """The roster LLMs are built once per process and cannot know their question, so the key is
+        absent by default; the v2 driver stamps it per call and PROMPT_SIZE_ALERT reads it back."""
+        assert QUESTION_METADATA_KEY not in llm_call_metadata("stacker", DONATED_KEY_ALIAS)
+        tagged = llm_call_metadata("gap_fill_v2_driver", DONATED_KEY_ALIAS, question_ref="https://x/questions/650/")
+        assert tagged[QUESTION_METADATA_KEY] == "https://x/questions/650/"
 
     @pytest.mark.parametrize(
         ("model", "expected"),
@@ -543,6 +577,84 @@ class TestRoleSpendTracker:
         match = spec.regex.search(caplog.text)
         assert match is not None, warnings
         assert match.group("timeout_s") == "0.0"
+
+
+def _alert_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith("PROMPT_SIZE_ALERT:")]
+
+
+@pytest.mark.usefixtures("clean_role_ledger")
+class TestPromptSizeAlert:
+    """One WARNING per LLM call whose prompt exceeds ``PROMPT_TOKENS_ALERT_THRESHOLD``.
+
+    The forecaster prompt measures about 17k tokens and the gap-fill v2 loop peaks near 41k
+    (2026-09-09 cost pass), so a call over the 150k threshold is a packet that blew up, the
+    operator's "500k is way too much and could degrade model performance" case. The call is
+    already billed when the callback sees its usage, so this reads and never gates.
+    """
+
+    async def test_oversized_prompt_fires_with_role_question_and_threshold(self, caplog) -> None:
+        tracker = RoleSpendTracker()
+        metadata = llm_call_metadata(
+            "gap_fill_v2_driver", DONATED_KEY_ALIAS, question_ref="https://www.metaculus.com/questions/38975/"
+        )
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.credit_telemetry"):
+            await tracker.async_log_success_event(
+                _success_kwargs(metadata), _response_with_usage(prompt_tokens=160_000, cost=0.4), None, None
+            )
+
+        assert _alert_lines(caplog) == [
+            "PROMPT_SIZE_ALERT: role=gap_fill_v2_driver question=https://www.metaculus.com/questions/38975/"
+            f" prompt_tokens=160000 threshold={PROMPT_TOKENS_ALERT_THRESHOLD}"
+        ]
+        # The call still lands on the ledger; the alert is a companion line, not a substitute row.
+        (row,) = role_spend_rows()
+        assert (row.tokens.prompt, row.max_prompt_tokens) == (160_000, 160_000)
+
+    async def test_normal_prompt_is_silent(self, caplog) -> None:
+        tracker = RoleSpendTracker()
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.credit_telemetry"):
+            await tracker.async_log_success_event(
+                _success_kwargs(llm_call_metadata("forecaster:openai", DONATED_KEY_ALIAS)),
+                _response_with_usage(prompt_tokens=17_000, cost=0.25),
+                None,
+                None,
+            )
+        assert _alert_lines(caplog) == []
+
+    async def test_a_prompt_exactly_at_the_threshold_is_silent(self, caplog) -> None:
+        tracker = RoleSpendTracker()
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.credit_telemetry"):
+            await tracker.async_log_success_event(
+                _success_kwargs(llm_call_metadata("parser", DONATED_KEY_ALIAS)),
+                _response_with_usage(prompt_tokens=PROMPT_TOKENS_ALERT_THRESHOLD, cost=0.01),
+                None,
+                None,
+            )
+        assert _alert_lines(caplog) == []
+
+    async def test_roster_call_without_a_question_reads_na_and_parses_under_the_registry_regex(self, caplog) -> None:
+        """A roster LLM carries no question in its metadata; the line says so rather than dropping
+        the field, and the registry regex still harvests it (with ``qid`` None)."""
+        tracker = RoleSpendTracker()
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.credit_telemetry"):
+            await tracker.async_log_success_event(
+                _success_kwargs(llm_call_metadata("forecaster:anthropic", DONATED_KEY_ALIAS)),
+                _response_with_usage(prompt_tokens=512_000, cost=1.5),
+                None,
+                None,
+            )
+
+        (line,) = _alert_lines(caplog)
+        assert " question=n/a " in line
+        spec = next(s for s in MARKER_SPECS if s.name == "prompt_size_alert")
+        match = spec.regex.search(line)
+        assert match is not None
+        assert (match.group("role"), match.group("question")) == ("forecaster:anthropic", "n/a")
+        assert (match.group("prompt_tokens"), match.group("threshold")) == (
+            "512000",
+            str(PROMPT_TOKENS_ALERT_THRESHOLD),
+        )
 
 
 class TestProdLlmsAreRoleTagged:
