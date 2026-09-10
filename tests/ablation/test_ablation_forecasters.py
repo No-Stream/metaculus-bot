@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from datetime import datetime
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -17,6 +19,7 @@ from forecasting_tools import (
     BinaryQuestion,
     GeneralLlm,
     MultipleChoiceQuestion,
+    NumericDistribution,
     NumericQuestion,
     PredictedOptionList,
     ReasonedPrediction,
@@ -24,15 +27,29 @@ from forecasting_tools import (
 from forecasting_tools.data_models.multiple_choice_report import PredictedOption
 from forecasting_tools.data_models.numeric_report import Percentile
 
+# litellm.exceptions, not the untyped top-level re-export, which trips reportPrivateImportUsage.
+from litellm.exceptions import APIError, RateLimitError
+
 from main import TemplateForecaster
 from metaculus_bot.ablation import forecasters as forecasters_module
+from metaculus_bot.ablation import window_patch as wp_module
 from metaculus_bot.ablation.cache import AblationCache, model_slug_to_filename
-from metaculus_bot.ablation.forecasters import run_forecasters_batch, run_forecasters_for_question
+from metaculus_bot.ablation.forecaster_lineup import FREE_FORECASTER_MODELS, FREE_PARSER_MODEL
+from metaculus_bot.ablation.forecasters import (
+    _build_bot,
+    _infer_failure_stage,
+    _parse_retry_after_seconds,
+    _run_one_forecaster,
+    deserialize_prediction_value,
+    run_forecasters_batch,
+    run_forecasters_for_question,
+    serialize_prediction_value,
+)
 from metaculus_bot.aggregation_strategies import AggregationStrategy
+from metaculus_bot.exceptions import ValueExtractionError
+from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
 
-# ---------------------------------------------------------------------------
 # Fixtures and helpers
-# ---------------------------------------------------------------------------
 
 
 _OPEN = datetime(2026, 1, 1)
@@ -54,13 +71,11 @@ def _make_binary_question(qid: int = 1234) -> BinaryQuestion:
 
 
 def _make_mc_question(qid: int = 2345) -> MultipleChoiceQuestion:
-    # ``option_is_ordered`` is not a declared field on MultipleChoiceQuestion; pydantic
-    # ignores the extra kwarg at runtime. Splat via a ``dict[str, Any]`` so the type
-    # checker doesn't flag the undeclared field while preserving the runtime no-op.
-    from typing import (
-        Any,
-    )
+    """Build an MC question through a ``dict[str, Any]`` splat.
 
+    ``option_is_ordered`` is not a declared field on MultipleChoiceQuestion: pydantic ignores
+    the extra kwarg at runtime, and the splat keeps the type checker from flagging it.
+    """
     fields: dict[str, Any] = {
         "question_text": "Which option?",
         "id_of_post": qid,
@@ -107,8 +122,6 @@ def _make_forecaster_llms(count: int | None = None) -> list[GeneralLlm]:
     default), returns one mock per model in the live lineup so tests don't
     have to track lineup-size changes.
     """
-    from metaculus_bot.ablation.forecaster_lineup import FREE_FORECASTER_MODELS
-
     slugs = FREE_FORECASTER_MODELS if count is None else FREE_FORECASTER_MODELS[:count]
     llms: list[GeneralLlm] = []
     for slug in slugs:
@@ -125,8 +138,6 @@ def parser_llm() -> GeneralLlm:
     Avoids brittleness when the parser model is swapped in the lineup
     (e.g., gpt-oss-120b → gemma-4 in task #16).
     """
-    from metaculus_bot.ablation.forecaster_lineup import FREE_PARSER_MODEL
-
     parser = MagicMock(spec=GeneralLlm)
     parser.model = FREE_PARSER_MODEL
     return parser
@@ -145,14 +156,10 @@ def six_forecaster_llms() -> list[GeneralLlm]:
     return _make_forecaster_llms()
 
 
-# ---------------------------------------------------------------------------
 # Serialize / deserialize round-trips
-# ---------------------------------------------------------------------------
 
 
 def test_serialize_binary_prediction_value() -> None:
-    from metaculus_bot.ablation.forecasters import deserialize_prediction_value, serialize_prediction_value
-
     q = _make_binary_question()
     payload = serialize_prediction_value(0.42, "binary")
     assert payload == {"type": "binary", "prob": 0.42}
@@ -162,8 +169,6 @@ def test_serialize_binary_prediction_value() -> None:
 
 
 def test_serialize_mc_prediction_value() -> None:
-    from metaculus_bot.ablation.forecasters import deserialize_prediction_value, serialize_prediction_value
-
     options = PredictedOptionList(
         predicted_options=[
             PredictedOption(option_name="A", probability=0.5),
@@ -192,11 +197,6 @@ def test_serialize_numeric_prediction_value() -> None:
     computed 201-point CDF), so deserialize can reconstruct a PchipNumericDistribution
     without re-running ``build_numeric_distribution``.
     """
-    from forecasting_tools import NumericDistribution
-
-    from metaculus_bot.ablation.forecasters import deserialize_prediction_value, serialize_prediction_value
-    from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
-
     percentiles = [
         Percentile(value=v, percentile=p)
         for v, p in zip(
@@ -206,8 +206,7 @@ def test_serialize_numeric_prediction_value() -> None:
         )
     ]
     q = _make_numeric_question()
-    # Build a real PchipNumericDistribution with a deterministic 201-point CDF so
-    # we can compare round-tripped CDFs exactly.
+    # A deterministic 201-point CDF makes the round-trip comparison exact.
     pchip_cdf = [i / 200 for i in range(201)]
     distribution = create_pchip_numeric_distribution(
         pchip_cdf=pchip_cdf,
@@ -245,8 +244,6 @@ def test_deserialize_rejects_old_payload_shape() -> None:
     the stacker — they would force re-derivation of the CDF via build_numeric_distribution,
     coupling cached artifacts to whatever pipeline code happens to be loaded.
     """
-    from metaculus_bot.ablation.forecasters import deserialize_prediction_value
-
     q = _make_numeric_question()
     old_payload = {
         "type": "numeric",
@@ -256,9 +253,7 @@ def test_deserialize_rejects_old_payload_shape() -> None:
         deserialize_prediction_value(old_payload, q)
 
 
-# ---------------------------------------------------------------------------
 # run_forecasters_for_question
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -268,8 +263,6 @@ async def test_run_forecasters_returns_payload_per_model(
     parser_llm: GeneralLlm,
 ) -> None:
     """Mocked _make_prediction returns canned ReasonedPrediction; runner returns 6 entries."""
-    from metaculus_bot.ablation.forecasters import run_forecasters_for_question
-
     q = _make_binary_question(qid=1001)
     canned = ReasonedPrediction(prediction_value=0.42, reasoning="rationale")
 
@@ -293,8 +286,6 @@ async def test_payload_has_required_fields(
     six_forecaster_llms: list[GeneralLlm],
     parser_llm: GeneralLlm,
 ) -> None:
-    from metaculus_bot.ablation.forecasters import run_forecasters_for_question
-
     q = _make_binary_question(qid=1002)
     canned = ReasonedPrediction(prediction_value=0.42, reasoning="rationale")
 
@@ -327,8 +318,6 @@ async def test_cache_hit_skips_make_prediction(
     parser_llm: GeneralLlm,
 ) -> None:
     """One model pre-cached → _make_prediction called for the OTHER 5."""
-    from metaculus_bot.ablation.forecasters import run_forecasters_for_question
-
     q = _make_binary_question(qid=1003)
     canned = ReasonedPrediction(prediction_value=0.42, reasoning="rationale")
 
@@ -372,8 +361,6 @@ async def test_force_true_re_runs_all_forecasters(
     parser_llm: GeneralLlm,
 ) -> None:
     """force=True ignores cache; _make_prediction called for all 6."""
-    from metaculus_bot.ablation.forecasters import run_forecasters_for_question
-
     q = _make_binary_question(qid=1004)
     canned = ReasonedPrediction(prediction_value=0.42, reasoning="fresh rationale")
 
@@ -417,9 +404,6 @@ async def test_window_patch_active_during_make_prediction(
     parser_llm: GeneralLlm,
 ) -> None:
     """During _make_prediction the window patch context manager is active."""
-    from metaculus_bot.ablation import window_patch as wp_module
-    from metaculus_bot.ablation.forecasters import run_forecasters_for_question
-
     q = _make_binary_question(qid=1005)
     flags_during_call: list[bool] = []
 
@@ -450,8 +434,6 @@ async def test_per_forecaster_failure_caches_error_and_continues(
     parser_llm: GeneralLlm,
 ) -> None:
     """First forecaster raises; the other 5 succeed; error cached, batch continues."""
-    from metaculus_bot.ablation.forecasters import run_forecasters_for_question
-
     q = _make_binary_question(qid=1006)
     failing_model = six_forecaster_llms[0].model
     canned = ReasonedPrediction(prediction_value=0.42, reasoning="rationale")
@@ -498,8 +480,6 @@ async def test_research_cache_populated_in_bot(
     parser_llm: GeneralLlm,
 ) -> None:
     """TemplateForecaster.__init__ receives research_cache={qid: blob}; run_research returns blob without providers."""
-    from metaculus_bot.ablation.forecasters import run_forecasters_for_question
-
     q = _make_binary_question(qid=1007)
     captured_kwargs: list[dict] = []
 
@@ -536,8 +516,6 @@ async def test_run_research_short_circuits_on_cached_blob(
     parser_llm: GeneralLlm,
 ) -> None:
     """With research_cache populated, calling bot.run_research returns the cached blob without invoking providers."""
-    from metaculus_bot.ablation.forecasters import _build_bot
-
     q = _make_binary_question(qid=1008)
     bot = _build_bot(
         question=q,
@@ -547,9 +525,7 @@ async def test_run_research_short_circuits_on_cached_blob(
     )
 
     # Sentinel: if providers WOULD run, this would fail.
-    bot._select_research_providers = MagicMock(  # ty: ignore[invalid-assignment]
-        side_effect=AssertionError("providers must not run")
-    )  # type: ignore[method-assign]
+    bot._select_research_providers = MagicMock(side_effect=AssertionError("providers must not run"))  # type: ignore[method-assign]
 
     research = await bot.run_research(q)
     assert research == "cached research"
@@ -561,8 +537,6 @@ async def test_aggregation_strategy_is_mean_so_stacker_doesnt_fire(
     six_forecaster_llms: list[GeneralLlm],
     parser_llm: GeneralLlm,
 ) -> None:
-    from metaculus_bot.ablation.forecasters import run_forecasters_for_question
-
     q = _make_binary_question(qid=1009)
     captured: list[object] = []
 
@@ -595,8 +569,6 @@ async def test_is_benchmarking_true_in_constructor(
     six_forecaster_llms: list[GeneralLlm],
     parser_llm: GeneralLlm,
 ) -> None:
-    from metaculus_bot.ablation.forecasters import run_forecasters_for_question
-
     q = _make_binary_question(qid=1010)
     captured: list[object] = []
 
@@ -630,8 +602,6 @@ async def test_runner_serializes_binary_prediction_value(
     parser_llm: GeneralLlm,
 ) -> None:
     """The cached payload's prediction_value matches the binary serialization format."""
-    from metaculus_bot.ablation.forecasters import run_forecasters_for_question
-
     q = _make_binary_question(qid=1011)
     canned = ReasonedPrediction(prediction_value=0.42, reasoning="r")
 
@@ -664,11 +634,6 @@ async def test_runner_serializes_numeric_prediction_value(
     AND deserialize back to a ``PchipNumericDistribution`` whose ``.cdf`` matches
     the original probabilities exactly.
     """
-    from forecasting_tools import NumericDistribution
-
-    from metaculus_bot.ablation.forecasters import deserialize_prediction_value, run_forecasters_for_question
-    from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
-
     q = _make_numeric_question(qid=1012)
     percentiles = [
         Percentile(value=v, percentile=p)
@@ -706,8 +671,7 @@ async def test_runner_serializes_numeric_prediction_value(
     assert pv["declared_percentiles"][0] == {"percentile": 0.025, "value": 10.0}
     assert payload["errors"] == [], f"unexpected errors (tuple bug regressed?): {payload['errors']}"
 
-    # Round-trip the cached payload back to a NumericDistribution. The result is a
-    # ``PchipNumericDistribution`` (subclass), and its .cdf must match the original.
+    # The cached payload must come back as the PchipNumericDistribution subclass with its CDF intact.
     restored = deserialize_prediction_value(pv, q)
     assert isinstance(restored, NumericDistribution)
     assert type(restored).__name__ == "PchipNumericDistribution"
@@ -728,19 +692,14 @@ async def test_one_serialize_failure_does_not_drop_other_forecaster_payloads(
     runner caught it as "qid=X failed entirely", and EVERY other forecaster's
     cache write for that qid was lost. This test pins that contract: the broken
     forecaster gets ``prediction_value=None`` and a non-empty errors list; the
-    healthy forecaster's payload still lands.
+    healthy forecaster's payload still lands. The broken arm returns a raw
+    string, the tuple bug's exact bad shape, which the serializer rejects.
     """
-    from metaculus_bot.ablation.forecasters import run_forecasters_for_question
-    from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
-
     q = _make_numeric_question(qid=1014)
     two_llms = _make_forecaster_llms(count=2)
     healthy_model = two_llms[0].model
     broken_model = two_llms[1].model
 
-    # Healthy forecaster returns a real NumericDistribution; broken returns a
-    # raw string (the exact failure mode of the tuple bug — bad shape that the
-    # serializer rejects).
     percentiles = [
         Percentile(value=v, percentile=p)
         for v, p in zip(
@@ -857,8 +816,6 @@ async def test_runner_serializes_mc_prediction_value(
     six_forecaster_llms: list[GeneralLlm],
     parser_llm: GeneralLlm,
 ) -> None:
-    from metaculus_bot.ablation.forecasters import run_forecasters_for_question
-
     q = _make_mc_question(qid=1013)
     options = PredictedOptionList(
         predicted_options=[
@@ -885,9 +842,7 @@ async def test_runner_serializes_mc_prediction_value(
     assert names == {"A", "B", "C"}
 
 
-# ---------------------------------------------------------------------------
 # run_forecasters_batch
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -896,8 +851,6 @@ async def test_batch_returns_dict_keyed_by_qid(
     six_forecaster_llms: list[GeneralLlm],
     parser_llm: GeneralLlm,
 ) -> None:
-    from metaculus_bot.ablation.forecasters import run_forecasters_batch
-
     q1 = _make_binary_question(qid=2001)
     q2 = _make_binary_question(qid=2002)
     canned = ReasonedPrediction(prediction_value=0.42, reasoning="r")
@@ -922,9 +875,6 @@ async def test_batch_per_question_failure_does_not_kill_batch(
     parser_llm: GeneralLlm,
 ) -> None:
     """If run_forecasters_for_question raises for Q1, Q2 still completes."""
-    from metaculus_bot.ablation import forecasters as forecasters_module
-    from metaculus_bot.ablation.forecasters import run_forecasters_batch
-
     q1 = _make_binary_question(qid=2003)
     q2 = _make_binary_question(qid=2004)
 
@@ -1007,9 +957,6 @@ async def test_batch_concurrency_respected(
     parser_llm: GeneralLlm,
 ) -> None:
     """per_question_concurrency caps in-flight runner invocations."""
-    from metaculus_bot.ablation import forecasters as forecasters_module
-    from metaculus_bot.ablation.forecasters import run_forecasters_batch
-
     questions = [_make_binary_question(qid=3000 + i) for i in range(4)]
 
     in_flight = 0
@@ -1040,12 +987,7 @@ async def test_batch_concurrency_respected(
     assert max_in_flight == 2
 
 
-# ---------------------------------------------------------------------------
-# Bug-1 regression: PROBABILISTIC_TOOLS_ENABLED env var must NOT leak into
-# the forecast stage. If the operator's shell has the var set, every
-# forecaster rationale would otherwise get baked-in tool output before
-# caching, contaminating BOTH ablation arms with the treatment.
-# ---------------------------------------------------------------------------
+# Bug-1 regression: PROBABILISTIC_TOOLS_ENABLED must not leak into the forecast stage
 
 
 @pytest.mark.asyncio
@@ -1063,8 +1005,6 @@ async def test_forecast_stage_disables_tools_env_var_during_make_prediction(
     becomes meaningless. The forecast stage must explicitly disable the env var
     while running, then restore the operator's original setting on exit.
     """
-    from metaculus_bot.ablation.forecasters import run_forecasters_for_question
-
     monkeypatch.setenv("PROBABILISTIC_TOOLS_ENABLED", "1")
 
     q = _make_binary_question(qid=9001)
@@ -1072,8 +1012,6 @@ async def test_forecast_stage_disables_tools_env_var_during_make_prediction(
     observed_env_values: list[str | None] = []
 
     async def env_observer(self, question, research, llm) -> ReasonedPrediction:  # type: ignore[no-untyped-def]
-        import os
-
         observed_env_values.append(os.environ.get("PROBABILISTIC_TOOLS_ENABLED"))
         return canned
 
@@ -1093,23 +1031,10 @@ async def test_forecast_stage_disables_tools_env_var_during_make_prediction(
     )
 
     # After the runner returns, the operator's original "1" must be restored.
-    import os
-
     assert os.environ.get("PROBABILISTIC_TOOLS_ENABLED") == "1"
 
 
-# ---------------------------------------------------------------------------
 # Regression: notepad lifecycle around _make_prediction
-#
-# Every other test in this file mocks ``TemplateForecaster._make_prediction``
-# directly, which structurally bypasses the framework's ``_get_notepad``
-# lookup. That lookup is what failed in the first live ablation run: the
-# framework raises ``ValueError("No notepad found...")`` if the bot hasn't
-# registered a notepad for the question, and the runner never registered one.
-# Mocking lower (at the forecast-method level) lets the framework's
-# ``_make_prediction`` actually run and exercises the lifecycle our runner
-# now owns.
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -1120,18 +1045,17 @@ async def test_run_one_forecaster_initializes_notepad_so_framework_get_notepad_w
     """``_run_one_forecaster`` must register a notepad before ``_make_prediction``.
 
     The framework's ``_make_prediction`` (main.py:1085 / forecast_bot.py:473)
-    starts with ``await self._get_notepad(question)``, which raises if no
-    notepad has been registered. The ablation runner bypasses
+    starts with ``await self._get_notepad(question)``, which raises
+    ``ValueError("No notepad found...")`` if no notepad has been registered.
+    That is what killed the first live ablation run: the runner bypasses
     ``_run_individual_question`` (the framework's normal entry that calls
-    ``_initialize_notepad`` + appends to ``_note_pads``), so the runner must
-    own that lifecycle itself.
+    ``_initialize_notepad`` + appends to ``_note_pads``), so it must own that
+    lifecycle itself.
 
-    This test exercises the real ``_make_prediction`` path by mocking the
-    LLM-calling forecast method (``_run_forecast_on_binary``) one level down,
-    not ``_make_prediction`` itself.
+    Every other test here mocks ``_make_prediction`` directly and never reaches
+    the lookup, so this one mocks the LLM-calling forecast method
+    (``_run_forecast_on_binary``) one level down instead.
     """
-    from metaculus_bot.ablation.forecasters import run_forecasters_for_question
-
     q = _make_binary_question(qid=9101)
     canned = ReasonedPrediction(prediction_value=0.42, reasoning="rationale")
     one_llm = _make_forecaster_llms(count=1)
@@ -1165,14 +1089,10 @@ async def test_run_one_forecaster_removes_notepad_after_make_prediction_raises(
     accumulate notepads — not catastrophic in our per-(qid, model) bot lifetime
     but a correctness invariant that should not regress.
     """
-    from metaculus_bot.ablation.forecasters import _build_bot, _run_one_forecaster
-
     q = _make_binary_question(qid=9102)
     one_llm = _make_forecaster_llms(count=1)[0]
 
-    # Build the bot manually so we can inspect ``_note_pads`` after the call.
-    # The runner builds its own bot internally; here we patch ``_build_bot``
-    # to return our inspectable instance.
+    # Patch _build_bot to hand the runner this instance so _note_pads is inspectable after the call.
     bot = _build_bot(
         question=q,
         research_blob="research",
@@ -1197,28 +1117,19 @@ async def test_run_one_forecaster_removes_notepad_after_make_prediction_raises(
     assert bot._note_pads == [], f"notepad leaked after exception: {bot._note_pads}"
 
 
-# ---------------------------------------------------------------------------
 # Rate-limit retry behavior
-#
-# OpenRouter ``:free`` model variants are rate-limited at the upstream provider
-# level (Venice, OpenInference, etc.) — separate from the per-key quota.
-# When 429s fire, OpenRouter exposes the upstream provider's ``Retry-After``
-# value in the exception payload's ``retry_after_seconds`` field. The runner
-# must honor that hint and retry up to ``max_retries`` times before giving up.
-# ---------------------------------------------------------------------------
 
 
 def _build_rate_limit_exc(retry_after: int | float | None = 13) -> Exception:
     """Build a litellm.RateLimitError that mirrors the live OpenRouter 429 shape.
 
-    Matches a real exception from /tmp/ablation_phase_a1_v3.log so the parser
-    is exercised against the actual JSON shape, not a synthetic one.
+    OpenRouter ``:free`` variants are rate-limited at the upstream provider (Venice,
+    OpenInference, etc.), separately from the per-key quota, and the 429 payload carries
+    the provider's ``Retry-After`` as ``retry_after_seconds``; the runner must honor that
+    hint and retry up to ``max_retries`` times before giving up. The message matches a real
+    exception from /tmp/ablation_phase_a1_v3.log so the parser is exercised against the
+    actual JSON shape, not a synthetic one.
     """
-    # Import from the public ``litellm.exceptions`` path (litellm's top-level ``__init__``
-    # re-export is untyped, which trips ``reportPrivateImportUsage``); matches the product
-    # import in metaculus_bot/ablation/forecasters.py.
-    from litellm.exceptions import RateLimitError
-
     if retry_after is None:
         # Omit the retry_after_seconds field so the parser falls back to exponential backoff.
         msg = (
@@ -1248,8 +1159,6 @@ async def test_run_one_forecaster_retries_on_rate_limit_then_succeeds(
     parser_llm: GeneralLlm,
 ) -> None:
     """``RateLimitError`` on first two attempts, success on third → final payload OK, await_count=3."""
-    from metaculus_bot.ablation.forecasters import _run_one_forecaster
-
     q = _make_binary_question(qid=9201)
     one_llm = _make_forecaster_llms(count=1)[0]
     canned = ReasonedPrediction(prediction_value=0.42, reasoning="rationale")
@@ -1286,8 +1195,6 @@ async def test_run_one_forecaster_honors_retry_after_seconds(
     parser_llm: GeneralLlm,
 ) -> None:
     """``retry_after_seconds`` parsed from the exception payload is passed to asyncio.sleep."""
-    from metaculus_bot.ablation.forecasters import _run_one_forecaster
-
     q = _make_binary_question(qid=9202)
     one_llm = _make_forecaster_llms(count=1)[0]
     canned = ReasonedPrediction(prediction_value=0.42, reasoning="rationale")
@@ -1324,8 +1231,6 @@ async def test_run_one_forecaster_falls_back_to_exponential_when_retry_after_mis
     parser_llm: GeneralLlm,
 ) -> None:
     """When ``retry_after_seconds`` cannot be parsed, jittered exponential backoff is used."""
-    from metaculus_bot.ablation.forecasters import _run_one_forecaster
-
     q = _make_binary_question(qid=9203)
     one_llm = _make_forecaster_llms(count=1)[0]
     canned = ReasonedPrediction(prediction_value=0.42, reasoning="rationale")
@@ -1362,8 +1267,6 @@ async def test_run_one_forecaster_exhausts_retries_records_errors_no_raise(
     parser_llm: GeneralLlm,
 ) -> None:
     """Mock failing 4 times with RateLimitError; max_retries=3 → returns normally with all 4 attempts in errors."""
-    from metaculus_bot.ablation.forecasters import _run_one_forecaster
-
     q = _make_binary_question(qid=9204)
     one_llm = _make_forecaster_llms(count=1)[0]
     rate_limit_exc = _build_rate_limit_exc(retry_after=13)
@@ -1400,8 +1303,6 @@ async def test_run_one_forecaster_non_rate_limit_error_not_retried(
     parser_llm: GeneralLlm,
 ) -> None:
     """A plain ``RuntimeError`` (not 429) must NOT trigger the retry loop — single attempt only."""
-    from metaculus_bot.ablation.forecasters import _run_one_forecaster
-
     q = _make_binary_question(qid=9205)
     one_llm = _make_forecaster_llms(count=1)[0]
     runtime_exc = RuntimeError("model exploded — not a rate limit")
@@ -1431,27 +1332,21 @@ async def test_run_one_forecaster_non_rate_limit_error_not_retried(
     assert "RuntimeError" in payload["errors"][0]
 
 
-# ---------------------------------------------------------------------------
-# M1 — _parse_retry_after_seconds also accepts HTTP-date form
-#
-# RFC 7231 Retry-After allows both integer-seconds AND HTTP-date format.
-# Some upstreams proxy the date form through OpenRouter; without parsing it,
-# we fast-fall back to exponential backoff (cap 60s) and may burn the
-# retry budget while a real >60s window applies.
-# ---------------------------------------------------------------------------
+# M1: _parse_retry_after_seconds also accepts the HTTP-date form
 
 
 def test_parse_retry_after_seconds_handles_integer_form() -> None:
-    from metaculus_bot.ablation.forecasters import _parse_retry_after_seconds
-
     exc = Exception('"Retry-After":"30","retry_after_seconds":30')
     assert _parse_retry_after_seconds(exc) == pytest.approx(30.0)
 
 
 def test_parse_retry_after_seconds_handles_http_date_form() -> None:
-    """An HTTP-date Retry-After header parses to a positive float seconds."""
-    from metaculus_bot.ablation.forecasters import _parse_retry_after_seconds
+    """An HTTP-date Retry-After header parses to a positive float seconds.
 
+    RFC 7231 allows Retry-After as integer seconds or an HTTP-date, and some upstreams
+    proxy the date form through OpenRouter. Without parsing it the runner fell back to the
+    60 s-capped exponential backoff and could burn its retry budget inside a real >60 s window.
+    """
     exc = Exception(
         'OpenrouterException - {"error":{"code":429,"metadata":'
         '{"headers":{"Retry-After":"Wed, 21 Oct 2099 07:28:00 GMT"}}}}'
@@ -1464,8 +1359,6 @@ def test_parse_retry_after_seconds_handles_http_date_form() -> None:
 def test_parse_retry_after_seconds_returns_none_for_garbage_date() -> None:
     """Garbage value in Retry-After must not crash; parser returns None so
     the caller falls back to exponential backoff."""
-    from metaculus_bot.ablation.forecasters import _parse_retry_after_seconds
-
     exc = Exception('"Retry-After":"garbage-not-a-date"')
     assert _parse_retry_after_seconds(exc) is None
 
@@ -1473,8 +1366,6 @@ def test_parse_retry_after_seconds_returns_none_for_garbage_date() -> None:
 def test_parse_retry_after_seconds_clamps_negative_past_date_to_zero() -> None:
     """A past HTTP-date (already elapsed) parses to 0 — the caller sleeps
     nothing and retries immediately."""
-    from metaculus_bot.ablation.forecasters import _parse_retry_after_seconds
-
     exc = Exception('"Retry-After":"Wed, 21 Oct 2000 07:28:00 GMT"')
     parsed = _parse_retry_after_seconds(exc)
     assert parsed == pytest.approx(0.0)
@@ -1487,11 +1378,7 @@ def test_infer_failure_stage_tags_value_extraction_error_as_parser() -> None:
     terminal ladder failure surfaces as ``ValueExtractionError`` and must be
     tagged ``parser`` regardless of exception message content.
     """
-    from metaculus_bot.ablation.forecasters import _infer_failure_stage
-    from metaculus_bot.exceptions import ValueExtractionError
-
-    # Include a model-slug substring in the message to prove the isinstance
-    # branch wins over the "slug in msg → forecaster" textual heuristic.
+    # The message carries a model slug to prove the isinstance branch beats the slug-in-message heuristic.
     exc = ValueExtractionError("all rungs failed for question=42 model=some-model")
     assert _infer_failure_stage(exc, "some-model") == "parser"
 
@@ -1504,10 +1391,6 @@ def test_infer_failure_stage_reads_reported_429_not_message_digits() -> None:
     prompt — either can contain "429" that was never a status. English wording stays live
     as the statusless fallback, since AskNews-shaped SDKs report no status at all.
     """
-    from litellm.exceptions import APIError
-
-    from metaculus_bot.ablation.forecasters import _infer_failure_stage
-
     reported_429 = APIError(status_code=429, message="slow down", llm_provider="openrouter", model="openai/gpt-5.6-sol")
     assert _infer_failure_stage(reported_429, "some-model") == "forecaster"
 
@@ -1515,8 +1398,7 @@ def test_infer_failure_stage_reads_reported_429_not_message_digits() -> None:
     assert _infer_failure_stage(RuntimeError("rate limit hit upstream"), "some-model") == "forecaster"
     assert _infer_failure_stage(RuntimeError("Too Many Requests"), "some-model") == "forecaster"
 
-    # A key hash carrying "429" on a 403 refusal is not a rate limit. It used to be,
-    # because the digits were matched in the message.
+    # A 403 whose key hash contains "429" used to classify as a rate limit; the digits were matched in the message.
     key_hash_403 = APIError(
         status_code=403,
         message='OpenrouterException - {"error":{"message":"Blocked by moderation. Manage your key at '
@@ -1527,17 +1409,7 @@ def test_infer_failure_stage_reads_reported_429_not_message_digits() -> None:
     assert _infer_failure_stage(key_hash_403, "some-model") == "unknown"
 
 
-# ---------------------------------------------------------------------------
-# C1 — Soft-deadline timeout
-#
-# Production wraps ``_make_prediction`` in ``asyncio.wait_for(... ,
-# timeout=FORECASTER_SOFT_DEADLINE)`` (main.py:1063). Without that wrapper,
-# a single Anthropic stall can hold a question for litellm timeout(480) *
-# allowed_tries(3) ≈ 24 min — at 50q with serial forecasters this parks
-# the whole batch for hours. The wrapper bounds each call at
-# FORECASTER_SOFT_DEADLINE (10 min) and re-records the timeout in the
-# forecaster's ``errors`` so downstream surfaces it as a normal failure.
-# ---------------------------------------------------------------------------
+# C1: soft-deadline timeout
 
 
 @pytest.mark.asyncio
@@ -1548,16 +1420,18 @@ async def test_run_one_forecaster_enforces_soft_deadline_timeout(
 ) -> None:
     """A stuck ``_make_prediction`` is killed by FORECASTER_SOFT_DEADLINE.
 
+    Production wraps ``_make_prediction`` in ``asyncio.wait_for(..., timeout=FORECASTER_SOFT_DEADLINE)``
+    (``_forecaster_with_soft_deadline`` in ``forecaster.py``). Without that wrapper a single
+    Anthropic stall holds a question for litellm timeout(480) * allowed_tries(3), about 24 min,
+    and at 50 questions with serial forecasters that parks the whole batch for hours. The wrapper
+    bounds each call at FORECASTER_SOFT_DEADLINE (10 min) and records the timeout in the
+    forecaster's ``errors`` so downstream surfaces it as a normal failure.
+
     Mocks the call to sleep ``FORECASTER_SOFT_DEADLINE + 5`` seconds; the
     runner must return within ``FORECASTER_SOFT_DEADLINE * 1.1`` with a
     TimeoutError recorded in the payload's ``errors``.
     """
-    from metaculus_bot.ablation import forecasters as forecasters_module
-    from metaculus_bot.ablation.forecasters import _run_one_forecaster
-
-    # Shrink the deadline so the test is fast (3s instead of 600s). The
-    # production constant only matters for the wall-clock cap; the wrap
-    # behavior under test is identical at any value.
+    # 3 s instead of 600 s: the wrap behavior under test is identical at any value; only the wall clock changes.
     monkeypatch.setattr(forecasters_module, "FORECASTER_SOFT_DEADLINE", 3)
 
     q = _make_binary_question(qid=9501)
@@ -1594,9 +1468,6 @@ async def test_run_one_forecaster_soft_deadline_does_not_retry_after_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A timeout is not a rate limit; the runner must NOT retry it."""
-    from metaculus_bot.ablation import forecasters as forecasters_module
-    from metaculus_bot.ablation.forecasters import _run_one_forecaster
-
     monkeypatch.setattr(forecasters_module, "FORECASTER_SOFT_DEADLINE", 1)
 
     q = _make_binary_question(qid=9502)
@@ -1630,8 +1501,6 @@ async def test_run_forecasters_for_question_threads_max_retries(
     parser_llm: GeneralLlm,
 ) -> None:
     """``max_retries`` kwarg on ``run_forecasters_for_question`` reaches ``_run_one_forecaster``."""
-    from metaculus_bot.ablation.forecasters import run_forecasters_for_question
-
     q = _make_binary_question(qid=9206)
     one_llm = _make_forecaster_llms(count=1)
     canned = ReasonedPrediction(prediction_value=0.42, reasoning="rationale")
@@ -1666,9 +1535,6 @@ async def test_run_forecasters_batch_threads_max_retries(
     parser_llm: GeneralLlm,
 ) -> None:
     """``max_retries`` kwarg on ``run_forecasters_batch`` flows through to per-question runner."""
-    from metaculus_bot.ablation import forecasters as forecasters_module
-    from metaculus_bot.ablation.forecasters import run_forecasters_batch
-
     q1 = _make_binary_question(qid=9207)
     captured_kwargs: list[dict] = []
 
@@ -1700,8 +1566,6 @@ async def test_max_sleep_cap_honors_retry_after_90s(
     The runner must trust that signal — capping below it would shed forecasters
     that would otherwise succeed on the next attempt.
     """
-    from metaculus_bot.ablation.forecasters import _run_one_forecaster
-
     q = _make_binary_question(qid=9301)
     one_llm = _make_forecaster_llms(count=1)[0]
     canned = ReasonedPrediction(prediction_value=0.42, reasoning="rationale")
@@ -1743,8 +1607,6 @@ async def test_max_sleep_cap_bounds_runaway_retry_after(
     against that runaway. New cap is 120s (more generous than the 60s exponential-
     backoff cap to honor legitimate long Retry-After signals).
     """
-    from metaculus_bot.ablation.forecasters import _run_one_forecaster
-
     q = _make_binary_question(qid=9302)
     one_llm = _make_forecaster_llms(count=1)[0]
     canned = ReasonedPrediction(prediction_value=0.42, reasoning="rationale")
@@ -1788,10 +1650,6 @@ async def test_retry_log_includes_provider_name_and_attempt(
     their own throttling windows. When several free-tier forecasters all share an
     upstream provider, the operator needs to see which provider is causing pain.
     """
-    import logging
-
-    from metaculus_bot.ablation.forecasters import _run_one_forecaster
-
     q = _make_binary_question(qid=9303)
     one_llm = _make_forecaster_llms(count=1)[0]
     canned = ReasonedPrediction(prediction_value=0.42, reasoning="rationale")
