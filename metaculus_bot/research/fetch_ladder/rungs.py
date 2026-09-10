@@ -590,6 +590,7 @@ async def _rendered_rung(
         http_status=direct.http_status if direct.http_status is not None else 200,
         # What the browser left of the wall: the render spent the rest, and the extractor's
         # optional second pass declines under its floor rather than overrunning the provider.
+        query=ctx.query,
         remaining_wall_s=ctx.rung_budget_s(),
         pol=ctx.policy,
     )
@@ -840,8 +841,13 @@ async def _wayback_snapshot_result(
         content_type=snapshot.content_type,
         datawrapper_charts=snapshot.datawrapper_charts,
         unreadable_embeds=snapshot.unreadable_embeds,
+        status_reason=snapshot.status_reason,
+        chrome_metric_withheld=snapshot.chrome_metric_withheld,
         precision_rescued=snapshot.precision_rescued,
         links=snapshot.links,
+        passages_returned=snapshot.passages_returned,
+        passages_grounded=snapshot.passages_grounded,
+        fallback_used=snapshot.fallback_used,
     )
     _capture_wayback_read(
         ctx,
