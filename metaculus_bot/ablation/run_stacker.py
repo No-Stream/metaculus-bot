@@ -269,7 +269,9 @@ async def _dispatch_stacker(
 ) -> tuple[Any, str]:
     """Call the right ``stacking.run_stacking_*`` based on question type.
 
-    ``aggregated_tool_output`` is forwarded directly to ``stacking.run_stacking_*``.
+    ``aggregated_tool_output`` is forwarded directly to ``stacking.run_stacking_*``. The numeric
+    branch mirrors ``AggregationPipeline._run_stacking_numeric`` in ``aggregation_pipeline``:
+    sanitize, unit-mismatch guard, then the ``NumericDistribution`` the cache needs.
     """
     if isinstance(question, BinaryQuestion):
         return await stacking.run_stacking_binary(
@@ -297,7 +299,6 @@ async def _dispatch_stacker(
         )
 
         upper_msg, lower_msg = bound_messages(question)
-        # Prod mirror (main.py:436-468): sanitize, unit-mismatch guard, then the NumericDistribution the cache needs.
         perc_list, meta_text = await stacking.run_stacking_numeric(
             stacker_llm,
             parser_llm,
@@ -330,7 +331,7 @@ def _median_fallback_prediction(
 ) -> Any:
     """Return a MEDIAN aggregation of surviving forecaster predictions.
 
-    Mirrors production at main.py:1304-1322: when both primary and
+    Mirrors ``AggregationPipeline._median_fallback``: when both primary and
     fallback stackers fail, MEDIAN-aggregate the per-forecaster
     predictions so the question still gets a publishable forecast.
     Per question type:
@@ -438,7 +439,7 @@ def _build_stacker_inputs(
     Three steps, in order. Per-forecaster tool augmentation:
     ``run_tools_for_forecaster`` checks the env flag internally and returns "" when
     off, so on arm A this produces no augmentations and each rationale passes through
-    unchanged (the ``## Computed quantities`` append mirrors production at ``main.py:1131``);
+    unchanged (the ``## Computed quantities`` append mirrors ``TemplateForecaster._make_prediction``);
     base texts are stripped of the leading ``Model: <name>`` tag, mirroring
     ``AggregationPipeline.run_stacking``. Then the once-per-question
     cross-model aggregation, which receives the *raw* (with-Model-tag) rationales for
@@ -530,12 +531,15 @@ async def _stack_with_fallback(
     ``patched_window_for_question`` is a global monkey-patch that raises on nested
     entry, so entry is serialized under the module-level asyncio.Lock: each call gets
     its own patched region without colliding with a concurrent batch call.
+
+    Both waits mirror the primary and fallback deadlines in
+    ``AggregationPipeline.stack_predictions``.
     """
     errors: list[str] = []
     async with _get_window_patch_lock():
         with patched_window_for_question(question):
             try:
-                # Prod mirror (main.py:1243): a stuck stacker would otherwise hold the lock for litellm's whole 480 s.
+                # A stuck stacker would otherwise hold the lock for litellm's whole 480 s.
                 result = await asyncio.wait_for(
                     _dispatch_stacker(
                         question=question,
@@ -556,7 +560,7 @@ async def _stack_with_fallback(
             if fallback_stacker_llm is None:
                 return None, None, errors
             try:
-                # Tighter deadline mirrors main.py:1271: a fallback is already late on the critical path.
+                # Tighter deadline: a fallback is already late on the critical path.
                 result = await asyncio.wait_for(
                     _dispatch_stacker(
                         question=question,
@@ -583,7 +587,7 @@ def _median_fallback_payload(
     model_used: str | None,
     errors: list[str],
 ) -> dict:
-    """Tertiary MEDIAN fallback payload (mirror of main.py:1287-1322).
+    """Tertiary MEDIAN fallback payload (mirror of the MEDIAN rung in ``AggregationPipeline.stack_predictions``).
 
     Both stackers failed but we still have surviving forecasters, so median-aggregate
     them: the question gets a degraded-but-publishable forecast instead of being lost
