@@ -1,33 +1,27 @@
-"""The four tools the gap-fill v2 driver calls, and the fetch ladder behind ``fetch``.
+"""The four tools the gap-fill v2 driver calls, and this caller's half of the fetch ladder.
 
-This module owns the handlers (``search_news``, ``search_web``, ``fetch``,
-``read_document``), the ladder spine they run on — the plain hop loop with its redirect
-vetting, the mapping of a rendered page onto this ladder's result type, the window cache
-that serves ``start_char`` continuations — and ``build_gap_fill_tools``, whose list order is
-the order the driver sees.
+The handlers are here (``search_news``, ``search_web``, ``fetch``, ``read_document``) and so is
+``build_gap_fill_tools``, whose list order is the order the driver sees. What used to be here and is
+not any more is the ladder itself: ``fetch`` and ``read_document``'s free acquisition both run the
+SHARED ladder through ``_fetch_via_ladder``, which calls ``fetch_ladder.ladder.fetch_url`` under one
+of the three gap-fill presets and maps what comes back through ``ladder_adapter``. The loop's own
+former rungs (``_fetch_plain`` and friends) are unreferenced and are deleted with the rest of the
+duplication.
 
-Support pieces live next door: ``tool_descriptions`` (driver-facing text + JSON schemas),
-``tool_backends`` (the AskNews / Exa / Gemini calls and their result formatting),
-``fetch_outcomes`` (classifying one plain HTTP response), ``local_document`` (the local PDF
-rung, the run's document cache, and the passage digest ``read_document`` serves). The
-headless-Chromium TRANSPORT moved out one level, to ``research.rendered_fetch``, when the
-Tier-1 resolution-source fetcher gained the same rung — the DNS pin, the route guard and the
-process-global launch cap are all load-bearing and a second copy of any of them would drift.
-``_try_rendered_fetch`` stays here because what a rendered page MEANS is this ladder's
-business: extracted text plus outbound links for a driver model. The TLS-impersonating retry
-(``research.impersonated_fetch``, added 2026-09-04) follows the same split: the transport and
-its policy (the trigger set, the kill switch, the per-run host memo) are shared with Tier 1, and
-``_try_impersonated_fetch`` here maps its response onto this ladder, from both free ladders that
-run a plain GET (``fetch`` and ``read_document``'s local-document acquisition).
+What stays this caller's: the window cache that serves ``start_char`` continuations, the
+question-platform refusal that runs before anything is dialed, the throttle-phrase check on a body
+the ladder read, the auto-escalation to ``read_document``, the paid reader and its robots pre-check,
+and the two shared fetch markers emitted after each tool call. Support pieces live next door:
+``tool_descriptions`` (driver-facing text and JSON schemas), ``tool_backends`` (the AskNews, Exa and
+Gemini calls), ``fetch_outcomes`` (this ladder's result type and its refusals), ``local_document``
+(what the free ladder holds, and the digest ``read_document`` serves), ``ladder_adapter`` (the two
+vocabularies' one meeting point).
 
-The seams the suite monkeypatches
-— ``_read_response_body``, ``_fetch_plain``, ``_try_rendered_fetch``,
-``_try_impersonated_fetch``, ``fetch_impersonated``,
-``_acquire_local_document``, ``_run_document_read_sync``, ``read_document``,
-``_READ_DOCUMENT_TIMEOUT_S`` — are attributes of THIS module and are resolved here at call
-time, so their callers stay here even where the callee moved out. The render transport's own
-seams (``resolve_pinned_host``, the launch semaphore) are attributes of ``rendered_fetch``
-and are patched there.
+The seams the suite monkeypatches — ``_fetch_via_ladder``, ``_acquire_local_document``,
+``_run_document_read_sync``, ``read_document``, ``_READ_DOCUMENT_TIMEOUT_S`` — are attributes of THIS
+module and resolved here at call time. The ladder's own seams (``direct_fetch._fetch_direct``,
+``rungs._rendered_rung``, ``rungs.render_page``, ``rungs.fetch_impersonated``) are patched there.
+Detail: ``docs/agentic_gap_fill.md`` "The fetch ladder".
 """
 
 from __future__ import annotations
@@ -36,6 +30,7 @@ import asyncio
 import logging
 import os
 from collections import OrderedDict
+from dataclasses import replace
 from datetime import UTC, datetime
 from time import monotonic
 from urllib.parse import urlparse
@@ -55,8 +50,8 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_IMPERSONATE_MIN_BUDGET_S,
     RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
 )
-from metaculus_bot.research import derived_api, document_cache, impersonated_fetch
-from metaculus_bot.research.agentic import local_document
+from metaculus_bot.research import derived_api, document_cache, fetch_markers, impersonated_fetch
+from metaculus_bot.research.agentic import ladder_adapter, local_document
 from metaculus_bot.research.agentic.fetch_outcomes import (
     _FETCH_MIN_CONTENT_CHARS,
     _HTML_CONTENT_TYPE_TOKENS,
@@ -96,6 +91,15 @@ from metaculus_bot.research.agentic.tool_descriptions import (
 from metaculus_bot.research.agentic.types import ToolOutcome, ToolSpec
 from metaculus_bot.research.document_text import is_pdf_body
 from metaculus_bot.research.fetch_ladder import classify, guard
+from metaculus_bot.research.fetch_ladder.context import LadderContext, QuestionRungBudget
+from metaculus_bot.research.fetch_ladder.ladder import fetch_url
+from metaculus_bot.research.fetch_ladder.policy import (
+    GAP_FILL_DIRECT_POLICY,
+    GAP_FILL_DOCUMENT_POLICY,
+    GAP_FILL_FETCH_POLICY,
+    LADDER_CALLER_GAP_FILL_V2,
+    LadderPolicy,
+)
 from metaculus_bot.research.http_fetch import (
     MAX_REDIRECTS,
     REDIRECT_STATUSES,
@@ -114,6 +118,7 @@ from metaculus_bot.research.rendered_fetch import (
     note_rendered_no_text,
     render_page,
 )
+from metaculus_bot.research.resolution_fetch_result import FetchResult
 from metaculus_bot.research.robots_policy import ROBOTS_FETCH_TIMEOUT_S, google_extended_blocks_url, robots_host
 from metaculus_bot.research.wayback import (
     innermost_url,
@@ -125,18 +130,13 @@ from metaculus_bot.research.wayback import (
 
 logger = logging.getLogger(__name__)
 
-# This ladder's key into the transport's render memos: its "rendered to nothing" is bare
-# trafilatura emptiness, a weaker test than Tier-1's, so the two must not answer each other.
+# The dead `_try_rendered_fetch`'s memo key; the live scope is `LadderPolicy.render_memo_scope`.
 _RENDER_MEMO_SCOPE: MemoScope = "gap_fill_v2"
 
 _FETCH_WINDOW_CHARS = 8000
 _FETCH_CACHE_MAX_ENTRIES = 50
 _READ_DOCUMENT_TIMEOUT_S = 60.0
-# read_document is acquisition-first, so its budget holds two rungs: the free local ladder,
-# then the paid reader on what the total leaves it. The ToolSpec ceiling stays 70 s (see
-# build_gap_fill_tools) and so does the loop's wall discipline: 25 + 40 = 65, plus 5 s of
-# margin. The paid reader keeps its whole 60 s whenever acquisition failed fast, which is the
-# common case for the URLs that reach it (archived all-fail p50 0.3 s).
+# Two rungs share this: the free local ladder, then the paid reader on what the total leaves it.
 _LOCAL_DOCUMENT_BUDGET_S = 25.0
 _READ_DOCUMENT_TOTAL_BUDGET_S = 65.0
 _FETCH_HOST_SEMAPHORES: dict[str, asyncio.Semaphore] = {}
@@ -651,6 +651,50 @@ async def _try_wayback_fetch(
     )
 
 
+def _per_call_ctx(question_ctx: LadderContext | None, *, query: str) -> LadderContext:
+    """A per-CALL context off the question's: its own wall origin, its own rung list, its own ask.
+
+    ``started`` is the origin every rung bounds itself against and one tool call is one wall, so it
+    is taken here rather than at intake. What stays the question's is ``shared``, the per-question
+    rung budget the archive and paid-read caps count on, so a driver that spends both snapshots on
+    one gap cannot spend two more on the next. A call with no question context (which is what the
+    suite drives) gets a fresh budget, so it behaves exactly as one call always did.
+    """
+    base = LadderContext(host_sems=_FETCH_HOST_SEMAPHORES) if question_ctx is None else question_ctx
+    return replace(base, query=query, rungs=[], started=monotonic())
+
+
+async def _fetch_via_ladder(
+    url: str, *, query: str, pol: LadderPolicy, ctx: LadderContext | None, record: bool = True
+) -> PlainFetchResult:
+    """One run of the shared fetch ladder for ``url``, as this ladder's own result.
+
+    The question-platform refusal happens HERE rather than inside the ladder, because it is this
+    caller's own policy (the resolution-source fetcher drops those URLs when it selects them) and
+    because it must refuse before anything is dialed. Everything past it is the shared ladder:
+    the direct fetch with its redirect vetting and local document read, then the rungs ``pol``
+    enables. ``record`` is False for the robots.txt pre-check, which is not a fetch the driver made.
+    """
+    blocked = _fetch_plain_url_block(url)
+    if blocked is not None:
+        return blocked
+    result = await fetch_url(url, policy=pol, ctx=_per_call_ctx(ctx, query=query))
+    if record:
+        _log_ladder_markers(result)
+    return ladder_adapter.as_plain_result(result, requested_url=url)
+
+
+def _log_ladder_markers(result: FetchResult) -> None:
+    """The two shared fetch markers for one tool call, with ``question=None``.
+
+    The loop has no question id in hand at a tool call, exactly as its three event markers do not,
+    so a join to a question goes through the run id (docs/telemetry_markers.md).
+    """
+    logger.info(fetch_markers.fetch_marker_line(result, qid=None, caller=LADDER_CALLER_GAP_FILL_V2))
+    for line in fetch_markers.escalation_marker_lines(result, qid=None, caller=LADDER_CALLER_GAP_FILL_V2):
+        logger.info(line)
+
+
 async def search_news(query: str) -> ToolOutcome:
     client_id = os.getenv(ASKNEWS_CLIENT_ID_ENV)
     secret = os.getenv(ASKNEWS_SECRET_ENV)
@@ -725,60 +769,39 @@ def _held_from_result(url: str, result: PlainFetchResult) -> local_document.Held
     elif result.status == "ok" and result.method != DOCUMENT_NEEDED_METHOD:
         held = local_document.HeldDocument(text=result.text.strip())
     else:
-        # A document_needed result is "ok" and carries a placeholder sentence telling the driver
-        # to use read_document. Reading that as the page's text would hand the digest our own
-        # instruction to itself, so it holds nothing, exactly like a failed rung.
+        # Reading the use-read_document placeholder as the page would digest our own instruction.
         return local_document.HeldDocument()
     if held.has_text and matched_throttle_phrase(held.text) is not None:
-        # A rate-limit interstitial is not the document (q45191). Hold nothing, so the paid
-        # reader — which dials from Gemini's address rather than ours — gets its turn.
+        # An interstitial is not the document (q45191), so the paid reader gets its turn.
         return local_document.HeldDocument()
     if held.has_text:
         _cache_fetch_result(url, held.text, result.links)
     return held
 
 
-async def _run_local_document_ladder(url: str, *, deadline_monotonic_s: float) -> local_document.HeldDocument:
-    """The free rungs ``fetch`` runs, for a document read: plain, the impersonated retry, then rendered.
+async def _run_local_document_ladder(url: str, *, ctx: LadderContext | None) -> local_document.HeldDocument:
+    """The free rungs a document read gets: the shared ladder under ``GAP_FILL_DOCUMENT_POLICY``.
 
-    Escalation follows ``fetch``'s own rule rather than a looser one: a page whose plain text is
-    thin enough to look like a JavaScript shell goes to the browser even though we hold
-    something, because digesting 100 chars of navigation chrome would answer the ask out of
-    furniture. A parse ends the ladder either way — a scan is as far as the free route reaches,
-    and that is worth knowing rather than re-fetching. The impersonated retry runs here for the
-    same reason it runs in ``fetch``, and with more at stake: this ladder is the one in front of
-    the paid ``url_context`` read, so a 403 it left standing was a paid read of a page the retry
-    fetches for free (a bls.gov PDF is one of the four measured rescues). ``deadline_monotonic_s``
-    is the instant :func:`_acquire_local_document`'s ``wait_for`` fires, handed to the retry so it
-    sizes its dial to what is left instead of to a fresh wall the cancellation would cut short.
+    Its 25 s wall is what every rung bounds itself against, and its rung set is ``fetch``'s minus
+    the archive: this ladder sits immediately in front of the paid ``url_context`` read, and an
+    archived copy is not what a document read was asked for. The impersonated retry matters more
+    here than in ``fetch`` for the same reason — a 403 left standing was a paid read of a page the
+    free retry fetches (a bls.gov PDF is one of the four measured rescues) — and the browser still
+    runs on a page whose text is thin enough to look like a JavaScript shell, because digesting 100
+    characters of navigation chrome would answer the ask out of furniture.
     """
-    plain = await _fetch_plain_with_impersonated_retry(url, deadline_monotonic_s=deadline_monotonic_s)
-    held = _held_from_result(url, plain)
-    if held.oversize or held.pdf is not None or plain.method == DOCUMENT_NEEDED_METHOD:
-        # A parse, a refusal, or a document no local rung can read: an image, or a PDF with no
-        # text layer (whose parse the cache already holds). A browser reads neither, so the free
-        # ladder ends here rather than spending a Chromium launch to learn that again.
-        return held
-    if held.has_text and not plain.escalate_rendered:
-        return held
-    if plain.status in ("ok", "empty"):
-        rendered = await _try_rendered_fetch(plain.url)
-        if rendered is not None:
-            rendered_held = _held_from_result(url, rendered)
-            if rendered_held.has_text:
-                return rendered_held
-    return held
+    plain = await _fetch_via_ladder(url, query="", pol=GAP_FILL_DOCUMENT_POLICY, ctx=ctx)
+    return _held_from_result(url, plain)
 
 
-async def _acquire_local_document(url: str) -> local_document.HeldDocument:
+async def _acquire_local_document(url: str, *, ctx: LadderContext | None = None) -> local_document.HeldDocument:
     """What the free ladder holds for ``url``: something already read this run, or a fresh try.
 
     Bounded by ``_LOCAL_DOCUMENT_BUDGET_S`` so a slow host cannot spend the paid reader's
     budget as well as its own; on expiry we hold nothing and the reader gets its turn. The same
-    instant is handed to the ladder as its deadline, so the impersonated retry sizes its dial to
-    what is left rather than to a wall this cancellation would cut short. The cancelled work
-    includes at most one in-flight extraction thread, which finishes and drops its result,
-    because a thread cannot be cancelled.
+    figure is the ladder's own ``total_wall_s``, so every rung inside it declines under its floor
+    rather than being cancelled mid-dial. The cancelled work includes at most one in-flight
+    extraction thread, which finishes and drops its result, because a thread cannot be cancelled.
 
     That thread does NOT finish inside its own ``max_seconds``. The clock for that budget starts
     only once ``extract_pdf_text`` has read the declared page count and the whole bookmark
@@ -794,12 +817,8 @@ async def _acquire_local_document(url: str) -> local_document.HeldDocument:
     if cached_text is not None:
         _FETCH_TEXT_CACHE.move_to_end(url)
         return local_document.HeldDocument(text=cached_text)
-    deadline_monotonic_s = monotonic() + _LOCAL_DOCUMENT_BUDGET_S
     try:
-        return await asyncio.wait_for(
-            _run_local_document_ladder(url, deadline_monotonic_s=deadline_monotonic_s),
-            timeout=_LOCAL_DOCUMENT_BUDGET_S,
-        )
+        return await asyncio.wait_for(_run_local_document_ladder(url, ctx=ctx), timeout=_LOCAL_DOCUMENT_BUDGET_S)
     except TimeoutError:
         logger.info(
             "agentic read_document local acquisition exceeded %.0fs, falling back to the reader: %s",
@@ -812,21 +831,10 @@ async def _acquire_local_document(url: str) -> local_document.HeldDocument:
 async def _local_digest_outcome(url: str, ask: str, held: local_document.HeldDocument) -> ToolOutcome | None:
     """Answer the ask from text we hold, deterministically and for free — or None to pay instead.
 
-    None is returned for the one shape where a digest would answer the ask out of furniture: a
-    sub-floor page (under the same ``_FETCH_MIN_CONTENT_CHARS`` the fetch ladder escalates on),
-    with no parse behind it, whose digest selected NO passage. That is a JavaScript shell whose
-    browser rescue already failed, and digesting its navigation chrome stamped an unread page
-    ``fetched`` — the one tier that supersedes the briefing — while the tool description tells
-    the driver a zero-passage digest means the document does not discuss the ask (D5: a Manifold
-    sidebar carrying five OTHER markets' probabilities came back as the page's content). All
-    three conditions are needed: thin-but-real short sources exist and ``fetch`` serves them as
-    successes, a held parse is a real local read of a document a browser cannot help with, and a
-    matching passage is evidence the text is the page rather than its frame.
-
-    The digest runs off the loop: ``select_passages`` tokenises every window of the whole
-    document and holds one Counter per window, which measured a 1,365 ms contiguous stall for
-    six concurrent 400-page digests — inside a research phase whose wall discards work that
-    already succeeded (F47).
+    None means the one shape where a digest would answer the ask out of furniture: a sub-floor page
+    with no parse behind it whose digest selected NO passage. All three conditions are needed, and
+    the digest runs off the event loop for a measured reason; both receipts are in
+    ``docs/agentic_gap_fill.md`` "Why the free digest can refuse to answer".
     """
     digest = await asyncio.to_thread(
         local_document.digest_held,
@@ -848,58 +856,36 @@ async def _local_digest_outcome(url: str, ask: str, held: local_document.HeldDoc
     return ToolOutcome(content_markdown=digest.block, method=local_document.DIGEST_LOCAL_METHOD)
 
 
-async def fetch(url: str, start_char: int = 0, *, question_topic: str = "") -> ToolOutcome:
+async def fetch(
+    url: str, start_char: int = 0, *, question_topic: str = "", ctx: LadderContext | None = None
+) -> ToolOutcome:
+    """Read ``url`` for the driver: this run's window cache, else the whole shared fetch ladder.
+
+    The rungs — the impersonated retry on a host's 403, the browser on a page too thin to be the
+    page, the archive on one our address never reached — all run inside ``fetch_url`` under
+    ``GAP_FILL_FETCH_POLICY``, so what is left here is reading the outcome: refuse a blocked URL,
+    paginate a locally read document, hand a document with no text layer to ``read_document``, and
+    otherwise window and cache what was read. A page the browser could not rescue either comes back
+    ``empty`` and NEVER as a plain success, because the loop grants the ``fetched`` tier on status
+    alone (docs/agentic_gap_fill.md).
+    """
     cached = _fetch_from_cache(url, start_char)
     if cached is not None:
         return cached
 
-    plain = await _fetch_plain_with_impersonated_retry(url)
-    if _wayback_applies(plain):
-        # The archive is the one free route whose egress is not ours; a decline leaves plain as-is.
-        rescued = await _try_wayback_fetch(url, plain)
-        if rescued is not None:
-            return _read_content_outcome(url, rescued.text, rescued.links, method="wayback", start_char=start_char)
+    plain = await _fetch_via_ladder(url, query=question_topic, pol=GAP_FILL_FETCH_POLICY, ctx=ctx)
     if plain.status == "blocked":
         return _blocked_outcome(plain)
     if plain.method == local_document.PDF_LOCAL_METHOD:
         return _pdf_local_outcome(url, plain, start_char=start_char)
     if plain.method == DOCUMENT_NEEDED_METHOD:
-        # Auto-escalate to the read_document backend so the driver keeps its "handled
-        # automatically" contract without spending a second tool call. What reaches here is an
-        # image, or a PDF the local rung already proved has no text layer. Only the PDF is free
-        # of a second request: its parse is cached under the URL, whereas an image is classified
-        # on Content-Type alone and its body is never downloaded on either pass, so nothing
-        # caches it and the ladder would GET it again to re-derive the same verdict.
-        # ``ladder_exhausted`` says so directly — the free rungs just ran here.
-        return await read_document(plain.url, _generic_document_ask(question_topic), ladder_exhausted=True)
-    if plain.status not in ("ok", "empty"):
-        return ToolOutcome(content_markdown=plain.text, method=plain.method, status="error")
-    if plain.status == "ok" and not plain.escalate_rendered:
-        return _read_content_outcome(url, plain.text, plain.links, method=plain.method, start_char=start_char)
-    return await _rendered_escalation_outcome(url, plain, start_char=start_char, question_topic=question_topic)
-
-
-async def _rendered_escalation_outcome(
-    url: str, plain: PlainFetchResult, *, start_char: int, question_topic: str
-) -> ToolOutcome:
-    """The ladder's last rungs: headless Chromium, then whatever the plain rung really read."""
-    rendered = await _try_rendered_fetch(plain.url)
-    if rendered is not None:
-        if rendered.method == DOCUMENT_NEEDED_METHOD:
-            return await read_document(rendered.url, _generic_document_ask(question_topic), ladder_exhausted=True)
-        if rendered.status == "ok" and rendered.text:
-            # rendered.method is "rendered" for a DOM read, "derived_api" for a harvested JSON feed.
-            return _read_content_outcome(
-                url, rendered.text, rendered.links, method=rendered.method, start_char=start_char
-            )
-    # Rendered was unavailable, errored, or itself extracted nothing. Fall back to
-    # plain ONLY when the plain fetch actually read (thin-but-real) content; a plain
-    # fetch that produced nothing has no content to hand back and must not be
-    # laundered as a successful "plain"/"ok" retrieval (the companiesmarketcap.com
-    # js-wall failure: an unread page stamped `fetched` and superseded the briefing).
+        # `ladder_exhausted` says the free rungs just ran, so the reader does not re-request.
+        return await read_document(plain.url, _generic_document_ask(question_topic), ladder_exhausted=True, ctx=ctx)
     if plain.status == "ok":
         return _read_content_outcome(url, plain.text, plain.links, method=plain.method, start_char=start_char)
-    return _empty_fetch_outcome(plain.url)
+    if plain.status == "empty":
+        return _empty_fetch_outcome(plain.url)
+    return ToolOutcome(content_markdown=plain.text, method=plain.method, status="error")
 
 
 _ROBOTS_DISALLOWED_MSG = (
@@ -911,20 +897,24 @@ _ROBOTS_DISALLOWED_MSG = (
 )
 
 
-async def _fetch_robots_txt(robots_url: str) -> str | None:
-    """Read one robots.txt through THIS path's ladder; None when we could not read it.
+async def _fetch_robots_txt(robots_url: str, *, ctx: LadderContext | None = None) -> str | None:
+    """Read one robots.txt through the shared ladder's DIRECT fetch; None when we could not.
 
-    Goes through ``_fetch_plain`` rather than its own client so the SSRF preflight, the
-    filtering resolver, the redirect vetting and the body cap all apply unchanged. That path
-    also classifies, so a host serving robots.txt as HTML hands back trafilatura's idea of it
-    and a non-plain rung (an image, a PDF) is refused outright — both of which read as "no
-    directives", i.e. proceed and pay, which is the only direction an unreadable robots.txt is
-    allowed to fail in. The bound and the per-host cache are ``robots_policy``'s, shared with
-    the Tier-1 resolution-source reader, because a host's policy is a property of the host and
-    the two paths routinely reach the same government domains in one run.
+    ``GAP_FILL_DIRECT_POLICY`` is the point: one direct fetch, no escalation rung, and this
+    caller's verdict, which has no content floor. A robots.txt body is 33 to 45 characters, so a
+    floor would read every host as "no directives" and quietly open the paid rung on hosts that
+    disallow it. Everything else is the shared path's: the SSRF preflight, the filtering resolver,
+    the per-hop redirect vetting and the body cap. Bounded at ``ROBOTS_FETCH_TIMEOUT_S`` on top of
+    the hop's own clamp, because an unbounded per-host acquire is not a sensible price for a
+    pre-check whose only job is to avoid one paid call; a timeout reads as unreadable, which is the
+    only direction this may fail in. The per-host cache is ``robots_policy``'s, shared with the
+    Tier-1 reader, because a host's policy is a property of the host.
     """
     try:
-        result = await asyncio.wait_for(_fetch_plain(robots_url), timeout=ROBOTS_FETCH_TIMEOUT_S)
+        result = await asyncio.wait_for(
+            _fetch_via_ladder(robots_url, query="", pol=GAP_FILL_DIRECT_POLICY, ctx=ctx, record=False),
+            timeout=ROBOTS_FETCH_TIMEOUT_S,
+        )
     except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except  # pre-check soft-fail boundary: a robots.txt we cannot read must degrade to paying, never to failing the read
         logger.debug("agentic robots.txt pre-check failed for %s: %s: %s", robots_url, type(exc).__name__, exc)
         return None
@@ -933,7 +923,7 @@ async def _fetch_robots_txt(robots_url: str) -> str | None:
     return None
 
 
-async def _url_context_robots_skip(url: str) -> bool:
+async def _url_context_robots_skip(url: str, *, ctx: LadderContext | None = None) -> bool:
     """True when this host tells ``Google-Extended`` to stay out of ``url``'s path.
 
     Only the paid ``url_context`` rung consults this: the free rungs dial from our own client
@@ -941,7 +931,7 @@ async def _url_context_robots_skip(url: str) -> bool:
     that reference use is permitted. Proven live 2026-09-03 — see ``robots_policy``, which owns
     the per-host cache this shares with the Tier-1 reader.
     """
-    return await google_extended_blocks_url(url, fetch_text=_fetch_robots_txt)
+    return await google_extended_blocks_url(url, fetch_text=lambda robots_url: _fetch_robots_txt(robots_url, ctx=ctx))
 
 
 async def _free_route_outcome(url: str, ask: str, held: local_document.HeldDocument) -> ToolOutcome | None:
@@ -965,7 +955,9 @@ async def _free_route_outcome(url: str, ask: str, held: local_document.HeldDocum
     return None
 
 
-async def read_document(url: str, ask: str, *, ladder_exhausted: bool = False) -> ToolOutcome:
+async def read_document(
+    url: str, ask: str, *, ladder_exhausted: bool = False, ctx: LadderContext | None = None
+) -> ToolOutcome:
     """Answer ``ask`` about ``url``: from the page's own text where we can get it, else Gemini.
 
     Acquisition-first. The free ladder runs before anything is spent (this run's cache, then
@@ -975,42 +967,24 @@ async def read_document(url: str, ask: str, *, ladder_exhausted: bool = False) -
     page with no text at all, or a PDF with no text layer. Measured 2026-09-03, that is two of 47
     archived fetch failures, against 191 reader calls over the 2026 summer season.
 
-    A question-platform URL (metaculus.com, competitions.mantic.com) is refused before any rung
-    runs, with the same ``blocked`` outcome ``fetch`` gives it (``_fetch_plain_url_block``). The
-    paid reader dials from Google's address, so it is the one rung that our-IP refusal could not
-    otherwise reach, and on Mantic the page it would read carries the other bots' forecasts. A URL
-    that 3xxes onto a platform host is refused the same way: the free ladder's refusal of that hop
-    comes back as ``HeldDocument.refused_landing`` and the paid rung declines on it.
-
-    The retrieval-count guard on the paid rung stays exactly as it was, because it is what
-    keeps that rung honest: ``method="document"`` maps to the ``fetched`` tier
-    (``provenance._METHOD_TO_TIER``), the highest authority the artifact renderer has — only a
-    ``fetched`` discrepancy enters the SUPERSEDE block that tells every forecaster to override
-    the briefing. A fluent-but-ungrounded answer there is the Q38195 failure mode with a bigger
-    blast radius, and the quote check cannot catch it (WARN-only for this tool, since
-    paraphrase and ellipsis-joined quotes make a hard gate too false-positive-prone). So zero
-    successful url_context retrievals withholds the tier, mirroring the grounded-chunk floor
-    ``gemini_search`` applies. The local methods earn the same tier for the opposite reason:
-    the bytes are the host's own, decoded rather than described.
-
-    ``ladder_exhausted`` is internal and hidden from the driver-facing schema (the same way
-    ``fetch`` hides ``question_topic``): ``fetch``'s own escalations set it because the free
-    rungs just ran for that URL, and running them again would re-request an image the plain rung
-    classified from its Content-Type without ever downloading it.
+    A question-platform URL is refused before any rung runs, with the same ``blocked`` outcome
+    ``fetch`` gives it, and so is a URL that 3xxes onto one (the free ladder's refusal of that hop
+    comes back as ``HeldDocument.refused_landing``). Zero successful ``url_context`` retrievals withholds the ``fetched`` tier, and
+    ``ladder_exhausted`` is internal and hidden from the driver-facing schema; both receipts are in
+    ``docs/agentic_gap_fill.md`` "Why the paid reader's retrieval-count guard stays".
     """
     blocked = _fetch_plain_url_block(url)
     if blocked is not None:
         return _blocked_outcome(blocked)
     started = monotonic()
-    held = local_document.HeldDocument() if ladder_exhausted else await _acquire_local_document(url)
+    held = local_document.HeldDocument() if ladder_exhausted else await _acquire_local_document(url, ctx=ctx)
     settled = await _free_route_outcome(url, ask, held)
     if settled is not None:
         return settled
     if not os.getenv(GOOGLE_API_KEY_ENV):
         return _format_fetch_error(f"Google API key is not configured; set {GOOGLE_API_KEY_ENV}.", method="document")
-    if await _url_context_robots_skip(url):
-        # Its own status token, never mapped to a tier: nothing was read, and the reason is the
-        # host's policy rather than a failure worth retrying.
+    if await _url_context_robots_skip(url, ctx=ctx):
+        # Its own status token, never tiered: nothing was read, and a retry cannot help.
         logger.info(f"AGENTIC_URLCONTEXT_ROBOTS_SKIP: url={url} host={robots_host(url)}")
         return _format_fetch_error(
             _ROBOTS_DISALLOWED_MSG.format(host=robots_host(url)),
@@ -1018,17 +992,7 @@ async def read_document(url: str, ask: str, *, ladder_exhausted: bool = False) -
             method="document",
         )
     try:
-        # The reader gets what the total budget has left, so a long acquisition shortens the
-        # paid attempt instead of overrunning the tool's ceiling. Acquisition is itself capped at
-        # _LOCAL_DOCUMENT_BUDGET_S, so this wait is 40 s at that cap and 60 s when acquisition
-        # failed fast (the common case). The reader's own in-thread ceiling is FIXED at 55 s
-        # (tool_backends: 2 x 26.5 s + 2 s of backoff), so past ~10 s of acquisition this wait is
-        # the shorter of the two and a to_thread worker — which wait_for cannot cancel — can
-        # outlive it by up to 15 s, finishing a call whose answer is discarded. What that cannot
-        # do is start a NEW billed request after we stop waiting: the last attempt begins by
-        # 28.5 s in, well inside the 40 s floor. Sizing the attempts off this variable wait
-        # instead would cut one attempt to 19 s on the handover path and fail reads that succeed
-        # today, so the arithmetic stays fixed and the overrun is documented rather than traded.
+        # What the total budget has left (docs/agentic_gap_fill.md, the budget arithmetic).
         text, n_url_success, statuses = await asyncio.wait_for(
             asyncio.to_thread(_run_document_read_sync, url, ask),
             timeout=min(_READ_DOCUMENT_TIMEOUT_S, _READ_DOCUMENT_TOTAL_BUDGET_S - (monotonic() - started)),
@@ -1038,11 +1002,7 @@ async def read_document(url: str, ask: str, *, ladder_exhausted: bool = False) -
     except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except  # tool-handler soft-fail boundary: a dead reader becomes a tool result the driver can read, never a loop crash
         return _format_fetch_error(f"Document read failed: {type(exc).__name__}: {exc}", method="document")
     if n_url_success == 0:
-        # Greppable, mirroring gemini_search's GEMINI_UNGROUNDED_SUPPRESSED so the rate is
-        # measurable from the archived run logs. ``statuses`` carries every reported
-        # url_retrieval_status: a refused fetch, a retrieval timeout and a url_context tool
-        # that never ran all read as zero successes, and only the status names separate them.
-        # ``none`` means the SDK attached no url_metadata entry at all.
+        # Greppable and keyed on `statuses`, which is the only thing separating three zeroes.
         logger.warning(f"AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED: url={url} statuses={','.join(statuses) or 'none'}")
         return _format_fetch_error(
             f"Document read retrieved no URL content: Gemini's url_context tool fetched nothing from {url}, "
@@ -1052,18 +1012,38 @@ async def read_document(url: str, ask: str, *, ladder_exhausted: bool = False) -
     return ToolOutcome(content_markdown=text, method="document")
 
 
-def build_gap_fill_tools(question_topic: str) -> list[ToolSpec]:
+def question_ladder_context() -> LadderContext:
+    """The ONE fetch-ladder context a question's tool calls share.
+
+    What it carries is the per-question half: a fresh :class:`QuestionRungBudget`, which is what
+    caps this question at two archive snapshots and two paid reads however many URLs the driver
+    picks, and this ladder's own per-host politeness map. Everything per call — the ask, the wall
+    origin, the rung list — is derived off it in :func:`_per_call_ctx`. Its own function so the
+    seam that builds it (``agentic_gap_fill.run_gap_fill_v2``) does not have to know the fields.
+    """
+    return LadderContext(shared=QuestionRungBudget(), host_sems=_FETCH_HOST_SEMAPHORES)
+
+
+def build_gap_fill_tools(question_topic: str, *, ctx: LadderContext | None = None) -> list[ToolSpec]:
+    """The four tools the driver sees, in the order it sees them.
+
+    ``ctx`` is the question's fetch-ladder context (:func:`question_ladder_context`), captured into
+    the two handlers that fetch. None means one fresh budget per call, which is what a direct call
+    with no question in hand gets.
+    """
+
     async def _fetch_with_topic(url: str, start_char: int = 0) -> ToolOutcome:
-        # Binds the question topic for rung-3 document auto-escalation; the
-        # driver-facing schema stays (url, start_char) only.
-        return await fetch(url, start_char, question_topic=question_topic)
+        """``fetch`` with the topic and the ladder context bound; the schema stays (url, start_char)."""
+        return await fetch(url, start_char, question_topic=question_topic, ctx=ctx)
 
     async def _read_document_public(url: str, ask: str) -> ToolOutcome:
-        # (url, ask) only, for the same reason _fetch_with_topic hides question_topic: the loop
-        # binds handlers with **arguments straight off the model, so an advertised — or merely
-        # hallucinated — `ladder_exhausted: true` would skip the free ladder and pay. Resolves
-        # `read_document` as a module attribute at call time, so the suite's patches still land.
-        return await read_document(url, ask)
+        """``read_document`` with (url, ask) only, so a hallucinated ``ladder_exhausted`` cannot pay.
+
+        The loop binds handlers with ``**arguments`` straight off the model, so an advertised — or
+        merely invented — ``ladder_exhausted: true`` would skip the free ladder. Resolves
+        ``read_document`` as a module attribute at call time, so the suite's patches still land.
+        """
+        return await read_document(url, ask, ctx=ctx)
 
     return [
         ToolSpec(
@@ -1085,8 +1065,7 @@ def build_gap_fill_tools(question_topic: str) -> list[ToolSpec]:
             description=FETCH_DESCRIPTION,
             parameters=_FETCH_PARAMETERS,
             handler=_fetch_with_topic,
-            # Sits above _READ_DOCUMENT_TIMEOUT_S so the rung-3 document
-            # auto-escalation has room to fire and return inside this budget.
+            # Above _READ_DOCUMENT_TIMEOUT_S, so the document escalation fits inside this budget.
             timeout_s=90,
         ),
         ToolSpec(
@@ -1094,9 +1073,7 @@ def build_gap_fill_tools(question_topic: str) -> list[ToolSpec]:
             description=READ_DOCUMENT_DESCRIPTION,
             parameters=_READ_DOCUMENT_PARAMETERS,
             handler=_read_document_public,
-            # UNCHANGED at 70 even though the handler now runs a free local ladder before the
-            # paid read: the two share _READ_DOCUMENT_TOTAL_BUDGET_S (65) and 70 stays at
-            # GAP_FILL_V2_CONCLUDE_THRESHOLD, so the loop's wall discipline is untouched.
+            # 70 is GAP_FILL_V2_CONCLUDE_THRESHOLD (docs/agentic_gap_fill.md, the budget arithmetic).
             timeout_s=70,
         ),
     ]

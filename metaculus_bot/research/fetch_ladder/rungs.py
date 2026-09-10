@@ -710,15 +710,23 @@ async def _derived_api_rung(
 _WAYBACK_TRIGGER_STATUSES: frozenset[FetchStatus] = frozenset({"blocked", "error", "not_found"})
 
 
+# A body an archived copy is no more readable than the live one, so the archive adds nothing: a
+# declared image, which only a model read can turn into text at all.
+_WAYBACK_EXCLUDED_REASONS: frozenset[FetchStatusReason] = frozenset({"image_needs_reader"})
+
+
 def _wayback_rung_applies(direct: FetchResult, pol: LadderPolicy) -> bool:
     """Whether the archive is a plausible substitute for ``direct``, for THIS caller.
 
     The shared trigger set plus whatever the caller adds to it (the loop also substitutes for a
-    body it could not read at all). ``wayback_needs_host_refusal`` then drops a ``blocked`` that
-    carries no host status, which is a refusal WE made: handing that to a third-party fetcher is
-    the bypass ``ssrf_blocked``'s exclusion prevents, one reason over.
+    body it could not read at all), minus the reasons an archived copy cannot help with.
+    ``wayback_needs_host_refusal`` then drops a ``blocked`` that carries no host status, which is a
+    refusal WE made: handing that to a third-party fetcher is the bypass ``ssrf_blocked``'s
+    exclusion prevents, one reason over.
     """
     if direct.status not in (_WAYBACK_TRIGGER_STATUSES | pol.wayback_extra_trigger_statuses):
+        return False
+    if direct.status_reason in _WAYBACK_EXCLUDED_REASONS:
         return False
     return not (pol.wayback_needs_host_refusal and direct.status == "blocked" and direct.http_status is None)
 

@@ -50,6 +50,7 @@ from metaculus_bot.research.agentic.driver_prompt import (
     build_system_prompt,
     build_user_brief,
 )
+from metaculus_bot.research.agentic.tools import question_ladder_context
 
 __all__ = ["run_gap_fill_v2", "run_gap_fill_v2_ghost_v1"]
 
@@ -99,7 +100,8 @@ async def run_gap_fill_v2(
         today = datetime.now(UTC).strftime("%Y-%m-%d")
         system_prompt = build_system_prompt(today)
         user_brief = build_user_brief(question, bundle_markdown)
-        tools = build_gap_fill_tools(question.question_text)
+        # ONE fetch-ladder context per question, so its rung caps count across the tool calls.
+        tools = build_gap_fill_tools(question.question_text, ctx=question_ladder_context())
         question_ref = _question_ref(question)
         config = LoopConfig(
             model=GAP_FILL_V2_DRIVER_MODEL,

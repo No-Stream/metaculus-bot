@@ -50,7 +50,7 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_WALL_TIMEOUT,
     env_flag_enabled,
 )
-from metaculus_bot.research import resolution_datawrapper, resolution_presentation
+from metaculus_bot.research import fetch_markers, resolution_datawrapper, resolution_presentation
 from metaculus_bot.research.fetch_ladder import classify, context, guard, ladder, policy
 from metaculus_bot.research.fetch_ladder.policy import LADDER_CALLER_RESOLUTION_SOURCE
 from metaculus_bot.research.http_fetch import DatawrapperChartRef, datawrapper_live_data_url, host_semaphores
@@ -61,7 +61,6 @@ from metaculus_bot.research.resolution_fetch_result import (
     FetchResult,
     RungSkipReason,
     _fetch_result_sources,
-    fetch_outcome_token,
     looks_like_csv_rows,  # noqa: F401  # re-export: the Tier-1 suite imports the row-shape check from this module path
 )
 from metaculus_bot.research.resolution_presentation import format_resolution_sections  # noqa: F401  # public re-export
@@ -346,30 +345,9 @@ def _log_fetch_outcome_markers(qid: int | None, results: list[FetchResult]) -> N
     is exact only for earlier records and otherwise keys on the escalation line).
     """
     for r in results:
-        reason = f" reason={r.status_reason}" if r.status_reason else ""
-        route = f" route={r.route}" if r.route != "direct" else ""
-        # Failure diagnostics, each appended only when present so a success and every archived
-        # line stay byte-identical. Keyed and tail-positioned in a fixed order after `route`, so
-        # a line carrying some but not all of them parses without a positional group claiming a
-        # neighbour's value.
-        failure_class = f" failure_class={r.failure_class}" if r.failure_class else ""
-        exc = f" exc={r.exc}" if r.exc else ""
-        server = f" server={r.server}" if r.server else ""
-        logger.info(
-            f"RESOLUTION_SOURCE_FETCH: question={qid} url={r.url} status={fetch_outcome_token(r)} "
-            f"http={r.http_status if r.http_status is not None else 'n/a'} "
-            f"embeds={','.join(r.unreadable_embeds) if r.unreadable_embeds else 'none'}"
-            f"{reason}{route}{failure_class}{exc}{server} caller={LADDER_CALLER_RESOLUTION_SOURCE}"
-        )
-        for attempt in r.rung_attempts:
-            if attempt.skipped_reason:
-                continue
-            logger.info(
-                f"RESOLUTION_SOURCE_ESCALATION: question={qid} url={attempt.url} "
-                f"from_status={attempt.from_status} rung={attempt.rung} outcome={attempt.outcome} "
-                f"wall_s={attempt.wall_s if attempt.wall_s is not None else 0.0:.2f} "
-                f"caller={LADDER_CALLER_RESOLUTION_SOURCE}"
-            )
+        logger.info(fetch_markers.fetch_marker_line(r, qid=qid, caller=LADDER_CALLER_RESOLUTION_SOURCE))
+        for line in fetch_markers.escalation_marker_lines(r, qid=qid, caller=LADDER_CALLER_RESOLUTION_SOURCE):
+            logger.info(line)
 
 
 def _rung_counts(results: list[FetchResult]) -> dict[str, int]:

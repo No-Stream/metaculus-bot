@@ -147,8 +147,8 @@ FetchStatus = Literal[
 # URL (`_url_context_rung_applies`), the way `ssrf_blocked` is kept out of its trigger set, and
 # what separates "the host refused us" from "we refused the host" on the fetch marker.
 #
-# `oversize_document` and `image_needs_reader` are the two bodies a caller declined to READ; only the
-# gap-fill verdict produces them (docs/architecture.md "What a verdict decides").
+# `oversize_document` and `image_needs_reader` are the two bodies a caller declined to READ, and
+# `undecodable_body` the `unsupported_type` of one that arrived as mojibake (docs/architecture.md).
 FetchStatusReason = Literal[
     "embed_shell",
     "thin_page",
@@ -162,6 +162,7 @@ FetchStatusReason = Literal[
     "metaculus_self_ref",
     "oversize_document",
     "image_needs_reader",
+    "undecodable_body",
 ]
 
 # Why a RUNG ATTEMPT never ran, carried on `RungAttempt.skipped_reason` (empty when the rung

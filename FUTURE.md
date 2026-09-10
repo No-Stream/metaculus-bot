@@ -731,6 +731,18 @@ service.
 post; where it did (question 45202's Musk posts on Grok 4.7), the same claim was carried by a news
 citation (axios.com) that a Wayback or impersonated fetch reaches.
 
+## A rendered page that lands on a document no longer escalates to the reader
+
+The gap-fill v2 loop's own browser rung used to check the rendered page's Content-Type and, for a
+document or an image, hand the URL to `read_document` rather than classifying the DOM. The shared
+browser rung (`fetch_ladder/rungs._rendered_rung`) classifies every rendered DOM as HTML, so a page
+whose client-side redirect lands on a PDF now reads as a JavaScript wall and the driver is told
+nothing was readable. Narrow in practice: the render only happens after a 200 whose body was already
+classified as HTML-ish, so the landing has to change type mid-navigation. Restoring it means a
+caller-dependent branch inside the rung, which is the shape the proportion rule refuses for a case
+nobody has measured, so it is recorded rather than built. Recorded 2026-09-10 with step 3 of the
+fetch-ladder unification.
+
 ## Research-triage round 2026-07-16 (lit + repo survey + codebase verification)
 
 > Provenance: eight parallel research agents surveyed the last ~year of LLM-forecasting

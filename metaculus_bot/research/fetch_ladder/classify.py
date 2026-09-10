@@ -333,20 +333,22 @@ def _escalates_on_thin_content(read: HtmlVerdict, chart_block: str, pol: LadderP
 
 
 def _raw_body_outcome(
-    body: bytes, current_url: str, content_type: str, *, http_status: int, cap: int | None
+    body: bytes, current_url: str, content_type: str, *, http_status: int, pol: LadderPolicy
 ) -> FetchResult:
     """Classify a raw JSON / plain-text / CSV body we already hold: the one copy of the rule.
 
     Reached from :func:`_classify_body`, so a body the impersonated retry read goes through the
     same charset-honouring decode, the same markup strip and the same vacuity refusal as a
-    directly fetched one. ``cap`` is ``policy.per_url_max_chars``: None leaves the body whole for
-    a caller that windows it at presentation instead.
+    directly fetched one. ``pol.per_url_max_chars`` None leaves the body whole for a caller that
+    windows it at presentation instead, and ``pol.thin_content_escalation_chars`` decides whether
+    a short or unusable body earns the browser.
     """
     netloc = urlparse(current_url).netloc
     raw, undecodable_ratio = decode_text_body(body, content_type)
     # Text branches only: a JSON body's angle brackets are the data (see the doc).
     if any(ct in content_type for ct in _RAW_TEXT_CONTENT_TYPES):
         raw = strip_html_tags(raw)
+    floor = pol.thin_content_escalation_chars
     vacuous = vacuous_body_status(raw, undecodable_ratio, require_csv_rows=False)
     if vacuous is not None:
         # Reason line, not an outcome line: the marker already carries the status.
@@ -360,13 +362,19 @@ def _raw_body_outcome(
             text="",
             http_status=http_status,
             content_type=content_type or None,
+            # What we hold is replacement characters rather than the page, which a caller that
+            # escalates says differently to the driver than a type it does not read at all.
+            status_reason="undecodable_body" if vacuous == "unsupported_type" else None,
+            escalate_rendered=floor is not None,
         )
+    cap = pol.per_url_max_chars
     return FetchResult(
         url=current_url,
         status="success",
         text=raw if cap is None else _truncate_with_marker(raw, cap, current_url),
         http_status=http_status,
         content_type=content_type or None,
+        escalate_rendered=floor is not None and len(raw) < floor,
     )
 
 
@@ -593,9 +601,7 @@ async def _classify_body(
         )
         return classified.result
     if route == "text":
-        return _raw_body_outcome(
-            body, current_url, content_type, http_status=http_status, cap=ctx.policy.per_url_max_chars
-        )
+        return _raw_body_outcome(body, current_url, content_type, http_status=http_status, pol=ctx.policy)
     if route in ("image", "unsupported"):
         return _unread_body_outcome(route, current_url, content_type, http_status=http_status)
     return _document_outcome(

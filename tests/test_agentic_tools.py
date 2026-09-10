@@ -5,11 +5,14 @@ import io
 import logging
 import socket
 import sys
+from collections.abc import Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 from time import monotonic
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
+from urllib.parse import urlsplit
 
 import aiohttp
 import pytest
@@ -26,10 +29,18 @@ from metaculus_bot.constants import (
     GAP_FILL_V2_READER_THINKING_LEVEL,
     RESOLUTION_SOURCE_HTTP_TIMEOUT,
     RESOLUTION_SOURCE_IMPERSONATE_ENABLED_ENV,
+    RESOLUTION_SOURCE_IMPERSONATE_MIN_BUDGET_S,
     RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
     URL_CONTEXT_SIZE_GATE_TOKENS,
 )
-from metaculus_bot.research import document_cache, http_fetch, impersonated_fetch, rendered_fetch, robots_policy
+from metaculus_bot.research import (
+    derived_api,
+    document_cache,
+    http_fetch,
+    impersonated_fetch,
+    rendered_fetch,
+    robots_policy,
+)
 from metaculus_bot.research import providers as research_providers
 from metaculus_bot.research.agentic import fetch_outcomes, local_document, provenance, tool_backends
 from metaculus_bot.research.agentic import tools as agentic_tools
@@ -37,7 +48,13 @@ from metaculus_bot.research.agentic.loop import _harvest_verification_tiers, _me
 from metaculus_bot.research.agentic.tool_descriptions import FETCH_DESCRIPTION
 from metaculus_bot.research.agentic.types import ToolOutcome
 from metaculus_bot.research.document_text import extract_pdf_text
-from metaculus_bot.research.fetch_ladder import verdict
+from metaculus_bot.research.fetch_ladder import classify, context, direct_fetch, rungs, verdict
+from metaculus_bot.research.fetch_ladder.policy import (
+    GAP_FILL_DIRECT_POLICY,
+    GAP_FILL_DOCUMENT_POLICY,
+    GAP_FILL_FETCH_POLICY,
+    LadderPolicy,
+)
 from metaculus_bot.research.gemini_client_config import gemini_retry_sleep_allowance_s
 from metaculus_bot.research.impersonated_fetch import (
     IMPERSONATE_TRIGGER_STATUSES,
@@ -51,8 +68,10 @@ from metaculus_bot.research.impersonated_fetch import (
     impersonation_refused,
     reset_impersonation_memo,
 )
+from metaculus_bot.research.resolution_fetch_result import FetchResult, FetchStatus, FetchStatusReason
+from metaculus_bot.research.wayback import wayback_snapshot_url
 from tests.playwright_fakes import FakeBrowser, FakeChromium, FakePage, FakePlaywrightManager, install_fake_playwright
-from tests.resolution_source_fakes import _escape_config, _impersonated, fake_impersonated_fetch
+from tests.resolution_source_fakes import _escape_config, _fake_render, _impersonated, fake_impersonated_fetch
 from tests.test_document_text import build_text_pdf
 
 
@@ -85,7 +104,12 @@ class _FakeSession:
     async def __aexit__(self, exc_type, exc, tb) -> None:
         return None
 
-    def get(self, url: str, *, allow_redirects: bool = False) -> _FakeResponse:
+    def get(self, url: str, *, allow_redirects: bool = False, **kwargs: Any) -> _FakeResponse:
+        """The next queued response, recording the URL asked for.
+
+        ``**kwargs`` swallows the shared ladder's per-hop ``ClientTimeout``, a clamp no fake models.
+        """
+        del kwargs
         self.calls.append((url, allow_redirects))
         if len(self._responses) > 1:
             return self._responses.pop(0)
@@ -113,8 +137,87 @@ def _serve_pdf(monkeypatch: pytest.MonkeyPatch, body: bytes, *, content_type: st
     read_body = AsyncMock(return_value=body)
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True))
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
-    monkeypatch.setattr(agentic_tools, "_read_response_body", read_body)
+    monkeypatch.setattr(classify, "read_body_capped", read_body)
     return read_body
+
+
+_URL = "https://example.com/page"
+_DIRECT_FALLBACK = FetchResult(url="", status="not_found", text="", http_status=404, content_type=None)
+
+
+def _direct(
+    status: FetchStatus,
+    *,
+    url: str = _URL,
+    text: str = "",
+    http_status: int | None = None,
+    reason: FetchStatusReason | None = None,
+    links: Sequence[str] = (),
+    escalate_rendered: bool = False,
+    content_type: str | None = "text/html",
+) -> FetchResult:
+    """One canned outcome of the shared ladder's DIRECT fetch, as the gap-fill verdict would leave it."""
+    return FetchResult(
+        url=url,
+        status=status,
+        text=text,
+        http_status=http_status,
+        content_type=content_type,
+        status_reason=reason,
+        links=list(links),
+        escalate_rendered=escalate_rendered,
+    )
+
+
+def _serve_direct(monkeypatch: pytest.MonkeyPatch, answer: FetchResult | dict[str, FetchResult]) -> list[str]:
+    """Answer the shared ladder's DIRECT fetch with ``answer``, leaving every rung's gate live.
+
+    The seam ``tools._fetch_plain`` used to be. It is also the one every rung's own request goes
+    through — the archive snapshot, a remembered feed, the robots pre-check — so a dict keys those
+    apart by URL and anything unlisted comes back ``not_found`` rather than reaching the network.
+    Returns the list of URLs it was asked for, in order, which is how a test counts requests.
+    """
+    answers = answer if isinstance(answer, dict) else {_URL: answer}
+    asked: list[str] = []
+
+    async def _fake_direct(session: Any, url: str, host_sems: Any, ctx: Any) -> FetchResult:
+        del session, host_sems, ctx
+        await asyncio.sleep(0)
+        asked.append(url)
+        canned = answers.get(url)
+        return canned if canned is not None else replace(_DIRECT_FALLBACK, url=url)
+
+    monkeypatch.setattr(direct_fetch, "_fetch_direct", _fake_direct)
+    return asked
+
+
+def _serve_rendered(monkeypatch: pytest.MonkeyPatch, rescue: FetchResult | None) -> list[str]:
+    """Answer the shared ladder's BROWSER rung with ``rescue``, or None to decline.
+
+    The seam ``tools._try_rendered_fetch`` used to be, one layer in: the dispatcher's decision to
+    reach the browser at all stays live, which is what the escalation tests are about. Returns the
+    URLs the rung was invoked on.
+    """
+    rendered_on: list[str] = []
+
+    async def _fake_rendered(url: str, direct: FetchResult, host_sems: Any, ctx: Any) -> FetchResult | None:
+        del host_sems, ctx
+        await asyncio.sleep(0)
+        rendered_on.append(direct.url)
+        return rescue
+
+    monkeypatch.setattr(rungs, "_rendered_rung", _fake_rendered)
+    return rendered_on
+
+
+async def _fetch_direct_only(url: str) -> fetch_outcomes.PlainFetchResult:
+    """One DIRECT fetch through the shared ladder, as this ladder's own result.
+
+    What ``tools._fetch_plain`` was: the redirect loop, the classification and the local document
+    read, with no escalation rung (``GAP_FILL_DIRECT_POLICY``). Tests that pin the direct
+    classification drive this.
+    """
+    return await agentic_tools._fetch_via_ladder(url, query="", pol=GAP_FILL_DIRECT_POLICY, ctx=None)
 
 
 @pytest.fixture(autouse=True)
@@ -135,20 +238,16 @@ def _decline_the_impersonated_retry(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture(autouse=True)
 def _reset_tool_state() -> None:
-    # Run-scoped state of the local-document rung: held parses, plus the pypdf parse gate it now
-    # shares process-wide with the Tier-1 rung (its own reset helper, since the gate is
-    # loop-scoped and one test's held slot must not gate another's).
+    """Drop every piece of run-scoped state the tools share, so no test inherits another's."""
     document_cache.clear_document_cache()
     http_fetch.reset_pdf_parse_semaphore()
     agentic_tools._FETCH_TEXT_CACHE.clear()
     agentic_tools._FETCH_LINKS_CACHE.clear()
     agentic_tools._FETCH_HOST_SEMAPHORES.clear()
-    # Shared with the Tier-1 reader, so it is reset through its owning module.
+    # Shared with the Tier-1 reader and the Tier-1 rungs, so both reset through their own modules.
     robots_policy.reset_robots_cache()
-    # Run-scoped state of the shared render transport: the rendered-to-nothing memo, the
-    # one-shot playwright warn latch, and a FRESH launch semaphore (construction is loop-free
-    # in 3.12, so rebinding prevents a contended acquire in one test's event loop from leaking
-    # a loop binding into a later test).
+    derived_api.reset_derived_endpoints()
+    # A FRESH launch semaphore too, so no test's event-loop binding leaks into the next.
     rendered_fetch.reset_render_state()
 
 
@@ -496,15 +595,15 @@ async def test_fetch_plain_success_path_reuses_fetch_helpers(monkeypatch: pytest
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True))
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
     monkeypatch.setattr(
-        agentic_tools,
-        "_read_response_body",
+        classify,
+        "read_body_capped",
         AsyncMock(return_value=b'<html><body><a href="/a">A</a><p>Long body</p></body></html>'),
     )
     monkeypatch.setattr(
         "metaculus_bot.research.fetch_ladder.classify._extract_main_text",
         MagicMock(return_value="Rendered plain body " * 40),
     )
-    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
     outcome = await agentic_tools.fetch("https://example.com/page")
 
@@ -517,36 +616,20 @@ async def test_fetch_plain_success_path_reuses_fetch_helpers(monkeypatch: pytest
 
 @pytest.mark.asyncio
 async def test_fetch_js_wall_escalates_to_rendered(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        agentic_tools,
-        "_fetch_plain",
-        AsyncMock(
-            return_value=SimpleNamespace(
-                status="ok",
-                method="plain",
-                text="too short",
-                links=["https://example.com/plain"],
-                url="https://example.com/page",
-                escalate_rendered=True,
-            )
-        ),
+    _serve_direct(
+        monkeypatch, _direct("success", text="too short", links=["https://example.com/plain"], escalate_rendered=True)
     )
-    monkeypatch.setattr(
-        agentic_tools,
-        "_try_rendered_fetch",
-        AsyncMock(
-            return_value=SimpleNamespace(
-                status="ok",
-                method="rendered",
-                text="rendered body",
-                links=["https://example.com/rendered"],
-                url="https://example.com/page",
-            )
+    rendered_on = _serve_rendered(
+        monkeypatch,
+        replace(
+            _direct("success", text="rendered body", links=["https://example.com/rendered"]),
+            route="rendered",
         ),
     )
 
-    outcome = await agentic_tools.fetch("https://example.com/page")
+    outcome = await agentic_tools.fetch(_URL)
 
+    assert rendered_on == [_URL]
     assert outcome.method == "rendered"
     assert outcome.links == ["https://example.com/rendered"]
     assert outcome.content_markdown == "rendered body"
@@ -554,31 +637,10 @@ async def test_fetch_js_wall_escalates_to_rendered(monkeypatch: pytest.MonkeyPat
 
 @pytest.mark.asyncio
 async def test_fetch_thin_content_escalates_to_rendered(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        agentic_tools,
-        "_fetch_plain",
-        AsyncMock(
-            return_value=SimpleNamespace(
-                status="ok",
-                method="plain",
-                text="x" * 100,
-                links=[],
-                url="https://example.com/page",
-                escalate_rendered=True,
-            )
-        ),
-    )
-    monkeypatch.setattr(
-        agentic_tools,
-        "_try_rendered_fetch",
-        AsyncMock(
-            return_value=SimpleNamespace(
-                status="ok", method="rendered", text="x" * 600, links=[], url="https://example.com/page"
-            )
-        ),
-    )
+    _serve_direct(monkeypatch, _direct("success", text="x" * 100, escalate_rendered=True))
+    _serve_rendered(monkeypatch, replace(_direct("success", text="x" * 600), route="rendered"))
 
-    outcome = await agentic_tools.fetch("https://example.com/page")
+    outcome = await agentic_tools.fetch(_URL)
 
     assert outcome.method == "rendered"
     assert outcome.content_markdown == "x" * 600
@@ -620,31 +682,25 @@ async def test_fetch_document_escalation_generic_ask_contains_topic(monkeypatch:
         "Extract the main content relevant to: Will Nauru ratify the treaty?",
         # The free rungs just ran here, so the escalation says so rather than running them again.
         ladder_exhausted=True,
+        ctx=None,
     )
 
 
 @pytest.mark.asyncio
 async def test_fetch_pagination_second_call_uses_cache(monkeypatch: pytest.MonkeyPatch) -> None:
-    fetch_plain = AsyncMock(
-        return_value=SimpleNamespace(
-            status="ok",
-            method="plain",
-            text="A" * (agentic_tools._FETCH_WINDOW_CHARS + 5),
-            links=["https://example.com/a"],
-            url="https://example.com/page",
-            escalate_rendered=False,
-        )
+    asked = _serve_direct(
+        monkeypatch,
+        _direct("success", text="A" * (agentic_tools._FETCH_WINDOW_CHARS + 5), links=["https://example.com/a"]),
     )
-    monkeypatch.setattr(agentic_tools, "_fetch_plain", fetch_plain)
 
-    first = await agentic_tools.fetch("https://example.com/page")
-    second = await agentic_tools.fetch("https://example.com/page", start_char=agentic_tools._FETCH_WINDOW_CHARS)
+    first = await agentic_tools.fetch(_URL)
+    second = await agentic_tools.fetch(_URL, start_char=agentic_tools._FETCH_WINDOW_CHARS)
 
     assert first.truncated is True
     assert "[truncated at 8000 of 8005 chars — call again with start_char=8000]" in first.content_markdown
     assert second.method == "cache"
     assert second.content_markdown == "A" * 5
-    assert fetch_plain.await_count == 1
+    assert asked == [_URL], "the continuation is served from the window cache, with no second request"
 
 
 @pytest.mark.asyncio
@@ -660,9 +716,9 @@ async def test_fetch_plain_textual_branch_strips_allowlisted_markup(monkeypatch:
     session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/csv"}))
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True))
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
-    monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=csv_body))
+    monkeypatch.setattr(classify, "read_body_capped", AsyncMock(return_value=csv_body))
 
-    result = await agentic_tools._fetch_plain("https://example.com/data.csv")
+    result = await _fetch_direct_only("https://example.com/data.csv")
 
     assert result.status == "ok"
     assert "Emerson College" in result.text
@@ -690,17 +746,17 @@ async def test_fetch_plain_follows_redirect_to_public_url(monkeypatch: pytest.Mo
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True))
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
     monkeypatch.setattr(
-        agentic_tools,
-        "_read_response_body",
+        classify,
+        "read_body_capped",
         AsyncMock(return_value=b"<html><body><p>Final page body</p></body></html>"),
     )
     monkeypatch.setattr(
         "metaculus_bot.research.fetch_ladder.classify._extract_main_text",
         MagicMock(return_value="Final page body " * 40),
     )
-    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
-    result = await agentic_tools._fetch_plain("https://example.com/start")
+    result = await _fetch_direct_only("https://example.com/start")
 
     assert result.status == "ok"
     assert result.url == "https://example.com/final"
@@ -720,7 +776,7 @@ async def test_fetch_plain_blocks_redirect_to_non_public_target(monkeypatch: pyt
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", is_public)
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
 
-    result = await agentic_tools._fetch_plain("https://example.com/start")
+    result = await _fetch_direct_only("https://example.com/start")
 
     assert result.status == "blocked"
     assert "non-public redirect target" in result.text
@@ -737,7 +793,7 @@ async def test_fetch_plain_caps_redirect_chain(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True))
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
 
-    result = await agentic_tools._fetch_plain("https://example.com/start")
+    result = await _fetch_direct_only("https://example.com/start")
 
     assert result.status == "error"
     assert result.text == "Redirect limit exceeded."
@@ -750,7 +806,7 @@ async def test_fetch_plain_redirect_without_location_is_malformed(monkeypatch: p
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True))
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
 
-    result = await agentic_tools._fetch_plain("https://example.com/start")
+    result = await _fetch_direct_only("https://example.com/start")
 
     assert result.status == "error"
     assert "Malformed redirect" in result.text
@@ -775,7 +831,7 @@ async def test_fetch_plain_blocks_metaculus_without_network(url: str, monkeypatc
     get_session = MagicMock(side_effect=AssertionError("must not open a session for a question-platform URL"))
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", get_session)
 
-    result = await agentic_tools._fetch_plain(url)
+    result = await _fetch_direct_only(url)
 
     assert result.status == "blocked"
     # The block text is what the driver reads, so it has to name both hosts it must not fetch.
@@ -812,41 +868,43 @@ async def test_fetch_plain_blocks_redirect_to_metaculus(monkeypatch: pytest.Monk
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True))
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
 
-    result = await agentic_tools._fetch_plain("https://example.com/start")
+    result = await _fetch_direct_only("https://example.com/start")
 
     assert result.status == "blocked"
-    assert "metaculus.com" in result.text
+    assert result.text == fetch_outcomes._PLATFORM_FETCH_BLOCK_MSG
     # The metaculus hop must never be requested (only the initial URL was GET-ed).
     assert session.calls == [("https://example.com/start", False)]
 
 
 @pytest.mark.asyncio
 async def test_same_host_plain_and_rendered_fetches_serialize(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Plan §5 politeness: a plain and a rendered fetch to the same host must
+    """Plan §5 politeness: a direct and a rendered fetch to the same host must
     contend on the same per-host Semaphore(1) and never run concurrently."""
     events: list[str] = []
     release_plain = asyncio.Event()
+    plain_reading = asyncio.Event()
 
     session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/html"}))
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True))
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
 
-    async def blocking_read(resp: object, label: str, *, max_bytes: int = 0) -> bytes:
+    async def blocking_read(resp: object, *, label: str, max_bytes: int = 0) -> bytes:
         events.append("plain_read_started")
+        plain_reading.set()
         await release_plain.wait()
         events.append("plain_read_finished")
         return b"<html><body><p>Long body</p></body></html>"
 
-    monkeypatch.setattr(agentic_tools, "_read_response_body", blocking_read)
+    monkeypatch.setattr(classify, "read_body_capped", blocking_read)
     monkeypatch.setattr(
         "metaculus_bot.research.fetch_ladder.classify._extract_main_text",
         MagicMock(return_value="body text " * 60),
     )
-    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
     class _RecordingManager(FakePlaywrightManager):
         async def __aenter__(self) -> _RecordingManager:
-            # Runs strictly after _try_rendered_fetch acquires the host gate.
+            """Runs strictly after the transport has acquired the host gate."""
             events.append("rendered_started")
             return self
 
@@ -857,14 +915,22 @@ async def test_same_host_plain_and_rendered_fetches_serialize(monkeypatch: pytes
         manager_cls=_RecordingManager,
     )
 
-    plain_task = asyncio.create_task(agentic_tools._fetch_plain("https://example.com/plain-page"))
-    await asyncio.sleep(0)
-    assert events == ["plain_read_started"]  # plain holds the example.com gate
+    plain_task = asyncio.create_task(_fetch_direct_only("https://example.com/plain-page"))
+    await asyncio.wait_for(plain_reading.wait(), timeout=1.0)
+    assert events == ["plain_read_started"]  # the direct fetch holds the example.com gate
 
-    rendered_task = asyncio.create_task(agentic_tools._try_rendered_fetch("https://example.com/rendered-page"))
+    rendered_url = "https://example.com/rendered-page"
+    rendered_task = asyncio.create_task(
+        rungs._rendered_rung(
+            rendered_url,
+            _direct("js_wall", url=rendered_url),
+            agentic_tools._FETCH_HOST_SEMAPHORES,
+            context.LadderContext(policy=GAP_FILL_FETCH_POLICY),
+        )
+    )
     for _ in range(3):
         await asyncio.sleep(0)
-    # Rendered must be parked on the shared host gate while plain holds it.
+    # Rendered must be parked on the shared host gate while the direct fetch holds it.
     assert "rendered_started" not in events
 
     release_plain.set()
@@ -873,7 +939,7 @@ async def test_same_host_plain_and_rendered_fetches_serialize(monkeypatch: pytes
 
     assert plain_result.status == "ok"
     assert rendered_result is not None
-    assert rendered_result.method == "rendered"
+    assert rendered_result.status == "success"
     assert events.index("plain_read_finished") < events.index("rendered_started")
 
 
@@ -904,7 +970,7 @@ async def test_rendered_fetch_drains_routes_and_guard_tolerates_teardown_race(
     monkeypatch.setattr(
         "metaculus_bot.research.fetch_ladder.classify._extract_main_text", MagicMock(return_value="body text " * 60)
     )
-    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
     class FakeRoute:
         def __init__(self, *, raise_on_action: bool = False) -> None:
@@ -965,23 +1031,10 @@ async def test_fetch_ssrf_reject_returns_blocked(monkeypatch: pytest.MonkeyPatch
 
 @pytest.mark.asyncio
 async def test_fetch_playwright_missing_degrades_to_plain(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        agentic_tools,
-        "_fetch_plain",
-        AsyncMock(
-            return_value=SimpleNamespace(
-                status="ok",
-                method="plain",
-                text="plain body",
-                links=[],
-                url="https://example.com/page",
-                escalate_rendered=True,
-            )
-        ),
-    )
-    monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", AsyncMock(return_value=None))
+    _serve_direct(monkeypatch, _direct("success", text="plain body", escalate_rendered=True))
+    _serve_rendered(monkeypatch, None)
 
-    outcome = await agentic_tools.fetch("https://example.com/page")
+    outcome = await agentic_tools.fetch(_URL)
 
     assert outcome.method == "plain"
     assert outcome.content_markdown == "plain body"
@@ -1006,13 +1059,13 @@ async def test_fetch_plain_empty_extraction_returns_empty_status(
     session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/html"}))
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True))
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
-    monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=b"<html><body></body></html>"))
+    monkeypatch.setattr(classify, "read_body_capped", AsyncMock(return_value=b"<html><body></body></html>"))
     monkeypatch.setattr(
         "metaculus_bot.research.fetch_ladder.classify._extract_main_text", MagicMock(return_value=extracted)
     )
-    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
-    result = await agentic_tools._fetch_plain("https://example.com/js-wall")
+    result = await _fetch_direct_only("https://example.com/js-wall")
 
     assert result.status == "empty"
     assert result.escalate_rendered is True
@@ -1027,16 +1080,14 @@ async def test_fetch_plain_thin_extraction_is_ok_not_empty(monkeypatch: pytest.M
     session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/html"}))
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True))
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
-    monkeypatch.setattr(
-        agentic_tools, "_read_response_body", AsyncMock(return_value=b"<html><body><p>hi</p></body></html>")
-    )
+    monkeypatch.setattr(classify, "read_body_capped", AsyncMock(return_value=b"<html><body><p>hi</p></body></html>"))
     monkeypatch.setattr(
         "metaculus_bot.research.fetch_ladder.classify._extract_main_text",
         MagicMock(return_value="Short but real official statement."),
     )
-    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
-    result = await agentic_tools._fetch_plain("https://example.com/short")
+    result = await _fetch_direct_only("https://example.com/short")
 
     assert result.status == "ok"
     assert result.escalate_rendered is True  # thin -> escalate, but the content is real
@@ -1052,9 +1103,9 @@ async def test_fetch_plain_honors_declared_charset_on_textual_body(monkeypatch: 
     session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/csv; charset=windows-1252"}))
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True))
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
-    monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=body))
+    monkeypatch.setattr(classify, "read_body_capped", AsyncMock(return_value=body))
 
-    result = await agentic_tools._fetch_plain("https://example.com/data.csv")
+    result = await _fetch_direct_only("https://example.com/data.csv")
 
     assert result.status == "ok"
     assert "séries" in result.text
@@ -1070,9 +1121,9 @@ async def test_fetch_plain_refuses_an_undecodable_textual_body(monkeypatch: pyte
     session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/plain"}))
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True))
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
-    monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=body))
+    monkeypatch.setattr(classify, "read_body_capped", AsyncMock(return_value=body))
 
-    result = await agentic_tools._fetch_plain("https://example.com/data.txt")
+    result = await _fetch_direct_only("https://example.com/data.txt")
 
     assert result.status == "empty"
     assert result.escalate_rendered is True
@@ -1097,7 +1148,7 @@ class TestFetchPlainTerminalStatuses:
         )
         monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
 
-        result = await agentic_tools._fetch_plain("https://example.com/gated")
+        result = await _fetch_direct_only("https://example.com/gated")
 
         assert result.status == "blocked"
         assert result.method == "plain"
@@ -1112,7 +1163,7 @@ class TestFetchPlainTerminalStatuses:
         )
         monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
 
-        result = await agentic_tools._fetch_plain("https://example.com/down")
+        result = await _fetch_direct_only("https://example.com/down")
 
         assert result.status == "error"
         assert result.text == "Fetch failed with HTTP 503."
@@ -1125,7 +1176,7 @@ class TestFetchPlainTerminalStatuses:
             build_text_pdf([["The unemployment rate was 4.1 percent in May 2026, revised from 4.0 percent."]]),
         )
 
-        result = await agentic_tools._fetch_plain("https://example.com/report.pdf")
+        result = await _fetch_direct_only("https://example.com/report.pdf")
 
         assert result.status == "ok"
         assert result.method == "pdf_local"
@@ -1139,7 +1190,7 @@ class TestFetchPlainTerminalStatuses:
         """No text layer is the one PDF shape a model still has to read."""
         _serve_pdf(monkeypatch, _scanned_pdf())
 
-        result = await agentic_tools._fetch_plain("https://example.com/scan.pdf")
+        result = await _fetch_direct_only("https://example.com/scan.pdf")
 
         assert result.status == "ok"
         assert result.method == "document_needed"
@@ -1156,7 +1207,7 @@ class TestFetchPlainTerminalStatuses:
             content_type="text/html",
         )
 
-        result = await agentic_tools._fetch_plain("https://example.com/mislabeled")
+        result = await _fetch_direct_only("https://example.com/mislabeled")
 
         assert result.method == "pdf_local"
         assert "Mislabeled as HTML" in result.text
@@ -1168,9 +1219,9 @@ class TestFetchPlainTerminalStatuses:
             "metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True)
         )
         monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
-        monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=None))
+        monkeypatch.setattr(classify, "read_body_capped", AsyncMock(return_value=None))
 
-        result = await agentic_tools._fetch_plain("https://example.com/huge")
+        result = await _fetch_direct_only("https://example.com/huge")
 
         assert result.status == "error"
         assert result.text == "Fetch body exceeded the size limit."
@@ -1182,9 +1233,9 @@ class TestFetchPlainTerminalStatuses:
             "metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True)
         )
         monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
-        monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=b"PK\x03\x04payload"))
+        monkeypatch.setattr(classify, "read_body_capped", AsyncMock(return_value=b"PK\x03\x04payload"))
 
-        result = await agentic_tools._fetch_plain("https://example.com/bundle.zip")
+        result = await _fetch_direct_only("https://example.com/bundle.zip")
 
         assert result.status == "error"
         assert result.text == "Unsupported content type: application/zip"
@@ -1193,7 +1244,8 @@ class TestFetchPlainTerminalStatuses:
     @pytest.mark.asyncio
     async def test_transport_error_is_reported_not_raised(self, monkeypatch: pytest.MonkeyPatch) -> None:
         class _RaisingSession(_FakeSession):
-            def get(self, url: str, *, allow_redirects: bool = False):  # type: ignore[override]
+            def get(self, url: str, *, allow_redirects: bool = False, **kwargs: Any):  # type: ignore[override]
+                del kwargs
                 self.calls.append((url, allow_redirects))
                 raise aiohttp.ClientConnectorError(MagicMock(), OSError("refused"))
 
@@ -1203,7 +1255,7 @@ class TestFetchPlainTerminalStatuses:
         )
         monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
 
-        result = await agentic_tools._fetch_plain("https://example.com/unreachable")
+        result = await _fetch_direct_only("https://example.com/unreachable")
 
         assert result.status == "error"
         assert result.text.startswith("Fetch error: ClientConnectorError")
@@ -1219,11 +1271,11 @@ async def test_fetch_plain_redirect_to_empty_page_returns_empty(monkeypatch: pyt
     )
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True))
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
-    monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=b"<html><body></body></html>"))
+    monkeypatch.setattr(classify, "read_body_capped", AsyncMock(return_value=b"<html><body></body></html>"))
     monkeypatch.setattr("metaculus_bot.research.fetch_ladder.classify._extract_main_text", MagicMock(return_value=None))
-    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
-    result = await agentic_tools._fetch_plain("https://example.com/start")
+    result = await _fetch_direct_only("https://example.com/start")
 
     assert result.status == "empty"
     assert result.url == "https://example.com/final"
@@ -1234,24 +1286,13 @@ async def test_fetch_empty_plain_failed_render_returns_empty_not_ok(monkeypatch:
     """The core fix: an empty plain fetch whose rendered rung is unavailable must
     NOT be laundered back into a plain/ok success. It returns a distinct "empty"
     outcome, legible to the driver, that no tier map can promote to "fetched"."""
-    monkeypatch.setattr(
-        agentic_tools,
-        "_fetch_plain",
-        AsyncMock(
-            return_value=SimpleNamespace(
-                status="empty",
-                method="plain",
-                text="Plain fetch returned no extractable text.",
-                links=[],
-                url="https://companiesmarketcap.com/berkshire-hathaway/marketcap/",
-                escalate_rendered=True,
-            )
-        ),
-    )
-    monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", AsyncMock(return_value=None))
+    url = "https://companiesmarketcap.com/berkshire-hathaway/marketcap/"
+    _serve_direct(monkeypatch, {url: _direct("js_wall", url=url, escalate_rendered=True)})
+    rendered_on = _serve_rendered(monkeypatch, None)
 
-    outcome = await agentic_tools.fetch("https://companiesmarketcap.com/berkshire-hathaway/marketcap/")
+    outcome = await agentic_tools.fetch(url)
 
+    assert rendered_on == [url], "the browser rung was reached and declined"
     assert outcome.status == "empty"
     assert outcome.method == "empty"
     assert _method_to_tier(outcome.method) is None
@@ -1266,34 +1307,17 @@ async def test_fetch_empty_plain_failed_render_returns_empty_not_ok(monkeypatch:
 @pytest.mark.asyncio
 async def test_fetch_empty_plain_and_empty_render_returns_empty(monkeypatch: pytest.MonkeyPatch) -> None:
     """The exact prod scenario: plain extracts nothing AND the rendered rung runs
-    but also extracts nothing (status="error", empty text). The outcome stays
-    "empty" rather than falling back to the empty plain placeholder as ok."""
-    monkeypatch.setattr(
-        agentic_tools,
-        "_fetch_plain",
-        AsyncMock(
-            return_value=SimpleNamespace(
-                status="empty",
-                method="plain",
-                text="Plain fetch returned no extractable text.",
-                links=[],
-                url="https://example.com/page",
-                escalate_rendered=True,
-            )
-        ),
-    )
-    monkeypatch.setattr(
-        agentic_tools,
-        "_try_rendered_fetch",
-        AsyncMock(
-            return_value=SimpleNamespace(
-                status="error", method="rendered", text="", links=[], url="https://example.com/page"
-            )
-        ),
-    )
+    but also extracts nothing. The outcome stays "empty" rather than falling back to the
+    empty plain placeholder as ok."""
+    _serve_direct(monkeypatch, _direct("js_wall", escalate_rendered=True))
+    empty_dom = rendered_fetch.RenderedPage(url=_URL, content_type="text/html", html="<html><body></body></html>")
+    renders: list[dict[str, object]] = []
+    monkeypatch.setattr(rungs, "render_page", _fake_render(empty_dom, renders))
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.classify._extract_main_text", MagicMock(return_value=None))
 
-    outcome = await agentic_tools.fetch("https://example.com/page")
+    outcome = await agentic_tools.fetch(_URL)
 
+    assert [call["url"] for call in renders] == [_URL], "the browser really ran on this page"
     assert outcome.status == "empty"
     assert _method_to_tier(outcome.method) is None
 
@@ -1302,69 +1326,48 @@ async def test_fetch_empty_plain_and_empty_render_returns_empty(monkeypatch: pyt
 async def test_fetch_empty_plain_still_escalates_to_rendered(monkeypatch: pytest.MonkeyPatch) -> None:
     """An empty plain fetch must NOT short-circuit: the ladder still runs the
     rendered rung, and a successful render is returned as a real fetched outcome."""
-    monkeypatch.setattr(
-        agentic_tools,
-        "_fetch_plain",
-        AsyncMock(
-            return_value=SimpleNamespace(
-                status="empty",
-                method="plain",
-                text="Plain fetch returned no extractable text.",
-                links=[],
-                url="https://example.com/page",
-                escalate_rendered=True,
-            )
-        ),
+    _serve_direct(monkeypatch, _direct("js_wall", escalate_rendered=True))
+    rendered_on = _serve_rendered(
+        monkeypatch, replace(_direct("success", text="real rendered content"), route="rendered")
     )
-    rendered = AsyncMock(
-        return_value=SimpleNamespace(
-            status="ok", method="rendered", text="real rendered content", links=[], url="https://example.com/page"
-        )
-    )
-    monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", rendered)
 
-    outcome = await agentic_tools.fetch("https://example.com/page")
+    outcome = await agentic_tools.fetch(_URL)
 
     assert outcome.status == "ok"
     assert outcome.method == "rendered"
     assert outcome.content_markdown == "real rendered content"
-    rendered.assert_awaited_once()
+    assert rendered_on == [_URL]
 
 
 @pytest.mark.asyncio
-async def test_fetch_empty_plain_still_escalates_to_read_document(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An empty plain fetch must still permit escalation to read_document when the
-    rendered rung discovers a document (PDF/image) behind the URL."""
-    monkeypatch.setattr(
-        agentic_tools,
-        "_fetch_plain",
-        AsyncMock(
-            return_value=SimpleNamespace(
-                status="empty",
-                method="plain",
-                text="Plain fetch returned no extractable text.",
-                links=[],
-                url="https://example.com/report",
-                escalate_rendered=True,
-            )
-        ),
+async def test_fetch_still_escalates_to_read_document_after_the_rungs_ran(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ladder result only a reader can turn into text must still reach read_document.
+
+    A declared image is the shape that produces it: nothing local reads those bytes, and the
+    archive rung still gets its turn on the URL first, so the escalation has to survive a rung
+    having run rather than only firing on a bare direct fetch.
+    """
+    url = "https://example.com/chart.png"
+    _serve_direct(
+        monkeypatch,
+        {url: _direct("unsupported_type", url=url, reason="image_needs_reader", content_type="image/png")},
     )
-    monkeypatch.setattr(
-        agentic_tools,
-        "_try_rendered_fetch",
-        AsyncMock(
-            return_value=SimpleNamespace(
-                status="ok", method="document_needed", text="doc hint", links=[], url="https://example.com/report"
-            )
-        ),
-    )
+    archive_asked: list[str] = []
+
+    async def _no_capture(session: Any, page_url: str, direct: FetchResult, **kwargs: Any) -> None:
+        del session, direct, kwargs
+        await asyncio.sleep(0)
+        archive_asked.append(page_url)
+
+    monkeypatch.setattr(rungs, "_wayback_rung", _no_capture)
     read_document = AsyncMock(
         return_value=agentic_tools.ToolOutcome(content_markdown="Extracted doc content.", method="document")
     )
     monkeypatch.setattr(agentic_tools, "read_document", read_document)
 
-    outcome = await agentic_tools.fetch("https://example.com/report")
+    outcome = await agentic_tools.fetch(url)
 
+    assert archive_asked == [url], "the archive rung had its turn before the escalation"
     assert outcome.method == "document"
     assert outcome.content_markdown == "Extracted doc content."
     read_document.assert_awaited_once()
@@ -1377,21 +1380,8 @@ async def test_empty_fetch_cannot_earn_fetched_tier_but_real_fetch_can(monkeypat
     discrepancy on it can't supersede the briefing), while a genuinely read page
     earns "fetched". This is the load-bearing invariant."""
     url = "https://companiesmarketcap.com/berkshire-hathaway/marketcap/"
-    monkeypatch.setattr(
-        agentic_tools,
-        "_fetch_plain",
-        AsyncMock(
-            return_value=SimpleNamespace(
-                status="empty",
-                method="plain",
-                text="Plain fetch returned no extractable text.",
-                links=[],
-                url=url,
-                escalate_rendered=True,
-            )
-        ),
-    )
-    monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", AsyncMock(return_value=None))
+    _serve_direct(monkeypatch, {url: _direct("js_wall", url=url, escalate_rendered=True)})
+    _serve_rendered(monkeypatch, None)
 
     empty_outcome = await agentic_tools.fetch(url)
     empty_tiers = _harvest_verification_tiers("fetch", {"url": url}, empty_outcome)
@@ -1422,10 +1412,12 @@ _OGIMET_THROTTLE_BODY = (
 )
 
 
-def _plain_result(text: str, *, escalate_rendered: bool = False, url: str = "https://www.ogimet.com/summary") -> Any:
-    return SimpleNamespace(
-        status="ok", method="plain", text=text, links=[], url=url, escalate_rendered=escalate_rendered
-    )
+_OGIMET_URL = "https://www.ogimet.com/summary"
+
+
+def _ogimet_page(text: str, *, escalate_rendered: bool = False, url: str = _OGIMET_URL) -> dict[str, FetchResult]:
+    """One direct read of ``url`` carrying ``text``, in the form ``_serve_direct`` takes."""
+    return {url: _direct("success", url=url, text=text, escalate_rendered=escalate_rendered)}
 
 
 class TestThrottleInterstitialIsNotASuccess:
@@ -1445,26 +1437,15 @@ class TestThrottleInterstitialIsNotASuccess:
 
     @pytest.mark.asyncio
     async def test_a_rendered_interstitial_is_throttled_not_ok(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # The receipt's exact ladder path: the plain rung read too little and escalated, and
-        # the rendered rung returned the interstitial.
-        monkeypatch.setattr(
-            agentic_tools, "_fetch_plain", AsyncMock(return_value=_plain_result("nav only", escalate_rendered=True))
-        )
-        monkeypatch.setattr(
-            agentic_tools,
-            "_try_rendered_fetch",
-            AsyncMock(
-                return_value=SimpleNamespace(
-                    status="ok",
-                    method="rendered",
-                    text=_OGIMET_THROTTLE_BODY,
-                    links=[],
-                    url="https://www.ogimet.com/summary",
-                )
-            ),
+        """The receipt's own ladder path: a too-thin direct read escalated, and the browser rung
+        came back with the interstitial."""
+        _serve_direct(monkeypatch, _ogimet_page("nav only", escalate_rendered=True))
+        _serve_rendered(
+            monkeypatch,
+            replace(_direct("success", url=_OGIMET_URL, text=_OGIMET_THROTTLE_BODY), route="rendered"),
         )
 
-        outcome = await agentic_tools.fetch("https://www.ogimet.com/summary")
+        outcome = await agentic_tools.fetch(_OGIMET_URL)
 
         assert outcome.status == "throttled"
         assert outcome.method == "throttled"
@@ -1479,33 +1460,32 @@ class TestThrottleInterstitialIsNotASuccess:
     async def test_a_plain_interstitial_is_throttled_without_a_rendered_hop(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Same body arriving on the plain rung with enough chars not to escalate.
-        rendered = AsyncMock()
-        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=_plain_result(_OGIMET_THROTTLE_BODY)))
-        monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", rendered)
+        """The same body arriving on the direct rung, with enough chars not to escalate."""
+        _serve_direct(monkeypatch, _ogimet_page(_OGIMET_THROTTLE_BODY))
+        rendered_on = _serve_rendered(monkeypatch, None)
 
-        outcome = await agentic_tools.fetch("https://www.ogimet.com/summary")
+        outcome = await agentic_tools.fetch(_OGIMET_URL)
 
         assert outcome.status == "throttled"
-        rendered.assert_not_awaited()
+        assert rendered_on == []
 
     @pytest.mark.asyncio
     async def test_an_interstitial_is_never_cached_so_the_retry_refetches(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The half of the fix q45191 turned on: the driver's retry must be a real request."""
-        fetch_plain = AsyncMock(return_value=_plain_result(_OGIMET_THROTTLE_BODY))
-        monkeypatch.setattr(agentic_tools, "_fetch_plain", fetch_plain)
+        refused = _serve_direct(monkeypatch, _ogimet_page(_OGIMET_THROTTLE_BODY))
 
-        first = await agentic_tools.fetch("https://www.ogimet.com/summary")
+        first = await agentic_tools.fetch(_OGIMET_URL)
         assert first.status == "throttled"
         assert agentic_tools._FETCH_TEXT_CACHE == {}
 
         # The host has since let us through: the retry gets the page, not the stored refusal.
-        fetch_plain.return_value = _plain_result("31/08/2022  41.1  Phoenix Sky Harbor")
-        second = await agentic_tools.fetch("https://www.ogimet.com/summary")
+        served = _serve_direct(monkeypatch, _ogimet_page("31/08/2022  41.1  Phoenix Sky Harbor"))
+        second = await agentic_tools.fetch(_OGIMET_URL)
 
-        assert fetch_plain.await_count == 2
+        assert refused == [_OGIMET_URL]
+        assert served == [_OGIMET_URL], "the retry issued its own request rather than replaying the refusal"
         assert second.status == "ok"
         assert second.method == "plain"
         assert "Phoenix Sky Harbor" in second.content_markdown
@@ -1520,23 +1500,25 @@ class TestThrottleInterstitialIsNotASuccess:
         """
         body = "The Ministry confirmed the vote will be held on 12 October 2026."
         assert len(body) < fetch_outcomes.FETCH_THROTTLE_PAGE_MAX_CHARS
-        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=_plain_result(body)))
+        url = "https://example.gov/statement"
+        _serve_direct(monkeypatch, _ogimet_page(body, url=url))
 
-        outcome = await agentic_tools.fetch("https://example.gov/statement")
+        outcome = await agentic_tools.fetch(url)
 
         assert outcome.status == "ok"
         assert outcome.method == "plain"
         assert outcome.content_markdown == body
-        assert agentic_tools._FETCH_TEXT_CACHE["https://example.gov/statement"] == body
+        assert agentic_tools._FETCH_TEXT_CACHE[url] == body
 
     @pytest.mark.asyncio
     async def test_a_long_page_about_rate_limits_is_still_a_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The phrase half alone would demote a page that merely discusses throttling."""
         body = "This API returns 429 Too Many Requests once you exceed the rate limit. " * 40
         assert len(body) > fetch_outcomes.FETCH_THROTTLE_PAGE_MAX_CHARS
-        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=_plain_result(body)))
+        url = "https://example.com/api-docs"
+        _serve_direct(monkeypatch, _ogimet_page(body, url=url))
 
-        outcome = await agentic_tools.fetch("https://example.com/api-docs")
+        outcome = await agentic_tools.fetch(url)
 
         assert outcome.status == "ok"
         assert outcome.method == "plain"
@@ -1545,18 +1527,14 @@ class TestThrottleInterstitialIsNotASuccess:
     async def test_a_throttled_fetch_earns_no_verification_tier(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """End-to-end through the loop's real stamping helper: an interstitial can never be
         stamped ``fetched``, so a "correction" resting on it cannot supersede the briefing."""
-        url = "https://www.ogimet.com/summary"
-        monkeypatch.setattr(
-            agentic_tools, "_fetch_plain", AsyncMock(return_value=_plain_result(_OGIMET_THROTTLE_BODY, url=url))
-        )
+        _serve_direct(monkeypatch, _ogimet_page(_OGIMET_THROTTLE_BODY))
 
-        outcome = await agentic_tools.fetch(url)
+        outcome = await agentic_tools.fetch(_OGIMET_URL)
 
-        assert _harvest_verification_tiers("fetch", {"url": url}, outcome) == {}
+        assert _harvest_verification_tiers("fetch", {"url": _OGIMET_URL}, outcome) == {}
 
     def test_throttled_method_maps_to_no_tier(self) -> None:
-        # Belt-and-suspenders, exactly as for "empty": even if a future edit let
-        # status=="ok" through, the method itself grants nothing.
+        """Belt-and-suspenders, as for "empty": even a leaked ``ok`` status grants nothing."""
         assert _method_to_tier("throttled") is None
 
     @pytest.mark.asyncio
@@ -1565,17 +1543,12 @@ class TestThrottleInterstitialIsNotASuccess:
     ) -> None:
         """One greppable WARN per throttled fetch: without it the event has no trace at all,
         and ``phrase``/``chars`` are what let a prod fire be graded true or false positive."""
-        monkeypatch.setattr(
-            agentic_tools,
-            "_fetch_plain",
-            AsyncMock(return_value=_plain_result(_OGIMET_THROTTLE_BODY, url="https://www.ogimet.com/summary")),
-        )
+        _serve_direct(monkeypatch, _ogimet_page(_OGIMET_THROTTLE_BODY))
 
         with caplog.at_level(logging.WARNING, logger=agentic_tools.__name__):
-            await agentic_tools.fetch("https://www.ogimet.com/summary")
+            await agentic_tools.fetch(_OGIMET_URL)
 
-        # 303, not the archived body's 304: `chars` is the whitespace-stripped length the rule
-        # actually measured against the cap, so the field and the comparison can never disagree.
+        # 303, not the archived body's 304: `chars` is the stripped length the rule measured.
         assert (
             "AGENTIC_FETCH_THROTTLED: url=https://www.ogimet.com/summary method=plain chars=303 phrase=query per"
             in caplog.text
@@ -1643,7 +1616,7 @@ async def test_try_rendered_fetch_uses_playwright_objects(monkeypatch: pytest.Mo
     monkeypatch.setattr(
         "metaculus_bot.research.fetch_ladder.classify._extract_main_text", MagicMock(return_value="Rendered body")
     )
-    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
     outcome = await agentic_tools._try_rendered_fetch("https://example.com/page")
 
@@ -1705,7 +1678,7 @@ async def test_rendered_fetch_launches_bounded_by_global_semaphore(monkeypatch: 
     monkeypatch.setattr(
         "metaculus_bot.research.fetch_ladder.classify._extract_main_text", MagicMock(return_value="rendered body")
     )
-    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
     tasks = [
         asyncio.create_task(agentic_tools._try_rendered_fetch(f"https://host.example.com/page{index}"))
@@ -1777,7 +1750,7 @@ async def test_rendered_fetch_route_guard_blocks_private_redirect_target(monkeyp
     monkeypatch.setattr(
         "metaculus_bot.research.fetch_ladder.classify._extract_main_text", MagicMock(return_value="public content only")
     )
-    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
     outcome = await agentic_tools._try_rendered_fetch("https://example.com/page")
 
@@ -1814,7 +1787,7 @@ def test_host_resolver_rule_ipv6_is_bracketed() -> None:
 @pytest.mark.asyncio
 async def test_resolve_pinned_host_public_ip_returns_host_and_ip(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(socket, "getaddrinfo", MagicMock(return_value=_addrinfo("93.184.216.34")))
-    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
     assert await rendered_fetch.resolve_pinned_host("https://example.com/page") == ("example.com", "93.184.216.34")
 
@@ -1822,16 +1795,16 @@ async def test_resolve_pinned_host_public_ip_returns_host_and_ip(monkeypatch: py
 @pytest.mark.asyncio
 async def test_resolve_pinned_host_private_ip_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(socket, "getaddrinfo", MagicMock(return_value=_addrinfo("10.0.0.5")))
-    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
     assert await rendered_fetch.resolve_pinned_host("https://internal.example.com/page") is None
 
 
 @pytest.mark.asyncio
 async def test_resolve_pinned_host_link_local_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The Azure IMDS / cloud-metadata address is link-local — must fail closed.
+    """The Azure IMDS / cloud-metadata address is link-local, so the pin must fail closed."""
     monkeypatch.setattr(socket, "getaddrinfo", MagicMock(return_value=_addrinfo("169.254.169.254")))
-    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
     assert await rendered_fetch.resolve_pinned_host("https://rebind.example.com/page") is None
 
@@ -1842,7 +1815,7 @@ async def test_resolve_pinned_host_rejects_when_any_address_disallowed(monkeypat
     # rejected wholesale (same stance as the aiohttp preflight/FilteringResolver).
     mixed = _addrinfo("93.184.216.34") + _addrinfo("127.0.0.1")
     monkeypatch.setattr(socket, "getaddrinfo", MagicMock(return_value=mixed))
-    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
     assert await rendered_fetch.resolve_pinned_host("https://mixed.example.com/page") is None
 
@@ -1850,7 +1823,7 @@ async def test_resolve_pinned_host_rejects_when_any_address_disallowed(monkeypat
 @pytest.mark.asyncio
 async def test_resolve_pinned_host_ipv6_public_is_pinned(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(socket, "getaddrinfo", MagicMock(return_value=_addrinfo6("2606:2800:220:1:248:1893:25c8:1946")))
-    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
     assert await rendered_fetch.resolve_pinned_host("https://v6.example.com/page") == (
         "v6.example.com",
@@ -1883,7 +1856,7 @@ async def test_resolve_pinned_host_userinfo_and_scheme_fail_closed() -> None:
 @pytest.mark.asyncio
 async def test_resolve_pinned_host_dns_failure_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(socket, "getaddrinfo", MagicMock(side_effect=socket.gaierror("no such host")))
-    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
     assert await rendered_fetch.resolve_pinned_host("https://nxdomain.example.com/page") is None
 
@@ -1914,7 +1887,7 @@ async def test_rendered_fetch_launches_with_host_resolver_pin(monkeypatch: pytes
     monkeypatch.setattr(
         "metaculus_bot.research.fetch_ladder.classify._extract_main_text", MagicMock(return_value="Rendered body")
     )
-    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
     outcome = await agentic_tools._try_rendered_fetch("https://example.com/page")
 
@@ -1928,8 +1901,8 @@ def _robots_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
     """Say this host's robots.txt does not disallow ``Google-Extended``.
 
     The paid rung runs a one-request robots pre-check before it spends anything, and it goes
-    through ``_fetch_plain``, so a test about the reader itself would otherwise either dial the
-    network or answer the pre-check out of whatever fake body it wired for the document. Its own
+    through the shared direct fetch, so a test about the reader itself would otherwise either dial
+    the network or answer the pre-check out of whatever fake body it wired for the document. Its own
     behavior is covered by ``TestUrlContextRobotsPreCheck``.
     """
     monkeypatch.setattr(agentic_tools, "_url_context_robots_skip", AsyncMock(return_value=False))
@@ -1952,7 +1925,7 @@ def _no_local_document(monkeypatch: pytest.MonkeyPatch, _robots_allowed: None) -
 @pytest.mark.usefixtures("_no_local_document")
 async def test_read_document_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GOOGLE_API_KEY", "key")
-    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
     monkeypatch.setattr(
         agentic_tools,
         "_run_document_read_sync",
@@ -1988,7 +1961,7 @@ async def test_read_document_genai_client_uses_bounded_timeout(monkeypatch: pyte
         return SimpleNamespace(models=models)
 
     monkeypatch.setattr("google.genai.Client", fake_client)
-    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+    monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
     outcome = await agentic_tools.read_document("https://example.com/file.pdf", "What does it say?")
 
@@ -2102,8 +2075,7 @@ class TestReadDocumentRefusesQuestionPlatformPages:
         session = self._redirecting_onto_the_platform(monkeypatch)
         monkeypatch.setenv("GOOGLE_API_KEY", "key")
         reader = _no_paid_reader(monkeypatch)
-        rendered = AsyncMock(return_value=None)
-        monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", rendered)
+        rendered_on = _serve_rendered(monkeypatch, None)
 
         outcome = await agentic_tools.read_document("https://t.co/crucible650", "what do the other forecasters say?")
 
@@ -2112,7 +2084,7 @@ class TestReadDocumentRefusesQuestionPlatformPages:
         assert outcome.method == "plain"
         assert session.calls == [("https://t.co/crucible650", False)], "the platform hop itself is never dialed"
         reader.assert_not_called()
-        rendered.assert_not_awaited()
+        assert rendered_on == []
 
     @pytest.mark.asyncio
     async def test_the_redirect_refusal_is_the_one_fetch_gives(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2133,7 +2105,7 @@ class TestReadDocumentRefusesQuestionPlatformPages:
     ) -> None:
         """``blog.mantic.com`` is an outside source: only the competition host is the platform."""
         monkeypatch.setenv("GOOGLE_API_KEY", "key")
-        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
         reader = MagicMock(return_value=("Quoted answer.", 1, ["URL_RETRIEVAL_STATUS_SUCCESS"]))
         monkeypatch.setattr(agentic_tools, "_run_document_read_sync", reader)
 
@@ -2189,7 +2161,7 @@ class TestReadDocumentRequiresRealRetrieval:
                 )
             ),
         )
-        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
         with caplog.at_level(logging.WARNING, logger=agentic_tools.__name__):
             outcome = await agentic_tools.read_document("https://example.com/file.pdf", "What is revenue?")
@@ -2216,7 +2188,7 @@ class TestReadDocumentRequiresRealRetrieval:
                 )
             ),
         )
-        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
         outcome = await agentic_tools.read_document("https://example.com/file.pdf", "What is revenue?")
         assert outcome.status != "ok"
@@ -2239,7 +2211,7 @@ class TestReadDocumentRequiresRealRetrieval:
                 )
             ),
         )
-        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
         outcome = await agentic_tools.read_document("https://example.com/file.pdf", "What is revenue?")
         assert outcome.status == "ok"
@@ -2275,7 +2247,7 @@ class TestReadDocumentRequiresRealRetrieval:
                 )
             ),
         )
-        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
         with caplog.at_level(logging.WARNING, logger=agentic_tools.__name__):
             outcome = await agentic_tools.read_document("https://example.com/file.pdf", "What is revenue?")
@@ -2301,7 +2273,7 @@ class TestReadDocumentRequiresRealRetrieval:
                 )
             ),
         )
-        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
         with caplog.at_level(logging.WARNING, logger=agentic_tools.__name__):
             outcome = await agentic_tools.read_document("https://example.com/file.pdf", "What is revenue?")
@@ -2522,7 +2494,7 @@ class TestLocalPdfRung:
             "metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True)
         )
         monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
-        monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=None))
+        monkeypatch.setattr(classify, "read_body_capped", AsyncMock(return_value=None))
         reader = _no_paid_reader(monkeypatch)
 
         outcome = await agentic_tools.fetch("https://example.gov/huge.pdf")
@@ -2538,7 +2510,7 @@ class TestLocalPdfRung:
         """The 6.7 MB report local extraction reads in 5.3 s is over the ordinary page cap."""
         read_body = _serve_pdf(monkeypatch, build_text_pdf([["Long enough to count as a real text layer here."]]))
 
-        await agentic_tools._fetch_plain("https://example.gov/report.pdf")
+        await _fetch_direct_only("https://example.gov/report.pdf")
 
         assert read_body.await_args is not None
         assert read_body.await_args.kwargs["max_bytes"] == DOCUMENT_TEXT_PDF_MAX_BYTES
@@ -2628,26 +2600,14 @@ class TestReadDocumentAcquiresBeforePaying:
             "The unemployment rate stood at 4.1 percent in May 2026.\n\n"
             "Unrelated methodology notes about seasonal adjustment.\n\n"
         ) * 3
-        monkeypatch.setattr(
-            agentic_tools,
-            "_fetch_plain",
-            AsyncMock(
-                return_value=SimpleNamespace(
-                    status="ok",
-                    method="plain",
-                    text=page_text,
-                    links=[],
-                    url="https://example.gov/tracker",
-                    escalate_rendered=False,
-                )
-            ),
-        )
+        url = "https://example.gov/tracker"
+        _serve_direct(monkeypatch, {url: _direct("success", url=url, text=page_text)})
         reader = _no_paid_reader(monkeypatch)
         # No Google key at all: the local digest is free and must not depend on one.
         monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
 
         with caplog.at_level(logging.INFO, logger=local_document.__name__):
-            outcome = await agentic_tools.read_document("https://example.gov/tracker", "unemployment rate May 2026")
+            outcome = await agentic_tools.read_document(url, "unemployment rate May 2026")
 
         assert outcome.method == "digest_local"
         assert _method_to_tier(outcome.method) == "fetched"
@@ -2688,20 +2648,8 @@ class TestReadDocumentAcquiresBeforePaying:
         """The reader's remaining job: a host our own client cannot read from at all. A real 403
         result, so it would earn the impersonated retry; the module fixture declines that retry,
         which is the DataDome-fronted shape (sagaftra.org refused both clients on 2026-09-04)."""
-        monkeypatch.setattr(
-            agentic_tools,
-            "_fetch_plain",
-            AsyncMock(
-                return_value=fetch_outcomes.PlainFetchResult(
-                    status="blocked",
-                    method="plain",
-                    text="Fetch blocked with HTTP 403.",
-                    links=[],
-                    url="https://sagaftra.org/contract",
-                    http_status=403,
-                )
-            ),
-        )
+        url = "https://sagaftra.org/contract"
+        _serve_direct(monkeypatch, {url: _direct("blocked", url=url, http_status=403)})
         monkeypatch.setenv("GOOGLE_API_KEY", "key")
         monkeypatch.setattr(
             agentic_tools,
@@ -2710,7 +2658,7 @@ class TestReadDocumentAcquiresBeforePaying:
         )
         monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
-        outcome = await agentic_tools.read_document("https://sagaftra.org/contract", "what increase is stated?")
+        outcome = await agentic_tools.read_document(url, "what increase is stated?")
 
         assert outcome.method == "document"
         assert outcome.content_markdown == "The contract states a 3.5 percent increase."
@@ -2724,31 +2672,19 @@ class TestReadDocumentAcquiresBeforePaying:
         The paid reader dials from Gemini's address rather than ours, so it is the right next
         rung for exactly this case.
         """
-        monkeypatch.setattr(
-            agentic_tools,
-            "_fetch_plain",
-            AsyncMock(
-                return_value=SimpleNamespace(
-                    status="ok",
-                    method="plain",
-                    text="Limit for old data queries exceeded. Permitted a query per 20 seconds per IP",
-                    links=[],
-                    url="https://www.ogimet.com/summary",
-                    escalate_rendered=False,
-                )
-            ),
-        )
-        # The interstitial leaves us holding nothing, so the ladder tries the browser next; it
-        # is the plain rung's classification that is under test here.
-        monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", AsyncMock(return_value=None))
+        interstitial = "Limit for old data queries exceeded. Permitted a query per 20 seconds per IP"
+        _serve_direct(monkeypatch, _ogimet_page(interstitial, escalate_rendered=True))
+        # The interstitial is thin, so the browser is tried; the text it leaves standing holds nothing.
+        rendered_on = _serve_rendered(monkeypatch, None)
         monkeypatch.setenv("GOOGLE_API_KEY", "key")
         monkeypatch.setattr(
             agentic_tools, "_run_document_read_sync", MagicMock(return_value=("Model read.", 1, ["SUCCESS"]))
         )
         monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
-        outcome = await agentic_tools.read_document("https://www.ogimet.com/summary", "the 2022-08-31 maximum")
+        outcome = await agentic_tools.read_document(_OGIMET_URL, "the 2022-08-31 maximum")
 
+        assert rendered_on == [_OGIMET_URL]
         assert outcome.method == "document"
         assert "Limit for old data queries" not in outcome.content_markdown
 
@@ -2766,8 +2702,7 @@ class TestReadDocumentAcquiresBeforePaying:
             "metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True)
         )
         monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
-        rendered = AsyncMock()
-        monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", rendered)
+        rendered_on = _serve_rendered(monkeypatch, None)
         monkeypatch.setenv("GOOGLE_API_KEY", "key")
         monkeypatch.setattr(
             agentic_tools, "_run_document_read_sync", MagicMock(return_value=("The chart shows 41.", 1, ["SUCCESS"]))
@@ -2778,27 +2713,22 @@ class TestReadDocumentAcquiresBeforePaying:
 
         assert outcome.method == "document"
         assert outcome.content_markdown == "The chart shows 41."
-        rendered.assert_not_awaited()
+        assert rendered_on == []
 
     @pytest.mark.asyncio
     async def test_an_oversize_document_is_reported_rather_than_paid_for(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(
-            agentic_tools,
-            "_fetch_plain",
-            AsyncMock(
-                return_value=SimpleNamespace(
-                    status="error",
-                    method="oversize_document",
-                    text=local_document.oversize_message("https://example.gov/huge.pdf"),
-                    links=[],
-                    url="https://example.gov/huge.pdf",
-                    escalate_rendered=False,
+        url = "https://example.gov/huge.pdf"
+        _serve_direct(
+            monkeypatch,
+            {
+                url: _direct(
+                    "error", url=url, reason="oversize_document", http_status=200, content_type="application/pdf"
                 )
-            ),
+            },
         )
         reader = _no_paid_reader(monkeypatch)
 
-        outcome = await agentic_tools.read_document("https://example.gov/huge.pdf", "anything")
+        outcome = await agentic_tools.read_document(url, "anything")
 
         assert outcome.method == "oversize_document"
         assert "too large to read" in outcome.content_markdown.lower()
@@ -2815,40 +2745,16 @@ class TestReadDocumentAcquiresBeforePaying:
         answered from its text for free. Untested until 2026-09-03 — deleting the rendered block
         from the ladder left the whole suite green.
         """
-        monkeypatch.setattr(
-            agentic_tools,
-            "_fetch_plain",
-            AsyncMock(
-                return_value=SimpleNamespace(
-                    status="ok",
-                    method="plain",
-                    text="Loading…",
-                    links=[],
-                    url="https://example.gov/tracker",
-                    escalate_rendered=True,
-                )
-            ),
-        )
+        url = "https://example.gov/tracker"
+        _serve_direct(monkeypatch, {url: _direct("success", url=url, text="Loading…", escalate_rendered=True)})
         rendered_text = (
             "Weekly tracker.\n\nThe unemployment rate stood at 4.1 percent in May 2026.\n\n"
             "Methodology notes about seasonal adjustment follow.\n\n"
         ) * 3
-        monkeypatch.setattr(
-            agentic_tools,
-            "_try_rendered_fetch",
-            AsyncMock(
-                return_value=SimpleNamespace(
-                    status="ok",
-                    method="rendered",
-                    text=rendered_text,
-                    links=[],
-                    url="https://example.gov/tracker",
-                )
-            ),
-        )
+        _serve_rendered(monkeypatch, replace(_direct("success", url=url, text=rendered_text), route="rendered"))
         reader = _no_paid_reader(monkeypatch)
 
-        outcome = await agentic_tools.read_document("https://example.gov/tracker", "unemployment rate May 2026")
+        outcome = await agentic_tools.read_document(url, "unemployment rate May 2026")
 
         assert outcome.method == "digest_local"
         assert _method_to_tier(outcome.method) == "fetched", "the browser read the host's own bytes"
@@ -2868,21 +2774,10 @@ class TestReadDocumentAcquiresBeforePaying:
         description tells the driver a zero-passage digest means the document does not discuss
         what was asked. The paid reader, which dials from Gemini's address, is the right rung.
         """
-        monkeypatch.setattr(
-            agentic_tools,
-            "_fetch_plain",
-            AsyncMock(
-                return_value=SimpleNamespace(
-                    status="ok",
-                    method="plain",
-                    text="Home | Markets | Browse | Related questions | Sign in | Newsletter | About | Terms",
-                    links=[],
-                    url="https://manifold.markets/q/some-market",
-                    escalate_rendered=True,
-                )
-            ),
-        )
-        monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", AsyncMock(return_value=None))
+        url = "https://manifold.markets/q/some-market"
+        chrome = "Home | Markets | Browse | Related questions | Sign in | Newsletter | About | Terms"
+        _serve_direct(monkeypatch, {url: _direct("success", url=url, text=chrome, escalate_rendered=True)})
+        _serve_rendered(monkeypatch, None)
         monkeypatch.setenv("GOOGLE_API_KEY", "key")
         monkeypatch.setattr(
             agentic_tools, "_run_document_read_sync", MagicMock(return_value=("Model read.", 1, ["SUCCESS"]))
@@ -2890,9 +2785,7 @@ class TestReadDocumentAcquiresBeforePaying:
         monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
         with caplog.at_level(logging.INFO, logger=local_document.__name__):
-            outcome = await agentic_tools.read_document(
-                "https://manifold.markets/q/some-market", "what unemployment rate did the department report for May"
-            )
+            outcome = await agentic_tools.read_document(url, "what unemployment rate did the department report for May")
 
         assert outcome.method == "document"
         assert "Related questions" not in outcome.content_markdown
@@ -2908,24 +2801,13 @@ class TestReadDocumentAcquiresBeforePaying:
         ``fetch`` serves a thin-but-real page as a success by design (a one-line official
         statement), and here the same text answers the ask, so the free digest stands.
         """
-        monkeypatch.setattr(
-            agentic_tools,
-            "_fetch_plain",
-            AsyncMock(
-                return_value=SimpleNamespace(
-                    status="ok",
-                    method="plain",
-                    text="Statement: the unemployment rate stood at 4.1 percent in May 2026.",
-                    links=[],
-                    url="https://example.gov/statement",
-                    escalate_rendered=True,
-                )
-            ),
-        )
-        monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", AsyncMock(return_value=None))
+        url = "https://example.gov/statement"
+        statement = "Statement: the unemployment rate stood at 4.1 percent in May 2026."
+        _serve_direct(monkeypatch, {url: _direct("success", url=url, text=statement, escalate_rendered=True)})
+        _serve_rendered(monkeypatch, None)
         reader = _no_paid_reader(monkeypatch)
 
-        outcome = await agentic_tools.read_document("https://example.gov/statement", "unemployment rate May 2026")
+        outcome = await agentic_tools.read_document(url, "unemployment rate May 2026")
 
         assert outcome.method == "digest_local"
         assert "4.1 percent" in outcome.content_markdown
@@ -2964,58 +2846,52 @@ class TestTheDocumentedEscalationDoesNotRepeatItself:
         scanned PDF, whose parse is cached under the URL, and never held for an image, whose body
         is not downloaded on either pass and so is cached nowhere.
         """
+        url = "https://example.gov/chart.png"
         session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "image/png"}))
         read_body = AsyncMock(return_value=b"")
         monkeypatch.setattr(
             "metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True)
         )
         monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
-        monkeypatch.setattr(agentic_tools, "_read_response_body", read_body)
-        rendered = AsyncMock()
-        monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", rendered)
+        monkeypatch.setattr(classify, "read_body_capped", read_body)
+        rendered_on = _serve_rendered(monkeypatch, None)
         monkeypatch.setenv("GOOGLE_API_KEY", "key")
         monkeypatch.setattr(
             agentic_tools, "_run_document_read_sync", MagicMock(return_value=("The chart shows 41.", 1, ["SUCCESS"]))
         )
         monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
-        outcome = await agentic_tools.fetch("https://example.gov/chart.png")
+        outcome = await agentic_tools.fetch(url)
 
         assert outcome.method == "document"
-        assert len(session.calls) == 1, "the escalation must not re-GET a URL the plain rung just classified"
+        # The archive rung takes its own turn here, so the count is of THIS url's requests.
+        assert [requested for requested, _ in session.calls].count(url) == 1, (
+            "the escalation must not re-GET a URL the direct rung just classified"
+        )
         assert read_body.await_count == 0, "an image's body is never downloaded, on either pass"
-        rendered.assert_not_awaited()  # no browser reads an image
+        assert rendered_on == []  # no browser reads an image
 
     @pytest.mark.asyncio
     @pytest.mark.usefixtures("_robots_allowed")
     async def test_a_js_wall_renders_once_then_read_document_pays(self, monkeypatch: pytest.MonkeyPatch) -> None:
         chromium = self._wire_launch_counting_playwright(monkeypatch)
-        plain = AsyncMock(
-            return_value=SimpleNamespace(
-                status="empty",
-                method="plain",
-                text="",
-                links=[],
-                url="https://example.gov/wall",
-                escalate_rendered=True,
-            )
-        )
-        monkeypatch.setattr(agentic_tools, "_fetch_plain", plain)
+        url = "https://example.gov/wall"
+        asked = _serve_direct(monkeypatch, {url: _direct("js_wall", url=url, escalate_rendered=True)})
         monkeypatch.setenv("GOOGLE_API_KEY", "key")
         monkeypatch.setattr(
             agentic_tools, "_run_document_read_sync", MagicMock(return_value=("Model read.", 1, ["SUCCESS"]))
         )
         monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
-        walled = await agentic_tools.fetch("https://example.gov/wall")
+        walled = await agentic_tools.fetch(url)
         assert walled.status == "empty", "a page nothing could read must not be laundered as a success"
 
-        outcome = await agentic_tools.read_document("https://example.gov/wall", "what does the tracker report?")
+        outcome = await agentic_tools.read_document(url, "what does the tracker report?")
 
         assert outcome.method == "document", "the paid reader is the rung left for a page we cannot read"
         assert len(chromium.launch_args) == 1, "the second launch would re-learn what this run already knows"
-        assert plain.await_count == 2, (
-            "the plain GET is deliberately NOT negative-cached: the driver is told to retry these URLs"
+        assert asked == [url, url], (
+            "the direct GET is deliberately NOT negative-cached: the driver is told to retry these URLs"
         )
 
     @pytest.mark.asyncio
@@ -3027,30 +2903,20 @@ class TestTheDocumentedEscalationDoesNotRepeatItself:
         page — caching that outcome (as the pre-fix code cached its text) is what made the
         driver's own retry impossible.
         """
-        plain = AsyncMock(
-            return_value=SimpleNamespace(
-                status="ok",
-                method="plain",
-                text="Limit for old data queries exceeded. Permitted a query per 20 seconds per IP",
-                links=[],
-                url="https://www.ogimet.com/summary",
-                escalate_rendered=False,
-            )
-        )
-        monkeypatch.setattr(agentic_tools, "_fetch_plain", plain)
-        monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", AsyncMock(return_value=None))
+        interstitial = "Limit for old data queries exceeded. Permitted a query per 20 seconds per IP"
+        asked = _serve_direct(monkeypatch, _ogimet_page(interstitial))
         monkeypatch.setenv("GOOGLE_API_KEY", "key")
         monkeypatch.setattr(
             agentic_tools, "_run_document_read_sync", MagicMock(return_value=("Model read.", 1, ["SUCCESS"]))
         )
         monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
-        throttled = await agentic_tools.fetch("https://www.ogimet.com/summary")
-        outcome = await agentic_tools.read_document("https://www.ogimet.com/summary", "the 2022-08-31 maximum")
+        throttled = await agentic_tools.fetch(_OGIMET_URL)
+        outcome = await agentic_tools.read_document(_OGIMET_URL, "the 2022-08-31 maximum")
 
         assert throttled.status == "throttled"
         assert outcome.method == "document"
-        assert plain.await_count == 2, "a throttle is not a fact about the page, so nothing memoizes it"
+        assert asked == [_OGIMET_URL, _OGIMET_URL], "a throttle is not a fact about the page, so nothing memoizes it"
 
 
 class TestUrlContextSizeGate:
@@ -3106,7 +2972,7 @@ class TestRenderedRungSalvagesATimedOutNavigation:
     def _wire_playwright(monkeypatch: pytest.MonkeyPatch, page: FakePage) -> None:
         install_fake_playwright(monkeypatch, page, pinned=("example.com", "93.184.216.34"))
         monkeypatch.setattr(rendered_fetch, "_RENDERED_FETCH_GLOBAL_SEMAPHORE", asyncio.Semaphore(2))
-        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
     @pytest.mark.asyncio
     async def test_a_goto_timeout_still_returns_the_rendered_dom(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3252,58 +3118,53 @@ class TestRenderedRungTimeoutAtTheV2Wrapper:
 
 
 class TestGapFillV2RendersThePlainRungsFinalUrl:
-    """Both call sites hand the browser the plain rung's POST-REDIRECT URL, ``plain.url``, never
-    the URL the driver asked for. That is load-bearing since the transport pins Chromium's DNS to
-    the host it is asked for and refuses a main frame that lands anywhere else: rendering the
-    pre-redirect URL would pin the wrong host and then refuse the DOM when Chromium followed the
-    same hop (every http-to-https, apex-to-www and shortener redirect), and gap-fill v2 would
-    degrade on the resulting ``None`` with one warning line. Rewriting either site to ``url`` left
-    the whole suite green before these tests, so they exist to go red under that mutation."""
+    """The browser is handed the direct fetch's POST-REDIRECT URL, ``direct.url``, never the URL
+    the driver asked for. That is load-bearing since the transport pins Chromium's DNS to the host
+    it is asked for and refuses a main frame that lands anywhere else: rendering the pre-redirect
+    URL would pin the wrong host and then refuse the DOM when Chromium followed the same hop
+    (every http-to-https, apex-to-www and shortener redirect), and gap-fill v2 would degrade on the
+    resulting ``None`` with one warning line. Both of the loop's ladders reach the one rung that
+    decides it, so both are driven here."""
 
     _REQUESTED = "https://example.com/start"
     _FINAL = "https://www.example.com/final"
 
     @staticmethod
-    def _record_render_targets(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-        """A browser rung that declines, recording what it was asked to render."""
-        targets: list[str] = []
+    def _record_render_targets(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
+        """A browser TRANSPORT that declines, recording the URL the rung asked it to render.
 
-        async def _declining_recorder(target: str) -> None:
-            targets.append(target)
-            await asyncio.sleep(0)
-
-        monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", _declining_recorder)
-        return targets
-
-    def _thin_plain_read_that_landed_elsewhere(self) -> fetch_outcomes.PlainFetchResult:
-        return fetch_outcomes.PlainFetchResult(
-            status="ok", method="plain", text="Menu. Home.", links=[], url=self._FINAL, escalate_rendered=True
+        One layer under the rung, because which URL the rung dials is the thing under test.
+        """
+        calls: list[dict[str, object]] = []
+        monkeypatch.setattr(rungs, "render_page", _fake_render(None, calls))
+        # The landing differs from the cited URL, so the rung re-vets it before dialing.
+        monkeypatch.setattr(
+            "metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True)
         )
+        return calls
+
+    def _thin_direct_read_that_landed_elsewhere(self) -> FetchResult:
+        return _direct("success", url=self._FINAL, text="Menu. Home.", escalate_rendered=True)
 
     @pytest.mark.asyncio
-    async def test_the_escalation_outcome_renders_the_plain_rungs_final_url(self, monkeypatch: pytest.MonkeyPatch):
-        targets = self._record_render_targets(monkeypatch)
+    async def test_the_fetch_ladder_renders_the_direct_rungs_final_url(self, monkeypatch: pytest.MonkeyPatch):
+        renders = self._record_render_targets(monkeypatch)
+        _serve_direct(monkeypatch, {self._REQUESTED: self._thin_direct_read_that_landed_elsewhere()})
 
-        outcome = await agentic_tools._rendered_escalation_outcome(
-            self._REQUESTED, self._thin_plain_read_that_landed_elsewhere(), start_char=0, question_topic=""
-        )
+        outcome = await agentic_tools.fetch(self._REQUESTED)
 
-        assert targets == [self._FINAL]
-        # The browser declined, so the thin-but-real plain read stands under its own method.
+        assert [call["url"] for call in renders] == [self._FINAL]
+        # The browser declined, so the thin-but-real direct read stands under its own method.
         assert outcome.method == "plain"
 
     @pytest.mark.asyncio
-    async def test_the_document_ladder_renders_the_plain_rungs_final_url(self, monkeypatch: pytest.MonkeyPatch):
-        targets = self._record_render_targets(monkeypatch)
-        monkeypatch.setattr(
-            agentic_tools, "_fetch_plain", AsyncMock(return_value=self._thin_plain_read_that_landed_elsewhere())
-        )
+    async def test_the_document_ladder_renders_the_direct_rungs_final_url(self, monkeypatch: pytest.MonkeyPatch):
+        renders = self._record_render_targets(monkeypatch)
+        _serve_direct(monkeypatch, {self._REQUESTED: self._thin_direct_read_that_landed_elsewhere()})
 
-        held = await agentic_tools._run_local_document_ladder(
-            self._REQUESTED, deadline_monotonic_s=monotonic() + agentic_tools._LOCAL_DOCUMENT_BUDGET_S
-        )
+        held = await agentic_tools._run_local_document_ladder(self._REQUESTED, ctx=None)
 
-        assert targets == [self._FINAL]
+        assert [call["url"] for call in renders] == [self._FINAL]
         assert held.has_text
 
     @pytest.mark.asyncio
@@ -3321,7 +3182,7 @@ class TestGapFillV2RendersThePlainRungsFinalUrl:
         monkeypatch.setattr(
             "metaculus_bot.research.fetch_ladder.classify._extract_main_text", MagicMock(return_value="Rendered body")
         )
-        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
         result = await agentic_tools._try_rendered_fetch("https://example.com/senate")
 
@@ -3332,9 +3193,9 @@ class TestGapFillV2RendersThePlainRungsFinalUrl:
     @pytest.mark.asyncio
     async def test_through_fetch_a_scripted_302_decides_the_render_target(self, monkeypatch: pytest.MonkeyPatch):
         """End to end through the plain rung's own redirect loop, so the URL the browser is handed
-        is proven to be the hop the plain fetch actually landed on rather than a value a stub
+        is proven to be the hop the direct fetch actually landed on rather than a value a stub
         supplied. The final page is thin, which is what sends the ladder to the browser."""
-        targets = self._record_render_targets(monkeypatch)
+        renders = self._record_render_targets(monkeypatch)
         session = _FakeSession(
             _FakeResponse(status=302, headers={"Location": self._FINAL}),
             _FakeResponse(status=200, headers={"Content-Type": "text/html"}),
@@ -3344,19 +3205,19 @@ class TestGapFillV2RendersThePlainRungsFinalUrl:
         )
         monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
         monkeypatch.setattr(
-            agentic_tools,
-            "_read_response_body",
+            classify,
+            "read_body_capped",
             AsyncMock(return_value=b"<html><body><p>Menu. Home.</p></body></html>"),
         )
         monkeypatch.setattr(
             "metaculus_bot.research.fetch_ladder.classify._extract_main_text", MagicMock(return_value="Menu. Home.")
         )
-        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
         await agentic_tools.fetch(self._REQUESTED)
 
         assert session.calls == [(self._REQUESTED, False), (self._FINAL, False)]
-        assert targets == [self._FINAL]
+        assert [call["url"] for call in renders] == [self._FINAL]
 
 
 # ---------------------------------------------------------------------------
@@ -3371,36 +3232,26 @@ _GOOGLE_EXTENDED_BLOCKED_ROBOTS = "User-agent: Google-Extended\nDisallow: /\n"
 _GENERIC_CRAWLER_BLOCKED_ROBOTS = "User-agent: *\nDisallow: /\nCrawl-delay: 10\n"
 
 
-def _plain_result_stub(
-    url: str, *, status: str, text: str, http_status: int | None = None
-) -> fetch_outcomes.PlainFetchResult:
-    """A plain-rung result as production builds it: the real dataclass, so a field the ladder
-    gains (``http_status``, 2026-09-04) cannot be missing from the stand-in and a stub that
-    claims a 403 carries the status a real one carries."""
-    return fetch_outcomes.PlainFetchResult(
-        status=status, method="plain", text=text, links=[], url=url, http_status=http_status
-    )
+def _robots_answers(
+    page_url: str, robots_txt: str | None, *, page: FetchResult | None = None
+) -> dict[str, FetchResult]:
+    """``_serve_direct`` answers for one host: its ``/robots.txt``, and the page itself.
 
-
-def _fetch_plain_serving_robots(robots_txt: str | None, *, calls: list[str]) -> Any:
-    """A ``_fetch_plain`` double: ``/robots.txt`` gets ``robots_txt``, every other URL a 403.
-
-    The 403 is what leaves ``read_document``'s free ladder holding nothing, which is the state the
-    pre-check guards; it is a real host 403 (``http_status=403``), so it would earn the impersonated
-    retry, and the module fixture that declines that retry is what keeps these tests about the
-    pre-check. ``robots_txt=None`` stands for a robots.txt we could not read at all.
+    The page defaults to a real host 403 (``http_status=403``), which is what leaves
+    ``read_document``'s free ladder holding nothing and would earn the impersonated retry the
+    module fixture declines; ``robots_txt=None`` is a policy we could not read at all.
     """
-
-    async def fetch_plain(url: str) -> Any:
-        calls.append(url)
-        await asyncio.sleep(0)
-        if url.endswith("/robots.txt"):
-            if robots_txt is None:
-                return _plain_result_stub(url, status="error", text="Fetch error: TimeoutError:")
-            return _plain_result_stub(url, status="ok", text=robots_txt)
-        return _plain_result_stub(url, status="blocked", text="Fetch blocked with HTTP 403.", http_status=403)
-
-    return fetch_plain
+    split = urlsplit(page_url)
+    robots_url = f"{split.scheme}://{split.netloc}/robots.txt"
+    robots = (
+        _direct("error", url=robots_url, content_type=None)
+        if robots_txt is None
+        else _direct("success", url=robots_url, text=robots_txt, http_status=200, content_type="text/plain")
+    )
+    return {
+        robots_url: robots,
+        page_url: page if page is not None else _direct("blocked", url=page_url, http_status=403),
+    }
 
 
 class TestUrlContextRobotsPreCheck:
@@ -3424,35 +3275,44 @@ class TestUrlContextRobotsPreCheck:
     async def test_a_host_that_only_blocks_generic_crawlers_is_still_read(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        calls: list[str] = []
-        monkeypatch.setattr(
-            agentic_tools, "_fetch_plain", _fetch_plain_serving_robots(_GENERIC_CRAWLER_BLOCKED_ROBOTS, calls=calls)
-        )
+        url = "https://who.int/data/gho"
+        asked = _serve_direct(monkeypatch, _robots_answers(url, _GENERIC_CRAWLER_BLOCKED_ROBOTS))
         reader = self._wire_reader(monkeypatch)
 
-        outcome = await agentic_tools.read_document("https://who.int/data/gho", "what does the indicator read?")
+        outcome = await agentic_tools.read_document(url, "what does the indicator read?")
 
         assert outcome.method == "document"
         assert outcome.content_markdown == "Model read."
         reader.assert_called_once()
-        assert "https://who.int/robots.txt" in calls
+        assert "https://who.int/robots.txt" in asked
 
     @pytest.mark.asyncio
     async def test_a_google_extended_disallow_skips_the_paid_read(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        calls: list[str] = []
+        """The robots body goes through the REAL classification: a 41-character ``text/plain`` policy
+        has to come back as its own text rather than as a sub-floor withhold, and the skip below is
+        reachable only if it did."""
+        url = "https://internationalaisafetyreport.org/chapters/2/"
+        session = _FakeSession(
+            _FakeResponse(status=403, headers={"Content-Type": "text/html"}),
+            _FakeResponse(status=200, headers={"Content-Type": "text/plain"}),
+        )
         monkeypatch.setattr(
-            agentic_tools, "_fetch_plain", _fetch_plain_serving_robots(_GOOGLE_EXTENDED_BLOCKED_ROBOTS, calls=calls)
+            "metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True)
+        )
+        monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
+        monkeypatch.setattr(
+            classify, "read_body_capped", AsyncMock(return_value=_GOOGLE_EXTENDED_BLOCKED_ROBOTS.encode())
         )
         reader = _no_paid_reader(monkeypatch)
         monkeypatch.setenv("GOOGLE_API_KEY", "key")
 
-        url = "https://internationalaisafetyreport.org/chapters/2/"
         with caplog.at_level(logging.INFO, logger=agentic_tools.__name__):
             outcome = await agentic_tools.read_document(url, "what does the chapter say about compute?")
 
         reader.assert_not_called()
+        assert session.calls == [(url, False), ("https://internationalaisafetyreport.org/robots.txt", False)]
         assert outcome.status == "robots_disallowed"
         assert outcome.method == "document"
         assert _harvest_verification_tiers("read_document", {"url": url}, outcome) == {}, (
@@ -3467,30 +3327,31 @@ class TestUrlContextRobotsPreCheck:
     @pytest.mark.asyncio
     async def test_an_unreadable_robots_txt_proceeds_to_the_reader(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Every ambiguity resolves toward paying: a wrong skip loses a document we could read."""
-        calls: list[str] = []
-        monkeypatch.setattr(agentic_tools, "_fetch_plain", _fetch_plain_serving_robots(None, calls=calls))
+        url = "https://example.gov/report"
+        _serve_direct(monkeypatch, _robots_answers(url, None))
         reader = self._wire_reader(monkeypatch)
 
-        outcome = await agentic_tools.read_document("https://example.gov/report", "what is the figure?")
+        outcome = await agentic_tools.read_document(url, "what is the figure?")
 
         assert outcome.method == "document"
         reader.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_robots_txt_is_read_once_per_host_per_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        calls: list[str] = []
-        monkeypatch.setattr(
-            agentic_tools, "_fetch_plain", _fetch_plain_serving_robots(_GOOGLE_EXTENDED_BLOCKED_ROBOTS, calls=calls)
-        )
+        first_url = "https://internationalaisafetyreport.org/a"
+        second_url = "https://internationalaisafetyreport.org/b"
+        answers = _robots_answers(first_url, _GOOGLE_EXTENDED_BLOCKED_ROBOTS)
+        answers[second_url] = _direct("blocked", url=second_url, http_status=403)
+        asked = _serve_direct(monkeypatch, answers)
         _no_paid_reader(monkeypatch)
         monkeypatch.setenv("GOOGLE_API_KEY", "key")
 
-        first = await agentic_tools.read_document("https://internationalaisafetyreport.org/a", "ask one")
-        second = await agentic_tools.read_document("https://internationalaisafetyreport.org/b", "ask two")
+        first = await agentic_tools.read_document(first_url, "ask one")
+        second = await agentic_tools.read_document(second_url, "ask two")
 
         assert first.status == "robots_disallowed"
         assert second.status == "robots_disallowed"
-        robots_calls = [url for url in calls if url.endswith("/robots.txt")]
+        robots_calls = [url for url in asked if url.endswith("/robots.txt")]
         assert len(robots_calls) == 1, "the verdict is cached per host, so a run pays one request for it"
 
     @pytest.mark.asyncio
@@ -3502,19 +3363,14 @@ class TestUrlContextRobotsPreCheck:
         permitted, so a disallowing robots.txt must not withhold a free read.
         """
         page = "The report states that training compute grew fourfold in 2026. " * 12
-
-        async def fetch_plain(url: str) -> Any:
-            await asyncio.sleep(0)
-            if url.endswith("/robots.txt"):
-                return _plain_result_stub(url, status="ok", text=_GOOGLE_EXTENDED_BLOCKED_ROBOTS)
-            return _plain_result_stub(url, status="ok", text=page)
-
-        monkeypatch.setattr(agentic_tools, "_fetch_plain", fetch_plain)
+        url = "https://internationalaisafetyreport.org/chapters/2/"
+        _serve_direct(
+            monkeypatch,
+            _robots_answers(url, _GOOGLE_EXTENDED_BLOCKED_ROBOTS, page=_direct("success", url=url, text=page)),
+        )
         reader = _no_paid_reader(monkeypatch)
 
-        outcome = await agentic_tools.read_document(
-            "https://internationalaisafetyreport.org/chapters/2/", "training compute growth"
-        )
+        outcome = await agentic_tools.read_document(url, "training compute growth")
 
         assert outcome.method == "digest_local"
         assert "training compute grew fourfold" in outcome.content_markdown
@@ -3590,10 +3446,10 @@ _IMPERSONATED_PAGE = (
 
 
 class TestGapFillV2ImpersonatedRetry:
-    """The plain rung's 403, re-dialed under a real browser's TLS fingerprint through the transport
-    Tier 1 shares (`research/impersonated_fetch.py`) and mapped onto this ladder's result type.
+    """The direct fetch's 403, re-dialed under a real browser's TLS fingerprint by the shared rung
+    (`fetch_ladder.rungs._impersonate_rung`) and mapped onto this ladder's result type.
 
-    The transport is patched at the import seam `agentic_tools.fetch_impersonated`, never at its
+    The transport is patched at the rung's own import seam `rungs.fetch_impersonated`, never at its
     own session, so the suite's `_block_native_egress` guard stays armed underneath every test.
     """
 
@@ -3618,10 +3474,19 @@ class TestGapFillV2ImpersonatedRetry:
 
     @staticmethod
     def _transport(monkeypatch: pytest.MonkeyPatch, answer: Any) -> list[dict[str, Any]]:
-        """The one transport double both suites share, patched at THIS ladder's import seam."""
+        """The one transport double both suites share, patched at the shared rung's import seam."""
         calls: list[dict[str, Any]] = []
-        monkeypatch.setattr(agentic_tools, "fetch_impersonated", fake_impersonated_fetch(answer, calls))
+        monkeypatch.setattr(rungs, "fetch_impersonated", fake_impersonated_fetch(answer, calls))
         return calls
+
+    @staticmethod
+    def _ctx() -> context.LadderContext:
+        """A rung context carrying the loop's own host map and its `fetch` preset's dial cap."""
+        return context.LadderContext(policy=GAP_FILL_FETCH_POLICY, host_sems=agentic_tools._FETCH_HOST_SEMAPHORES)
+
+    def _serve_a_403(self, monkeypatch: pytest.MonkeyPatch, *, landed_on: str | None = None) -> list[str]:
+        """The host answered our own client 403, on ``landed_on`` where its redirect moved us."""
+        return _serve_direct(monkeypatch, {self._URL: self._blocked(landed_on or self._URL, 403)})
 
     @classmethod
     def _response(
@@ -3630,15 +3495,8 @@ class TestGapFillV2ImpersonatedRetry:
         return _impersonated(status, body=body, content_type=content_type, url=url or cls._URL)
 
     @staticmethod
-    def _blocked(url: str, http_status: int | None) -> fetch_outcomes.PlainFetchResult:
-        return fetch_outcomes.PlainFetchResult(
-            status="blocked",
-            method="plain",
-            text=f"Fetch blocked with HTTP {http_status}.",
-            links=[],
-            url=url,
-            http_status=http_status,
-        )
+    def _blocked(url: str, http_status: int | None) -> FetchResult:
+        return _direct("blocked", url=url, http_status=http_status)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("status", [403, 406, 429, 503])
@@ -3649,7 +3507,7 @@ class TestGapFillV2ImpersonatedRetry:
         )
         monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
 
-        result = await agentic_tools._fetch_plain("https://example.com/gated")
+        result = await _fetch_direct_only("https://example.com/gated")
 
         assert result.http_status == status
 
@@ -3661,19 +3519,20 @@ class TestGapFillV2ImpersonatedRetry:
             return "metaculus.com" in url
 
         monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", is_public)
-        get_session = MagicMock(side_effect=AssertionError("neither refusal opens a session"))
-        monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", get_session)
+        session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/html"}))
+        monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
 
-        non_public = await agentic_tools._fetch_plain("http://169.254.169.254/latest/meta-data/")
-        self_reference = await agentic_tools._fetch_plain("https://www.metaculus.com/questions/1/")
+        non_public = await _fetch_direct_only("http://169.254.169.254/latest/meta-data/")
+        self_reference = await _fetch_direct_only("https://www.metaculus.com/questions/1/")
 
         assert (non_public.status, non_public.http_status) == ("blocked", None)
         assert (self_reference.status, self_reference.http_status) == ("blocked", None)
+        assert session.calls == [], "neither refusal issues a request"
 
     @pytest.mark.asyncio
     async def test_a_403_is_retried_and_a_rescue_is_the_fetch_outcome(self, monkeypatch) -> None:
-        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=self._blocked(self._URL, 403)))
-        monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", AsyncMock(return_value=None))
+        self._serve_a_403(monkeypatch)
+        _serve_rendered(monkeypatch, None)
         calls = self._transport(monkeypatch, self._response(200, body=_IMPERSONATED_PAGE))
 
         outcome = await agentic_tools.fetch(self._URL)
@@ -3684,8 +3543,7 @@ class TestGapFillV2ImpersonatedRetry:
         assert _method_to_tier(outcome.method) == "fetched", "the retry read the host's own bytes"
         (call,) = calls
         assert call["url"] == self._URL
-        # This ladder's own host map and the plain rung's own bounds, not Tier 1's: both body caps,
-        # so a declared PDF between them is read as `_plain_response_outcome` would have read it.
+        # Both body caps, so a declared PDF between them is read as the direct route reads one.
         assert call["host_sems"] is agentic_tools._FETCH_HOST_SEMAPHORES
         assert call["per_hop_timeout_s"] == RESOLUTION_SOURCE_HTTP_TIMEOUT
         assert call["max_bytes"] == RESOLUTION_SOURCE_MAX_RESPONSE_BYTES
@@ -3695,9 +3553,7 @@ class TestGapFillV2ImpersonatedRetry:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("http_status", [406, 429])
     async def test_the_other_block_statuses_are_not_retried(self, http_status: int, monkeypatch) -> None:
-        monkeypatch.setattr(
-            agentic_tools, "_fetch_plain", AsyncMock(return_value=self._blocked(self._URL, http_status))
-        )
+        _serve_direct(monkeypatch, {self._URL: self._blocked(self._URL, http_status)})
         calls = self._transport(monkeypatch, self._response(200, body=_IMPERSONATED_PAGE))
 
         outcome = await agentic_tools.fetch(self._URL)
@@ -3741,7 +3597,7 @@ class TestGapFillV2ImpersonatedRetry:
         """Every member of the `ImpersonateDeclined` family folds back into `None` here, so the
         driver sees exactly the `blocked` outcome it saw before the rung existed, and none of them
         says anything about the host's view of our fingerprint, so none writes the memo."""
-        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=self._blocked(self._URL, 403)))
+        self._serve_a_403(monkeypatch)
         self._transport(monkeypatch, decline)
 
         outcome = await agentic_tools.fetch(self._URL)
@@ -3756,8 +3612,10 @@ class TestGapFillV2ImpersonatedRetry:
     async def test_a_still_403_declines_and_memoizes_the_host_for_the_run(self, monkeypatch) -> None:
         calls = self._transport(monkeypatch, self._response(403))
 
-        first = await agentic_tools._try_impersonated_fetch(self._URL)
-        second = await agentic_tools._try_impersonated_fetch(self._SECOND_URL)
+        first = await rungs._impersonate_rung(self._URL, self._blocked(self._URL, 403), host_sems={}, ctx=self._ctx())
+        second = await rungs._impersonate_rung(
+            self._SECOND_URL, self._blocked(self._SECOND_URL, 403), host_sems={}, ctx=self._ctx()
+        )
 
         assert first is None
         assert second is None
@@ -3774,8 +3632,9 @@ class TestGapFillV2ImpersonatedRetry:
         merely redirected never refused us."""
         answered = "https://edge.example.net/denied"
         self._transport(monkeypatch, self._response(403, url=answered))
+        direct = self._blocked(self._URL, 403)
 
-        assert await agentic_tools._try_impersonated_fetch(self._URL) is None
+        assert await rungs._impersonate_rung(self._URL, direct, host_sems={}, ctx=self._ctx()) is None
 
         assert impersonation_refused(answered) is True
         assert impersonation_refused(self._URL) is True
@@ -3784,9 +3643,13 @@ class TestGapFillV2ImpersonatedRetry:
     @pytest.mark.asyncio
     async def test_a_404_under_impersonation_declines_without_memoizing(self, monkeypatch) -> None:
         calls = self._transport(monkeypatch, self._response(404))
+        second = self._blocked(self._SECOND_URL, 403)
 
-        assert await agentic_tools._try_impersonated_fetch(self._URL) is None
-        assert await agentic_tools._try_impersonated_fetch(self._SECOND_URL) is None
+        assert (
+            await rungs._impersonate_rung(self._URL, self._blocked(self._URL, 403), host_sems={}, ctx=self._ctx())
+            is None
+        )
+        assert await rungs._impersonate_rung(self._SECOND_URL, second, host_sems={}, ctx=self._ctx()) is None
 
         assert len(calls) == 2
         assert impersonation_refused(self._URL) is False
@@ -3795,16 +3658,17 @@ class TestGapFillV2ImpersonatedRetry:
     async def test_the_kill_switch_declines_before_dialing(self, monkeypatch) -> None:
         monkeypatch.setenv(RESOLUTION_SOURCE_IMPERSONATE_ENABLED_ENV, "false")
         calls = self._transport(monkeypatch, self._response(200, body=_IMPERSONATED_PAGE))
+        direct = self._blocked(self._URL, 403)
 
-        assert await agentic_tools._try_impersonated_fetch(self._URL) is None
+        assert await rungs._impersonate_rung(self._URL, direct, host_sems={}, ctx=self._ctx()) is None
         assert calls == []
 
     @pytest.mark.asyncio
     async def test_the_trigger_is_the_transports_read_at_call_time(self, monkeypatch) -> None:
         """One switch for both fetchers: emptying the transport's set declines the retry here
-        exactly as it declines the Tier-1 rung, with the plain `blocked` standing."""
+        exactly as it declines the Tier-1 rung, with the direct `blocked` standing."""
         monkeypatch.setattr(impersonated_fetch, "IMPERSONATE_TRIGGER_STATUSES", frozenset())
-        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=self._blocked(self._URL, 403)))
+        self._serve_a_403(monkeypatch)
         calls = self._transport(monkeypatch, self._response(200, body=_IMPERSONATED_PAGE))
 
         outcome = await agentic_tools.fetch(self._URL)
@@ -3819,9 +3683,8 @@ class TestGapFillV2ImpersonatedRetry:
         the paid `url_context` read, so a cold `read_document` on a host whose 403 is a fingerprint
         verdict must be rescued by the same retry `fetch` runs and digested for free. Before this
         wiring the ladder held nothing and the reader was paid for bytes the retry fetches."""
-        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=self._blocked(self._URL, 403)))
-        rendered = AsyncMock(return_value=None)
-        monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", rendered)
+        self._serve_a_403(monkeypatch)
+        rendered_on = _serve_rendered(monkeypatch, None)
         calls = self._transport(monkeypatch, self._response(200, body=_IMPERSONATED_PAGE))
         reader = _no_paid_reader(monkeypatch)
         monkeypatch.setenv("GOOGLE_API_KEY", "key")
@@ -3833,14 +3696,14 @@ class TestGapFillV2ImpersonatedRetry:
         assert "12 major work stoppages" in outcome.content_markdown
         assert [call["url"] for call in calls] == [self._URL]
         reader.assert_not_called()
-        rendered.assert_not_awaited()
+        assert rendered_on == []
 
     @pytest.mark.asyncio
     @pytest.mark.usefixtures("_robots_allowed")
     async def test_read_document_on_a_host_that_refuses_both_clients_still_pays(self, monkeypatch) -> None:
         """The DataDome shape: a still-403 under impersonation leaves the ladder holding nothing,
         the host is memoized, and the paid reader (which dials from Gemini's address) gets its turn."""
-        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=self._blocked(self._URL, 403)))
+        self._serve_a_403(monkeypatch)
         calls = self._transport(monkeypatch, self._response(403))
         monkeypatch.setenv("GOOGLE_API_KEY", "key")
         monkeypatch.setattr(
@@ -3856,60 +3719,67 @@ class TestGapFillV2ImpersonatedRetry:
 
     @pytest.mark.asyncio
     async def test_the_document_ladder_declines_the_retry_when_its_budget_is_nearly_spent(self, monkeypatch) -> None:
-        """Under `read_document` the retry runs inside `_acquire_local_document`'s
-        `_LOCAL_DOCUMENT_BUDGET_S`. With less than the rung's floor left (the same
-        `RESOLUTION_SOURCE_IMPERSONATE_MIN_BUDGET_S` Tier 1 claims) it declines without a transport
-        call, instead of dialing a 20 s wall the ladder's own `wait_for` would cancel mid-transfer."""
-        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=self._blocked(self._URL, 403)))
-        rendered = AsyncMock(return_value=None)
-        monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", rendered)
+        """Under `read_document` the retry runs inside the document ladder's own 25 s wall. With
+        less than the rung's floor left (the same `RESOLUTION_SOURCE_IMPERSONATE_MIN_BUDGET_S`
+        Tier 1 claims) it declines without a transport call, instead of dialing a 20 s wall the
+        ladder's own `wait_for` would cancel mid-transfer."""
+        self._serve_a_403(monkeypatch)
+        rendered_on = _serve_rendered(monkeypatch, None)
         calls = self._transport(monkeypatch, self._response(200, body=_IMPERSONATED_PAGE))
+        nearly_spent = RESOLUTION_SOURCE_IMPERSONATE_MIN_BUDGET_S - 1.0
+        monkeypatch.setattr(context.LadderContext, "rung_budget_s", lambda self: nearly_spent)
 
-        held = await agentic_tools._run_local_document_ladder(self._URL, deadline_monotonic_s=monotonic() + 2.0)
+        held = await agentic_tools._run_local_document_ladder(self._URL, ctx=None)
 
         assert calls == []
         assert held.has_text is False
-        rendered.assert_not_awaited()
+        assert rendered_on == []
 
     @pytest.mark.asyncio
     async def test_the_document_ladder_dials_under_its_own_deadline(self, monkeypatch) -> None:
-        """With budget above the floor the retry dials, and the transport's deadline is the ladder's
-        own rather than a fresh `RESOLUTION_SOURCE_HTTP_TIMEOUT` wall that outlives it."""
-        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=self._blocked(self._URL, 403)))
+        """With budget above the floor the retry dials, and the transport's deadline is what is
+        left of the ladder's own wall rather than a fresh `RESOLUTION_SOURCE_HTTP_TIMEOUT` hop that
+        outlives it."""
+        self._serve_a_403(monkeypatch)
         calls = self._transport(monkeypatch, self._response(200, body=_IMPERSONATED_PAGE))
-        deadline = monotonic() + 10.0
+        left_of_the_ladders_wall = 8.0
+        monkeypatch.setattr(context.LadderContext, "rung_budget_s", lambda self: left_of_the_ladders_wall)
+        before = monotonic()
 
-        held = await agentic_tools._run_local_document_ladder(self._URL, deadline_monotonic_s=deadline)
+        held = await agentic_tools._run_local_document_ladder(self._URL, ctx=None)
 
         (call,) = calls
-        assert call["deadline_monotonic_s"] <= deadline
+        assert call["deadline_monotonic_s"] == pytest.approx(before + left_of_the_ladders_wall, abs=0.5)
         assert call["deadline_monotonic_s"] < monotonic() + RESOLUTION_SOURCE_HTTP_TIMEOUT - 5.0
         assert held.has_text
 
     @pytest.mark.asyncio
-    async def test_acquire_local_document_hands_the_ladder_its_budget_as_the_deadline(self, monkeypatch) -> None:
-        seen: list[float] = []
+    async def test_acquire_local_document_and_its_ladder_share_one_budget(self, monkeypatch) -> None:
+        """The `wait_for` that bounds acquisition and the wall every rung inside sizes itself off
+        have to be ONE figure, so a rung declines under its own floor rather than being cancelled
+        mid-dial."""
+        seen: list[LadderPolicy] = []
 
-        async def _ladder(url: str, *, deadline_monotonic_s: float) -> local_document.HeldDocument:
-            del url
-            seen.append(deadline_monotonic_s)
+        async def _record(url: str, *, policy: LadderPolicy, ctx: Any) -> FetchResult:
+            del ctx
+            seen.append(policy)
             await asyncio.sleep(0)
-            return local_document.HeldDocument()
+            return _direct("js_wall", url=url)
 
-        monkeypatch.setattr(agentic_tools, "_run_local_document_ladder", _ladder)
-        before = monotonic()
+        monkeypatch.setattr(agentic_tools, "fetch_url", _record)
 
         await agentic_tools._acquire_local_document(self._URL)
 
-        (deadline,) = seen
-        assert deadline == pytest.approx(before + agentic_tools._LOCAL_DOCUMENT_BUDGET_S, abs=0.5)
+        (policy,) = seen
+        assert policy is GAP_FILL_DOCUMENT_POLICY
+        assert policy.total_wall_s == agentic_tools._LOCAL_DOCUMENT_BUDGET_S
 
     @pytest.mark.asyncio
     async def test_fetch_keeps_the_full_wall(self, monkeypatch) -> None:
-        """Under the `fetch` tool (a 90 s ToolSpec) no ladder deadline applies, so the retry keeps
-        the one-plain-hop wall it always had."""
-        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=self._blocked(self._URL, 403)))
-        monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", AsyncMock(return_value=None))
+        """Under the `fetch` tool (a 90 s wall) the dial cap binds rather than the wall, so the
+        retry keeps the one-plain-hop budget it always had."""
+        self._serve_a_403(monkeypatch)
+        _serve_rendered(monkeypatch, None)
         calls = self._transport(monkeypatch, self._response(200, body=_IMPERSONATED_PAGE))
         before = monotonic()
 
@@ -3920,11 +3790,14 @@ class TestGapFillV2ImpersonatedRetry:
 
     @pytest.mark.asyncio
     async def test_the_retry_dials_the_plain_rungs_final_url(self, monkeypatch) -> None:
-        """`plain.url` is the last hop of the plain rung's own guarded redirect loop, the host that
-        actually refused us, the same choice the browser rung makes."""
+        """`direct.url` is the last hop of the direct fetch's own guarded redirect loop, the host
+        that actually refused us, the same choice the browser rung makes."""
         final = "https://www.bls.gov/wsp/index.htm"
-        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=self._blocked(final, 403)))
-        monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", AsyncMock(return_value=None))
+        monkeypatch.setattr(
+            "metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True)
+        )
+        self._serve_a_403(monkeypatch, landed_on=final)
+        _serve_rendered(monkeypatch, None)
         calls = self._transport(monkeypatch, self._response(200, body=_IMPERSONATED_PAGE, url=final))
 
         outcome = await agentic_tools.fetch(self._URL)
@@ -3934,16 +3807,16 @@ class TestGapFillV2ImpersonatedRetry:
 
     @pytest.mark.asyncio
     async def test_an_impersonated_pdf_keeps_the_local_document_rungs_method(self, monkeypatch) -> None:
-        """The bls.gov `wkstp.pdf` case: the body goes through the same local PDF rung a plain body
-        does, and the `fetch` handler keys on that method, so it is not renamed."""
+        """The bls.gov `wkstp.pdf` case: the body goes through the same local PDF rung a direct
+        body does, and the `fetch` handler keys on that method, so it is not renamed."""
         pdf = build_text_pdf([["The unemployment rate was 4.1 percent in May 2026, revised from 4.0 percent."]])
+        self._serve_a_403(monkeypatch)
         self._transport(monkeypatch, self._response(200, body=pdf, content_type="application/pdf"))
 
-        result = await agentic_tools._try_impersonated_fetch(self._URL)
+        outcome = await agentic_tools.fetch(self._URL)
 
-        assert result is not None
-        assert result.method == local_document.PDF_LOCAL_METHOD
-        assert "4.1 percent in May 2026" in result.text
+        assert outcome.method == local_document.PDF_LOCAL_METHOD
+        assert "4.1 percent in May 2026" in outcome.content_markdown
 
     def test_every_retrieval_method_is_tiered(self) -> None:
         """A method absent from `_METHOD_TO_TIER` grants NO verification tier, so a page the rung
@@ -3984,16 +3857,21 @@ class TestGapFillV2ImpersonatedRetry:
     async def test_the_body_classification_is_the_same_whichever_transport_read_it(
         self, content_type: str, body: bytes, monkeypatch
     ) -> None:
-        """`_plain_body_outcome` is the one copy of the classification rule: the aiohttp path and the
-        impersonated path must agree on every body shape."""
+        """`classify` is the one copy of the classification rule: the aiohttp path (through the
+        direct fetch) and the impersonated path must agree on every body shape."""
         url = "https://example.com/parity"
-        monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=body))
-        resp: Any = _FakeResponse(status=200, headers={"Content-Type": content_type})
+        session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": content_type}))
+        monkeypatch.setattr(
+            "metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True)
+        )
+        monkeypatch.setattr(classify, "read_body_capped", AsyncMock(return_value=body))
 
-        via_aiohttp = await agentic_tools._plain_response_outcome(resp, url)
-        via_body = await agentic_tools._plain_body_outcome(body, content_type, url)
+        via_aiohttp = await direct_fetch._fetch_direct(session, url, {}, self._ctx())
+        via_impersonated = await rungs._impersonated_body_outcome(
+            _impersonated(200, body=body, content_type=content_type, url=url), self._ctx()
+        )
 
-        assert via_aiohttp == via_body
+        assert via_aiohttp == via_impersonated
 
 
 class TestPlainHtmlExtractionPolicy:
@@ -4012,8 +3890,8 @@ class TestPlainHtmlExtractionPolicy:
             "metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True)
         )
         monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
-        monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=body))
-        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+        monkeypatch.setattr(classify, "read_body_capped", AsyncMock(return_value=body))
+        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
     @pytest.mark.asyncio
     async def test_the_html_path_runs_the_two_pass_extraction_policy(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4024,7 +3902,7 @@ class TestPlainHtmlExtractionPolicy:
         spy = MagicMock(return_value=verdict.PageExtraction(text="A calibrated extraction of the page body. " * 3))
         monkeypatch.setattr("metaculus_bot.research.fetch_ladder.classify._extract_page_text", spy)
 
-        result = await agentic_tools._fetch_plain("https://example.com/page")
+        result = await _fetch_direct_only("https://example.com/page")
 
         assert result.status == "ok"
         assert "A calibrated extraction of the page body." in result.text
@@ -4053,7 +3931,7 @@ class TestPlainHtmlExtractionPolicy:
 
         monkeypatch.setattr("metaculus_bot.research.fetch_ladder.classify._extract_main_text", fake_extract)
 
-        result = await agentic_tools._fetch_plain("https://example.com/report")
+        result = await _fetch_direct_only("https://example.com/report")
 
         assert result.status == "ok"
         assert "unemployment rate for May 2026" in result.text
@@ -4073,7 +3951,7 @@ class TestPlainHtmlExtractionPolicy:
             "metaculus_bot.research.fetch_ladder.classify._extract_main_text", MagicMock(return_value=None)
         )
 
-        result = await agentic_tools._fetch_plain("https://example.com/tracker")
+        result = await _fetch_direct_only("https://example.com/tracker")
 
         assert result.status == "ok"
         assert "2026=1240" in result.text
@@ -4091,7 +3969,7 @@ class TestPlainHtmlExtractionPolicy:
         )
         self._serve_html(monkeypatch, body)
 
-        result = await agentic_tools._fetch_plain("https://www.cdc.gov/outbreak")
+        result = await _fetch_direct_only("https://www.cdc.gov/outbreak")
 
         assert "Hospitalizations" in result.text
         assert "922" in result.text
@@ -4110,14 +3988,14 @@ class TestPlainHtmlExtractionPolicy:
             "metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True)
         )
         monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
-        monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(side_effect=[stub, target]))
+        monkeypatch.setattr(classify, "read_body_capped", AsyncMock(side_effect=[stub, target]))
         monkeypatch.setattr(
             "metaculus_bot.research.fetch_ladder.classify._extract_main_text",
             MagicMock(side_effect=[None, "Resolving content read from the refresh target. " * 3]),
         )
-        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
-        result = await agentic_tools._fetch_plain("https://example.com/stub")
+        result = await _fetch_direct_only("https://example.com/stub")
 
         assert result.status == "ok"
         assert result.url == "https://example.com/real/page"
@@ -4128,7 +4006,7 @@ class TestPlainHtmlExtractionPolicy:
 class TestGapFillV2WaybackRung:
     """Item B: the Wayback Machine as v2 `fetch`'s last free rung after the impersonated retry.
 
-    Reuses `research/wayback.py`'s pure helpers and this ladder's own `_fetch_plain`, so the
+    Reuses `research/wayback.py`'s pure helpers and the shared ladder's own direct fetch, so the
     snapshot GET inherits the 5 MiB body cap, the redirect vetting and the classification a live
     page gets. Unlike Tier 1 it applies NO age bound and SURFACES the capture date instead, because
     a driver-chosen URL is not a cited grading source. 133 never-read blocked URLs before the
@@ -4138,22 +4016,28 @@ class TestGapFillV2WaybackRung:
     _NOW = datetime(2026, 9, 9, tzinfo=UTC)
 
     @staticmethod
-    def _snapshot(
-        url: str, *, text: str = "ARCHIVED BODY of the stoppages table.", status: str = "ok"
-    ) -> fetch_outcomes.PlainFetchResult:
-        return fetch_outcomes.PlainFetchResult(
-            status=status, method="plain", text=text, links=["https://www.bls.gov/a"], url=url, content_type="text/html"
-        )
+    def _snapshot(url: str, *, text: str = "ARCHIVED BODY of the stoppages table.", status: FetchStatus = "success"):
+        return _direct(status, url=url, text=text, links=["https://www.bls.gov/a"], http_status=200)
 
     @staticmethod
-    def _blocked(url: str, http_status: int | None) -> fetch_outcomes.PlainFetchResult:
-        return fetch_outcomes.PlainFetchResult(
-            status="blocked",
-            method="plain",
-            text=f"Fetch blocked with HTTP {http_status}.",
-            links=[],
-            url=url,
-            http_status=http_status,
+    def _blocked(url: str, http_status: int | None) -> FetchResult:
+        return _direct("blocked", url=url, http_status=http_status)
+
+    def _question_ctx(self) -> context.LadderContext:
+        """The question's ladder context with the forecast clock pinned, so a capture's age is exact."""
+        return context.LadderContext(now=self._NOW, host_sems=agentic_tools._FETCH_HOST_SEMAPHORES)
+
+    def _rung_ctx(self) -> context.LadderContext:
+        return replace(self._question_ctx(), policy=GAP_FILL_FETCH_POLICY)
+
+    def _serve_the_archive(
+        self, monkeypatch: pytest.MonkeyPatch, snapshot: FetchResult, *, page: str = ""
+    ) -> list[str]:
+        """The cited page refuses us and the archive answers with ``snapshot``."""
+        url = page or self._URL
+        return _serve_direct(
+            monkeypatch,
+            {url: self._blocked(url, 403), wayback_snapshot_url(url, now=self._NOW): snapshot},
         )
 
     def _public(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4162,46 +4046,20 @@ class TestGapFillV2WaybackRung:
         )
 
     @pytest.mark.parametrize(
-        ("result", "applies"),
+        ("direct", "applies"),
         [
-            (
-                fetch_outcomes.PlainFetchResult(
-                    status="blocked", method="plain", text="b", links=[], url="https://x/y", http_status=403
-                ),
-                True,
-            ),
-            (
-                fetch_outcomes.PlainFetchResult(
-                    status="blocked", method="plain", text="b", links=[], url="https://x/y", http_status=429
-                ),
-                True,
-            ),
-            (
-                fetch_outcomes.PlainFetchResult(
-                    status="error", method="plain", text="Fetch error", links=[], url="https://x/y"
-                ),
-                True,
-            ),
-            (
-                fetch_outcomes.PlainFetchResult(
-                    status="blocked", method="plain", text="b", links=[], url="https://x/y", http_status=None
-                ),
-                False,
-            ),
-            (
-                fetch_outcomes.PlainFetchResult(status="ok", method="plain", text="page", links=[], url="https://x/y"),
-                False,
-            ),
-            (
-                fetch_outcomes.PlainFetchResult(status="empty", method="plain", text="", links=[], url="https://x/y"),
-                False,
-            ),
+            (_direct("blocked", url="https://x/y", http_status=403), True),
+            (_direct("blocked", url="https://x/y", http_status=429), True),
+            (_direct("error", url="https://x/y"), True),
+            (_direct("blocked", url="https://x/y", http_status=None), False),
+            (_direct("success", url="https://x/y", text="page"), False),
+            (_direct("js_wall", url="https://x/y"), False),
         ],
     )
     def test_wayback_applies_only_to_a_host_refusal_or_error_never_our_own(
-        self, result: fetch_outcomes.PlainFetchResult, applies: bool
+        self, direct: FetchResult, applies: bool
     ) -> None:
-        assert agentic_tools._wayback_applies(result) is applies
+        assert rungs._wayback_rung_applies(direct, GAP_FILL_FETCH_POLICY) is applies
 
     def test_wayback_method_maps_to_the_fetched_tier(self) -> None:
         assert _method_to_tier("wayback") == "fetched"
@@ -4214,30 +4072,22 @@ class TestGapFillV2WaybackRung:
         disclosed for the driver to weigh."""
         self._public(monkeypatch)
         cap = "https://web.archive.org/web/20260101000000id_/https://www.bls.gov/wsp/"
-        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=self._snapshot(cap)))
+        self._serve_the_archive(monkeypatch, self._snapshot(cap))
 
-        rescued = await agentic_tools._try_wayback_fetch(self._URL, self._blocked(self._URL, 403), now=self._NOW)
+        outcome = await agentic_tools.fetch(self._URL, ctx=self._question_ctx())
 
-        assert rescued is not None
-        assert rescued.method == "wayback"
-        assert "captured 2026-01-01" in rescued.text
-        assert "251 days before this forecast" in rescued.text
-        assert "ARCHIVED BODY of the stoppages table." in rescued.text
+        assert outcome.method == "wayback"
+        assert "captured 2026-01-01" in outcome.content_markdown
+        assert "251 days before this forecast" in outcome.content_markdown
+        assert "ARCHIVED BODY of the stoppages table." in outcome.content_markdown
 
     @pytest.mark.asyncio
     async def test_a_host_refused_page_is_served_from_the_archive(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._public(monkeypatch)
-        monkeypatch.setattr(
-            agentic_tools, "_fetch_plain_with_impersonated_retry", AsyncMock(return_value=self._blocked(self._URL, 403))
-        )
         cap = "https://web.archive.org/web/20250401000000id_/https://www.bls.gov/wsp/"
-        monkeypatch.setattr(
-            agentic_tools,
-            "_fetch_plain",
-            AsyncMock(return_value=self._snapshot(cap, text="12 major work stoppages in 2024.")),
-        )
+        self._serve_the_archive(monkeypatch, self._snapshot(cap, text="12 major work stoppages in 2024."))
 
-        outcome = await agentic_tools.fetch(self._URL)
+        outcome = await agentic_tools.fetch(self._URL, ctx=self._question_ctx())
 
         assert outcome.method == "wayback"
         assert "12 major work stoppages in 2024." in outcome.content_markdown
@@ -4247,18 +4097,12 @@ class TestGapFillV2WaybackRung:
     async def test_the_archive_is_not_tried_for_a_url_we_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A `blocked` with no `http_status` is our own refusal (non-public or platform self-ref);
         handing it to the archive is the SSRF bypass the exclusion prevents."""
-        monkeypatch.setattr(
-            agentic_tools,
-            "_fetch_plain_with_impersonated_retry",
-            AsyncMock(return_value=self._blocked(self._URL, None)),
-        )
-        spy = AsyncMock()
-        monkeypatch.setattr(agentic_tools, "_try_wayback_fetch", spy)
+        asked = _serve_direct(monkeypatch, {self._URL: self._blocked(self._URL, None)})
 
-        outcome = await agentic_tools.fetch(self._URL)
+        outcome = await agentic_tools.fetch(self._URL, ctx=self._question_ctx())
 
         assert outcome.status == "blocked"
-        spy.assert_not_awaited()
+        assert asked == [self._URL], "no snapshot was ever requested for a URL we refused ourselves"
 
     @pytest.mark.asyncio
     async def test_an_undatable_capture_declines(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4266,18 +4110,26 @@ class TestGapFillV2WaybackRung:
         cannot carry the age disclosure that makes it admissible."""
         self._public(monkeypatch)
         undated = "https://web.archive.org/web/2026id_/https://www.bls.gov/wsp/"
-        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=self._snapshot(undated)))
+        self._serve_the_archive(monkeypatch, self._snapshot(undated))
 
-        assert await agentic_tools._try_wayback_fetch(self._URL, self._blocked(self._URL, 403), now=self._NOW) is None
+        rescued = await rungs._wayback_rung(
+            None, self._URL, self._blocked(self._URL, 403), host_sems={}, ctx=self._rung_ctx()
+        )
+
+        assert rescued is None
 
     @pytest.mark.asyncio
     async def test_an_unreadable_capture_declines(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A capture whose body extracts to nothing (a JS-wall shell) is not served."""
         self._public(monkeypatch)
         cap = "https://web.archive.org/web/20260101000000id_/https://www.bls.gov/wsp/"
-        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=self._snapshot(cap, status="empty")))
+        self._serve_the_archive(monkeypatch, self._snapshot(cap, status="js_wall"))
 
-        assert await agentic_tools._try_wayback_fetch(self._URL, self._blocked(self._URL, 403), now=self._NOW) is None
+        rescued = await rungs._wayback_rung(
+            None, self._URL, self._blocked(self._URL, 403), host_sems={}, ctx=self._rung_ctx()
+        )
+
+        assert rescued is None
 
     @pytest.mark.asyncio
     async def test_a_capture_that_wraps_a_platform_page_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4286,23 +4138,24 @@ class TestGapFillV2WaybackRung:
         self._public(monkeypatch)
         platform = "https://www.metaculus.com/questions/1/"
         cap = f"https://web.archive.org/web/20260101000000id_/{platform}"
-        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=self._snapshot(cap)))
+        self._serve_the_archive(monkeypatch, self._snapshot(cap), page=platform)
 
-        assert await agentic_tools._try_wayback_fetch(platform, self._blocked(platform, 403), now=self._NOW) is None
+        rescued = await rungs._wayback_rung(
+            None, platform, self._blocked(platform, 403), host_sems={}, ctx=self._rung_ctx()
+        )
+
+        assert rescued is None
 
     @pytest.mark.asyncio
     async def test_the_served_capture_is_windowed_to_the_fetch_window(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The archived body is served through the same 8,000-char window every fetch uses (and the
-        snapshot GET went through `_fetch_plain`, so the 5 MiB body cap applies)."""
+        snapshot GET goes through the shared direct fetch, so the 5 MiB body cap applies)."""
         self._public(monkeypatch)
-        monkeypatch.setattr(
-            agentic_tools, "_fetch_plain_with_impersonated_retry", AsyncMock(return_value=self._blocked(self._URL, 403))
-        )
         cap = "https://web.archive.org/web/20250401000000id_/https://www.bls.gov/wsp/"
         long_body = "x" * (agentic_tools._FETCH_WINDOW_CHARS + 5000)
-        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=self._snapshot(cap, text=long_body)))
+        self._serve_the_archive(monkeypatch, self._snapshot(cap, text=long_body))
 
-        outcome = await agentic_tools.fetch(self._URL)
+        outcome = await agentic_tools.fetch(self._URL, ctx=self._question_ctx())
 
         assert outcome.method == "wayback"
         assert outcome.truncated is True
@@ -4331,7 +4184,14 @@ class TestGapFillV2DerivedApiOnEmptyRender:
             "metaculus_bot.research.fetch_ladder.classify._extract_main_text", MagicMock(return_value=None)
         )
         monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._sem_for_host", lambda *_: asyncio.Semaphore(1))
-        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
+        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
+
+    def _walled(self) -> FetchResult:
+        """The direct read the browser rung fires on: a 200 that carried no text."""
+        return _direct("js_wall", url=self._URL, escalate_rendered=True)
+
+    def _rung_ctx(self) -> context.LadderContext:
+        return context.LadderContext(policy=GAP_FILL_FETCH_POLICY, host_sems=agentic_tools._FETCH_HOST_SEMAPHORES)
 
     def test_the_derived_api_serve_earns_the_fetched_tier(self) -> None:
         assert _method_to_tier("derived_api") == "fetched"
@@ -4345,31 +4205,29 @@ class TestGapFillV2DerivedApiOnEmptyRender:
                 url="https://dashboard.example.gov/api/data", body=b'{"cases": 1240, "as_of": "2026-08-31"}'
             ),
         )
-        monkeypatch.setattr(agentic_tools, "render_page", AsyncMock(return_value=self._page(feeds)))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(self._page(feeds), []))
+        _serve_direct(monkeypatch, {self._URL: self._walled()})
 
-        result = await agentic_tools._try_rendered_fetch(self._URL)
+        outcome = await agentic_tools.fetch(self._URL)
 
-        assert result is not None
-        assert result.status == "ok"
-        assert result.method == "derived_api"
-        assert '"cases": 1240' in result.text
-        assert '{"f": 1}' not in result.text  # the smaller config feed is not the one served
-        assert "data feed" in result.text
-        assert "https://dashboard.example.gov/api/data" in result.text
+        assert outcome.status == "ok"
+        assert outcome.method == "derived_api"
+        assert '"cases": 1240' in outcome.content_markdown
+        assert '{"f": 1}' not in outcome.content_markdown  # the smaller config feed is not the one served
+        assert "data feed" in outcome.content_markdown
+        assert "https://dashboard.example.gov/api/data" in outcome.content_markdown
 
     @pytest.mark.asyncio
     async def test_an_empty_render_with_no_harvested_json_still_returns_empty(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         self._empty_dom(monkeypatch)
-        monkeypatch.setattr(agentic_tools, "render_page", AsyncMock(return_value=self._page(())))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(self._page(()), []))
 
-        result = await agentic_tools._try_rendered_fetch(self._URL)
+        result = await rungs._rendered_rung(self._URL, self._walled(), {}, self._rung_ctx())
 
-        assert result is not None
-        assert result.status == "error"
-        assert result.method == "rendered"
-        assert result.text == ""
+        assert result is None, "a fruitless render with no feed to harvest rescues nothing"
+        assert derived_api.endpoint_for(self._URL) is None
 
     @pytest.mark.asyncio
     async def test_fetch_preserves_the_derived_api_method_through_escalation(
@@ -4377,28 +4235,10 @@ class TestGapFillV2DerivedApiOnEmptyRender:
     ) -> None:
         """The rendered escalation now keeps the rung's own method, so a derived-api serve is not
         relabelled `rendered` on the way to the driver."""
-        monkeypatch.setattr(
-            agentic_tools,
-            "_fetch_plain",
-            AsyncMock(
-                return_value=SimpleNamespace(
-                    status="empty",
-                    method="plain",
-                    text="Plain fetch returned no extractable text.",
-                    links=[],
-                    url=self._URL,
-                    escalate_rendered=True,
-                )
-            ),
-        )
-        monkeypatch.setattr(
-            agentic_tools,
-            "_try_rendered_fetch",
-            AsyncMock(
-                return_value=SimpleNamespace(
-                    status="ok", method="derived_api", text='[feed lead]\n\n{"cases": 1240}', links=[], url=self._URL
-                )
-            ),
+        _serve_direct(monkeypatch, {self._URL: self._walled()})
+        _serve_rendered(
+            monkeypatch,
+            replace(_direct("success", url=self._URL, text='[feed lead]\n\n{"cases": 1240}'), route="derived_api"),
         )
 
         outcome = await agentic_tools.fetch(self._URL)
