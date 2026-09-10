@@ -59,7 +59,7 @@ logger: logging.Logger = logging.getLogger(__name__)
 # Broad by design; the pass soft-fails to "" and CancelledError escapes. See docs/research.md "v1 implementation notes".
 _GAP_FILL_SOFT_FAIL_EXCEPTIONS: tuple[type[BaseException], ...] = (Exception,)
 
-# The analyzer's grade fields, read by triage_gaps; the reason tokens are GAP_FILL_V1_TRIAGE field names (a data contract).
+# The pass-through allowlist _parse_gap_list copies; _grade validates the same three names. Reasons are marker fields.
 GAP_GRADE_FIELDS: tuple[str, ...] = ("answerable_now", "already_in_first_pass", "same_need_as")
 DROP_NOT_ANSWERABLE = "not_answerable"
 DROP_ALREADY_ANSWERED = "in_first_pass"
@@ -129,13 +129,15 @@ async def run_targeted_search(crux: str, question_text: str, *, is_benchmarking:
 
 
 def _parse_gap_list(raw: str) -> list[dict[str, Any]]:
-    """Extract the gap list from the analyzer's JSON output, every gap, ungraded and unclipped.
+    """Extract the gap list from the analyzer's JSON output, one slot per listed item, ungraded and unclipped.
 
     Robust to light markdown wrapping (```json``` fences) and trailing commentary.
-    Returns [] on any parse failure — callers should soft-fail. The three grade
-    fields (``GAP_GRADE_FIELDS``) pass through exactly as the analyzer typed them,
-    and only when present, so ``triage_gaps`` can tell an omitted grade from a
-    null one; grading and the ``GAP_FILL_MAX_GAPS`` cap both happen there.
+    Returns [] on any parse failure — callers should soft-fail. Every list item
+    keeps its slot (a non-dict item or one without gap text becomes an empty slot)
+    so ``same_need_as`` positions stay the analyzer's own; the three grade fields
+    (``GAP_GRADE_FIELDS``) pass through exactly as the analyzer typed them, and
+    only when present, so ``triage_gaps`` can tell an omitted grade from a null
+    one. Grading, the schema drops and the ``GAP_FILL_MAX_GAPS`` cap all happen there.
     """
     if not raw or not raw.strip():
         return []
@@ -164,15 +166,14 @@ def _parse_gap_list(raw: str) -> list[dict[str, Any]]:
 
     gaps: list[dict[str, Any]] = []
     for item in gaps_raw:
-        if not isinstance(item, dict):
-            continue
-        gap_text = str(item.get("gap", "")).strip()
-        search_query = str(item.get("search_query", "") or gap_text).strip()
-        why_matters = str(item.get("why_matters", "")).strip()
-        if not gap_text or not search_query:
-            continue
-        gap: dict[str, Any] = {"gap": gap_text, "search_query": search_query, "why_matters": why_matters}
-        gap.update({field: item[field] for field in GAP_GRADE_FIELDS if field in item})
+        fields: dict[str, Any] = item if isinstance(item, dict) else {}
+        gap_text = str(fields.get("gap", "")).strip()
+        gap: dict[str, Any] = {
+            "gap": gap_text,
+            "search_query": str(fields.get("search_query", "") or gap_text).strip(),
+            "why_matters": str(fields.get("why_matters", "")).strip(),
+        }
+        gap.update({field: fields[field] for field in GAP_GRADE_FIELDS if field in fields})
         gaps.append(gap)
     return gaps
 
@@ -197,11 +198,12 @@ class GapTriage:
         return sum(1 for gap in self.dropped if gap["reason"] == reason)
 
 
-def _grade_failure(gap: dict[str, Any], position: int) -> str | None:
-    """The drop reason a gap earns on its own grades, or None when every grade passes.
+def _grade(gap: dict[str, Any], position: int) -> tuple[str | None, int | None]:
+    """The drop reason a gap earns on its own grades (None when every grade passes) and its validated pointer.
 
-    An absent or mistyped grade is schema drift and drops the gap, because a grade that defaulted to
-    passing would spend exactly the money the grade exists to save. See docs/research.md "v1 triage".
+    An empty slot or an absent or mistyped grade is schema drift and drops the gap, because a grade
+    that defaulted to passing would spend exactly the money the grade exists to save; the pointer
+    comes back None in that case. See docs/research.md "v1 triage".
     """
     answerable_now = gap.get("answerable_now")
     already_in_first_pass = gap.get("already_in_first_pass")
@@ -209,39 +211,45 @@ def _grade_failure(gap: dict[str, Any], position: int) -> str | None:
     pointer_well_formed = "same_need_as" in gap and (
         same_need_as is None or (type(same_need_as) is int and 0 < same_need_as < position)
     )
-    if not isinstance(answerable_now, bool) or not isinstance(already_in_first_pass, bool) or not pointer_well_formed:
-        return DROP_SCHEMA
+    if (
+        not gap["gap"]
+        or not isinstance(answerable_now, bool)
+        or not isinstance(already_in_first_pass, bool)
+        or not pointer_well_formed
+    ):
+        return DROP_SCHEMA, None
     if not answerable_now:
-        return DROP_NOT_ANSWERABLE
+        return DROP_NOT_ANSWERABLE, same_need_as
     if already_in_first_pass:
-        return DROP_ALREADY_ANSWERED
-    return None
+        return DROP_ALREADY_ANSWERED, same_need_as
+    return None, same_need_as
 
 
 def triage_gaps(gaps: Sequence[dict[str, Any]], *, max_gaps: int) -> GapTriage:
     """Drop the gaps the analyzer graded as not worth a search, dedupe restatements, then cap the rest.
 
     Grades come first (not answerable now, already in the first pass), then ``same_need_as`` is
-    followed to the NEED it names: a restatement of a need that a kept gap is searching, or that the
-    first pass already answers, is dropped, while a restatement of a need nobody covers (its earlier
-    phrasing was future-dated or ungraded) becomes the need's carrier and is kept. The cap applies
+    followed to the NEED it names, the root of its pointer chain: a restatement of a need that a kept
+    gap is searching, or that the first pass already answers, is dropped, while a restatement of a
+    need nobody covers (its earlier phrasing was future-dated or ungraded) becomes the need's
+    carrier and is kept, and every later restatement of that need is then dropped. The cap applies
     last, so a dropped gap never displaces a kept one. See docs/research.md "v1 triage".
     """
     kept: list[tuple[int, dict[str, Any]]] = []
     dropped: list[dict[str, Any]] = []
-    need_covered: dict[int, bool] = {}
+    need_of: dict[int, int] = {}
+    covered_needs: set[int] = set()
     for position, gap in enumerate(gaps, start=1):
-        reason = _grade_failure(gap, position)
-        restates = None if reason == DROP_SCHEMA else gap["same_need_as"]
-        if reason is None and restates is not None and need_covered[restates]:
+        reason, restates = _grade(gap, position)
+        need = need_of[position] = position if restates is None else need_of[restates]
+        if reason is None and need in covered_needs:
             reason = DROP_SAME_NEED
         if reason is None:
             kept.append((position, gap))
         else:
             dropped.append({**gap, "position": position, "reason": reason})
-        need_covered[position] = reason in (None, DROP_ALREADY_ANSWERED) or (
-            restates is not None and need_covered[restates]
-        )
+        if reason in (None, DROP_ALREADY_ANSWERED):
+            covered_needs.add(need)
     for position, gap in kept[max_gaps:]:
         dropped.append({**gap, "position": position, "reason": DROP_OVER_CAP})
     return GapTriage(kept=[gap for _, gap in kept[:max_gaps]], dropped=dropped)
@@ -373,7 +381,9 @@ async def run_gap_fill_pass(
         return ""
 
     triage = triage_gaps(gaps, max_gaps=GAP_FILL_MAX_GAPS)
-    logger.info(_format_triage_marker(qid, triage))
+    # Every slot failing the schema is v1 gone dark while the analyzer still bills: WARN, like a dead analyzer.
+    wholesale_schema_drift = triage.listed > 0 and triage.dropped_for(DROP_SCHEMA) == triage.listed
+    (logger.warning if wholesale_schema_drift else logger.info)(_format_triage_marker(qid, triage))
     for gap in triage.dropped:
         logger.info(
             f"GapFill: dropped gap #{gap['position']} reason={gap['reason']} "

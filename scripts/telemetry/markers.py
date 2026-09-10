@@ -673,7 +673,7 @@ MARKER_SPECS: list[MarkerSpec] = [
     ),
     MarkerSpec(
         "gap_fill_v1_triage",
-        # Why: emitted only when the analyzer answered, so listed=0 is "no gaps", not a dead analyzer. Receipt: docs/telemetry_markers.md "GAP_FILL_V1_TRIAGE".
+        # Why: emitted only when the analyzer answered; listed=0 is "no parsable gaps", not a dead analyzer. Receipt: docs/telemetry_markers.md "GAP_FILL_V1_TRIAGE".
         re.compile(
             r"GAP_FILL_V1_TRIAGE:\s*question=(?P<question>\S+)\s+listed=(?P<listed>\d+)\s+kept=(?P<kept>\d+)"
             r"\s+dropped_not_answerable=(?P<dropped_not_answerable>\d+)"

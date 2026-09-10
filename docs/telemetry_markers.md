@@ -1208,16 +1208,22 @@ because it holds the exception's `str`. `qid_kind` is `question_id` (`targeted.p
 ### GAP_FILL_V1_TRIAGE
 
 Per-question gap-fill v1 triage (`research/targeted.py:run_gap_fill_pass`, added 2026-09-09), emitted
-once for every question whose analyzer answered, so `listed=0` is "the analyzer found no gaps" and a
-dead analyzer is `GAP_FILL_ANALYZER_FAILED` alone. `listed` is the analyzer's gap count, `kept` the
-number the resolver searched, and the five `dropped_*` counts partition the rest, one reason per gap
-in the order the triage applies them: `dropped_not_answerable` (the analyzer graded `answerable_now`
-false: the answer is a reading, result or event dated after the run), `dropped_in_first_pass`
-(`already_in_first_pass` true: the first pass already states the value with its date),
-`dropped_same_need` (`same_need_as` named an earlier gap whose need a kept gap is searching or the
-first pass answers), `dropped_schema` (a grade was omitted or mistyped, and the gap is dropped rather
-than read as passing) and `dropped_over_cap` (a survivor past `GAP_FILL_MAX_GAPS`, which applies after
-the filter). `listed = kept + sum(dropped_*)` on every line. Receipt: about a third of v1's resolver
+once for every question whose analyzer answered, so `listed=0` is "the analyzer answered and produced
+no parsable gaps" (an unparseable reply lands there too, traced only by the `GapFill: could not parse
+analyzer JSON` warning in the run log) and a dead analyzer is `GAP_FILL_ANALYZER_FAILED` alone.
+`listed` is the analyzer's slot count (a malformed item keeps its slot), `kept` the number the
+resolver searched, and the five `dropped_*` counts partition the rest, one reason per gap in the
+order the triage applies them: `dropped_not_answerable` (the analyzer graded `answerable_now` false:
+the gap can only be answered by an observation not yet made or a result not yet published),
+`dropped_in_first_pass` (`already_in_first_pass` true: the first pass already states the value with
+its date), `dropped_same_need` (`same_need_as` named an earlier gap whose need a kept gap is
+searching or the first pass answers), `dropped_schema` (a grade was omitted or mistyped, or the slot
+was malformed, and the gap is dropped rather than read as passing) and `dropped_over_cap` (a survivor
+past `GAP_FILL_MAX_GAPS`, which applies after the filter). `listed = kept + sum(dropped_*)` on every
+line. The line is INFO, except when every listed slot dropped as `dropped_schema`, which is WARNING:
+the analyzer has stopped emitting the grades and v1 has gone dark while it still bills, the same
+outcome `GAP_FILL_ANALYZER_FAILED` warns about; the level is not part of the marker contract, so the
+harvester reads both. Receipt: about a third of v1's resolver
 calls bought nothing on the archive (`scratch/cost_pass_2026-09-09/v1_gap_redundancy/REDUNDANCY.md`),
 and this marker is how that share is measured once the filter is live; the dropped gaps themselves,
 with position and reason, ride the raw research record (`provider="gap_fill"`, key `dropped`). The

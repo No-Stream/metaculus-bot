@@ -1890,7 +1890,9 @@ budget drops it: the fast path, or a research phase that ran out of budget):
    factual gaps, ranked by decision-relevance, so the trailing slot holds the least
    forecast-moving gap. Since 2026-09-09 each gap carries three grades the code reads:
    `answerable_now`, `already_in_first_pass` and `same_need_as` (the prompt's
-   `GRADE EVERY GAP` clause, `docs/prompts.md` "Research-side prompt rules").
+   `GRADE EVERY GAP` clause, `docs/prompts.md` "Research-side prompt rules"). The parser
+   keeps one slot per listed item, so a malformed item (not an object, or no gap text)
+   becomes an empty slot rather than shifting every later `same_need_as` pointer.
 2. `triage_gaps` drops the gaps whose grades fail, dedupes restatements, and caps the
    survivors at `GAP_FILL_MAX_GAPS`, all before any resolver call; the
    `GAP_FILL_V1_TRIAGE` marker records the counts. The rules, the decisions behind them
@@ -1929,38 +1931,50 @@ analyzer's ranking is unreliable (`scratch/cost_pass_2026-09-09/v1_gap_redundanc
 The analyzer grades every gap on three fields, and `triage_gaps` applies them in this order, one
 reason per gap so the marker's counts partition the list:
 
-1. **Grades.** `answerable_now` false (the answer is a reading, result or event dated after the
-   run) drops the gap as `not_answerable`; `already_in_first_pass` true (the first pass already
-   states the value or fact with its date) drops it as `in_first_pass`. These are the two
-   discipline rules the ANSWERABLE NOW block already stated, made checkable.
+1. **Grades.** `answerable_now` false (the gap can only be answered by an observation not yet
+   made or a result not yet published; the prompt carries no run date, so the grade is defined
+   by whether the observation exists, not by a date) drops the gap as `not_answerable`;
+   `already_in_first_pass` true (the first pass already states the value or fact with its date)
+   drops it as `in_first_pass`. These are the two discipline rules the ANSWERABLE NOW block
+   already stated, made checkable.
 2. **Dedupe.** `same_need_as` is the 1-based position of an earlier gap in the same list that the
-   same fact from the same source would answer, else null. It is followed to the NEED it names, not
-   to the literal gap: a restatement of a need that a kept gap is searching, or that the first pass
-   already answers, is dropped as `same_need`; a restatement of a need nobody covers, because its
-   earlier phrasing was future-dated or ungraded, becomes the need's carrier and is kept. So gap 3
-   restating gap 2 restating gap 1 collapses onto gap 1; a future-dated gap 1 and its present-tense
-   rewording as gap 2 keeps gap 2; a first-pass-answered gap 1 and its rewording as gap 2 keeps
-   neither, whatever gap 2's own `already_in_first_pass` says.
+   same fact from the same source would answer, else null. It is followed to the NEED it names, the
+   root of its pointer chain, not to the literal gap: a restatement of a need that a kept gap is
+   searching, or that the first pass already answers, is dropped as `same_need`; a restatement of
+   a need nobody covers, because its earlier phrasing was future-dated or ungraded, becomes the
+   need's carrier and is kept, and every later restatement of that need, whether it points at the
+   carrier or at the original phrasing, is dropped. So gap 3 restating gap 2 restating gap 1
+   collapses onto gap 1; a future-dated gap 1 with two present-tense rewordings as gaps 2 and 3
+   keeps gap 2 only; a first-pass-answered gap 1 and its rewording as gap 2 keeps neither, whatever
+   gap 2's own `already_in_first_pass` says.
 3. **Schema drift fails shut.** A gap with a grade omitted or mistyped (a string for a boolean, a
-   pointer at itself, forward, at zero, or non-integer, an absent `same_need_as` key) is dropped as
-   `schema`, never read as passing: a grade that defaulted to passing would spend exactly the money
-   the grade exists to save, and an analyzer that ignores the schema wholesale then shows up as
-   `dropped_schema=listed` on every question, which is loud, cheap and forecast-neutral (the
-   forecast proceeds on the first pass and gap-fill v2).
+   pointer at itself, forward, at zero, or non-integer, an absent `same_need_as` key, an empty
+   slot) is dropped as `schema`, never read as passing: a grade that defaulted to passing would
+   spend exactly the money the grade exists to save. An analyzer that ignores the schema wholesale
+   shows up as `dropped_schema=listed` on every question, and the marker line is emitted at
+   WARNING in exactly that case (the same level as `GAP_FILL_ANALYZER_FAILED`, because v1 has gone
+   dark while the analyzer still bills), while a question whose gaps all fail on legitimate grades
+   stays at INFO, because that is the filter working. Either way the forecast proceeds on the
+   first pass and gap-fill v2.
 4. **The cap last.** `GAP_FILL_MAX_GAPS` applies to the survivors, so a dropped gap never displaces
    a kept one; a survivor past the cap is dropped as `over_cap`. The analyzer is still asked for at
    most that many, so this binds only when it over-lists.
 
 Three records make the filter measurable after the GitHub Actions logs expire. The
 `GAP_FILL_V1_TRIAGE` marker (`docs/telemetry_markers.md`) carries `listed`, `kept` and a count per
-reason, and is emitted for every question whose analyzer answered, so `listed=0` is a legitimately
-empty list and a dead analyzer stays `GAP_FILL_ANALYZER_FAILED` alone. One INFO line per dropped gap
+reason, and is emitted for every question whose analyzer answered, so `listed=0` means the analyzer
+answered and produced no parsable gaps (an unparseable reply lands there too, traced only by the
+`GapFill: could not parse analyzer JSON` warning in the run log) and a dead analyzer stays
+`GAP_FILL_ANALYZER_FAILED` alone. One INFO line per dropped gap
 (`GapFill: dropped gap #<position> reason=<reason> same_need_as=<pointer>: <text>`) makes a run log
 readable by eye. And the raw research record (`provider="gap_fill"`) carries the dropped gaps under
 `dropped`, each with its analyzer `position` and `reason`, beside the kept `gaps` and their
 `results`; that list is the precision check on the analyzer's grading (are the dropped gaps really
-junk?) for the next redundancy audit. The saving itself is confirmed only by a paid run, which is
-the operator's call.
+junk?) for the next redundancy audit. Since 2026-09-09 that record is written whenever the analyzer
+answered, including the zero-gap and all-dropped cases (where `gaps` is empty), so a presence or
+provider-mix count off the raw archive must filter on a non-empty `gaps`, with 2026-09-09 as the
+era boundary; before it, a question with no searched gap wrote no record. The saving itself is
+confirmed only by a paid run, which is the operator's call.
 
 ### v1 implementation notes (`research/targeted.py`)
 
@@ -2045,7 +2059,8 @@ SDK error cannot take the whole addendum down.
 **`run_gap_fill_pass`: the raw-research record.** It stores the raw per-gap search results alongside
 the gaps the resolver searched (`gaps`, aligned with `results` and with the addendum's `Gap N` index)
 and, since 2026-09-09, the gaps triage dropped (`dropped`, each with its analyzer position and reason);
-exceptions serialize to their `str` through the logger's encoder.
+it is written whenever the analyzer answered, empty `gaps` included (see "v1 triage" for the
+presence-count consequence), and exceptions serialize to their `str` through the logger's encoder.
 
 **The two `# fmt: skip` directives.** Both log lines carry `# fmt: skip` ahead of the
 `HARNESS-SCAN-EXEMPT-subsampling` pragma, and the directive is load-bearing rather than cosmetic. The

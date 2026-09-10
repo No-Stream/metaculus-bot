@@ -198,8 +198,11 @@ class ProbeRun:
 def parse_archived_gaps(research_text: str) -> list[ArchivedGap]:
     """Read the ``### Gap N:`` sections of the archived research text.
 
-    The index is the analyzer's own (``run_gap_fill_pass`` numbers from the full gap list, so a
-    gap whose resolver failed leaves a hole). The suggested search query is not rendered; the
+    Since 2026-09-09 the index is the survivor ordinal: ``run_gap_fill_pass`` numbers the gaps
+    that passed triage (``docs/research.md`` "v1 triage"), and a triage-dropped gap's analyzer
+    position lives only in the raw record's ``dropped`` list. Before that date it was the
+    analyzer's own position over the full list. Either way a gap whose resolver failed leaves a
+    hole. The suggested search query is not rendered; the
     caller fills it from the raw analyzer record when one exists, else from the gap text, which
     is the analyzer's own default when it omits one.
     """
@@ -230,10 +233,12 @@ def parse_archived_gaps(research_text: str) -> list[ArchivedGap]:
 
 
 def raw_analyzer_gaps(raw_dir: Path, run_id: str, question_id: int) -> list[dict[str, str]] | None:
-    """The analyzer's own gap list from the run's raw research log, or None when the run has none.
+    """The gaps the resolver searched, from the run's raw research log, or None when the run has none.
 
-    ``record_raw_research`` writes the ``gap_fill`` payload as ``{"gaps": [...], "results": [...]}``
-    and ``scripts/download_raw_research.py`` archives one ``<run_id>.jsonl`` per run.
+    ``record_raw_research`` writes the ``gap_fill`` payload as ``{"gaps": [...], "results": [...]}``,
+    plus ``"dropped": [...]`` since 2026-09-09 (the triage-dropped gaps with their analyzer position
+    and reason; ``gaps`` is then the survivors, aligned with ``results`` and the rendered index), and
+    ``scripts/download_raw_research.py`` archives one ``<run_id>.jsonl`` per run.
     """
     path = raw_dir / f"{run_id}.jsonl"
     if not path.is_file():

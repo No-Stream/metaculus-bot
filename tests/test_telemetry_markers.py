@@ -3634,7 +3634,7 @@ GAP_FILL_V1_TRIAGE_LINE = (
     "dropped_same_need=1 dropped_schema=0 dropped_over_cap=0"
 )
 # Verbatim from research/gap_fill_stages.py; shares the GAP_FILL_V1_ prefix with the triage marker.
-GAP_FILL_V1_CUT_LINE = PFX_WARN + "GAP_FILL_V1_CUT_FOR_BUDGET: question=44912; research phase deadline reached"
+GAP_FILL_V1_CUT_LINE = PFX_WARN + "GAP_FILL_V1_CUT_FOR_BUDGET: question=44912; research phase ran out of budget"
 
 
 class TestGapFillV1Triage:

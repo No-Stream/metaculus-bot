@@ -32,6 +32,7 @@ from metaculus_bot.research.targeted import (
     run_gap_fill_pass,
     triage_gaps,
 )
+from scripts.telemetry.markers import MARKER_SPECS
 
 
 @dataclass
@@ -139,11 +140,26 @@ class TestParseGapList:
 
         assert out == []
 
-    def test_gap_missing_gap_field_is_dropped(self) -> None:
+    def test_a_slot_without_gap_text_is_kept_empty_for_triage_to_drop(self) -> None:
+        """The parser never compacts the list: ``same_need_as`` is a position in the ANALYZER's list, so a
+        skipped slot would shift every later pointer onto the wrong gap. An item with no gap text keeps
+        its slot as an empty one and triage drops it as schema drift."""
         raw = '{"gaps": [{"why_matters": "wm", "search_query": "sq"}]}'
+
         out = _parse_gap_list(raw)
 
-        assert out == []
+        assert out == [{"gap": "", "search_query": "sq", "why_matters": "wm"}]
+        assert [d["reason"] for d in triage_gaps(out, max_gaps=4).dropped] == [DROP_SCHEMA]
+
+    def test_a_non_dict_item_is_kept_as_an_empty_slot(self) -> None:
+        raw = '{"gaps": ["just a string", {"gap": "g2", "search_query": "q2", "why_matters": "w2"}]}'
+
+        out = _parse_gap_list(raw)
+
+        assert out == [
+            {"gap": "", "search_query": "", "why_matters": ""},
+            {"gap": "g2", "search_query": "q2", "why_matters": "w2"},
+        ]
 
     def test_gap_missing_search_query_falls_back_to_gap_text(self) -> None:
         raw = '{"gaps": [{"gap": "my gap text", "why_matters": "wm"}]}'
@@ -323,6 +339,51 @@ class TestTriageGaps:
         assert triage.kept == []
         assert [d["reason"] for d in triage.dropped] == [DROP_ALREADY_ANSWERED, DROP_SAME_NEED]
 
+    def test_a_malformed_slot_ahead_of_a_pointer_keeps_the_positions_aligned(self) -> None:
+        """The analyzer list [malformed, A future-dated, B distinct, C same_need_as=2 (A's present-tense
+        rewording)]: C's pointer must still name A, so C is kept as A's carrier. A parser that dropped
+        the malformed slot would renumber and C's pointer would land on B."""
+        gaps = [
+            {"gap": "", "search_query": "", "why_matters": ""},
+            _gap("what the tracker will show on 2026-09-30", answerable_now=False),
+            _gap("an unrelated base rate"),
+            _gap("what the tracker shows now", same_need_as=2),
+        ]
+
+        triage = triage_gaps(gaps, max_gaps=4)
+
+        assert [g["gap"] for g in triage.kept] == ["an unrelated base rate", "what the tracker shows now"]
+        assert [(d["position"], d["reason"]) for d in triage.dropped] == [(1, DROP_SCHEMA), (2, DROP_NOT_ANSWERABLE)]
+
+    def test_two_siblings_of_an_unanswerable_gap_share_one_carrier(self) -> None:
+        """Both restatements point at the same future-dated gap rather than at each other: the first
+        becomes the need's carrier, and the second is a restatement of a need now being searched."""
+        gaps = [
+            _gap("what the tracker will show on 2026-09-30", answerable_now=False),
+            _gap("what the tracker shows now", same_need_as=1),
+            _gap("the tracker's reading via its mirror", same_need_as=1),
+        ]
+
+        triage = triage_gaps(gaps, max_gaps=4)
+
+        assert triage.kept == [gaps[1]]
+        assert [(d["position"], d["reason"]) for d in triage.dropped] == [
+            (1, DROP_NOT_ANSWERABLE),
+            (3, DROP_SAME_NEED),
+        ]
+
+    def test_two_siblings_of_a_schema_dropped_gap_share_one_carrier(self) -> None:
+        gaps = [
+            {"gap": "ungraded", "search_query": "q", "why_matters": ""},
+            _gap("graded restatement", same_need_as=1),
+            _gap("another graded restatement", same_need_as=1),
+        ]
+
+        triage = triage_gaps(gaps, max_gaps=4)
+
+        assert triage.kept == [gaps[1]]
+        assert [(d["position"], d["reason"]) for d in triage.dropped] == [(1, DROP_SCHEMA), (3, DROP_SAME_NEED)]
+
     def test_paraphrase_of_a_schema_dropped_gap_stands_on_its_own_grades(self) -> None:
         """An ungraded gap says nothing about whether its need is covered, so a graded restatement of it is
         judged on its own fields."""
@@ -488,8 +549,32 @@ async def test_two_gaps_run_in_parallel() -> None:
     assert completion_order == ["q2", "q1"]
 
 
-def _triage_markers(caplog: pytest.LogCaptureFixture) -> list[str]:
-    return [rec.message for rec in caplog.records if rec.message.startswith("GAP_FILL_V1_TRIAGE:")]
+_TRIAGE_SPEC = next(spec for spec in MARKER_SPECS if spec.name == "gap_fill_v1_triage")
+
+
+def _triage_markers(caplog: pytest.LogCaptureFixture) -> list[dict[str, str]]:
+    """Every emitted GAP_FILL_V1_TRIAGE line, parsed by the registry's own regex so the emitter and the spec
+    fail side by side here rather than only against the hand-typed literal in tests/test_telemetry_markers.py."""
+    lines = [rec.message for rec in caplog.records if rec.message.startswith("GAP_FILL_V1_TRIAGE:")]
+    parsed = [_TRIAGE_SPEC.regex.search(line) for line in lines]
+    assert all(parsed), f"a GAP_FILL_V1_TRIAGE line does not match its MarkerSpec: {lines}"
+    return [match.groupdict() for match in parsed if match is not None]
+
+
+def _triage_record(question: str, listed: int, kept: int, **dropped: int) -> dict[str, str]:
+    """The expected parse of one marker line; every reason not named counts zero."""
+    counts = {f"dropped_{reason}": str(dropped.get(reason, 0)) for reason in DROP_REASONS}
+    return {"question": question, "listed": str(listed), "kept": str(kept), **counts}
+
+
+def _triage_levels(caplog: pytest.LogCaptureFixture) -> list[int]:
+    return [rec.levelno for rec in caplog.records if rec.message.startswith("GAP_FILL_V1_TRIAGE:")]
+
+
+def test_marker_spec_fields_are_the_drop_reasons() -> None:
+    """The emitter derives its field set and order from DROP_REASONS while the spec spells them out; a new
+    reason has to land in both, or the harvester silently records zero rows."""
+    assert set(_TRIAGE_SPEC.regex.groupindex) - {"question", "listed", "kept"} == {f"dropped_{r}" for r in DROP_REASONS}
 
 
 @pytest.mark.asyncio
@@ -525,10 +610,7 @@ async def test_resolver_runs_exactly_the_survivors_in_order(caplog: pytest.LogCa
     assert "r4" in out
     assert "future reading" not in out
     assert "restated" not in out
-    assert _triage_markers(caplog) == [
-        "GAP_FILL_V1_TRIAGE: question=42 listed=4 kept=2 dropped_not_answerable=1 dropped_in_first_pass=0 "
-        "dropped_same_need=1 dropped_schema=0 dropped_over_cap=0"
-    ]
+    assert _triage_markers(caplog) == [_triage_record("42", listed=4, kept=2, not_answerable=1, same_need=1)]
 
 
 @pytest.mark.asyncio
@@ -548,6 +630,7 @@ async def test_every_gap_dropped_returns_empty_and_counts_them(caplog: pytest.Lo
     with (
         patch("metaculus_bot.research.targeted._run_analyzer", AsyncMock(return_value=gaps)),
         _patch_resolver(fake_search) as builder,
+        patch("metaculus_bot.research.targeted.record_raw_research") as rec,
         caplog.at_level(logging.INFO, logger="metaculus_bot.research.targeted"),
     ):
         out = await run_gap_fill_pass(_q(question), "first-pass research")
@@ -556,9 +639,42 @@ async def test_every_gap_dropped_returns_empty_and_counts_them(caplog: pytest.Lo
     fake_search.assert_not_called()
     builder.assert_not_called()
     assert _triage_markers(caplog) == [
-        "GAP_FILL_V1_TRIAGE: question=42 listed=4 kept=0 dropped_not_answerable=1 dropped_in_first_pass=1 "
-        "dropped_same_need=1 dropped_schema=1 dropped_over_cap=0"
+        _triage_record("42", listed=4, kept=0, not_answerable=1, in_first_pass=1, same_need=1, schema=1)
     ]
+    # Legitimate grades are the filter working, so the marker stays at INFO.
+    assert _triage_levels(caplog) == [logging.INFO]
+    # The dropped list is the whole audit trail on this path, so the raw record is written with it.
+    payload = rec.call_args.kwargs["payload"]
+    assert payload["gaps"] == []
+    assert payload["results"] == []
+    assert [(d["position"], d["reason"]) for d in payload["dropped"]] == [
+        (1, DROP_NOT_ANSWERABLE),
+        (2, DROP_ALREADY_ANSWERED),
+        (3, DROP_SAME_NEED),
+        (4, DROP_SCHEMA),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_every_gap_failing_the_schema_warns(caplog: pytest.LogCaptureFixture) -> None:
+    """An analyzer that stopped emitting the grades is v1 gone dark while it still bills, the same outcome
+    as a dead analyzer, so the marker line is a WARNING then and only then."""
+    question = MockQuestion()
+    gaps = [
+        {"gap": "g1", "search_query": "q1", "why_matters": ""},
+        {"gap": "g2", "search_query": "q2", "why_matters": ""},
+    ]
+
+    with (
+        patch("metaculus_bot.research.targeted._run_analyzer", AsyncMock(return_value=gaps)),
+        _patch_resolver(AsyncMock()),
+        caplog.at_level(logging.INFO, logger="metaculus_bot.research.targeted"),
+    ):
+        out = await run_gap_fill_pass(_q(question), "first-pass research")
+
+    assert out == ""
+    assert _triage_markers(caplog) == [_triage_record("42", listed=2, kept=0, schema=2)]
+    assert _triage_levels(caplog) == [logging.WARNING]
 
 
 @pytest.mark.asyncio
@@ -588,15 +704,16 @@ async def test_analyzer_with_no_gaps_emits_a_zero_triage_marker(caplog: pytest.L
     with (
         patch("metaculus_bot.research.targeted._run_analyzer", AsyncMock(return_value=[])),
         _patch_resolver(AsyncMock()),
+        patch("metaculus_bot.research.targeted.record_raw_research") as rec,
         caplog.at_level(logging.INFO, logger="metaculus_bot.research.targeted"),
     ):
         out = await run_gap_fill_pass(_q(question), "first-pass research")
 
     assert out == ""
-    assert _triage_markers(caplog) == [
-        "GAP_FILL_V1_TRIAGE: question=42 listed=0 kept=0 dropped_not_answerable=0 dropped_in_first_pass=0 "
-        "dropped_same_need=0 dropped_schema=0 dropped_over_cap=0"
-    ]
+    assert _triage_markers(caplog) == [_triage_record("42", listed=0, kept=0)]
+    assert _triage_levels(caplog) == [logging.INFO]
+    # A raw record exists whenever the analyzer answered, so archive presence counts filter on non-empty gaps.
+    assert rec.call_args.kwargs["payload"] == {"gaps": [], "results": [], "dropped": []}
 
 
 @pytest.mark.asyncio
@@ -639,7 +756,7 @@ async def test_cap_applies_after_the_grade_filter(caplog: pytest.LogCaptureFixtu
     assert fake_search.await_count == GAP_FILL_MAX_GAPS
     assert f"### Gap {GAP_FILL_MAX_GAPS}: gap {oversized_count - 1}" in out
     assert f"res{oversized_count - 1}" in out
-    assert "dropped_over_cap=0" in _triage_markers(caplog)[0]
+    assert _triage_markers(caplog)[0]["dropped_over_cap"] == "0"
 
 
 @pytest.mark.asyncio
@@ -658,7 +775,7 @@ async def test_survivors_past_the_cap_are_not_searched(caplog: pytest.LogCapture
 
     assert fake_search.await_count == GAP_FILL_MAX_GAPS
     assert f"### Gap {GAP_FILL_MAX_GAPS + 1}:" not in out
-    assert "dropped_over_cap=2" in _triage_markers(caplog)[0]
+    assert _triage_markers(caplog)[0]["dropped_over_cap"] == "2"
 
 
 @pytest.mark.asyncio
@@ -721,6 +838,24 @@ async def test_analyzer_prompt_carries_the_mc_ballot() -> None:
     assert stub_llm.invoke.await_args is not None
     prompt = stub_llm.invoke.await_args.args[0]
     assert "Options (in resolution order): Mir Kim | Hunter Feuerstein | Other" in prompt
+
+
+@pytest.mark.asyncio
+async def test_analyzer_returns_every_listed_gap_unclipped() -> None:
+    """The cap lives in triage, after the grade filter; a clip restored at the parse call would let a
+    dropped gap displace a kept one again with every other test still green."""
+    question = MockQuestion()
+    listed = [_gap(f"g{i}", f"q{i}") for i in range(1, GAP_FILL_MAX_GAPS + 3)]
+
+    stub_llm = MagicMock()
+    stub_llm.invoke = AsyncMock(return_value=json.dumps({"gaps": listed}))
+    with patch(
+        "metaculus_bot.fallback_openrouter.build_llm_with_openrouter_fallback",
+        MagicMock(return_value=stub_llm),
+    ):
+        gaps = await _run_analyzer(_q(question), "first-pass research", is_benchmarking=False)
+
+    assert gaps == listed
 
 
 @pytest.mark.asyncio

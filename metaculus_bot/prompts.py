@@ -2109,9 +2109,10 @@ def gap_fill_analyzer_prompt(
         fields or scores; keep the schema exactly as below.
 
         GRADE EVERY GAP. Fill the three grade fields honestly: code reads them and drops a
-        failing gap before its search is paid for. answerable_now is false when the answer
-        is a reading, result or event dated after today. already_in_first_pass is true when
-        the first-pass research already states the value or fact with its date. same_need_as
+        failing gap before its search is paid for. answerable_now is false when the gap can
+        only be answered by an observation not yet made or a result not yet published.
+        already_in_first_pass is true when the first-pass research already states the value
+        or fact with its date. same_need_as
         is the position (1 = the first gap) of an earlier gap in this list that the same fact
         from the same source would answer, else null; a dashboard and its monthly summary, or
         official and preliminary results, are one need and one search.

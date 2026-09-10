@@ -648,8 +648,9 @@ class TestPresentTenseInstrumentGaps:
 
 
 class TestGapFillAnalyzerSlotDiscipline:
-    """The analyzer fills every slot whatever it is told: 55-77% of archived records sit at
-    the cap and only 8 of 308 returned one or two gaps, so the old "Most questions have 0-2
+    """The analyzer fills every slot whatever it is told: since 2026-07-17 it fills every slot
+    on about half of questions and lists three or more gaps on 96% (an earlier "55-77% at the
+    cap" figure matched no cap-aware reading of the archive), so the old "Most questions have 0-2
     real gaps; a few have 3-5" was behaviourally dead and "3-5" was stale against
     GAP_FILL_MAX_GAPS = 4. What earns its place is the discipline with its reason (each gap
     is a paid search) and the ordering contract the cap relies on (order is the ranking, no
@@ -967,9 +968,14 @@ class TestGapFillAnalyzerGradeFields:
         assert "grade every gap" in flat
         assert "code reads them and drops a failing gap before its search is paid for" in flat
 
-    def test_answerable_now_is_defined_against_todays_date(self) -> None:
+    def test_answerable_now_needs_no_reference_date(self) -> None:
+        """The prompt carries no run date (only the bare year in gap type 8, which the ablation harness
+        rewrites), so the grade is defined by whether the observation exists yet, not by a date."""
         flat = _flat(self._analyzer())
-        assert "answerable_now is false when the answer is a reading, result or event dated after today" in flat
+        assert (
+            "answerable_now is false when the gap can only be answered by an observation not yet made "
+            "or a result not yet published" in flat
+        )
 
     def test_already_in_first_pass_requires_the_dated_value(self) -> None:
         flat = _flat(self._analyzer())
