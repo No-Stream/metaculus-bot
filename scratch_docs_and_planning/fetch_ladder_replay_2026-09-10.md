@@ -122,3 +122,14 @@ counts 386 outcomes without replaying them. No replayable row carries `throttled
 status inverse exists, but this corpus supplies no throttle row. The 23 derived rows per applicable
 policy are the expected `derived_api -> rendered` selections. After those intentional mappings,
 policy differences, and documented rescue gaps, no unexpected replay mismatch remains.
+
+The two rows labelled "lost" are archived resolution-source `url_context` attempts applied to
+gap-fill presets that deliberately do not contain that rung. Both archived outcomes were
+`no_resolving_content`, rather than successful reads. The explicit gap-fill `read_document`
+fallback sits outside this replay. These counts therefore do not establish two lost production
+rescues. The undecidable rows lack the original HTTP status needed to evaluate the archived
+rescue trigger; they remain unresolved evidence gaps.
+
+Full per-record output: `scratch/fall_ladder_replay_2026-09-10/fetch_ladder_replay.json` in the main
+workspace. The status-equality check is a consistency check on reconstruction and stubbed
+dispatch, not an independent test of fetched content.
