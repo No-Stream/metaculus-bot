@@ -216,7 +216,21 @@ class TestParseGrid:
 
         assert cell == probe.GridCell("openai/gpt-5.6-sol", "openai/gpt-5.6-sol", "medium")
 
-    @pytest.mark.parametrize("spec", ["current", "current:huge", "sol:high", ":high"])
+    def test_a_third_field_is_the_reasoning_effort_and_defaults_to_production(self) -> None:
+        with_effort, default = probe.parse_grid(["luna:high:medium", "luna:high"])
+
+        assert with_effort == probe.GridCell("luna", probe.CANDIDATE_MODEL, "high", "medium")
+        assert (with_effort.label, with_effort.model_label) == ("luna:high:medium", "luna@medium")
+        assert default.reasoning_effort == GAP_FILL_RESOLVER_REASONING_EFFORT
+        assert (default.label, default.model_label) == ("luna:high", "luna")
+
+    def test_a_slug_carrying_a_colon_still_parses(self) -> None:
+        (cell,) = probe.parse_grid(["openai/gpt-5.6-luna:batch:low"])
+
+        assert cell.model_slug == "openai/gpt-5.6-luna:batch"
+        assert (cell.search_context_size, cell.reasoning_effort) == ("low", GAP_FILL_RESOLVER_REASONING_EFFORT)
+
+    @pytest.mark.parametrize("spec", ["current", "current:huge", "sol:high", ":high", "current:high:turbo"])
     def test_malformed_cells_are_rejected(self, spec: str) -> None:
         with pytest.raises(ValueError, match="grid cell"):
             probe.parse_grid([spec])
@@ -427,16 +441,43 @@ class TestAcceptedPath:
         markdown = md_path.read_text(encoding="utf-8")
         assert "# Gap-fill resolver probe: question 44267 (post 44256)" in markdown
         assert (
-            "| current:high | openai/gpt-5.6-terra | high | 3 | 0 | $0.3000 | $0.1000 | 240000 | 1800 | 0 | 600 |"
+            "| current:high | openai/gpt-5.6-terra | high | low | 3 | 0 | $0.3000 | $0.1000 | 240000 | 1800 | 0 | 600 |"
             in markdown
         )
-        assert "| luna:low | openai/gpt-5.6-luna | low | 0 | 3 | n/a | n/a | 0 | 0 | 0 | 0 |" in markdown
+        assert "| luna:low | openai/gpt-5.6-luna | low | low | 0 | 3 | n/a | n/a | 0 | 0 | 0 | 0 |" in markdown
         assert "- luna/current at high: 0.10x" in markdown
         assert "- luna low/high: n/a" in markdown
         assert "## Gap 2: Clarify whether the question resolves on the headline total or the ADIZ subset." in markdown
         assert "### Archived production answer (run 28674047443)" in markdown
         assert "The resolving metric is the headline total" in markdown
         assert "ERROR: RuntimeError('provider returned nothing')" in markdown
+
+
+class TestCostRatios:
+    def test_an_effort_cell_is_compared_to_its_own_high_and_to_production_at_its_size(self) -> None:
+        cells = probe.parse_grid(["current:high", "current:low", "luna:high:medium", "luna:medium:medium"])
+        costs = {"current:high": 0.20, "current:low": 0.15, "luna:high:medium": 0.05, "luna:medium:medium": 0.04}
+        results = [
+            probe.CellResult(
+                gap_index=1,
+                cell=cell,
+                role=probe.probe_role(1, cell),
+                answer="ok",
+                error=None,
+                wall_s=1.0,
+                calls=1,
+                cost_usd=costs[cell.label],
+            )
+            for cell in cells
+        ]
+
+        ratios = dict(probe.cost_ratios(probe.summarize_cells(cells, results)))
+
+        assert ratios["current low/high"] == pytest.approx(0.75)
+        assert ratios["luna@medium medium/high"] == pytest.approx(0.8)
+        assert ratios["luna@medium/current at high"] == pytest.approx(0.25)
+        assert ratios["luna@medium/current at medium"] is None, "no production cell at medium in this grid"
+        assert "luna@medium/current at low" not in ratios, "no luna@medium cell at low, so no ratio is offered for it"
 
 
 class TestRenderMarkdown:
@@ -477,7 +518,7 @@ class TestRenderMarkdown:
         ]
         assert len(cell_headings) == len(gaps) * len(cells)
         assert (
-            "### luna:medium (openai/gpt-5.6-luna, context medium): $0.0200, 85000 prompt / 700 completion tokens (1000 cached, 300 reasoning), 12.5 s, 1 billed call(s)"
+            "### luna:medium (openai/gpt-5.6-luna, context medium, effort low): $0.0200, 85000 prompt / 700 completion tokens (1000 cached, 300 reasoning), 12.5 s, 1 billed call(s)"
             in markdown
         )
         assert "luna:medium says 26" in markdown

@@ -61,6 +61,8 @@ CANDIDATE_MODEL_ALIAS = "luna"
 MODEL_ALIASES: dict[str, str] = {CURRENT_MODEL_ALIAS: GAP_FILL_RESOLVER_MODEL, CANDIDATE_MODEL_ALIAS: CANDIDATE_MODEL}
 SEARCH_CONTEXT_SIZES: tuple[str, ...] = ("low", "medium", "high")
 PRODUCTION_CONTEXT_SIZE = "high"
+REASONING_EFFORTS: tuple[str, ...] = ("low", "medium", "high")
+PRODUCTION_REASONING_EFFORT = GAP_FILL_RESOLVER_REASONING_EFFORT
 DEFAULT_GRID: tuple[str, ...] = (
     "current:high",
     "current:medium",
@@ -87,15 +89,25 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class GridCell:
-    """One ``model:context_size`` cell of the grid."""
+    """One ``model:context_size[:effort]`` cell of the grid; the effort defaults to production's."""
 
     model_alias: str
     model_slug: str
     search_context_size: str
+    reasoning_effort: str = PRODUCTION_REASONING_EFFORT
+
+    @property
+    def model_label(self) -> str:
+        """The model alias, suffixed with ``@effort`` when the effort is not production's."""
+        if self.reasoning_effort == PRODUCTION_REASONING_EFFORT:
+            return self.model_alias
+        return f"{self.model_alias}@{self.reasoning_effort}"
 
     @property
     def label(self) -> str:
-        return f"{self.model_alias}:{self.search_context_size}"
+        if self.reasoning_effort == PRODUCTION_REASONING_EFFORT:
+            return f"{self.model_alias}:{self.search_context_size}"
+        return f"{self.model_alias}:{self.search_context_size}:{self.reasoning_effort}"
 
 
 @dataclass(frozen=True)
@@ -307,20 +319,32 @@ def fetch_question_wording(post_id: int) -> QuestionWording:
 # --- The grid ---------------------------------------------------------------------------------
 
 
+def _split_cell_spec(spec: str) -> tuple[str, str, str]:
+    """``model:size`` or ``model:size:effort`` from the right, so a slug carrying a colon still parses."""
+    head, separator, last = spec.rpartition(":")
+    if separator and last in REASONING_EFFORTS:
+        model_token, size_separator, size = head.rpartition(":")
+        if size_separator and size in SEARCH_CONTEXT_SIZES:
+            return model_token, size, last
+    if separator and last in SEARCH_CONTEXT_SIZES:
+        return head, last, PRODUCTION_REASONING_EFFORT
+    raise ValueError(
+        f"grid cell {spec!r}: expected <model>:<{'|'.join(SEARCH_CONTEXT_SIZES)}>[:<{'|'.join(REASONING_EFFORTS)}>]"
+    )
+
+
 def parse_grid(specs: Sequence[str]) -> list[GridCell]:
-    """Turn ``model:context_size`` specs into cells; the model is an alias or a bare OpenRouter slug."""
+    """Turn ``model:context_size[:effort]`` specs into cells; the model is an alias or a bare OpenRouter slug."""
     cells: list[GridCell] = []
     for spec in specs:
-        model_token, separator, size = spec.rpartition(":")
-        if not separator or size not in SEARCH_CONTEXT_SIZES:
-            raise ValueError(f"grid cell {spec!r}: expected <model>:<{'|'.join(SEARCH_CONTEXT_SIZES)}>")
+        model_token, size, effort = _split_cell_spec(spec)
         slug = MODEL_ALIASES.get(model_token, model_token)
         if "/" not in slug:
             aliases = ", ".join(MODEL_ALIASES)
             raise ValueError(
                 f"grid cell {spec!r}: model must be an alias ({aliases}) or a vendor/model OpenRouter slug"
             )
-        cell = GridCell(model_alias=model_token, model_slug=slug, search_context_size=size)
+        cell = GridCell(model_alias=model_token, model_slug=slug, search_context_size=size, reasoning_effort=effort)
         if cell in cells:
             raise ValueError(f"grid cell {spec!r} is listed twice")
         cells.append(cell)
@@ -341,7 +365,10 @@ def print_cost_estimate(question: ArchivedQuestion, gaps: Sequence[ArchivedGap],
     )
     print(f"  Grid, {len(cells)} cell(s):")
     for cell in cells:
-        print(f"    {cell.label:<16} {cell.model_slug} at search_context_size={cell.search_context_size}")
+        print(
+            f"    {cell.label:<22} {cell.model_slug} at search_context_size={cell.search_context_size}, "
+            f"reasoning effort {cell.reasoning_effort}"
+        )
     print(f"  {len(gaps)} x {len(cells)} = {n_calls} resolver calls on the operator's PERSONAL OpenRouter key")
     print(
         f"  Ceiling: ${estimate_ceiling_usd(len(gaps), len(cells)):.2f} at ${PER_CALL_CEILING_USD:.2f} a call, the\n"
@@ -383,7 +410,7 @@ async def _resolve_cell(
     role = probe_role(gap.index, cell)
     llm = build_native_search_llm(
         cell.model_slug,
-        reasoning_effort=GAP_FILL_RESOLVER_REASONING_EFFORT,
+        reasoning_effort=cell.reasoning_effort,
         search_context_size=cell.search_context_size,
         role=role,
     )
@@ -461,26 +488,30 @@ def summarize_cells(cells: Sequence[GridCell], results: Sequence[CellResult]) ->
 
 
 def cost_ratios(summaries: Sequence[CellSummary]) -> list[tuple[str, float | None]]:
-    """The two families of ratio the grid is for: each size against high within a model, and each
-    model against the current one at the same size. Fully costed cells only; ``None`` otherwise."""
-    cost = {summary.cell.label: summary.cost_usd for summary in summaries if summary.failed == 0}
-    aliases = list(dict.fromkeys(summary.cell.model_alias for summary in summaries))
-    sizes = list(dict.fromkeys(summary.cell.search_context_size for summary in summaries))
+    """The two families of ratio the grid is for: each size against high within one model and effort,
+    and each model or effort against the production model at the same size. Fully costed cells only;
+    ``None`` otherwise, including when the grid lacks the cell a ratio divides by."""
+    cost = {summary.cell: summary.cost_usd for summary in summaries if summary.failed == 0}
+    cells = [summary.cell for summary in summaries]
     ratios: list[tuple[str, float | None]] = []
 
-    def ratio(numerator: str, denominator: str) -> float | None:
+    def ratio(numerator: GridCell, denominator: GridCell) -> float | None:
         top, bottom = cost.get(numerator), cost.get(denominator)
         return None if top is None or not bottom else top / bottom
 
-    for alias in aliases:
-        for size in sizes:
-            if size != PRODUCTION_CONTEXT_SIZE:
-                ratios.append((f"{alias} {size}/{PRODUCTION_CONTEXT_SIZE}", ratio(f"{alias}:{size}", f"{alias}:high")))
-    for alias in aliases:
-        if alias == CURRENT_MODEL_ALIAS:
+    for cell in cells:
+        if cell.search_context_size != PRODUCTION_CONTEXT_SIZE:
+            at_high = GridCell(cell.model_alias, cell.model_slug, PRODUCTION_CONTEXT_SIZE, cell.reasoning_effort)
+            ratios.append(
+                (f"{cell.model_label} {cell.search_context_size}/{PRODUCTION_CONTEXT_SIZE}", ratio(cell, at_high))
+            )
+    for cell in cells:
+        if cell.model_alias == CURRENT_MODEL_ALIAS and cell.reasoning_effort == PRODUCTION_REASONING_EFFORT:
             continue
-        for size in sizes:
-            ratios.append((f"{alias}/{CURRENT_MODEL_ALIAS} at {size}", ratio(f"{alias}:{size}", f"current:{size}")))
+        production = GridCell(CURRENT_MODEL_ALIAS, GAP_FILL_RESOLVER_MODEL, cell.search_context_size)
+        ratios.append(
+            (f"{cell.model_label}/{CURRENT_MODEL_ALIAS} at {cell.search_context_size}", ratio(cell, production))
+        )
     return ratios
 
 
@@ -502,7 +533,8 @@ def render_markdown(run: ProbeRun) -> str:
         "",
         f"Run at {run.run_at.isoformat(timespec='seconds')} on the operator's personal OpenRouter key; gaps from "
         f"archive run {question.run_id} ({question.timestamp}); {len(gaps_run)} gap(s) x {len(cells)} cell(s) = "
-        f"{len(results)} resolver calls, reasoning effort {GAP_FILL_RESOLVER_REASONING_EFFORT}.",
+        f"{len(results)} resolver calls; production is {CURRENT_MODEL_ALIAS}:{PRODUCTION_CONTEXT_SIZE} at reasoning "
+        f"effort {PRODUCTION_REASONING_EFFORT}.",
         "",
         "## Question",
         "",
@@ -514,12 +546,13 @@ def render_markdown(run: ProbeRun) -> str:
         "",
         "## Summary per cell",
         "",
-        "| cell | model | context | answered | failed | total cost | mean cost/call | prompt tokens | completion | cached | reasoning | mean wall s |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "| cell | model | context | effort | answered | failed | total cost | mean cost/call | prompt tokens | completion | cached | reasoning | mean wall s |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for summary in summaries:
         lines.append(
             f"| {summary.cell.label} | {summary.cell.model_slug} | {summary.cell.search_context_size} | "
+            f"{summary.cell.reasoning_effort} | "
             f"{summary.answered} | {summary.failed} | {_usd(summary.cost_usd)} | {_usd(summary.mean_cost_usd)} | "
             f"{summary.tokens.prompt} | {summary.tokens.completion} | {summary.tokens.cached} | "
             f"{summary.tokens.reasoning} | {summary.mean_wall_s:.1f} |"
@@ -545,7 +578,8 @@ def render_markdown(run: ProbeRun) -> str:
         for result in (result for result in results if result.gap_index == gap_index):
             lines += [
                 "",
-                f"### {result.cell.label} ({result.cell.model_slug}, context {result.cell.search_context_size}): "
+                f"### {result.cell.label} ({result.cell.model_slug}, context {result.cell.search_context_size}, "
+                f"effort {result.cell.reasoning_effort}): "
                 f"{_usd(result.cost_usd)}, {result.tokens.prompt} prompt / {result.tokens.completion} completion tokens "
                 f"({result.tokens.cached} cached, {result.tokens.reasoning} reasoning), {result.wall_s:.1f} s, "
                 f"{result.calls} billed call(s)",
@@ -562,7 +596,7 @@ def build_payload(run: ProbeRun) -> dict[str, Any]:
     return {
         "run_at": run.run_at.isoformat(timespec="seconds"),
         "key": "personal",
-        "reasoning_effort": GAP_FILL_RESOLVER_REASONING_EFFORT,
+        "production_cell": asdict(GridCell(CURRENT_MODEL_ALIAS, GAP_FILL_RESOLVER_MODEL, PRODUCTION_CONTEXT_SIZE)),
         "question": asdict(run.question),
         "wording": asdict(run.wording),
         "cells": [asdict(cell) for cell in run.cells],
