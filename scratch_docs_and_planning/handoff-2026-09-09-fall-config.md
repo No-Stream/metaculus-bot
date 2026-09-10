@@ -208,9 +208,7 @@ it. Step 4 depends on the merge. Step 5 is independent housekeeping.
    (d) The `page_digest_extractor` role: constants `PAGE_DIGEST_EXTRACTOR_MODEL` and
    `PAGE_DIGEST_EXTRACTOR_EFFORT` in `constants.py`, `CREDIT_ROLE_SPEND` billing under that role
    name, marker fields `passages_returned`, `passages_grounded` and `fallback_used`.
-   (e) A fire-rate flag for the two new prompt rules in the structured forecast block. The operator
-   has not decided. Recommendation: skip it for the fall and hand code the fire rate per the
-   preregistration. [open; ask the operator once, then act on the answer]
+   (e) RESOLVED 2026-09-09 (operator): no fire-rate flag and no extra logging in the forecaster prompts ("let them focus on what matters"). Read the two new prompt rules by hand-coding rationales after the fact, per the preregistration, with a small subagent workflow when the sample is large enough.
    (f) The tagging pass writes `fall_config` into `triple_subera_fine`
    (`scratch/residual_2026-09-09/bucket_by_era.py` is where the field is written today), so the era
    gap fall read works:
