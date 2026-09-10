@@ -95,11 +95,9 @@ until Mantic comments go public.
   prompt states four times that there is no `above_range` key, and the live run showed all three
   forecasters obeying that. The residual risk is a model that takes the bullet literally and emits an
   `above_range` key, which the per-bin parser refuses at the free block rung, sending that member to
-  the paid salvage rung (usually recovered, otherwise the member drops). Candidate rewording: step (6)
-  "including, where the upper bound is open, a date beyond the displayed window"; step (8) "put any
-  'not within the window' mass beyond the upper bound where the question leaves it open". Three
-  presence pins move with it (`tests/prompts/test_date_prompt.py`, `tests/prompts/test_pmf_prompt.py`).
-  Because Metaculus date renders change, it needs the operator's go under the prompt-edit rule.
+  the paid salvage rung (usually recovered, otherwise the member drops). Shipped in `12faf31`
+  with the three presence pins (`tests/prompts/test_date_prompt.py`,
+  `tests/prompts/test_pmf_prompt.py`) moved to the new wording.
 - **Per-bin table in the Mantic comment (Mantic-only, presentation).** The comment's summary and
   per-model bullets come from the framework's numeric report, which prints interpolated percentiles
   ("10.00% chance of value below 2026-09-10 11:48:26 UTC"). On a day-binned per-bin question the
@@ -109,28 +107,22 @@ until Mantic comments go public.
   per-bin questions, so no Metaculus render or residual-analysis parser changes. The comment is
   private on Mantic and scores nothing, so this is low priority unless Mantic comments go public.
 
-### Fall 2026 season: both competitions are configured (updated 2026-09-06, **operator action**)
+### Fall 2026 season: both competitions configured, cup workflow enabled, nothing left open (updated 2026-09-09)
 
-Metaculus granted $1,500 of API credits on 2026-09-03 for the bot to compete in both the fall
-Metaculus Cup and the fall bot tournament. The cup side is done in the repo: `METACULUS_CUP_ID` holds
-`metaculus-cup-fall-2026` (project 33108, forecasting through 2027-01-01, API-verified), the cup
-workflow is at full env parity with the tournament workflow and runs hourly at :13/:33/:53,
-`FALL_CUP_CONFIGURED` is True so the dated reminder is discharged, and research records are labelled
-by run mode so cup runs no longer archive under the bot tournament's slug. The bot tournament was
-published as project 33121 and configured here on 2026-09-06. **One thing remains open, and it is
-the operator's.**
+Metaculus granted $1,500 of API credits on 2026-09-03 for the bot to compete in the fall Metaculus
+Cup and the fall bot tournament. Both are configured: `METACULUS_CUP_ID` holds
+`metaculus-cup-fall-2026` (project 33108, forecasting through 2027-01-01) and `TOURNAMENT_ID` holds
+`fall-futureeval-2026` (project 33121, forecasting end 2027-01-06, two-week hard stop 2027-01-20);
+the cup workflow runs hourly at :13/:33/:53 at full env parity with the tournament workflow, and
+the run mode labels each research record. The one step no merge could do was to enable
+`run_bot_on_metaculus_cup.yaml` on GitHub; the operator did it, and `gh workflow list --all` read
+the workflow as `active` on 2026-09-09. Receipts and the API reads: `docs/operations.md` "Fall 2026 season".
+`make supply_probe` is the free watch for new questions.
 
-The fall bot tournament is configured. The API object at
-`/api/projects/tournaments/33121/` identifies slug `fall-futureeval-2026`,
-`forecasting_end_date` 2027-01-06, and `close_date` 2027-03-05. `TOURNAMENT_ID`
-and `TOURNAMENT_END_DATE` now use that slug and forecasting end date; the
-two-week hard stop is 2027-01-20. `make supply_probe` remains the free watch
-for new questions. Details and receipts: `docs/operations.md` "Fall 2026 season".
-
-1. **Enable `run_bot_on_metaculus_cup.yaml` on GitHub.** It is `disabled_manually` there, which no
-   merge can change, so the crons fire nothing until it is switched on. There is no repo-side
-   warning for this state; the way to notice is a supply-probe row showing cup questions with no bot
-   forecasts.
+**Fall 2026 preregistration** (`scratch_docs_and_planning/fall_2026_preregistration.md`,
+2026-09-09): the six reads the fall residual rounds commit to before any fall question resolves,
+the n floors at 15 and 30 fall records, and the season-long commitments (roster fixed, k_tail held,
+no stacking or mean).
 
 ### Mantic Crucible: Phases 1, 2 and Wave C shipped 2026-09-08 and 2026-09-09, what awaits live data (added 2026-09-08, updated 2026-09-09)
 
@@ -226,17 +218,17 @@ C6 await live data, each with its read-only command):
   the miss rate per UTC release hour plus the realized window-length distribution. This is the
   instrument for the cadence decision below; the command that settles it after the first Series
   2 week is in `docs/operations.md` "Scheduling reliability".
-- **External dispatcher: RESOLVED 2026-09-09.** cron-job.org dispatches each bot workflow twice
-  an hour; the jobs, cadence, token and monitoring are in `docs/operations.md` "Scheduling
-  reliability". The entry as it stood while open (review item 2): GitHub drops most of this
-  repo's scheduled firings (the measured delivery rate and gap lengths live in
-  `docs/operations.md` "Scheduling reliability"). The Mantic workflow runs three crons at
-  :05/:15/:25, not six: a pickup after about :30 of a 60-minute window falls under the 1815 s
-  fast-path threshold and the last quarter-hour under the 300 s viability floor, so later
-  entries buy little or nothing. The durable fix is an always-on cron or a free Cloudflare
-  Worker cron trigger calling GitHub's workflow-dispatch API at :01 (dispatch events are not
-  subject to schedule dropping); a self-hosted runner does not help because the drops are
-  scheduler-side, and running the bot on a box directly loses the artifact pipeline.
+- **External dispatcher and the Series 2 cadence: RESOLVED 2026-09-09.** cron-job.org dispatches
+  each bot workflow twice an hour; the jobs, cadence, token and monitoring are in
+  `docs/operations.md` "Scheduling reliability". The Mantic dispatcher job exists disabled and is
+  enabled after the merge with `make cronjob_dispatch_setup ARGS="--apply --enable-mantic"`. The
+  reasoning as it stood while open (review item 2): GitHub drops most of this repo's scheduled
+  firings; Series 1 windows were exactly one hour, opened on the hour, up to three questions an
+  hour, so two crons at :17/:47 would have forfeited roughly half of them; the Mantic workflow
+  runs three crons at :05/:15/:25, not six, because a pickup after about :30 of a 60-minute
+  window falls under the 1815 s fast-path threshold and the last quarter-hour under the 300 s
+  viability floor; and a self-hosted runner does not help because the drops are scheduler-side,
+  while running the bot on a box directly loses the artifact pipeline.
 - **Mantic-only 5% out-of-range tail floor: APPROVED and BUILT 2026-09-08.** The Phase 2
   plan HELD it pending live `oor_low` / `oor_high` telemetry; the corpus read in
   `mantic_adversarial_candidates_2026-09-08.md` (candidate 1) flipped the decision. Corrected
@@ -394,14 +386,6 @@ multiple-choice ceiling; Mantic comment backfill.
   A date question's `scaling` bounds arrive as epoch seconds, the axis the ghost's percentiles
   and the published CDF already use, so date scoring, when wanted, is the numeric path plus a
   date-resolution parser.
-- **Series 2 cadence: three early crons, dispatcher decision RESOLVED 2026-09-09 (Wave C
-  above).** cron-job.org dispatches each bot workflow twice an hour; the jobs, cadence, token and
-  monitoring are in `docs/operations.md` "Scheduling reliability". The Mantic dispatcher job
-  exists disabled and is enabled after the merge with
-  `make cronjob_dispatch_setup ARGS="--apply --enable-mantic"`. Series 1 windows were exactly one
-  hour, opened on the hour, up to three questions an hour; two crons at :17/:47 under the
-  delivery rate measured in that section would have forfeited roughly half of them, and the :47
-  pickup would have had only the fast path.
 - **Prompts naming Metaculus and the peer score: SHIPPED in Phase 2** as platform-aware named
   constants (`_METACULUS_SCORING_SENTENCE`, `_MANTIC_SCORING_SENTENCE`) read off the question's
   `page_url` host, with the Metaculus-only scoring facts deleted; see `docs/operations.md`
@@ -450,7 +434,35 @@ multiple-choice ceiling; Mantic comment backfill.
   forecast before close; the non-bot-token case is already disclosed by the report's identity
   hint, which the reorder would silence.
 
-### Triple-era September re-read (numeric watch + the era's whole scoreboard) (added 2026-07-20, **HIGH, operator-confirmed 2026-08-25**)
+### Triple-era September re-read (numeric watch + the era's whole scoreboard) (added 2026-07-20, **HIGH, operator-confirmed 2026-08-25**; READ 2026-09-09, CLOSED)
+
+**Season-final read, 2026-09-09: all four legs read three days early, checkpoint CLOSED**
+(`scratch/residual_2026-09-09/SYNTHESIS.md` §1 and §3). The live three-model roster's STRICT
+summer cohort doubled to n=63 at spot peer +21.99, against +12.70 for the retired six-model roster
+on the same tournament. The type-adjusted era gap is +10.71 with a cluster interval of [+1.72,
++19.69], but horizon matching (the six-model arm capped at the triple arm's 45.2-day longest lag)
+takes it to +8.19 with [-3.21, +19.90]: the retired arm's score falls monotonically with forecast
+horizon and a season's final wave is its long tail, so there is no supportable roster-improvement
+claim, only "no era penalty". Zero resolved records were forecast under the live config (the newest
+scored comment predates the time-budget merge), so every pipeline change since 2026-08-26 is still
+a counterfactual. The numeric width gate was met at n=27: PIT std 0.2646 against the 0.2887 ideal,
+central-80 coverage 0.889, a lean flipped from slightly narrow to slightly wide, and `k_tail` = 1.0
+HOLDS. The numeric-family legs read no visible loss against the retired roster (triple STRICT
+numeric +24.15 on 15 records, discrete +35.12 on 12; the horizon-matched discrete gap is +27.41),
+so nothing in the read argues for a re-add under the decision rule below. The bot finished 15th of
+277 on the summer leaderboard, about $1,584 of the pool, provisional.
+
+Two standing changes came out of the round. Horizon matching is now standing tooling,
+`metaculus_bot/performance_analysis/era_gap.py` (`e5f23a4`, `405f878`, `eff72aa`): the
+type-adjusted horizon-matched gap with a cluster-bootstrap interval, a curated cluster map via
+`--clusters` (the symmetric STRICT watch row reads +5.56 with [-5.56, +16.41] on the round's own
+clusters), and `--era-field` for sub-eras, so the fall read is
+`--era-field triple_subera_fine --treated-era fall_config --comparison-era ranked_markets`. And
+a TWO-SIDED WATCH replaces the ledger's reopen band [-6.67, +13.90]: a concern reopens only
+when the STRICT type-adjusted horizon-matched gap is below -5 with the cluster interval excluding
+zero, and a favourable gap is reported, never flagged (operator ruling 2026-09-09). Detail:
+`docs/performance_analysis.md` "The era gap and the horizon confound". The entry as it stood
+follows.
 
 **Scope, per the operator: the checkpoint is the FULL triple-era read, not numerics alone.** Five
 reads come due at the same checkpoint and share one cohort, so they run together (the fourth added
@@ -479,7 +491,8 @@ so four remain live:
    +17.46 against post_flip's summer-clean +14.33, a type-mix-adjusted gap of +3.66 spot with a
    cluster bootstrap interval of [−6.67, +13.90], and +5.79 on the coverage-scaled field the
    earlier round used, which sits inside that round's own reopen interval. The correct statement
-   is "no measurable era difference".
+   is "no measurable era difference". The two-sided watch rule replaced the reopen band on
+   2026-09-09 (season-final read above).
 
    Two honesty notes travel with the retirement. Retired is not inverted: both rounds warn
    explicitly that reading these numbers as "the triple is better" would be the same small-sample
@@ -503,9 +516,11 @@ so four remain live:
    against a fixed roster, and `anchor_present=False` must be read through
    `anchor_confidence`, since a trimmed comment-backfill record can read absent when it isn't.
 4. **The gap-fill v2 ghost re-score** (`make score_ghosts`, free). The first read was a null at
-   n=12 and joins the same resolutions this cohort waits on, so it rides along rather than being
-   scheduled separately; the composition guardrail (most scored ghosts are byte-identical to the
-   driver's PRE-research dry run) is in the demoted entry under Low-priority.
+   n=12; the 2026-09-09 read has 63 of 63 STRICT records carrying a scored ghost, and the
+   ensemble beats the ghost on binary and numeric and loses on multiple choice, a non-difference
+   that argues for having an ensemble. The ghost-versus-published delta is NOT a v2 treatment
+   effect, because both arms carry v2's findings; the corrected instrument and its +7.18
+   pre-versus-post read are in the ghost entry under Low-priority.
 5. **The effect of the two Phase 1 prompt rules the next-season bundle adds**, `_SOFT_CLOCK_RULE`
    and `_HISTORY_DISCHARGED_RULE` in `metaculus_bot/prompts.py` (Items A and C of
    `scratch_docs_and_planning/announced_unscheduled_fix_plan_2026-09-02.md`; live from the
@@ -545,8 +560,9 @@ floor of ±3.37 log pts/Q on the 95% half-width **no matter how many numeric que
 resolve**: every operator precision target (±1/±2/±3 pt) sits below the floor and is
 unreachable by question accrual. The only lever that tightens numeric is more *independent
 roster-stable eras* (the tau/√n_era term), each of which is months of fixed-roster operation,
-and no successor tournament slug exists yet (probed 2026-08-24: HTTP 400 on every plausible
-fall-2026 name), so the next era cannot start until a new tournament does. This is a
+and no successor tournament slug existed when this was written (probed 2026-08-24: HTTP 400 on
+every plausible fall-2026 name; `fall-futureeval-2026` was configured 2026-09-06 and its first
+questions close 2026-09-28), so the next era cannot start until the fall questions resolve. This is a
 ship-and-watch bet decided on today's lean, not a measurement we can sharpen by collecting more
 questions.
 
@@ -558,8 +574,9 @@ questions.
    is the *first* modern-lineage era. This is the second roster change authored on 2026-07-20 (it
    supersedes the morning fable-5 → opus-4.7 swap, which rode the SAME merge and so never ran in
    prod at all); do not swap members mid-window.
-2. **Checkpoint 2026-09-12 (moved from 2026-08-25); the read is DESCRIPTIVE: do not run
-   `run_all.sh` as a decision gate.** The cohort is **complete at 37 numeric-family questions
+2. **Checkpoint 2026-09-12 (moved from 2026-08-25): READ 2026-09-09 on all four legs, see the
+   season-final block above. The read is DESCRIPTIVE: do not run `run_all.sh` as a decision
+   gate.** The cohort is **complete at 37 numeric-family questions
    forecast** (18 numeric + 19 discrete) and merely pending resolution: 6 resolved as of
    2026-08-24, all 31 open ones scheduled ≤ 2026-09-04 (the 30th on 2026-09-02; observed
    scheduled→actual lag 0.6–3.6 days). Ceiling **n ≈ 35 ALL / 34 STRICT; 50 is unreachable by
@@ -591,23 +608,23 @@ questions.
    split is the config spaghetti the operator would rather avoid, and it only earns its cost
    under that condition.
 
-**Cost context for the re-add decision.** The MEASURED per-question OpenRouter spend in the
-triple era is **$0.38–0.41/question**, an OpenRouter-only lower bound; excludes Google AI Studio
-prepaid (Gemini grounded search, gap-fill v2 document reads), the AskNews subscription, and Exa;
-measured over 29 triple-era runs / 33 questions ($0.4082/question; $0.3836 in the ranked-markets
-window). Receipt: `scratch/residual_2026-08-31/gemini_review/RECOMMENDATION.md` §3, "Cost, and a
-standing figure that should stop being quoted". The earlier estimate that the 6→3 drop cut
-per-question reasoning spend from ~$3.05 to ~$1.65 (three fewer xhigh forecasters) was never
-measured and is an order of magnitude too high; it is superseded and must not appear in a re-add
-decision. Removing grok did also end routine personal-key forecaster spend. A 4th reasoning
-forecaster is plausibly +$0.10–0.15/question, but the measured total cannot yet be split into
-forecaster versus research versus ranker, so that increment is an assertion until the per-role
-ledger accumulates a season of runs: `CREDIT_ROLE_SPEND` (`metaculus_bot/credit_telemetry.py`,
-"Per-role dollar attribution", shipped in the 2026-09 bundle) books every OpenRouter completion
-under its role (`forecaster:<vendor>`, `native_search`, `gap_fill_resolver`, `parser`, ...), and
-`scripts/reconcile_credit_spend.py --roles` tabulates it against settled per-run spend. Price a
-re-add off those rows, not off this paragraph. A re-add must clear both the score bar above *and*
-justify the cost it brings back.
+**Cost context for the re-add decision (corrected 2026-09-09).** A published question costs
+**$2.07 to $2.21 all in** on the fall configuration ($2.00 after the ledger double count that
+`f4fa773` fixed with `charged_usd`), measured by the cost pass
+(`scratch/cost_pass_2026-09-09/COST_PASS.md`) from OpenRouter's per-call usage on the
+`CREDIT_ROLE_SPEND` ledger and confirmed by both accounts' balance deltas. The figure this
+paragraph used to carry, $0.38 to $0.41 a question, was an OpenRouter-only lower bound on one key
+(`scratch/residual_2026-08-31/gemini_review/RECOMMENDATION.md` §3) and must not be quoted; nor may
+the never-measured "$3.05 to $1.65" estimate for the 6-to-3 drop. Where the money goes: gap-fill
+v1 is the largest line at $0.76 a question, gap-fill v2 $0.36, and the three forecaster slots are
+within 12% of each other at $0.24 to $0.27, so a fourth forecaster costs about $0.25 a question,
+not the $0.10 to $0.15 this paragraph once guessed. Removing grok did also end routine
+personal-key forecaster spend. Cost is now a first-class number: every run ends with a
+`CREDIT_RUN_SUMMARY` line, `make cost_report` (`c553b88`, free, off the telemetry archive)
+tabulates it per run and per role, and `PROMPT_SIZE_ALERT` fires at 150k prompt tokens
+(`e00ff44`). Price a re-add off those rows. A re-add must clear both the score bar above *and*
+justify the cost it brings back; the fall cost decision itself (gap-fill v1 leaned or off) is the
+operator's and sits in the "Bundle content-audit findings" entry.
 
 **Coverage caveat on those role rows (added 2026-09-01, forge F1/R18; registered 2026-09-04).** The
 same bundle bounded litellm's end-of-run callback drain at `LITELLM_CALLBACK_DRAIN_TIMEOUT_S` (10 s)
@@ -635,6 +652,84 @@ Receipts: `scratch/ensemble_power_model_2026-07-20/synthesis.md` (composed-delta
 floor, dated re-run plan) and `scratch/ensemble_3member_audit_2026-07-20/synthesis.md` (paired
 bootstrap audit). Era boundary: **2026-07-21T17:07:37Z** (`b4e9df0`) = the triple config live in prod;
 2026-07-20 is only its authoring date.
+
+### SEC EDGAR client: BUILT standalone 2026-09-09, wiring waits on the ladder and a contact secret
+
+`metaculus_bot/research/sec_edgar.py` (`f692c0c`) reaches EDGAR's public JSON APIs (a filer's
+submissions, its XBRL company facts, one concept across all filers for a period, full-text search
+since 2001, and the raw filing document) under SEC's fair-access policy, because sec.gov answered
+the browser-shaped fetch with 403 on 12 blocked events across 5 questions and that 403 is a policy
+asking for a name and an address, not a fingerprint verdict. Nothing calls it yet: the wiring is
+the "known API translation" step of the shared fetch ladder. Before that wiring,
+`SEC_EDGAR_CONTACT_EMAIL` must be set in `.env` and as a GitHub Actions secret; it is the contact
+in the fair-access User-Agent, and `edgar_session()` refuses to open a socket without it. Detail:
+`docs/research.md` "SEC EDGAR client". The ranked list of public APIs for the other blocked hosts
+is `scratch/cost_pass_2026-09-09/public_apis/PUBLIC_APIS.md`.
+
+### Screenshot plus vision read for pages whose rendered DOM carries no text (2026-09-09)
+
+**Status:** not started. Bottom of high priority by the operator's call: heavy, and rare in the record.
+
+**Problem.** The gap-fill v2 `fetch` ladder ends at headless Chromium, and a dashboard that draws its
+numbers on a canvas, or a chart served as an image, comes back with nothing to extract. Over 121 archived
+transcripts the render rung succeeded 80 times and left 5 URLs empty (robotracker.app `/cities/2` and
+`/map`, sos.wyo.gov, news.sd.gov, nvcourts.gov recordings), while 33 of the 80 successes served under 500
+characters. The driver asked for a rendered or screenshot value in 9 `conclude` pending leads across 7
+questions (question 14333's Figure 2 curve, question 44857's StatCounter bar chart, question 44950's GWIS
+map images, question 44881's Robo Tracker leaderboard rows).
+
+**Sketch.** After `_try_rendered_fetch` extracts nothing, `page.screenshot()` on the `RenderedPage` the
+transport already holds, then one vision read through the existing `url_context_reader` client (the same
+Gemini key and robots pre-check) with the driver's `ask`. Return the answer as a `read_document`-shaped
+outcome with a new method token so the provenance map can grant it no higher than the `snippet` tier;
+a model's reading of pixels is not a fetched page.
+
+**Cost.** One 1280x800 screenshot is about 1,300 input tokens to a Gemini-class model plus the answer;
+the driver's packet sees only the answer (median paid-read answer 1,478 chars, about 400 tokens). Spend is
+on the reader per use, bounded by the same per-question cap the paid read should carry.
+
+**Why not now.** 5 empty renders and 7 questions of chart leads in 121 transcripts, against 133 anti-bot
+blocks that the impersonated retry and a Wayback rung address for free. Build after the free rungs the
+loop lacks (meta-refresh, ARIA rewrite, inline chart data, harvested-feed reuse, Wayback) are in and
+measured, since each of those removes cases this would otherwise be asked to handle.
+
+### OCR or figure digitization for image-only tables and charts (2026-09-09)
+
+**Status:** not started. Bottom of high priority: heavy, and the record shows no demand at the fetch layer.
+
+**Problem.** A resolving figure that exists only as an image (a scanned table, a published figure's
+curve, a bar chart with no data attribute) cannot be read by any rung. In 1,221 archived `fetch` and
+`read_document` results the loop never once fetched an image URL, and no cited resolution source ever
+recorded an unreadable embed (0 of 129 Tier-1 records). The demand shows up one level higher: the driver
+named an image or screenshot in 4 pending leads (4 questions) and a chart or figure value in 9 (7
+questions), and question 14333's lead says outright that "the figure image/document extractor returned no
+readable numeric axis/quantile extraction. A future run could digitize the publisher-hosted figure
+directly, clearly labeling any values as digitized estimates."
+
+**Sketch.** Two shapes, both behind the paid reader: (a) an image URL handed to `read_document` goes to a
+vision read with the ask, which the auto-escalation already does for images (0 fires on record);
+(b) a figure digitization prompt that returns axis-labelled points, rendered under a mandatory "digitized
+estimate" caveat in the findings, the way `pdf_local` and `url_context` carry route caveats today.
+
+**Cost.** Per use, one vision call; per packet, the answer text only.
+
+**Why not now.** Zero image fetches in the archive and a Tier-1 inline chart-data rung that already reads
+the chart configuration out of the HTML when a page carries one (question 43949's receipt). The gap is
+real for figures published only as raster images, and it is small.
+
+### A social-media and video reader (2026-09-09)
+
+**Status:** not started. Record it and leave it.
+
+**Problem.** Native search sometimes cites posts and videos the loop does not attempt: across the 99
+both-on pairs v1 cited reddit.com 13 times, linkedin.com 5 and x.com 5, and no video at all; the loop
+attempted 2 social URLs and read both. One pending lead in 121 transcripts asked for a transcript. x.com is
+API-gated, reddit's JSON endpoints throttle non-browser clients, and a video transcript needs a third-party
+service.
+
+**Why not now.** Frequency is a handful per hundred questions and the resolving fact rarely lives in a
+post; where it did (question 45202's Musk posts on Grok 4.7), the same claim was carried by a news
+citation (axios.com) that a Wayback or impersonated fetch reaches.
 
 ## Research-triage round 2026-07-16 (lit + repo survey + codebase verification)
 
@@ -1181,18 +1276,32 @@ an estimate.
 and live in prod 2026-07-21T17:07Z (merge `b4e9df0`; the merge date is the era boundary) after
 the paid smoke, the blind driver eval (winner: gpt-5.6-terra effort=low, now the prod default),
 and the Exa-alive confirmation replay (`scratch/driver_replay_2026-07-17/arm_terra_low_exa_alive/`).
-Pending: turn v1 gap-fill OFF after the overlap window (operator must remember: **now gated on
-quality, not just time, per the 2026-07-18 content-audit entry**); the 3.5-flash researcher switch
-is undecided. Full design (source of truth): `scratch_docs_and_planning/agentic_gap_fill_v2_plan.md`
-(rev 4).
+The v1-off decision was gated on quality per the 2026-07-18 content-audit entry; that gate was
+discharged 2026-09-09 (verdict MIXED) and the fall decision is the operator's, recorded there. The
+3.5-flash researcher switch is undecided. Full design (source of truth):
+`scratch_docs_and_planning/agentic_gap_fill_v2_plan.md` (rev 4).
 
 Summary: a bounded agentic tool loop is the second-pass research stage. A driver LLM briefed with
 the forecaster prompt template privately dry-runs the forecast to find fill/verify targets, then
 iterates over four tools: `search_news` (AskNews rate-limit machinery), `search_web` (Exa direct,
-key stored locally / GHA secret `exa_key`), `fetch` (ladder plain → headless Chromium → Gemini
-url_context), `read_document` (Gemini flash url_context). Output: a detached citation-only findings
-artifact appended to the bundle; a ghost forecast logged for telemetry only. DIY litellm-direct,
-append-only message array for prompt-cache discipline.
+key stored locally / GHA secret `exa_key`), `fetch` (a ladder that since 2026-09-09 runs Tier 1's
+HTML extraction steps, the impersonated retry, a Wayback rung with the capture date surfaced and no
+age bound, and the harvested JSON feed when a render is empty, per `21f3122`, `8eba338` and
+`246fe68`, with the driver told not to scrape FRED, Kalshi or Yahoo Finance in `924cfc2`; current
+rung order in `docs/agentic_gap_fill.md` "The fetch ladder"), `read_document` (Gemini flash
+url_context). Output: a detached citation-only findings artifact appended to the bundle; a ghost
+forecast logged for telemetry only. DIY litellm-direct, append-only message array for prompt-cache
+discipline.
+
+**Shared-ladder unification is the next step**
+(`scratch_docs_and_planning/fetch_ladder_unification_plan_2026-09-09.md`, `f120e23`, `e0186e1`):
+one ladder for the resolution-source fetcher and this loop, with three operator decisions, each
+recommended yes. Share the loop's throttle-phrase check with the resolution fetcher, so a 200 that
+is a rate-limit interstitial becomes `throttled` instead of a JavaScript wall that buys a Chromium
+launch. Digest a long cited page against the question instead of head-first truncation at 6,000
+characters, which changes what every forecaster reads on a long cited page. Surface the Wayback
+capture date to the driver rather than applying the 30-day bound calibrated on cited grading
+sources.
 
 **Rollout: BOTH v1 and v2 run in prod during an overlap window** (independent flags
 `GAP_FILL_ENABLED` / `GAP_FILL_V2_ENABLED`, distinct headers); artifact diffs + resolution scoring
@@ -1221,13 +1330,29 @@ Three findings from the 2026-07-18 bundle content audit
 
 1. **Gap-fill v1 retirement risk: do NOT flip v1 off on the calendar alone.** v1 is the MOST
    load-bearing section per token (59% unique content; carried the decisive single-source fact in
-   the majority of sampled questions). The ~$190/quarter retirement savings holds only if quality
-   is preserved. **Gate:** compare v1 vs v2 findings on the first ~20 prod questions where both are
-   present; flip only if v2 consistently surfaces the same decisive facts. **Status 2026-08-25: gate
-   NOT met, and the cheap proxy came back uninformative.** The first scored ghost read is a null at
-   n=12 with 7 of those 12 ghosts byte-identical to the driver's pre-research dry run (see the ghost
-   entry under Low-priority), so it says nothing about whether v2's findings stand on their own. The
-   v1-vs-v2 findings comparison still has to be done by hand over the both-on cohort.
+   the majority of sampled questions). **Gate:** compare v1 vs v2 findings on the first ~20 prod
+   questions where both are present; flip only if v2 consistently surfaces the same decisive facts.
+   Status 2026-08-25: gate NOT met, and the cheap proxy (the first ghost read, a null at n=12) was
+   uninformative.
+
+   **Gate DISCHARGED 2026-09-09 by a blind comparison over 99 both-on bundles; verdict MIXED**
+   (`scratch/cost_pass_2026-09-09/v1_vs_v2/V1_VS_V2_GATE.md` and `TRACES_SYNTHESIS.md`). On the
+   gate's own wording it is NOT met: the forecaster lens reads v1 59 / v2 32 / tie 8 (sign test
+   p 0.006), and v2 fully surfaces v1's named decisive fact on 4 of 99 pairs. On the fact the
+   question turned on, the resolution lens reads 28 / 24 / 11 (p 0.68), and the two lenses agree
+   that a resolving fact was v1-only on 2 of 63 resolved questions and v2-only on 8. The passes
+   are complementary: v1 builds reference classes and historical series and is heaviest on
+   numeric, v2 reads the resolving instrument directly. v1's gaps are one third waste
+   (future-dated, or re-buying the first pass; about $0.21 of its $0.71) with paraphrase repeats
+   on one question in three, and a positional cap of 2 would drop the useful gap on 4 of 6 traced
+   questions, so any lean must be grade-based (structured analyzer fields, filter and dedupe in
+   code), not positional. v1 costs $0.76 a question, the largest single line (cost pass,
+   2026-09-09), so the "~$190/quarter" saving this item once carried is superseded. **The fall
+   decision, before the first fall question closes on 2026-09-28, is the operator's:** v1 leaned
+   (about $1.70 to $1.85 a question, above the $1.50 ceiling) or v1 off (about $1.37). Two v1
+   changes shipped alongside and are not the decision: the resolver now reads the resolution
+   criteria and fine print, and the resolver probe settled its model and context size (both in
+   the "Gap-fill v1 resolver" entry below).
 2. **AskNews reform: shipped 2026-07-18.** Audit: 44% of the bundle by tokens, 57% padding, AND
    stale/directionally-wrong in 5/10 sampled questions while smaller sections had the right answer.
    "Longer is better" nudge removed (`5cfb6cd`); quality audit
@@ -1251,6 +1376,24 @@ Three findings from the 2026-07-18 bundle content audit
    read as resolutions); do NOT remove. Live follow-ups on the ranked design are in the
    "Market-render follow-ups" entry (added 2026-08-24).
    (`scratch/residual_2026-08-24/dim_market-informativeness.md`.)
+
+### Gap-fill v1 resolver: criteria passthrough SHIPPED, model and context size probed (added 2026-09-09)
+
+The per-gap resolver (`research/targeted.py`) now receives the question's `resolution_criteria`
+and `fine_print` in its search prompt (`9c49378`). Receipt: q44267 (spot peer -95.66), where the
+resolver ruled "headline count" from a sister question's title while the analyzer, which saw the
+criteria, had posed the right gap. Do not price the fix at +100. Declined alongside, until a second
+instance appears: a base-prompt clause for the running-maximum atom.
+
+The resolver probe (`make probe_resolver QUESTION=<id>`, paid, personal key; receipts
+`scratch/probes/gap_fill_resolver_probe_*.md`) settled two cost questions.
+`NATIVE_SEARCH_CONTEXT_SIZE` is NOT a cost lever: medium against high priced at 1.02x and low
+against high at 0.96x, so the setting is inert on the OpenRouter native-search path.
+`gpt-5.6-luna` costs 0.21x of terra per resolver call but repeats the definitional error behind
+q44267 and fabricated a citation at medium effort, so the resolver stays on terra at low effort.
+One account fact for anyone reading the ledger: the personal OpenRouter account routes OpenAI
+through a BYOK key billed to the operator's OpenAI account (`is_byok=true` on 64 probe calls); the
+operator knows and is fine with it.
 
 ### Market-render follow-ups from the first ranked-era resolutions (added 2026-08-24; three of four SHIPPED 2026-08-25)
 
@@ -2217,8 +2360,8 @@ size and raises the required n. **There is no accrual path inside summer-futuree
 latest scored MC submission anywhere is 2026-08-15 and the tournament closes 2026-09-06, **but
 there is one now outside it.** Updated 2026-09-03: the fall Metaculus Cup is configured
 (`METACULUS_CUP_ID` = `metaculus-cup-fall-2026`, project 33108, forecasting through 2027-01-01) and
-its workflow runs hourly, so cup MC ballots start accruing once the operator enables that workflow
-on GitHub and the cup publishes its first questions (it held 0 as of 2026-09-03). Two caveats before
+its workflow runs hourly and was enabled on GitHub by 2026-09-09, so cup MC ballots accrue as the
+cup publishes questions (0 as of 2026-09-03; five cup questions were forecast on 2026-09-07). Two caveats before
 counting on it: cup questions are drawn for humans rather than for a bot benchmark, so the MC mix
 may differ from the tournament's, and no successor to `summer-futureeval-2026` existed on 2026-09-03,
 so the tournament side stays closed until one opens. Treat 22 more questions as reachable over the
@@ -2376,10 +2519,19 @@ them OUT of feature work, land as their own PRs.
   that anchor block twice, at the cost of one extra yfinance call (free, and the render is the
   actual cost). Skipped as a corner case; the fix is a dedupe in the job builder, natural to do
   when the peg table moves out to its own `currency_pegs.py` per the split above.
+- **Hoist `tests/test_cli.py`'s 17 redundant function-level imports (added 2026-09-09).** Each
+  carries a `HARNESS-SCAN-EXEMPT-function-level-import` marker, and the standing rule forbids
+  deleting a marker, so the hoist needs the operator's sign-off on the marker rule first; it rides
+  the file-split PR rather than the Mantic merge.
 
 ## Medium-term (requires more exploration)
 
-### Consider migrating scheduled runs off GitHub Actions cron (added 2026-07-19, MEDIUM)
+### Consider migrating scheduled runs off GitHub Actions cron (added 2026-07-19, MEDIUM; RESOLVED 2026-09-09)
+
+**RESOLVED 2026-09-09 by the cron-job.org dispatcher.** It calls GitHub's workflow-dispatch API
+twice an hour per bot workflow, and dispatch events are not subject to schedule dropping;
+`make dispatch_watch` is the free delivery read. Detail: `docs/operations.md` "Scheduling
+reliability". The history below is kept for the four loss mechanisms it names.
 
 The 2026-07-18 latency/completeness audit
 (`scratch/residual_2026-07-18/followups/latency_completeness.md`) traced ~80% of the
@@ -2936,11 +3088,11 @@ the exact Q14333/Q578 prompts via a cheap manual call to see whether the empty c
 reproduce and isolate the content trigger), or provider behavior changes. Reconsider both roles
 together.
 
-### Score the archived gap-fill v2 ghost forecasts: harness DONE, first read is a null (added 2026-07-18; demoted from HIGH 2026-08-25)
+### Score the archived gap-fill v2 ghost forecasts: harness DONE, instrument corrected 2026-09-09 (added 2026-07-18; demoted from HIGH 2026-08-25)
 
 **Demoted 2026-08-25:** the harness shipped and the first scored read is in, so there is no
-buildable work left here; the next read rides the September checkpoint as scope item 4 of the
-triple-era entry (free, `make score_ghosts`). The one remaining lever is a paid prompt change.
+buildable work left here; the September read landed 2026-09-09 (below, with the instrument
+correction). The one remaining lever is a paid prompt change.
 
 **What shipped.** The v2 loop privately dry-runs a forecast per question and archives it
 (`archive_sink=_capture_gap_fill_v2`, `research/orchestrator.py`). The payload carries the full
@@ -2951,12 +3103,21 @@ numerics through the existing CDF machinery, with a regex fallback for the pre-u
 (the legacy `GHOST_FORECAST` marker exposed only a numeric median, so numeric ghosts were countable
 but not scoreable).
 
-**Interpretation guardrail (still load-bearing).** The ghost is a same-model (terra-low driver)
-counterfactual, NOT a panel proxy: it measures whether the v2 findings alone, forecast by one cheap
-model, land near truth, not whether v2 would improve the ensemble. Its decision relevance is to the
-gap-fill-v1-retirement call (gate in the "Bundle content-audit findings" entry): v1 carries the
-decisive single-source fact in most sampled questions, so a ghost score is the cheapest read on
-whether v2 findings stand on their own before v1 goes off.
+**Interpretation guardrail (still applies, corrected 2026-09-09).** The ghost is a same-model
+(terra-low driver) counterfactual, NOT a panel proxy: it measures whether the bundle plus the v2
+findings, forecast by one cheap model, land near truth, not whether v2 would improve the ensemble.
+Its decision relevance was to the gap-fill-v1-retirement call (gate in the "Bundle content-audit
+findings" entry), which was discharged 2026-09-09 by a direct v1-versus-v2 comparison rather than
+by this instrument.
+
+**Instrument correction, 2026-09-09.** The ghost-versus-published delta (`loop_moved` -3.82 at
+n=36) is NOT a v2 treatment effect, because both arms carry v2's findings: the published forecast
+read the same findings the ghost did. The read that isolates the loop is the same driver before
+and after its research: **+7.18 log points on the 36 pairs the loop moved, [+1.26, +13.99], and
++4.38 over all 59**. The v1 ghost (`0cf14f6`, marker `GHOST_FORECAST_V1`: the driver's ghost
+re-asked with gap-fill v1's section) measures v1's marginal value the same way, and
+`scripts/score_ghosts.py` prints both reads. Detail: `docs/agentic_gap_fill.md` "The v1 ghost" and
+"Scoring the ghosts"; receipt `scratch/cost_pass_2026-09-09/COST_PASS.md` §3.
 
 **First scored read, 2026-08-24** (`scratch/residual_2026-08-24/dim_ghosts.md`). 94 archived
 ghosts, 12 joined to resolutions, 12 scored: pooled ghost-minus-published delta **+7.02** (median
@@ -2979,7 +3140,7 @@ change, so paid validation, operator's call.
 
 The gap-fill v2 plan (near-term entry; `scratch_docs_and_planning/agentic_gap_fill_v2_plan.md`) IS this:
 a bounded tool-loop second pass, ON in prod (`GAP_FILL_V2_ENABLED: 'true'`). The old cost blocker is
-resolved by budget caps (~$0.50/q) + early-stop; selective activation via the template dry-run. Direction
+resolved by budget caps + early-stop (measured at $0.36 a question by the 2026-09-09 cost pass); selective activation via the template dry-run. Direction
 confirmed by the 2026-07-16 lit survey: keep it a **shared** stage (one loop → detached artifact all
 forecasters read), NOT per-forecaster integrated pipelines (BTF-2 arXiv 2604.26106: strong prompt on
 shared research edged the best integrated agent; integrated benefit was Opus-class-only). Watch
@@ -3276,7 +3437,8 @@ HTTP proxy on the operator's EC2 box, or a self-hosted runner). Operator 2026-09
 too complicated" for that half; it stays parked here, and the Wayback and url_context rungs
 cover it in the meantime. The same runner-side cause is consistent with GitHub cron gaps
 (q45092 forfeited 2026-09-01: the 00:05Z fire saw 0 questions and the next fire was 04:55Z,
-past a 2.8-hour window).
+past a 2.8-hour window); the cron half is covered since 2026-09-09 by the cron-job.org dispatcher
+(`docs/operations.md` "Scheduling reliability").
 
 ### A 200 challenge or throttle interstitial as a Tier-1 impersonation trigger (added 2026-09-04; LOW)
 
