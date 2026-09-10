@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from forecasting_tools import PredictedOptionList
 
+from metaculus_bot.ablation import run_stacker as run_stacker_module
 from metaculus_bot.ablation.cache import AblationCache, model_slug_to_filename
 from metaculus_bot.ablation.run_stacker import ARM_STACK, run_stacker_for_arm
 from tests.ablation_stacker_fakes import (
@@ -147,18 +148,18 @@ class TestPrimaryFallbackChain:
 
 # ===========================================================================
 # C1 — Soft deadlines on stacker calls
-#
-# Production wraps each stacker dispatch in
-# ``asyncio.wait_for(... , timeout=STACKER_SOFT_DEADLINE)`` (main.py:1243,
-# 1271). Without that wrapper, a stuck stacker can hold a question for the
-# entire litellm timeout(480) when allowed_tries=1, and once concurrent
-# stacker calls share the global window-patch lock, every other question
-# waits behind the stalled one. The soft deadline bounds each call and
-# lets the primary→fallback chain make progress.
 # ===========================================================================
 
 
 class TestSoftDeadline:
+    """Each stacker dispatch is bounded, mirroring production at main.py:1243 and 1271.
+
+    Unbounded, a stuck stacker holds its question for the whole litellm timeout of 480s at
+    ``allowed_tries=1``, and because concurrent stacker calls share the global window-patch
+    lock, every other question queues behind the stalled one instead of progressing down the
+    primary-to-fallback chain.
+    """
+
     def test_primary_stacker_timeout_falls_back_to_fallback_llm(
         self,
         cache: AblationCache,
@@ -173,10 +174,6 @@ class TestSoftDeadline:
         timeout, fall back to the fallback LLM, succeed, and record the
         timeout in the payload's ``errors``.
         """
-        from metaculus_bot.ablation import (
-            run_stacker as run_stacker_module,  # HARNESS-SCAN-EXEMPT-function-level-import
-        )
-
         monkeypatch.setattr(run_stacker_module, "STACKER_SOFT_DEADLINE", 1)
 
         async def _slow_or_fast(*args: Any, **_kwargs: Any) -> tuple[float, str]:
@@ -234,10 +231,6 @@ class TestSoftDeadline:
         """When BOTH primary and fallback stall past their deadlines, the
         median fallback (M3) takes over — but errors record both timeouts.
         """
-        from metaculus_bot.ablation import (
-            run_stacker as run_stacker_module,  # HARNESS-SCAN-EXEMPT-function-level-import
-        )
-
         monkeypatch.setattr(run_stacker_module, "STACKER_SOFT_DEADLINE", 1)
         monkeypatch.setattr(run_stacker_module, "STACKER_FALLBACK_SOFT_DEADLINE", 1)
 
@@ -280,14 +273,6 @@ class TestSoftDeadline:
 
 # ===========================================================================
 # M3 — Tertiary MEDIAN fallback when both stackers fail
-#
-# Production at main.py:1287-1323 has a final MEDIAN aggregation when both
-# the primary and fallback stackers raise. The ablation previously just
-# recorded success=False and lost the question for both arms. With this
-# fix, a both-stackers-fail outcome yields a degraded-but-publishable
-# MEDIAN forecast tagged stacker_model_used="median_fallback" so the
-# confounder analysis can distinguish it from the regular primary/fallback
-# outcomes.
 # ===========================================================================
 
 
@@ -357,6 +342,13 @@ class TestNoStackerFallback:
 
 
 class TestMedianFallback:
+    """Both stackers failing yields a degraded MEDIAN forecast, mirroring production at main.py:1287-1323.
+
+    The ablation used to record ``success=False`` and lose the question for both arms. The
+    ``stacker_model_used="median_fallback"`` tag is what lets confounder analysis separate these
+    from the regular primary and fallback outcomes.
+    """
+
     def test_both_stackers_fail_falls_back_to_median_binary(
         self,
         cache: AblationCache,
