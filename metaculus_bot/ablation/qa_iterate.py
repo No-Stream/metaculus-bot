@@ -469,57 +469,50 @@ async def run_qa_iterate_batch(
     ``run_prune_for_qids``. Without them the whole stage was pinned to the
     ``claude_cli`` defaults and ``_invoke_verifier``'s own parameters were
     dead outside the test suite.
+
+    Each qid is its own failure boundary: one that raises is logged at ERROR with
+    its traceback and conservatively dropped, landing in ``manual_rejects.json``
+    with a ``qa_iterate_failed:`` reason the operator can re-evaluate, while the
+    rest of the batch still completes.
     """
     semaphore = asyncio.Semaphore(concurrency)
 
-    async def _one(qid: int, payload: dict[str, Any]) -> tuple[int, IterateOutcome]:
+    async def _one(qid: int, payload: dict[str, Any]) -> IterateOutcome:
         async with semaphore:
-            try:
-                outcome = await run_qa_iterate_for_qid(
-                    qid=qid,
-                    question=payload["question"],
-                    ground_truth=payload["ground_truth"],
-                    current_blob=payload["current_blob"],
-                    screen_verdict=payload["screen_verdict"],
-                    cache=cache,
-                    max_iterations=max_iterations,
-                    leakage_threshold=leakage_threshold,
-                    forecastability_threshold=forecastability_threshold,
-                    claude_executable=claude_executable,
-                    timeout_seconds=timeout_seconds,
-                )
-            except (KeyboardInterrupt, SystemExit, MemoryError, asyncio.CancelledError):
-                # System-level resource exhaustion / operator interrupts /
-                # cancellation are NOT per-qid failures. Let them propagate so
-                # the run halts visibly instead of trickle-rejecting every
-                # subsequent qid with the same root cause.
-                raise
-            except Exception as exc:
-                # Conservative-drop on any per-qid failure (subprocess, timeout,
-                # JSON parse). Mirrors forecasters._run_one's posture: a single
-                # qid's failure must not cancel the rest of the batch via
-                # asyncio.gather. The qid lands in manual_rejects.json with a
-                # `qa_iterate_failed:` reason so the operator can re-evaluate.
-                logger.warning(
-                    "qa_iterate | qid=%d failed entirely | %s: %s",
-                    qid,
-                    type(exc).__name__,
-                    exc,
-                    exc_info=True,
-                )
-                outcome = IterateOutcome(
-                    qid=qid,
-                    final_status="rejected_leakage",
-                    iterations=0,
-                    final_blob_path=None,
-                    verifier_scores=[],
-                    reject_reason=f"qa_iterate_failed: {type(exc).__name__}",
-                )
-        return qid, outcome
+            return await run_qa_iterate_for_qid(
+                qid=qid,
+                question=payload["question"],
+                ground_truth=payload["ground_truth"],
+                current_blob=payload["current_blob"],
+                screen_verdict=payload["screen_verdict"],
+                cache=cache,
+                max_iterations=max_iterations,
+                leakage_threshold=leakage_threshold,
+                forecastability_threshold=forecastability_threshold,
+                claude_executable=claude_executable,
+                timeout_seconds=timeout_seconds,
+            )
 
     tasks = [_one(qid, payload) for qid, payload in inputs.items()]
-    results = await asyncio.gather(*tasks)
-    return dict(results)
+    outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+    results: dict[int, IterateOutcome] = {}
+    for qid, outcome in zip(inputs, outcomes, strict=True):
+        if isinstance(outcome, BaseException):
+            # Cancellation, an operator interrupt and exhausted memory would trickle-reject every remaining qid.
+            if not isinstance(outcome, Exception) or isinstance(outcome, MemoryError):
+                raise outcome
+            logger.error("qa_iterate | qid=%d failed entirely", qid, exc_info=outcome)
+            results[qid] = IterateOutcome(
+                qid=qid,
+                final_status="rejected_leakage",
+                iterations=0,
+                final_blob_path=None,
+                verifier_scores=[],
+                reject_reason=f"qa_iterate_failed: {type(outcome).__name__}",
+            )
+        else:
+            results[qid] = outcome
+    return results
 
 
 # ---------------------------------------------------------------------------

@@ -729,10 +729,10 @@ async def test_run_qa_iterate_batch_isolates_per_qid_subprocess_failure(
 ) -> None:
     """A subprocess failure for one qid must NOT cancel other qids in the batch.
 
-    Prior to C1, ``asyncio.gather(*tasks)`` cancelled every in-flight task on
-    a single failure. Wrap ``_one`` in try/except that converts subprocess
-    failures into auto-rejected ``IterateOutcome`` (status=rejected_leakage,
-    reason=qa_iterate_failed: <ExceptionType>).
+    ``asyncio.gather`` with ``return_exceptions=True`` keeps the siblings running and the
+    loop over its outcomes converts the failure into an auto-rejected ``IterateOutcome``
+    (status=rejected_leakage, reason=qa_iterate_failed: <ExceptionType>) plus one ERROR
+    record carrying the traceback.
     """
     import logging
     import subprocess
@@ -777,7 +777,7 @@ async def test_run_qa_iterate_batch_isolates_per_qid_subprocess_failure(
     monkeypatch.setattr("metaculus_bot.ablation.qa_iterate._invoke_verifier", failing_verifier)
     monkeypatch.setattr("metaculus_bot.ablation.qa_iterate._invoke_re_redactor", AsyncMock())
 
-    with caplog.at_level(logging.WARNING, logger="metaculus_bot.ablation.qa_iterate"):
+    with caplog.at_level(logging.ERROR, logger="metaculus_bot.ablation.qa_iterate"):
         outcomes = await qa_iterate.run_qa_iterate_batch(
             inputs,
             cache=cache,
@@ -794,8 +794,10 @@ async def test_run_qa_iterate_batch_isolates_per_qid_subprocess_failure(
     assert failed.reject_reason.startswith("qa_iterate_failed:")
     assert "CalledProcessError" in failed.reject_reason
 
-    warning_records = [r for r in caplog.records if r.levelno == logging.WARNING and "qid=31" in r.getMessage()]
-    assert warning_records, "expected a WARNING log for the failed qid"
+    error_records = [r for r in caplog.records if r.levelno == logging.ERROR and "qid=31" in r.getMessage()]
+    assert error_records, "expected an ERROR log for the failed qid"
+    assert error_records[0].exc_info is not None
+    assert isinstance(error_records[0].exc_info[1], subprocess.CalledProcessError)
 
 
 # ---------------------------------------------------------------------------
@@ -1134,12 +1136,50 @@ async def test_run_qa_iterate_batch_propagates_memory_error(
 
 
 @pytest.mark.asyncio
-async def test_run_qa_iterate_batch_still_catches_value_error_per_qid(
+async def test_run_qa_iterate_batch_propagates_cancellation(
     cache: AblationCache,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Application-level ValueError still gets caught and recorded as
-    qa_iterate_failed for that qid (regression guard for MAJ-3 carve-out).
+    """A cancelled child is not an ordinary per-qid failure: it must not become qa_iterate_failed."""
+    import asyncio
+
+    from metaculus_bot.ablation import qa_iterate
+
+    qid = 8889
+    inputs: dict[int, dict[str, Any]] = {
+        qid: {
+            "question": _make_question(qid),
+            "ground_truth": _make_ground_truth(qid),
+            "current_blob": "blob",
+            "screen_verdict": _make_screen_verdict(is_leaked=False),
+        }
+    }
+
+    async def raise_cancelled(**_kwargs: Any) -> Any:
+        await asyncio.sleep(0)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(qa_iterate, "run_qa_iterate_for_qid", raise_cancelled)
+
+    with pytest.raises(asyncio.CancelledError):
+        await qa_iterate.run_qa_iterate_batch(inputs, cache=cache, max_iterations=3)
+
+
+@pytest.mark.parametrize(
+    "raised",
+    [ValueError("verifier returned malformed JSON"), KeyError("payload bug")],
+    ids=["expected_parse_failure", "unexpected_bug"],
+)
+@pytest.mark.asyncio
+async def test_run_qa_iterate_batch_still_catches_ordinary_exceptions_per_qid(
+    cache: AblationCache,
+    monkeypatch: pytest.MonkeyPatch,
+    raised: Exception,
+) -> None:
+    """Every ordinary exception is recorded as qa_iterate_failed for that qid, bug classes included.
+
+    The batch is the failure boundary here, so a bug surfaces as an ERROR record with its
+    traceback rather than costing the rest of a paid run (regression guard for the MAJ-3 carve-out).
     """
     from metaculus_bot.ablation import qa_iterate
 
@@ -1155,15 +1195,15 @@ async def test_run_qa_iterate_batch_still_catches_value_error_per_qid(
 
     import asyncio
 
-    async def raise_value_error(**_kwargs: Any) -> Any:
+    async def raise_it(**_kwargs: Any) -> Any:
         await asyncio.sleep(0)
-        raise ValueError("verifier returned malformed JSON")
+        raise raised
 
-    monkeypatch.setattr(qa_iterate, "run_qa_iterate_for_qid", raise_value_error)
+    monkeypatch.setattr(qa_iterate, "run_qa_iterate_for_qid", raise_it)
 
     outcomes = await qa_iterate.run_qa_iterate_batch(inputs, cache=cache, max_iterations=3)
     assert outcomes[qid].final_status == "rejected_leakage"
-    assert outcomes[qid].reject_reason == "qa_iterate_failed: ValueError"
+    assert outcomes[qid].reject_reason == f"qa_iterate_failed: {type(raised).__name__}"
 
 
 # ---------------------------------------------------------------------------
