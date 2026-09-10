@@ -1,12 +1,16 @@
 """Tests for the Gemini-only ablation research module.
 
-These tests mock both ``gemini_search_provider`` (callable) and ``run_gap_fill_pass``.
+These tests mock ``gemini_search_provider`` (callable) and, except where a test drives the
+real ``run_gap_fill_pass`` to prove its soft-fail contract, ``run_gap_fill_pass`` itself.
 No live API calls. The module under test is ``metaculus_bot.ablation.research``.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
+from contextlib import contextmanager
 from datetime import datetime
 from types import SimpleNamespace
 from typing import cast
@@ -15,11 +19,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from forecasting_tools import MetaculusQuestion
 
+from metaculus_bot import constants
 from metaculus_bot.ablation.cache import AblationCache
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+from metaculus_bot.ablation.research import run_gemini_only_research, run_gemini_research_for_qids
+from metaculus_bot.research import targeted
 
 
 def _make_question(
@@ -78,19 +81,12 @@ def _install_mocks(
     return gemini_callable, gap_fill, factory
 
 
-# ---------------------------------------------------------------------------
-# run_gemini_only_research — cache behavior
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_cache_hit_short_circuits_gemini(
     cache: AblationCache,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Pre-populated cache → no API calls."""
-    from metaculus_bot.ablation.research import run_gemini_only_research
-
     question = _make_question(qid=42)
     cache.write_research(qid=42, blob="cached blob", meta={"gemini_search_used": True})
 
@@ -114,8 +110,6 @@ async def test_cache_hit_returns_cached_values(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Cached blob and meta dict are returned exactly as stored."""
-    from metaculus_bot.ablation.research import run_gemini_only_research
-
     question = _make_question(qid=99)
     original_meta = {
         "gemini_search_used": True,
@@ -145,8 +139,6 @@ async def test_force_true_bypasses_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """force=True ignores existing cache and re-fetches both APIs."""
-    from metaculus_bot.ablation.research import run_gemini_only_research
-
     question = _make_question(qid=7)
     cache.write_research(qid=7, blob="OLD", meta={"first_pass_chars": 0})
 
@@ -171,19 +163,12 @@ async def test_force_true_bypasses_cache(
     assert fresh_first_pass in new_blob
 
 
-# ---------------------------------------------------------------------------
-# run_gemini_only_research — happy path
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_cache_miss_invokes_both_apis(
     cache: AblationCache,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Fresh question → factory + callable + run_gap_fill_pass each called once."""
-    from metaculus_bot.ablation.research import run_gemini_only_research
-
     question = _make_question(qid=1)
     long_first_pass = "first-pass research blob " * 20  # well above 200 chars
     gemini_callable, gap_fill, factory = _install_mocks(
@@ -205,8 +190,6 @@ async def test_concatenated_blob_matches_production_format(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Concatenation matches main.run_research's exact separator + header."""
-    from metaculus_bot.ablation.research import run_gemini_only_research
-
     question = _make_question(qid=2)
     first_pass = "first pass result " * 20  # > 200 chars
     gap_addendum = "Gap fill text"
@@ -225,8 +208,6 @@ async def test_gap_fill_skipped_when_first_pass_too_short(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """First-pass < GAP_FILL_MIN_RESEARCH_CHARS → gap-fill not called; meta marks gap_fill_used=False."""
-    from metaculus_bot.ablation.research import run_gemini_only_research
-
     question = _make_question(qid=3)
     short_first_pass = "tiny"  # 4 chars, well below 200
     _gemini_callable, gap_fill, _factory = _install_mocks(
@@ -244,20 +225,22 @@ async def test_gap_fill_skipped_when_first_pass_too_short(
 
 
 @pytest.mark.asyncio
-async def test_gap_fill_failure_caches_first_pass_alone(
+async def test_gap_fill_provider_failure_caches_first_pass_alone(
     cache: AblationCache,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Gap-fill raising → first-pass blob still cached; function returns successfully."""
-    from metaculus_bot.ablation.research import run_gemini_only_research
+    """The analyzer's wall timeout, absorbed by the REAL ``run_gap_fill_pass``, leaves the first pass cached alone.
 
+    ``run_gap_fill_pass`` is deliberately not mocked here: the soft-fail lives in it, so this
+    drives it end to end with only its analyzer stubbed to fail the way a slow provider does.
+    """
     question = _make_question(qid=4)
     long_first_pass = "first-pass result " * 20
-    _install_mocks(
-        monkeypatch,
-        gemini_blob=long_first_pass,
-        gap_blob=RuntimeError("gap-fill exploded"),
+    monkeypatch.setattr(
+        "metaculus_bot.ablation.research.gemini_search_provider",
+        MagicMock(return_value=AsyncMock(return_value=long_first_pass)),
     )
+    monkeypatch.setattr("metaculus_bot.research.targeted._run_analyzer", AsyncMock(side_effect=TimeoutError()))
 
     blob, meta = await run_gemini_only_research(question, cache)
 
@@ -271,9 +254,23 @@ async def test_gap_fill_failure_caches_first_pass_alone(
     assert cached_blob == long_first_pass
 
 
-# ---------------------------------------------------------------------------
-# run_gemini_only_research — failure semantics
-# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_gap_fill_bug_propagates_and_caches_nothing(
+    cache: AblationCache,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exception ``run_gap_fill_pass`` lets out is a bug: it propagates and the qid is not cached."""
+    question = _make_question(qid=14)
+    _install_mocks(
+        monkeypatch,
+        gemini_blob="first-pass result " * 20,
+        gap_blob=KeyError("gap"),
+    )
+
+    with pytest.raises(KeyError, match="gap"):
+        await run_gemini_only_research(question, cache)
+
+    assert cache.read_research(qid=14) is None
 
 
 @pytest.mark.asyncio
@@ -282,8 +279,6 @@ async def test_primary_gemini_failure_reraises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Gemini callable raises → re-raised; cache is not written."""
-    from metaculus_bot.ablation.research import run_gemini_only_research
-
     question = _make_question(qid=5)
     _install_mocks(
         monkeypatch,
@@ -297,11 +292,6 @@ async def test_primary_gemini_failure_reraises(
     assert cache.read_research(qid=5) is None
 
 
-# ---------------------------------------------------------------------------
-# run_gemini_only_research — patches & threading
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_gap_fill_max_gaps_monkey_patched(
     cache: AblationCache,
@@ -310,10 +300,6 @@ async def test_gap_fill_max_gaps_monkey_patched(
     """gap_fill_max_gaps overrides constants.GAP_FILL_MAX_GAPS in BOTH modules during the call,
     and restores both after the call returns.
     """
-    from metaculus_bot import constants
-    from metaculus_bot.ablation.research import run_gemini_only_research
-    from metaculus_bot.research import targeted
-
     question = _make_question(qid=6)
     long_first_pass = "first pass " * 30
 
@@ -353,11 +339,7 @@ async def test_gap_fill_max_gaps_restored_on_exception(
     cache: AblationCache,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Even if gap-fill raises, the GAP_FILL_MAX_GAPS patch is reverted (try/finally)."""
-    from metaculus_bot import constants
-    from metaculus_bot.ablation.research import run_gemini_only_research
-    from metaculus_bot.research import targeted
-
+    """Even when gap-fill raises and the bug propagates, the GAP_FILL_MAX_GAPS patch is reverted (try/finally)."""
     question = _make_question(qid=8)
     long_first_pass = "first pass " * 30
 
@@ -373,8 +355,8 @@ async def test_gap_fill_max_gaps_restored_on_exception(
     original_constants = constants.GAP_FILL_MAX_GAPS
     original_tr = targeted.GAP_FILL_MAX_GAPS
 
-    # Gap-fill failure is absorbed (matches production soft-fail), so this returns normally.
-    await run_gemini_only_research(question, cache, gap_fill_max_gaps=2)
+    with pytest.raises(RuntimeError, match="kaboom"):
+        await run_gemini_only_research(question, cache, gap_fill_max_gaps=2)
 
     assert original_constants == constants.GAP_FILL_MAX_GAPS
     assert original_tr == targeted.GAP_FILL_MAX_GAPS
@@ -386,14 +368,10 @@ async def test_gap_fill_year_patched_during_gap_fill(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """patched_gap_fill_year_for_question is active when run_gap_fill_pass is called."""
-    from metaculus_bot.ablation.research import run_gemini_only_research
-
     question = _make_question(qid=9)
     long_first_pass = "first pass " * 30
 
     entered = {"flag": False}
-
-    from contextlib import contextmanager
 
     @contextmanager
     def fake_patcher(q: MetaculusQuestion):  # type: ignore[no-untyped-def]
@@ -429,8 +407,6 @@ async def test_is_benchmarking_threaded_to_gemini(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """is_benchmarking=True passes through to gemini_search_provider factory and run_gap_fill_pass."""
-    from metaculus_bot.ablation.research import run_gemini_only_research
-
     question = _make_question(qid=10)
     long_first_pass = "first pass " * 30
 
@@ -449,19 +425,12 @@ async def test_is_benchmarking_threaded_to_gemini(
     assert gap_fill.call_args.kwargs.get("is_benchmarking") is True
 
 
-# ---------------------------------------------------------------------------
-# Meta payload
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_meta_fields_populated(
     cache: AblationCache,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Every documented meta key is present in the returned dict."""
-    from metaculus_bot.ablation.research import run_gemini_only_research
-
     question = _make_question(qid=11)
     long_first_pass = "first pass content " * 30
     gap_blob = "gap addendum text"
@@ -492,19 +461,12 @@ async def test_meta_fields_populated(
     datetime.fromisoformat(meta["researched_at"])
 
 
-# ---------------------------------------------------------------------------
-# run_gemini_research_for_qids — batch wrapper
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_batch_wrapper_runs_concurrently_under_semaphore(
     cache: AblationCache,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """concurrency=2 over 4 questions caps in-flight calls at 2 simultaneously."""
-    from metaculus_bot.ablation.research import run_gemini_research_for_qids
-
     questions = [_make_question(qid=100 + i) for i in range(4)]
     long_first_pass = "first pass " * 30
 
@@ -549,8 +511,6 @@ async def test_batch_wrapper_per_question_failure_does_not_kill_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Q1 raises in primary Gemini → results[Q1.id] is None; Q2 still succeeds."""
-    from metaculus_bot.ablation.research import run_gemini_research_for_qids
-
     q1 = _make_question(qid=201)
     q2 = _make_question(qid=202)
     long_first_pass = "first pass " * 30
@@ -580,13 +540,52 @@ async def test_batch_wrapper_per_question_failure_does_not_kill_batch(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [TimeoutError("gemini wall"), KeyError("meta")], ids=["provider", "bug"])
+async def test_batch_wrapper_logs_the_failed_question_with_its_traceback(
+    cache: AblationCache,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure: Exception,
+) -> None:
+    """Whatever one question raises, the batch logs it at ERROR with the traceback, caches nothing for it and goes on."""
+    failing = _make_question(qid=211)
+    healthy = _make_question(qid=212)
+    long_first_pass = "first pass " * 30
+
+    async def selective_callable(q: MetaculusQuestion) -> str:
+        await asyncio.sleep(0)
+        if q.id_of_question == 211:
+            raise failure
+        return long_first_pass
+
+    monkeypatch.setattr(
+        "metaculus_bot.ablation.research.gemini_search_provider",
+        MagicMock(return_value=selective_callable),
+    )
+    monkeypatch.setattr(
+        "metaculus_bot.ablation.research.run_gap_fill_pass",
+        AsyncMock(return_value="addendum"),
+    )
+
+    with caplog.at_level(logging.ERROR, logger="metaculus_bot.ablation.research"):
+        results = await run_gemini_research_for_qids([failing, healthy], cache, concurrency=2)
+
+    assert results[211] is None
+    assert results[212] is not None
+    assert cache.read_research(qid=211) is None
+    assert cache.read_research(qid=212) is not None
+    failure_records = [r for r in caplog.records if r.levelno == logging.ERROR and "qid 211" in r.getMessage()]
+    assert len(failure_records) == 1
+    assert failure_records[0].exc_info is not None
+    assert failure_records[0].exc_info[1] is failure
+
+
+@pytest.mark.asyncio
 async def test_batch_wrapper_caches_each_qid_separately(
     cache: AblationCache,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """After a batch run, each successful qid has its own cache entry."""
-    from metaculus_bot.ablation.research import run_gemini_research_for_qids
-
     questions = [_make_question(qid=300 + i) for i in range(3)]
     long_first_pass = "first pass " * 30
 
@@ -614,11 +613,6 @@ async def test_batch_wrapper_caches_each_qid_separately(
         assert f"-{q.id_of_question}" in cached_blob
 
 
-# ---------------------------------------------------------------------------
-# gemini_model parameter (CLI flag → env var override during call)
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_run_gemini_only_research_sets_gemini_search_model_env_during_call(
     cache: AblationCache,
@@ -629,10 +623,6 @@ async def test_run_gemini_only_research_sets_gemini_search_model_env_during_call
     After the call returns, the env var is restored to whatever it was beforehand.
     The CLI flag is canonical — it must override any pre-existing shell setting.
     """
-    import os
-
-    from metaculus_bot.ablation.research import run_gemini_only_research
-
     question = _make_question(qid=1500)
     long_first_pass = "first pass " * 30
 
@@ -668,8 +658,6 @@ async def test_run_gemini_only_research_records_actual_model_in_meta(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Meta payload's ``gemini_model`` reflects the model actually requested."""
-    from metaculus_bot.ablation.research import run_gemini_only_research
-
     question = _make_question(qid=1501)
     long_first_pass = "first pass " * 30
     _install_mocks(monkeypatch, gemini_blob=long_first_pass, gap_blob="addendum")
@@ -677,11 +665,6 @@ async def test_run_gemini_only_research_records_actual_model_in_meta(
     _, meta = await run_gemini_only_research(question, cache, gemini_model="gemini-2.5-flash")
 
     assert meta["gemini_model"] == "gemini-2.5-flash"
-
-
-# ---------------------------------------------------------------------------
-# enable_gap_fill parameter (gates gap-fill stage entirely)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -693,8 +676,6 @@ async def test_run_gemini_only_research_skips_gap_fill_when_disabled(
 
     Meta payload must record ``gap_fill_enabled=False`` and ``gap_fill_used=False``.
     """
-    from metaculus_bot.ablation.research import run_gemini_only_research
-
     question = _make_question(qid=1600)
     long_first_pass = "first pass " * 30  # > 200 chars
     _gemini_callable, gap_fill, _factory = _install_mocks(
@@ -717,8 +698,6 @@ async def test_run_gemini_only_research_runs_gap_fill_when_enabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``enable_gap_fill=True`` goes through the existing gap-fill path."""
-    from metaculus_bot.ablation.research import run_gemini_only_research
-
     question = _make_question(qid=1601)
     long_first_pass = "first pass " * 30
     _, gap_fill, _ = _install_mocks(
@@ -734,11 +713,6 @@ async def test_run_gemini_only_research_runs_gap_fill_when_enabled(
     assert meta["gap_fill_used"] is True
 
 
-# ---------------------------------------------------------------------------
-# Batch wrapper threads new kwargs through
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_batch_wrapper_threads_gemini_model_and_gap_fill_flags(
     cache: AblationCache,
@@ -747,8 +721,6 @@ async def test_batch_wrapper_threads_gemini_model_and_gap_fill_flags(
     """``run_gemini_research_for_qids`` accepts ``gemini_model`` + ``enable_gap_fill``
     and threads them into each per-question call.
     """
-    from metaculus_bot.ablation.research import run_gemini_research_for_qids
-
     questions = [_make_question(qid=1700 + i) for i in range(2)]
     long_first_pass = "first pass " * 30
 
