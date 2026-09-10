@@ -220,9 +220,9 @@ async def _resolve_single_gap(
     Migrated 2026-06-25 off direct-Google grounded Gemini (google-genai, personal
     GOOGLE_API_KEY) to native search on the Metaculus-donated key — this is the
     dominant cost-saving change since the resolver fans out up to GAP_FILL_MAX_GAPS
-    calls per question. Runs gpt-5.6-sol at low effort (same LOW as the main
-    native_search provider): the workers run in parallel, so latency is the
-    slowest call, not the sum.
+    calls per question. Runs GAP_FILL_RESOLVER_MODEL at GAP_FILL_RESOLVER_REASONING_EFFORT
+    (the same low as the main native_search provider): the workers run in parallel, so
+    latency is the slowest call, not the sum.
 
     Raises on SDK/OpenRouter errors — the caller uses ``asyncio.gather(..., return_exceptions=True)``
     so one failure doesn't kill the rest.
@@ -253,10 +253,10 @@ async def run_gap_fill_pass(
     """Identify and resolve factual gaps in first-pass research.
 
     Two-stage flow:
-    1. Analyzer call (gpt-5.6-terra effort=low via OpenRouter, no grounding) →
+    1. Analyzer call (GAP_FILL_ANALYZER_MODEL at low effort via OpenRouter, no grounding) →
        JSON list of up to ``GAP_FILL_MAX_GAPS`` gaps.
-    2. Parallel OpenAI native web searches (gpt-5.6-sol low effort via
-       OpenRouter), one per gap, via ``asyncio.gather``.
+    2. Parallel OpenAI native web searches (GAP_FILL_RESOLVER_MODEL at
+       GAP_FILL_RESOLVER_REASONING_EFFORT via OpenRouter), one per gap, via ``asyncio.gather``.
 
     Never raises. Returns "" on any upstream failure (missing API key, timeout,
     SDK error, network error), logging type + message. This is a deliberate
