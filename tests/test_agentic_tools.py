@@ -4129,15 +4129,30 @@ class TestGapFillV2WaybackRung:
     @pytest.mark.parametrize(
         ("result", "applies"),
         [
-            (_blocked.__func__("https://x/y", 403), True),
-            (_blocked.__func__("https://x/y", 429), True),
+            (
+                fetch_outcomes.PlainFetchResult(
+                    status="blocked", method="plain", text="b", links=[], url="https://x/y", http_status=403
+                ),
+                True,
+            ),
+            (
+                fetch_outcomes.PlainFetchResult(
+                    status="blocked", method="plain", text="b", links=[], url="https://x/y", http_status=429
+                ),
+                True,
+            ),
             (
                 fetch_outcomes.PlainFetchResult(
                     status="error", method="plain", text="Fetch error", links=[], url="https://x/y"
                 ),
                 True,
             ),
-            (_blocked.__func__("https://x/y", None), False),
+            (
+                fetch_outcomes.PlainFetchResult(
+                    status="blocked", method="plain", text="b", links=[], url="https://x/y", http_status=None
+                ),
+                False,
+            ),
             (
                 fetch_outcomes.PlainFetchResult(status="ok", method="plain", text="page", links=[], url="https://x/y"),
                 False,
