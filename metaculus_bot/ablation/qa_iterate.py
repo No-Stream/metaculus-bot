@@ -61,11 +61,7 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_ITERATIONS = 3
 DEFAULT_LEAKAGE_THRESHOLD = 0.3
-# Score values BELOW (strict less-than) DEFAULT_FORECASTABILITY_THRESHOLD
-# reject as low_forecastability; values AT or ABOVE the threshold pass.
-# qid 43151 in the smoke run scored exactly 0.20 on iter 2 and passed —
-# the strict-less-than convention is intentional, not an off-by-one. Pick
-# the threshold so this alignment is what you want.
+# Strict less-than by design: qid 43151 scored exactly 0.20 on iter 2 of the smoke run and passed.
 DEFAULT_FORECASTABILITY_THRESHOLD = 0.2
 
 FinalStatus = Literal["clean", "rejected_leakage", "rejected_forecastability"]
@@ -280,13 +276,7 @@ def _parse_re_redactor_response(raw: str, qid: int, ground_truth: GroundTruth) -
         sanitized = entry.get("sanitized_blob")
         if not isinstance(sanitized, str) or sanitized == "":
             raise ValueError(f"re-redactor produced empty sanitized_blob for qid={qid}")
-        # Sanity check that the re-redactor LLM didn't leave ground truth verbatim.
-        # This is a belt-and-suspenders check; the real leakage detection is the
-        # verifier subagent's leakage_risk score on the next iteration. The
-        # substring-only check false-positived on binary GTs ("no" inside "not"/
-        # "now") and ended iteration at iter=0; the type-aware path (binary skip,
-        # MC word-boundary, numeric strict-substring) lives in prune.py and is
-        # shared by both stages.
+        # Belt-and-suspenders; the verifier's next leakage_risk is the real check. Bare substring matched "no" in "not".
         passes, reject_reason = verbatim_leak_check_passes(sanitized, ground_truth, ground_truth.question_type)
         if not passes:
             raise ValueError(f"re-redactor for qid={qid}: {reject_reason}")
@@ -306,9 +296,9 @@ def _verifier_score_from_entry(entry: dict[str, Any], iteration: int) -> Verifie
     build that nudges output formatting; or the model hallucinates a slightly
     different shape) used to silently default ``forecastability=0.0`` —
     rejecting every qid as ``rejected_forecastability`` for an invented
-    reason. Fail-fast with a ValueError instead; the per-qid try/except in
-    ``run_qa_iterate_batch`` converts it to ``qa_iterate_failed: ValueError``
-    so the operator sees the schema drift explicitly.
+    reason. Fail-fast with a ValueError instead; ``run_qa_iterate_batch``
+    converts it to ``qa_iterate_failed: ValueError`` so the operator sees the
+    schema drift explicitly.
     """
     required = ("leakage_risk", "forecastability", "hallucination_risk")
     missing = [k for k in required if k not in entry]
@@ -356,11 +346,6 @@ async def run_qa_iterate_for_qid(
     blob = current_blob
     scores: list[VerifierScore] = []
     screen_says_clean = not screen_verdict.get("is_leaked", False)
-    # Snapshot whatever's in the cache at entry. If the iteration loop hits
-    # max_iterations without reaching leakage acceptance, we restore this
-    # snapshot so the cache reflects the pre-iteration state. None means the
-    # cache was empty at entry; the operator-recovery path won't surface a
-    # blob that was never there in the first place.
     pre_iter_cache = cache.read_pruned_research(qid)
 
     iteration = 0
@@ -430,12 +415,7 @@ async def run_qa_iterate_for_qid(
         )
         screen_says_clean = True  # re-redaction supersedes the screen's verdict on the old blob
 
-    # Restore the pre-iteration snapshot to the cache. The iteration loop has
-    # been overwriting research_pruned/<qid>.{md,meta.json} with each
-    # re-redactor pass; on max-iter exhaustion the LATEST blob is the
-    # leakiest one (verifier rejected it). Operator-recovery via
-    # manual_rejects.json should pull the original baseline (or nothing, if
-    # there was no baseline) instead of the leaky re-redactor output.
+    # Each re-redactor pass overwrote the cache and the last blob is the leakiest; operator recovery wants the baseline.
     if pre_iter_cache is not None:
         original_blob, original_meta = pre_iter_cache
         # Strip cache_schema_version (write_pruned_research re-injects it).
