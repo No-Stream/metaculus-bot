@@ -708,8 +708,8 @@ are here.
   rejects, makes the stage report a lost source, which bumps the market provider's source-loss
   counter and fails `_assert_pipeline_ran`'s `alertable_count == 0`.
 - `_CANNED_GAP_ANALYZER`: graded to pass the gap-fill v1 triage (`answerable_now` true,
-  `already_in_first_pass` false, no `same_need_as`) so the resolver path runs. Drop a grade field
-  and `triage_gaps` discards the gap as `schema` before any resolver call.
+  `already_in_first_pass` false, `same_need_as` null) so the resolver path runs. Drop either boolean
+  grade and `triage_gaps` discards the gap as `schema` before any resolver call.
 - `_REQUIRED_OK_PROVIDERS`: verified empirically (all three question types, INFO logs) to be
   identical, with asknews, native_search, gemini_search and resolution_source all landing `ok`
   while financial_data legitimately returns `empty` on a non-financial question, so financial_data

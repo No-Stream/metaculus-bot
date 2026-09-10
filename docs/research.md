@@ -1947,15 +1947,19 @@ reason per gap so the marker's counts partition the list:
    collapses onto gap 1; a future-dated gap 1 with two present-tense rewordings as gaps 2 and 3
    keeps gap 2 only; a first-pass-answered gap 1 and its rewording as gap 2 keeps neither, whatever
    gap 2's own `already_in_first_pass` says.
-3. **Schema drift fails shut.** A gap with a grade omitted or mistyped (a string for a boolean, a
-   pointer at itself, forward, at zero, or non-integer, an absent `same_need_as` key, an empty
-   slot) is dropped as `schema`, never read as passing: a grade that defaulted to passing would
-   spend exactly the money the grade exists to save. An analyzer that ignores the schema wholesale
-   shows up as `dropped_schema=listed` on every question, and the marker line is emitted at
-   WARNING in exactly that case (the same level as `GAP_FILL_ANALYZER_FAILED`, because v1 has gone
-   dark while the analyzer still bills), while a question whose gaps all fail on legitimate grades
-   stays at INFO, because that is the filter working. Either way the forecast proceeds on the
-   first pass and gap-fill v2.
+3. **Schema drift fails shut.** Only the two booleans are required. A gap missing either of them, or
+   carrying a string where a boolean belongs, or pointing at itself, forward, at zero or with a
+   non-integer, or sitting in an empty slot, is dropped as `schema`, never read as passing: a grade
+   that defaulted to passing would spend exactly the money the grade exists to save. An ABSENT
+   `same_need_as` key is the one exception and reads as null, no pointer, because the analyzer's JSON
+   is not schema-enforced at the request level and models routinely omit a key whose value would be
+   null, so dropping every gap over a missing pointer would switch v1 off entirely, which is worse
+   than the drift it would catch. A `same_need_as` the analyzer did type is still validated. An
+   analyzer that ignores the schema wholesale shows up as `dropped_schema=listed` on every question,
+   and the marker line is emitted at WARNING in exactly that case (the same level as
+   `GAP_FILL_ANALYZER_FAILED`, because v1 has gone dark while the analyzer still bills), while a
+   question whose gaps all fail on legitimate grades stays at INFO, because that is the filter
+   working. Either way the forecast proceeds on the first pass and gap-fill v2.
 4. **The cap last.** `GAP_FILL_MAX_GAPS` applies to the survivors, so a dropped gap never displaces
    a kept one; a survivor past the cap is dropped as `over_cap`. The analyzer is still asked for at
    most that many, so this binds only when it over-lists.

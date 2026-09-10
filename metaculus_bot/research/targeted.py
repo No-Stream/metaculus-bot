@@ -201,16 +201,15 @@ class GapTriage:
 def _grade(gap: dict[str, Any], position: int) -> tuple[str | None, int | None]:
     """The drop reason a gap earns on its own grades (None when every grade passes) and its validated pointer.
 
-    An empty slot or an absent or mistyped grade is schema drift and drops the gap, because a grade
-    that defaulted to passing would spend exactly the money the grade exists to save; the pointer
-    comes back None in that case. See docs/research.md "v1 triage".
+    An empty slot, an absent or mistyped boolean grade, or a ``same_need_as`` the analyzer typed but
+    that names no earlier position is schema drift and drops the gap, because a grade that defaulted
+    to passing would spend exactly the money the grade exists to save; the pointer comes back None in
+    that case. A MISSING ``same_need_as`` key reads as null instead. See docs/research.md "v1 triage".
     """
     answerable_now = gap.get("answerable_now")
     already_in_first_pass = gap.get("already_in_first_pass")
     same_need_as = gap.get("same_need_as")
-    pointer_well_formed = "same_need_as" in gap and (
-        same_need_as is None or (type(same_need_as) is int and 0 < same_need_as < position)
-    )
+    pointer_well_formed = same_need_as is None or (type(same_need_as) is int and 0 < same_need_as < position)
     if (
         not gap["gap"]
         or not isinstance(answerable_now, bool)
@@ -354,21 +353,14 @@ async def run_gap_fill_pass(
 ) -> str:
     """Identify, triage and resolve factual gaps in first-pass research.
 
-    Three-stage flow:
-    1. Analyzer call (GAP_FILL_ANALYZER_MODEL at low effort via OpenRouter, no grounding) →
-       JSON list of gaps, each graded on ``answerable_now``, ``already_in_first_pass`` and
-       ``same_need_as``.
-    2. ``triage_gaps`` drops the failing gaps before any spend and caps the survivors at
-       ``GAP_FILL_MAX_GAPS``; the ``GAP_FILL_V1_TRIAGE`` marker records the counts per reason.
-    3. Parallel OpenAI native web searches (GAP_FILL_RESOLVER_MODEL at
-       GAP_FILL_RESOLVER_REASONING_EFFORT via OpenRouter), one per survivor, via ``asyncio.gather``.
+    An analyzer call for the graded gap list, then ``triage_gaps``, then one parallel native web
+    search per survivor. The models, the stage detail and the triage rules are in docs/research.md
+    "v1: targeted gap-fill".
 
-    Never raises. Returns "" on any upstream failure (missing API key, timeout,
-    SDK error, network error), logging type + message. This is a deliberate
-    blanket soft-fail because the gap-fill pass is an optional enrichment layer
-    and a forecast with only first-pass research is strictly better than no
-    forecast at all; the `research.strip()` guard at the call site already
-    ensures we never swallow a first-pass failure here.
+    Never raises: returns "" on any upstream failure (missing API key, timeout, SDK error, network
+    error), logging the type and message, because gap-fill is optional enrichment and a forecast on
+    first-pass research alone beats no forecast. The ``research.strip()`` guard at the call site
+    keeps this from swallowing a first-pass failure.
     """
     qid = getattr(question, "id_of_question", None)
     try:

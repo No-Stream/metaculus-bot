@@ -83,6 +83,13 @@ def _gap(
     }
 
 
+def _gap_without(field: str) -> dict[str, Any]:
+    """An otherwise-passing gap with one grade key absent, as a model that omits null-valued keys emits it."""
+    gap = _gap("g")
+    del gap[field]
+    return gap
+
+
 @contextmanager
 def _patch_resolver(invoke: AsyncMock) -> Iterator[MagicMock]:
     """Patch ``build_native_search_llm`` so the per-gap resolver uses ``invoke``.
@@ -398,6 +405,8 @@ class TestTriageGaps:
         "gap",
         [
             pytest.param({"gap": "g", "search_query": "q", "why_matters": ""}, id="no grade fields at all"),
+            pytest.param(_gap_without("answerable_now"), id="answerable_now key omitted"),
+            pytest.param(_gap_without("already_in_first_pass"), id="already_in_first_pass key omitted"),
             pytest.param(_gap("g", answerable_now=None), id="answerable_now null"),
             pytest.param(_gap("g", answerable_now="true"), id="answerable_now as a string"),
             pytest.param(_gap("g", already_in_first_pass=None), id="already_in_first_pass null"),
@@ -418,14 +427,16 @@ class TestTriageGaps:
         assert triage.kept == []
         assert triage.dropped == [{**gap, "position": 1, "reason": DROP_SCHEMA}]
 
-    def test_an_omitted_same_need_as_key_is_schema_drift(self) -> None:
-        """Omitting the key is not the same as ``null``: the schema asks for all three grades on every gap."""
-        gap = _gap("g")
-        del gap["same_need_as"]
+    def test_an_omitted_same_need_as_key_reads_as_no_pointer(self) -> None:
+        """Models routinely omit a key whose value would be null, and the analyzer's JSON is not
+        schema-enforced, so dropping every gap over a missing pointer would switch v1 off outright. A
+        pointer the analyzer did type is still validated (see ``test_schema_drift_drops_the_gap``)."""
+        gap = _gap_without("same_need_as")
 
         triage = triage_gaps([gap], max_gaps=4)
 
-        assert [d["reason"] for d in triage.dropped] == [DROP_SCHEMA]
+        assert triage.kept == [gap]
+        assert triage.dropped == []
 
     def test_cap_applies_after_the_filter(self) -> None:
         """Six listed, two failing: all four survivors are searched. A parse-time clip to four would have

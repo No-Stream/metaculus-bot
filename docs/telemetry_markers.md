@@ -1217,18 +1217,20 @@ order the triage applies them: `dropped_not_answerable` (the analyzer graded `an
 the gap can only be answered by an observation not yet made or a result not yet published),
 `dropped_in_first_pass` (`already_in_first_pass` true: the first pass already states the value with
 its date), `dropped_same_need` (`same_need_as` named an earlier gap whose need a kept gap is
-searching or the first pass answers), `dropped_schema` (a grade was omitted or mistyped, or the slot
-was malformed, and the gap is dropped rather than read as passing) and `dropped_over_cap` (a survivor
-past `GAP_FILL_MAX_GAPS`, which applies after the filter). `listed = kept + sum(dropped_*)` on every
-line. The line is INFO, except when every listed slot dropped as `dropped_schema`, which is WARNING:
-the analyzer has stopped emitting the grades and v1 has gone dark while it still bills, the same
-outcome `GAP_FILL_ANALYZER_FAILED` warns about; the level is not part of the marker contract, so the
-harvester reads both. Receipt: about a third of v1's resolver
-calls bought nothing on the archive (`scratch/cost_pass_2026-09-09/v1_gap_redundancy/REDUNDANCY.md`),
-and this marker is how that share is measured once the filter is live; the dropped gaps themselves,
-with position and reason, ride the raw research record (`provider="gap_fill"`, key `dropped`). The
-rules and the receipts: `docs/research.md` "v1 triage". `qid_kind` is `question_id` (`targeted.py`
-passes `question.id_of_question`).
+searching or the first pass answers), `dropped_schema` (one of the two required booleans was omitted
+or mistyped, or a typed `same_need_as` named no earlier position, or the slot was malformed, and the
+gap is dropped rather than read as passing; a missing `same_need_as` key reads as null and does not
+drop the gap) and `dropped_over_cap` (a survivor past `GAP_FILL_MAX_GAPS`, which applies after the
+filter). `listed = kept + sum(dropped_*)` on every line. The line is INFO, except when every listed
+slot dropped as `dropped_schema`, which is WARNING: the analyzer has stopped emitting the grades and
+v1 has gone dark while it still bills, the same outcome `GAP_FILL_ANALYZER_FAILED` warns about; the
+level is not part of the marker contract, so the harvester reads both. Receipt: about a third of
+v1's resolver calls bought nothing on the archive
+(`scratch/cost_pass_2026-09-09/v1_gap_redundancy/REDUNDANCY.md`), and this marker is how that share
+is measured once the filter is live; the dropped gaps themselves, with position and reason, ride the
+raw research record (`provider="gap_fill"`, key `dropped`). The rules and the receipts:
+`docs/research.md` "v1 triage". `qid_kind` is `question_id` (`targeted.py` passes
+`question.id_of_question`).
 
 ### CREDIT_BALANCE
 
