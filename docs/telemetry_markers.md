@@ -623,6 +623,22 @@ order, each emitted only when present, so an old parser and every archived line 
 line carrying a later field but not an earlier one cannot mis-claim a neighbour's value. `qid_kind`
 is `question_id` (`resolution_source.py` emits `question.id_of_question`).
 
+`passages_returned` / `passages_grounded` / `fallback_used` (all optional, 2026-09-09) are the page
+digest's counters (`research/page_digest.py`; docs/research.md "Page digest"): how many passages the
+`page_digest_extractor` model answered with, how many of those were literal substrings of the page
+after whitespace and quote-glyph normalisation, and whether the passages served after the page's
+opening came from the BM25 fallback instead (`True` / `False`, harvested as a bool). The difference of
+the two counts is the model's fabrication count for that page. Both counts are `0` with
+`fallback_used=True` on every fallback that has no answer to count: no call was made (the remaining
+wall was below the floor, or the page was empty), a call was made and failed before answering (the
+timeout, a provider error, an off-schema or empty completion), or the model answered with an empty
+list. The three fields therefore cannot separate a skipped call from a failed one; the run log's
+`PAGE_DIGEST` lines, one per fallback naming its reason, carry that distinction. Keyed and
+tail-positioned after `server` in that fixed order, appended by the callers only on a fetch that ran
+the digest, so a page under the digest threshold and every archived line still parse with the three
+harvested as None. The spec was added ahead of its emitter: the fetch-ladder unification's callers
+append the three values off the `PageDigest` the digest returns.
+
 ### RESOLUTION_SOURCE_ESCALATION
 
 One line per escalated-URL rung attempt: the direct fetch could not read the page, so the ladder
@@ -1292,8 +1308,9 @@ usage accounting (`credit_telemetry.py`, "Per-role dollar attribution"; the fiel
 their receipts are in `docs/operations.md` "Per-role spend"). `usd` is `n/a` when no call of that
 row carried cost data, never a fabricated zero, and `costed_calls` says how many of `calls` the
 sum covers. `byok_usd` is the sum of `usage.cost_details.upstream_inference_cost`, the
-upstream-provider charge OpenRouter reports beside its own `usage.cost`. Roles are the names in
-`credit_telemetry.llm_call_metadata` (`forecaster:<vendor>`, `parser`, `native_search`, ...);
+upstream-provider charge OpenRouter reports beside its own `usage.cost`. Roles are the string literals
+each builder call site passes through `credit_telemetry.llm_call_metadata` (`forecaster:<vendor>`,
+`parser`, `native_search`, ...), enumerated only in `docs/operations.md` "Per-role spend";
 `untagged` means a completion nobody stamped.
 
 `usd` is `usage.cost + upstream_inference_cost` summed over the row, the definition it has had

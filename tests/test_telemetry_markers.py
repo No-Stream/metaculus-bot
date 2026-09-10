@@ -1234,6 +1234,22 @@ RESOLUTION_SOURCE_FETCH_TRANSPORT_ERROR_LINE = (
     PFX + "RESOLUTION_SOURCE_FETCH: question=44211 url=https://slow.example.com/x "
     "status=error http=n/a embeds=none failure_class=timeout exc=ServerTimeoutError"
 )
+# The page digest's three counters (research/page_digest.py), keyed and last, appended only where the digest ran.
+RESOLUTION_SOURCE_FETCH_DIGEST_LINE = (
+    PFX + "RESOLUTION_SOURCE_FETCH: question=44554 url=https://www.bls.gov/news.release/empsit.nr0.htm "
+    "status=ok http=200 embeds=none route=direct passages_returned=6 passages_grounded=4 fallback_used=False"
+)
+RESOLUTION_SOURCE_FETCH_DIGEST_FALLBACK_LINE = (
+    PFX + "RESOLUTION_SOURCE_FETCH: question=44554 url=https://www.bls.gov/news.release/empsit.nr0.htm "
+    "status=ok http=200 embeds=none passages_returned=0 passages_grounded=0 fallback_used=True"
+)
+# Every optional tail group at once, in the documented order; the spec's positional groups make this order the contract.
+RESOLUTION_SOURCE_FETCH_FULL_TAIL_LINE = (
+    PFX + "RESOLUTION_SOURCE_FETCH: question=44211 url=https://www.cbp.gov/newsroom/stats "
+    "status=no_resolving_content http=200 embeds=none reason=thin_page route=rendered "
+    "failure_class=http_5xx exc=ServerTimeoutError server=akamaighost "
+    "passages_returned=3 passages_grounded=2 fallback_used=False"
+)
 
 
 class TestAsknewsNoArticles:
@@ -1378,6 +1394,45 @@ class TestResolutionSourceFetch:
             assert rec.get("failure_class") is None
             assert rec.get("exc") is None
             assert rec.get("server") is None
+
+    def test_the_page_digest_counters_parse_as_ints_and_a_bool(self):
+        """`passages_returned` minus `passages_grounded` is the extractor's fabrication count for that page."""
+        rec = _parse_one(RESOLUTION_SOURCE_FETCH_DIGEST_LINE)
+        assert rec["status"] == "ok"
+        assert rec["route"] == "direct"
+        assert rec["passages_returned"] == 6
+        assert rec["passages_grounded"] == 4
+        assert rec["fallback_used"] is False
+
+    def test_a_digest_fallback_parses_without_a_route(self):
+        """The three sit after every earlier optional group, so a line carrying them and no route cannot mis-claim."""
+        rec = _parse_one(RESOLUTION_SOURCE_FETCH_DIGEST_FALLBACK_LINE)
+        assert rec["passages_returned"] == 0
+        assert rec["passages_grounded"] == 0
+        assert rec["fallback_used"] is True
+        assert rec["route"] is None
+        assert rec["reason"] is None
+
+    def test_lines_without_the_digest_fields_harvest_them_as_none(self):
+        """A page under the digest threshold, and every archived line, carry none of the three."""
+        for line in (RESOLUTION_SOURCE_FETCH_OK_LINE, RESOLUTION_SOURCE_FETCH_FAILURE_CLASS_LINE):
+            rec = _parse_one(line)
+            assert rec.get("passages_returned") is None
+            assert rec.get("passages_grounded") is None
+            assert rec.get("fallback_used") is None
+
+    def test_every_optional_tail_group_parses_together_in_the_documented_order(self):
+        """The spec ships ahead of its emitter, so this line is the order the emitter must follow: a digest
+        group written before `server` would parse, silently, with `server` harvested as None."""
+        rec = _parse_one(RESOLUTION_SOURCE_FETCH_FULL_TAIL_LINE)
+        assert rec["reason"] == "thin_page"
+        assert rec["route"] == "rendered"
+        assert rec["failure_class"] == "http_5xx"
+        assert rec["exc"] == "ServerTimeoutError"
+        assert rec["server"] == "akamaighost"
+        assert rec["passages_returned"] == 3
+        assert rec["passages_grounded"] == 2
+        assert rec["fallback_used"] is False
 
 
 # Verbatim from resolution_source.py; one line per ESCALATED rung tried after the direct route failed to read the page.

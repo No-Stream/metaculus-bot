@@ -361,6 +361,8 @@ MARKER_SPECS: list[MarkerSpec] = [
             r"\s+status=(?P<status>\S+)\s+http=(?P<http>\S+)\s+embeds=(?P<embeds>\S+)"
             r"(?:\s+reason=(?P<reason>\S+))?(?:\s+route=(?P<route>\S+))?"
             r"(?:\s+failure_class=(?P<failure_class>\S+))?(?:\s+exc=(?P<exc>\S+))?(?:\s+server=(?P<server>\S+))?"
+            r"(?:\s+passages_returned=(?P<passages_returned>\S+))?(?:\s+passages_grounded=(?P<passages_grounded>\S+))?"
+            r"(?:\s+fallback_used=(?P<fallback_used>\S+))?"
         ),
         qid_kind=QID_KIND_QUESTION_ID,  # resolution_source.py emits question.id_of_question
     ),
