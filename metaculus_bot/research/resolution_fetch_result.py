@@ -395,7 +395,7 @@ class RungAttempt:
     ``wall_s`` and ``outcome`` are THIS rung's own: what the attempt cost, and the status
     that stood once it was over — its rescue, its verdict (the Wayback withhold, the paid
     reader's ``ungrounded``), or the direct status it left standing when it declined. Both
-    are None until the dispatcher closes the rung (``FetchContext.close_rungs``), because a
+    are None until the dispatcher closes the rung (``LadderContext.close_rungs``), because a
     rung is only over once its result is known a layer above where the attempt is created:
     the meta-refresh hop ends when the followed request comes back, the browser rung when
     its harvest fallback has been tried. A rung that measures something finer stamps itself
@@ -467,7 +467,7 @@ class FetchResult:
     # majority and renders no extra telemetry at all.
     route: FetchRoute = "direct"
     rung_attempts: list[RungAttempt] = field(default_factory=list)
-    # The HTML extractor policy's decisions (`resolution_source._extract_page_text`); False off
+    # The HTML extractor policy's decisions (`classify._extract_page_text`); False off
     # the HTML path. `chrome_metric_withheld`: the line-shape metric withheld an HTML extraction
     # of this URL somewhere on its ladder — an extraction that cleared the chrome floor on
     # navigation alone. That is a fact about the URL's ladder, not necessarily about this

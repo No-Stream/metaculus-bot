@@ -15,6 +15,7 @@ import pytest
 
 from metaculus_bot.research import impersonated_fetch, rendered_fetch, resolution_source
 from metaculus_bot.research.derived_api import reset_derived_endpoints
+from metaculus_bot.research.fetch_ladder import guard
 from metaculus_bot.research.http_fetch import reset_host_semaphores, reset_pdf_parse_semaphore
 from metaculus_bot.research.impersonated_fetch import reset_impersonation_memo
 from metaculus_bot.research.robots_policy import reset_robots_cache
@@ -147,7 +148,7 @@ def _stub_public_dns(monkeypatch):
         del host, port, args, kwargs
         return [(0, 0, 0, "", ("8.8.8.8", 0))]
 
-    monkeypatch.setattr(resolution_source.socket, "getaddrinfo", _sync_ainfo)
+    monkeypatch.setattr(guard.socket, "getaddrinfo", _sync_ainfo)
 
 
 @pytest.fixture

@@ -13,7 +13,7 @@ The sibling gap-fill v2 reader has three dedicated pins on exactly this arithmet
 nowhere in this package and the ``except TimeoutError`` branch was untested.
 
 Pinned against the CONTRACT rather than the rung's line order: every test fixes
-``FetchContext.rung_budget_s`` to a constant, so where in the rung the budget is read (before or
+``LadderContext.rung_budget_s`` to a constant, so where in the rung the budget is read (before or
 after the robots pre-check) does not change what these assert.
 """
 
@@ -28,8 +28,9 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_URL_CONTEXT_MIN_BUDGET_S,
 )
 from metaculus_bot.research import resolution_source
+from metaculus_bot.research.fetch_ladder.context import LadderContext
 from metaculus_bot.research.gemini_client_config import gemini_retry_sleep_allowance_s
-from metaculus_bot.research.resolution_source import FetchContext, _fetch_one, _rung_counts
+from metaculus_bot.research.resolution_source import _fetch_one, _rung_counts
 from tests.resolution_source_fakes import _URL, arm_paid_rung, paid_reader, refused_page_with_robots
 
 # Comfortably above the rung's floor, so the read runs and the kwargs are observable. Chosen
@@ -47,7 +48,7 @@ class TestThePaidReadIsBoundedByTheRemainingWall:
         reader, calls = paid_reader()
         arm_paid_rung(monkeypatch, reader, budget_s=_ROOMY_BUDGET_S)
 
-        result = await _fetch_one(refused_page_with_robots(), _URL, {}, FetchContext(query="How many stoppages?"))
+        result = await _fetch_one(refused_page_with_robots(), _URL, {}, LadderContext(query="How many stoppages?"))
 
         assert result.status == "success"
         assert calls[0]["attempts"] == RESOLUTION_SOURCE_URL_CONTEXT_ATTEMPTS
@@ -74,7 +75,7 @@ class TestThePaidReadIsBoundedByTheRemainingWall:
         arm_paid_rung(monkeypatch, reader, budget_s=_ROOMY_BUDGET_S)
         monkeypatch.setattr(resolution_source.asyncio, "wait_for", _recording_wait_for)
 
-        result = await _fetch_one(refused_page_with_robots(), _URL, {}, FetchContext(query="ask"))
+        result = await _fetch_one(refused_page_with_robots(), _URL, {}, LadderContext(query="ask"))
 
         assert result.status == "success"
         assert _ROOMY_BUDGET_S in waits
@@ -100,7 +101,7 @@ class TestThePaidReadIsBoundedByTheRemainingWall:
         reader, calls = paid_reader()
         arm_paid_rung(monkeypatch, reader, budget_s=RESOLUTION_SOURCE_URL_CONTEXT_MIN_BUDGET_S)
 
-        await _fetch_one(refused_page_with_robots(), _URL, {}, FetchContext(query="ask"))
+        await _fetch_one(refused_page_with_robots(), _URL, {}, LadderContext(query="ask"))
 
         attempts = calls[0]["attempts"]
         per_attempt_timeout_ms = calls[0]["timeout_ms"]
@@ -128,7 +129,7 @@ class TestATimedOutReadPublishesNothing:
         arm_paid_rung(monkeypatch, reader, budget_s=_ROOMY_BUDGET_S)
 
         with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.resolution_source"):
-            result = await _fetch_one(refused_page_with_robots(), _URL, {}, FetchContext(query="ask"))
+            result = await _fetch_one(refused_page_with_robots(), _URL, {}, LadderContext(query="ask"))
 
         assert len(calls) == 1
         assert result.status == "blocked"

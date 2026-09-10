@@ -21,8 +21,8 @@ interchangeable (see :func:`rendered_to_nothing`). The timed-out memo is the one
 writes itself, because only the transport knows whether a browser actually ran before the
 clock cut it off (see :class:`RenderTimeout`).
 
-The SSRF guard is resolved through ``resolution_source`` at call time, from inside the two
-functions that need it, and both halves of that are deliberate — see :func:`resolve_pinned_host`.
+The SSRF guard is read off :mod:`metaculus_bot.research.fetch_ladder.guard` at call time, which
+is what keeps the guard to one patch surface — see :func:`resolve_pinned_host`.
 
 The DNS-pin helpers here, :func:`pinnable_url_host` and :func:`resolve_pinned_host`, have a
 THIRD consumer: the TLS-impersonation transport (:mod:`metaculus_bot.research.impersonated_fetch`,
@@ -45,6 +45,7 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 
 from metaculus_bot.constants import RENDERED_DOM_MAX_CHARS
+from metaculus_bot.research.fetch_ladder import guard
 from metaculus_bot.research.http_fetch import BROWSER_HEADERS
 from metaculus_bot.research.public_suffix import registrable_domain
 
@@ -425,8 +426,8 @@ async def resolve_pinned_host(url: str) -> tuple[str, str] | None:
     =MAP host [ip]`` in :func:`_host_resolver_rule`, libcurl's ``host:port:[ip]`` in the
     impersonation transport's ``_resolve_entry``), so returning the bracketed form here would make
     one caller's pin match nothing. That bare-address return is part of the contract. Mirrors
-    :func:`resolution_source.is_public_http_url`'s classification (scheme, userinfo, and the shared
-    :func:`resolution_source.resolve_vetted_public_ip` predicate) so neither client can dial an
+    :func:`guard.is_public_http_url`'s classification (scheme, userinfo, and the shared
+    :func:`guard.resolve_vetted_public_ip` predicate) so neither client can dial an
     address the airtight aiohttp ``FilteringResolver`` path would also refuse.
 
     This is what closes the DNS-rebinding TOCTOU on both pinned transports: the per-request route
@@ -440,19 +441,11 @@ async def resolve_pinned_host(url: str) -> tuple[str, str] | None:
     ladder degrades to whatever the plain rung already had), and the impersonation caller declines
     the retry with :class:`impersonated_fetch.ImpersonateUnpinnable`.
 
-    The ``resolution_source`` import is function-scoped for two reasons at once, and both
-    have to hold for it to stay. It is a REAL circular import — that module imports this one
-    at module scope for its own rendered rung — and it is the LATE BINDING the suites rely
-    on: ``resolution_source.is_public_http_url`` / ``resolve_vetted_public_ip`` /
-    ``_ip_is_disallowed`` are monkeypatched on that module by both fetch paths' tests, and
-    the guard has exactly ONE patch surface precisely because every reader resolves it
-    there. Hoisting the guard into a lower module would give it two, which is how a patch at
-    the wrong module stays green while proving nothing.
+    Every predicate is read off the ``guard`` module at call time, which is what keeps the guard
+    to ONE patch surface: both fetch paths' suites monkeypatch ``guard.is_public_http_url`` /
+    ``resolve_vetted_public_ip`` / ``_ip_is_disallowed`` there, and a second binding is how a
+    patch at the wrong module stays green while proving nothing.
     """
-    from metaculus_bot.research import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # real cycle + the guard's single patch surface, per the docstring
-        resolution_source,
-    )
-
     host = pinnable_url_host(url)
     if not host:
         return None
@@ -460,11 +453,11 @@ async def resolve_pinned_host(url: str) -> tuple[str, str] | None:
     # IP-literal host: no DNS to rebind. Vet directly and pin to itself.
     literal = _ip_literal(host)
     if literal is not None:
-        if resolution_source._ip_is_disallowed(literal):
+        if guard._ip_is_disallowed(literal):
             return None
         return host, str(literal)
 
-    vetted_ip = await resolution_source.resolve_vetted_public_ip(host)
+    vetted_ip = await guard.resolve_vetted_public_ip(host)
     if vetted_ip is None:
         return None
     return host, vetted_ip
@@ -483,15 +476,11 @@ async def _vet_route(route: Any, request: Any, playwright_error: type[BaseExcept
     residual-race backstop. Only Playwright's own Error is caught, so a genuine bug still
     propagates.
 
-    The guard is resolved through ``resolution_source`` at call time for the reasons
+    The guard is read off the ``guard`` module at call time for the reason
     :func:`resolve_pinned_host` states.
     """
-    from metaculus_bot.research import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # real cycle + the guard's single patch surface, see resolve_pinned_host
-        resolution_source,
-    )
-
     try:
-        if await resolution_source.is_public_http_url(request.url):
+        if await guard.is_public_http_url(request.url):
             await route.continue_()
         else:
             await route.abort("blockedbyclient")

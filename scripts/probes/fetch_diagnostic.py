@@ -14,7 +14,7 @@ Cloudflare, CloudFront and DataDome hosts are IP-blocked.
 
 So this script runs four probes per URL and prints one table plus a ladder block:
 
-  A  the bot's REAL client — ``resolution_source._get_session()``, so the browser
+  A  the bot's REAL client — ``guard._get_session()``, so the browser
      headers, the SSRF FilteringResolver and the fetcher's own HTTP timeout are
      exactly what a live run uses.
   B  the same GET through curl_cffi with ``impersonate="chrome"``, which presents a
@@ -69,10 +69,11 @@ from curl_cffi import CurlError
 from curl_cffi import requests as curl_requests
 
 from metaculus_bot.constants import RESOLUTION_SOURCE_MAX_RESPONSE_BYTES, RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV
+from metaculus_bot.research.fetch_ladder.guard import _get_session, is_public_http_url
 from metaculus_bot.research.http_fetch import read_body_capped
 from metaculus_bot.research.impersonated_fetch import reset_impersonation_memo
 from metaculus_bot.research.resolution_fetch_result import FetchResult, RungAttempt
-from metaculus_bot.research.resolution_source import _get_session, fetch_resolution_sources, is_public_http_url
+from metaculus_bot.research.resolution_source import fetch_resolution_sources
 from metaculus_bot.research.wayback import parse_snapshot_url, snapshot_age_days, wayback_snapshot_url
 
 _HOST_SPACING_S = 1.0

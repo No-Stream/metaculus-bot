@@ -5,15 +5,12 @@ from __future__ import annotations
 import asyncio
 
 from metaculus_bot.research import rendered_fetch, resolution_presentation, resolution_source
+from metaculus_bot.research.fetch_ladder import guard
+from metaculus_bot.research.fetch_ladder.context import LadderContext
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail
 from metaculus_bot.research.rendered_fetch import HarvestedJson, RenderedPage
 from metaculus_bot.research.resolution_fetch_result import ROUTE_CAVEATS
-from metaculus_bot.research.resolution_source import (
-    FetchContext,
-    _fetch_one,
-    _rung_counts,
-    resolution_source_provider,
-)
+from metaculus_bot.research.resolution_source import _fetch_one, _rung_counts, resolution_source_provider
 from tests.resolution_source_fakes import (
     _FEED_URL,
     _JS_SHELL,
@@ -122,7 +119,7 @@ class TestDerivedApiRung:
                 _FEED_URL: FakeResponse(200, body=self._FEED.encode(), content_type="application/json"),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
         question = _mock_question(resolution_criteria=f"Resolves per {_URL} and {second_url}")
 
         section = await resolution_source_provider(is_benchmarking=False)(question)
@@ -234,7 +231,7 @@ class TestDerivedApiRung:
         )
 
         await _fetch_one(session, _URL, {})
-        monkeypatch.setattr(FetchContext, "rung_budget_s", lambda self: 1.0)
+        monkeypatch.setattr(LadderContext, "rung_budget_s", lambda self: 1.0)
         second = await _fetch_one(session, second_url, {})
 
         assert second.status == "js_wall"

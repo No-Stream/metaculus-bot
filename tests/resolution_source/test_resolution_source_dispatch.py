@@ -10,16 +10,13 @@ from datetime import UTC, datetime, timedelta
 
 from metaculus_bot.constants import RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV
 from metaculus_bot.research import impersonated_fetch, resolution_source
+from metaculus_bot.research.fetch_ladder import guard
+from metaculus_bot.research.fetch_ladder.context import LadderContext
 from metaculus_bot.research.impersonated_fetch import IMPERSONATE_TRIGGER_STATUSES
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail
 from metaculus_bot.research.rendered_fetch import HarvestedJson, RenderedPage
 from metaculus_bot.research.resolution_fetch_result import ROUTE_CAVEATS
-from metaculus_bot.research.resolution_source import (
-    _WAYBACK_TRIGGER_STATUSES,
-    FetchContext,
-    _fetch_one,
-    resolution_source_provider,
-)
+from metaculus_bot.research.resolution_source import _WAYBACK_TRIGGER_STATUSES, _fetch_one, resolution_source_provider
 from metaculus_bot.research.wayback import wayback_snapshot_url
 from tests.resolution_source_fakes import (
     _FEED_URL,
@@ -157,7 +154,7 @@ class TestFastPath:
             _fake_render(_rendered_document(f"<h1>Polling average</h1><p>{_RENDERED_PROSE}</p>"), calls),
         )
         session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
         question = _mock_question(resolution_criteria=f"Resolves per {_URL}")
 
         section = await resolution_source_provider(is_benchmarking=False, fast_path=True)(question)
@@ -178,7 +175,7 @@ class TestFastPath:
             _fake_render(_rendered_document(f"<h1>Polling average</h1><p>{_RENDERED_PROSE}</p>"), calls),
         )
         session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
         question = _mock_question(resolution_criteria=f"Resolves per {_URL}")
 
         section = await resolution_source_provider(is_benchmarking=False)(question)
@@ -197,9 +194,9 @@ class TestFastPath:
 
         # Armed, then disarmed by dropping the flag alone, so the two runs differ in nothing else.
         arm_paid_rung(monkeypatch, reader)
-        armed = await _fetch_one(session, _URL, {}, FetchContext(query="ask", fast_path=True))
+        armed = await _fetch_one(session, _URL, {}, LadderContext(query="ask", fast_path=True))
         monkeypatch.delenv(RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV)
-        unarmed = await _fetch_one(session, _URL, {}, FetchContext(query="ask", fast_path=True))
+        unarmed = await _fetch_one(session, _URL, {}, LadderContext(query="ask", fast_path=True))
 
         assert calls == []
         assert armed.status == "blocked"
@@ -225,8 +222,8 @@ class TestFastPath:
             }
         )
 
-        archived = await _fetch_one(session, _URL, {}, FetchContext(now=now, fast_path=True))
-        derived = await _fetch_one(session, feed_page, {}, FetchContext(now=now, fast_path=True))
+        archived = await _fetch_one(session, _URL, {}, LadderContext(now=now, fast_path=True))
+        derived = await _fetch_one(session, feed_page, {}, LadderContext(now=now, fast_path=True))
 
         assert archived.route == "wayback"
         assert archived.status == "success"
@@ -246,7 +243,7 @@ class TestFastPath:
         )
         session = FakeSession({_URL: FakeResponse(403, body=b"", content_type="text/html")})
 
-        result = await _fetch_one(session, _URL, {}, FetchContext(fast_path=True))
+        result = await _fetch_one(session, _URL, {}, LadderContext(fast_path=True))
 
         assert len(calls) == 1
         assert result.route == "impersonate"
@@ -277,7 +274,7 @@ class TestProviderLevelRungMarkers:
             _fake_render(_rendered_document(f"<h1>Polling average</h1><p>{_RENDERED_PROSE}</p>"), []),
         )
         session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
         q = _mock_question(resolution_criteria=f"Resolves per {_URL}")
 
         with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
@@ -304,7 +301,7 @@ class TestProviderLevelRungMarkers:
         )
         monkeypatch.setattr(resolution_source, "render_page", _fake_render(harvested, []))
         session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
         q = _mock_question(resolution_criteria=f"Resolves per {_URL}")
 
         with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
@@ -350,7 +347,7 @@ class TestProviderLevelRungMarkers:
             fake_impersonated_fetch(_impersonated(200, body=_prose_page(_RENDERED_PROSE)), calls),
         )
         session = FakeSession({_URL: FakeResponse(403, body=b"denied", content_type="text/html")})
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
         q = _mock_question(resolution_criteria=f"Resolves per {_URL}")
 
         with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
@@ -412,7 +409,7 @@ class TestProviderLevelRungMarkers:
                 snapshot: FakeResponse(200, body=_prose_page(_RENDERED_PROSE), content_type="text/html"),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
         q = _mock_question(resolution_criteria=f"Resolves per {_URL}")
 
         with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
@@ -447,7 +444,7 @@ class TestProviderLevelRungMarkers:
                 snapshot: FakeResponse(200, body=_prose_page(_RENDERED_PROSE), content_type="text/html"),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
         q = _mock_question(resolution_criteria=f"Resolves per {_URL}")
 
         with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
@@ -468,7 +465,7 @@ class TestProviderLevelRungMarkers:
         reader, _calls = paid_reader()
         arm_paid_rung(monkeypatch, reader)
         session = refused_page_with_robots()
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
         q = _mock_question(resolution_criteria=f"Resolves per {_URL}")
 
         with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):

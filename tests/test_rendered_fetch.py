@@ -31,9 +31,10 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from metaculus_bot.research import rendered_fetch, resolution_source
 from metaculus_bot.research.agentic import tools as agentic_tools
 from metaculus_bot.research.derived_api import DerivedEndpoint, derived_api_lead, largest_json
+from metaculus_bot.research.fetch_ladder import guard
+from metaculus_bot.research.fetch_ladder.context import LadderContext
 from metaculus_bot.research.rendered_fetch import HarvestedJson, RenderedPage
 from metaculus_bot.research.resolution_fetch_result import FetchResult
-from metaculus_bot.research.resolution_source import FetchContext
 from scripts.telemetry.markers import MARKER_SPECS
 from tests.playwright_fakes import (
     FakeBrowser,
@@ -67,7 +68,7 @@ def _reset_state(monkeypatch):
         del host, port, args, kwargs
         return [(0, 0, 0, "", ("8.8.8.8", 0))]
 
-    monkeypatch.setattr(resolution_source.socket, "getaddrinfo", _public_dns)
+    monkeypatch.setattr(guard.socket, "getaddrinfo", _public_dns)
     rendered_fetch.reset_render_state()
     FakeResponse.reset_read_tracking()
     yield
@@ -489,7 +490,7 @@ class TestTheRenderMemos:
         assert len(chromium.launch_args) == 1
 
         direct = FetchResult(url=_PAGE_URL, status="js_wall", text="", http_status=200, content_type="text/html")
-        ctx = FetchContext()
+        ctx = LadderContext()
         tier1_result = await resolution_source._rendered_rung(_PAGE_URL, direct, {}, ctx)
 
         assert len(chromium.launch_args) == 2
@@ -537,7 +538,7 @@ class TestTheNavigationBudgetAfterTheGates:
 
         monkeypatch.setattr(resolution_source, "render_page", _expired)
         direct = FetchResult(url=_PAGE_URL, status="js_wall", text="", http_status=200, content_type="text/html")
-        ctx = FetchContext()
+        ctx = LadderContext()
 
         result = await resolution_source._rendered_rung(_PAGE_URL, direct, {}, ctx)
 
@@ -705,10 +706,10 @@ class TestTheNavigationBudgetAfterTheGates:
             await asyncio.sleep(0)
 
         monkeypatch.setattr(resolution_source, "render_page", _recording_render)
-        monkeypatch.setattr(FetchContext, "rung_budget_s", lambda self: 20.0)
+        monkeypatch.setattr(LadderContext, "rung_budget_s", lambda self: 20.0)
         direct = FetchResult(url=_PAGE_URL, status="js_wall", text="", http_status=200, content_type="text/html")
 
-        await resolution_source._rendered_rung(_PAGE_URL, direct, {}, FetchContext())
+        await resolution_source._rendered_rung(_PAGE_URL, direct, {}, LadderContext())
 
         (call,) = calls
         assert call["memo_scope"] == _TIER1_SCOPE
@@ -753,7 +754,7 @@ class TestTheDomCeiling:
 
         monkeypatch.setattr(resolution_source, "render_page", _too_large)
         direct = FetchResult(url=_PAGE_URL, status="js_wall", text="", http_status=200, content_type="text/html")
-        ctx = FetchContext()
+        ctx = LadderContext()
 
         result = await resolution_source._rendered_rung(_PAGE_URL, direct, {}, ctx)
 
@@ -1005,7 +1006,7 @@ class TestTheMainFrameStatus:
 
         monkeypatch.setattr(resolution_source, "render_page", _blocked_render)
         direct = FetchResult(url=_PAGE_URL, status="js_wall", text="", http_status=200, content_type="text/html")
-        ctx = FetchContext()
+        ctx = LadderContext()
 
         with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.resolution_source"):
             result = await resolution_source._rendered_rung(_PAGE_URL, direct, {}, ctx)
@@ -1025,7 +1026,7 @@ class TestTheMainFrameStatus:
         monkeypatch.setattr(resolution_source, "render_page", _ok_render)
         direct = FetchResult(url=_PAGE_URL, status="js_wall", text="", http_status=200, content_type="text/html")
 
-        result = await resolution_source._rendered_rung(_PAGE_URL, direct, {}, FetchContext())
+        result = await resolution_source._rendered_rung(_PAGE_URL, direct, {}, LadderContext())
 
         assert result is not None
         assert result.status == "success"
@@ -1360,7 +1361,7 @@ class TestTheLandingHost:
         landed = "https://www.dashboard.example.com/senate"
         direct = FetchResult(url=landed, status="js_wall", text="", http_status=200, content_type="text/html")
 
-        result = await resolution_source._rendered_rung(_PAGE_URL, direct, {}, FetchContext())
+        result = await resolution_source._rendered_rung(_PAGE_URL, direct, {}, LadderContext())
 
         assert result is None
         assert calls == [landed]
@@ -1377,7 +1378,7 @@ class TestTheLandingHost:
 
         monkeypatch.setattr(resolution_source, "render_page", _off_host)
         direct = FetchResult(url=_PAGE_URL, status="js_wall", text="", http_status=200, content_type="text/html")
-        ctx = FetchContext()
+        ctx = LadderContext()
 
         result = await resolution_source._rendered_rung(_PAGE_URL, direct, {}, ctx)
 
@@ -1625,7 +1626,7 @@ class TestTheDomReadIsBounded:
         page = FakePage([], content_raises=PlaywrightError(self._NAVIGATING))
         install_fake_playwright(monkeypatch, page)
         direct = FetchResult(url=_PAGE_URL, status="js_wall", text="", http_status=200, content_type="text/html")
-        ctx = FetchContext()
+        ctx = LadderContext()
 
         result = await resolution_source._rendered_rung(_PAGE_URL, direct, {}, ctx)
 

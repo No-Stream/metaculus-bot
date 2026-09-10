@@ -15,6 +15,7 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 from metaculus_bot.research import resolution_source
+from metaculus_bot.research.fetch_ladder import guard
 from metaculus_bot.research.http_fetch import FilteringResolver
 from metaculus_bot.research.provider_diagnostics import _counts_suffix, pop_provider_detail
 from metaculus_bot.research.resolution_source import (
@@ -56,7 +57,7 @@ class TestResolutionSourceProvider:
         session = FakeSession(
             {"https://www.bls.gov/cpi/": FakeResponse(200, body=article_html, content_type="text/html")}
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         provider = resolution_source_provider(is_benchmarking=False)
         out = await provider(_mock_question(resolution_criteria="See https://www.bls.gov/cpi/ for the reading."))
@@ -68,7 +69,7 @@ class TestResolutionSourceProvider:
         """Nothing else pins that the question's own text gets as far as BM25.
 
         `fetch_resolution_sources` defaults `query=""`, every PDF test drives `_fetch_one`
-        with a hand-built FetchContext, and no test references `_document_query` — so a
+        with a hand-built LadderContext, and no test references `_document_query` — so a
         dropped or misspelled kwarg here type-checks, passes the whole suite, and renders
         every cited document's header and outline with the "no passage matched" sentence and
         none of the resolving figures. The vocabulary below appears ONLY in the resolution
@@ -88,7 +89,7 @@ class TestResolutionSourceProvider:
                 )
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
         q = _mock_question(
             resolution_criteria=(
                 "Resolves per the laboratory-confirmed cyclosporiasis hospitalizations "
@@ -107,7 +108,7 @@ class TestResolutionSourceProvider:
         # unreachable notice through the full provider path (feeds the header).
         monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
         session = FakeSession({"https://www.bls.gov/cpi/": FakeResponse(403, body=b"", content_type="text/html")})
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         provider = resolution_source_provider(is_benchmarking=False)
         out = await provider(_mock_question(resolution_criteria="See https://www.bls.gov/cpi/ for the reading."))
@@ -119,7 +120,7 @@ class TestResolutionSourceProvider:
         # all-failed notice must NOT leak into a benchmarking run.
         monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
         session = FakeSession({"https://www.bls.gov/cpi/": FakeResponse(403, body=b"", content_type="text/html")})
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         provider = resolution_source_provider(is_benchmarking=True)
         out = await provider(_mock_question(resolution_criteria="See https://www.bls.gov/cpi/ for the reading."))
@@ -135,7 +136,7 @@ class TestResolutionSourceProvider:
                 "https://cbp.gov/data": FakeResponse(403, body=b"", content_type="text/html"),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         q = _mock_question(resolution_criteria="See https://www.bls.gov/cpi/ and https://cbp.gov/data")
         await resolution_source_provider(is_benchmarking=False)(q)
@@ -151,7 +152,7 @@ class TestResolutionSourceProvider:
         session = FakeSession(
             {"https://www.bls.gov/cpi/": FakeResponse(200, body=article_html, content_type="text/html")}
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         q = _mock_question(resolution_criteria="See https://www.bls.gov/cpi/ for the reading.")
         await resolution_source_provider(is_benchmarking=False)(q)
@@ -255,34 +256,34 @@ class TestIsPublicHttpUrl:
     """
 
     async def test_rejects_non_http_scheme(self):
-        assert await resolution_source.is_public_http_url("ftp://example.com/x") is False
-        assert await resolution_source.is_public_http_url("file:///etc/passwd") is False
-        assert await resolution_source.is_public_http_url("javascript:alert(1)") is False
+        assert await guard.is_public_http_url("ftp://example.com/x") is False
+        assert await guard.is_public_http_url("file:///etc/passwd") is False
+        assert await guard.is_public_http_url("javascript:alert(1)") is False
 
     async def test_rejects_userinfo(self):
         # `https://trusted@169.254.169.254/` — the userinfo pretends to be a
         # trusted host in casual reading but the request goes to the IMDS.
-        assert await resolution_source.is_public_http_url("https://trusted@169.254.169.254/") is False
-        assert await resolution_source.is_public_http_url("https://user:pass@example.com/x") is False
+        assert await guard.is_public_http_url("https://trusted@169.254.169.254/") is False
+        assert await guard.is_public_http_url("https://user:pass@example.com/x") is False
 
     async def test_rejects_ipv4_link_local(self):
         # AWS IMDS lives at 169.254.169.254 — the canonical SSRF target.
-        assert await resolution_source.is_public_http_url("http://169.254.169.254/latest/meta-data/") is False
+        assert await guard.is_public_http_url("http://169.254.169.254/latest/meta-data/") is False
 
     async def test_rejects_ipv4_loopback(self):
-        assert await resolution_source.is_public_http_url("http://127.0.0.1/") is False
-        assert await resolution_source.is_public_http_url("http://127.0.0.1:8000/admin") is False
+        assert await guard.is_public_http_url("http://127.0.0.1/") is False
+        assert await guard.is_public_http_url("http://127.0.0.1:8000/admin") is False
 
     async def test_rejects_ipv4_private_ranges(self):
-        assert await resolution_source.is_public_http_url("http://10.0.0.5/") is False
-        assert await resolution_source.is_public_http_url("http://192.168.1.1/") is False
-        assert await resolution_source.is_public_http_url("http://172.16.0.1/") is False
+        assert await guard.is_public_http_url("http://10.0.0.5/") is False
+        assert await guard.is_public_http_url("http://192.168.1.1/") is False
+        assert await guard.is_public_http_url("http://172.16.0.1/") is False
 
     async def test_rejects_bracketed_ipv6_loopback(self):
-        assert await resolution_source.is_public_http_url("http://[::1]/") is False
+        assert await guard.is_public_http_url("http://[::1]/") is False
 
     async def test_rejects_bracketed_ipv6_link_local(self):
-        assert await resolution_source.is_public_http_url("http://[fe80::1]/") is False
+        assert await guard.is_public_http_url("http://[fe80::1]/") is False
 
     async def test_accepts_public_ipv4_literal(self, monkeypatch):
         # A public IP literal should NOT trigger DNS resolution — the ip_address
@@ -290,8 +291,8 @@ class TestIsPublicHttpUrl:
         def _fail(*_args, **_kwargs):
             raise AssertionError("getaddrinfo must not be called for IP literals")
 
-        monkeypatch.setattr(resolution_source.socket, "getaddrinfo", _fail)
-        assert await resolution_source.is_public_http_url("http://8.8.8.8/") is True
+        monkeypatch.setattr(guard.socket, "getaddrinfo", _fail)
+        assert await guard.is_public_http_url("http://8.8.8.8/") is True
 
     async def test_rejects_hostname_resolving_to_private(self, monkeypatch):
         # Patch getaddrinfo to return a private IP for the hostname.
@@ -306,8 +307,8 @@ class TestIsPublicHttpUrl:
             del host, port, args, kwargs
             return [_addrinfo("10.0.0.5")]
 
-        monkeypatch.setattr(resolution_source.socket, "getaddrinfo", _sync_ainfo)
-        assert await resolution_source.is_public_http_url("https://malicious.example.com/x") is False
+        monkeypatch.setattr(guard.socket, "getaddrinfo", _sync_ainfo)
+        assert await guard.is_public_http_url("https://malicious.example.com/x") is False
 
     async def test_rejects_hostname_where_any_address_is_private(self, monkeypatch):
         # If ANY resolved address is private, reject — protects against DNS
@@ -316,16 +317,16 @@ class TestIsPublicHttpUrl:
             del host, port, args, kwargs
             return [_addrinfo("8.8.8.8"), _addrinfo("127.0.0.1")]
 
-        monkeypatch.setattr(resolution_source.socket, "getaddrinfo", _sync_ainfo)
-        assert await resolution_source.is_public_http_url("https://mixed.example.com/") is False
+        monkeypatch.setattr(guard.socket, "getaddrinfo", _sync_ainfo)
+        assert await guard.is_public_http_url("https://mixed.example.com/") is False
 
     async def test_accepts_hostname_resolving_to_public(self, monkeypatch):
         def _sync_ainfo(host, port, *args, **kwargs):
             del host, port, args, kwargs
             return [_addrinfo("8.8.8.8")]
 
-        monkeypatch.setattr(resolution_source.socket, "getaddrinfo", _sync_ainfo)
-        assert await resolution_source.is_public_http_url("https://google.example.com/") is True
+        monkeypatch.setattr(guard.socket, "getaddrinfo", _sync_ainfo)
+        assert await guard.is_public_http_url("https://google.example.com/") is True
 
     async def test_rejects_on_dns_failure(self, monkeypatch):
         # DNS failure -> treat as unfetchable (would fail the fetch anyway).
@@ -335,8 +336,8 @@ class TestIsPublicHttpUrl:
             del host, port, args, kwargs
             raise _socket.gaierror("nodename nor servname provided")
 
-        monkeypatch.setattr(resolution_source.socket, "getaddrinfo", _sync_ainfo)
-        assert await resolution_source.is_public_http_url("https://nxdomain.example.com/") is False
+        monkeypatch.setattr(guard.socket, "getaddrinfo", _sync_ainfo)
+        assert await guard.is_public_http_url("https://nxdomain.example.com/") is False
 
 
 class TestFetchOneSsrf:
@@ -455,7 +456,7 @@ class TestGetSessionUsesFilteringResolver:
     that pass the same predicate as the preflight guard."""
 
     async def test_connector_is_wired_to_filtering_resolver(self):
-        session_cm = resolution_source._get_session()
+        session_cm = guard._get_session()
         try:
             # session_cm is an aiohttp.ClientSession (build_session returns
             # the session directly, not an async context manager wrapper).
@@ -466,7 +467,7 @@ class TestGetSessionUsesFilteringResolver:
                 f"expected FilteringResolver on the connector, got {type(resolver).__name__}"
             )
             # And that resolver's predicate is our SSRF disallowlist.
-            assert resolver._disallow is resolution_source._ip_is_disallowed
+            assert resolver._disallow is guard._ip_is_disallowed
         finally:
             await session_cm.close()
 
@@ -475,7 +476,7 @@ class TestGetSessionUsesFilteringResolver:
         # explicit predicate list. Direct spot-check on _ip_is_disallowed.
 
         cgnat = ipaddress.ip_address("100.64.0.1")
-        assert resolution_source._ip_is_disallowed(cgnat) is True
+        assert guard._ip_is_disallowed(cgnat) is True
         # And a legit public address still passes.
         public = ipaddress.ip_address("8.8.8.8")
-        assert resolution_source._ip_is_disallowed(public) is False
+        assert guard._ip_is_disallowed(public) is False

@@ -55,7 +55,7 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_IMPERSONATE_MIN_BUDGET_S,
     RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
 )
-from metaculus_bot.research import derived_api, impersonated_fetch, resolution_source
+from metaculus_bot.research import derived_api, impersonated_fetch
 from metaculus_bot.research.agentic import local_document
 from metaculus_bot.research.agentic.fetch_outcomes import (
     _FETCH_MIN_CONTENT_CHARS,
@@ -95,6 +95,7 @@ from metaculus_bot.research.agentic.tool_descriptions import (
 )
 from metaculus_bot.research.agentic.types import ToolOutcome, ToolSpec
 from metaculus_bot.research.document_text import is_pdf_body
+from metaculus_bot.research.fetch_ladder import classify, guard
 from metaculus_bot.research.http_fetch import (
     MAX_REDIRECTS,
     REDIRECT_STATUSES,
@@ -144,7 +145,7 @@ _FETCH_LINKS_CACHE: OrderedDict[str, list[str]] = OrderedDict()
 
 
 def _host_gate(url: str) -> asyncio.Semaphore:
-    return resolution_source._sem_for_host(_FETCH_HOST_SEMAPHORES, url)
+    return guard._sem_for_host(_FETCH_HOST_SEMAPHORES, url)
 
 
 def _cache_fetch_result(url: str, text: str, links: list[str]) -> None:
@@ -371,7 +372,7 @@ async def _fetch_one_hop(session: aiohttp.ClientSession, current_url: str) -> Pl
 
 
 async def _fetch_plain(url: str) -> PlainFetchResult:
-    if not await resolution_source.is_public_http_url(url):
+    if not await guard.is_public_http_url(url):
         return PlainFetchResult(
             status="blocked",
             method="plain",
@@ -383,7 +384,7 @@ async def _fetch_plain(url: str) -> PlainFetchResult:
     if blocked is not None:
         return blocked
 
-    session = resolution_source._get_session()
+    session = guard._get_session()
     async with session:
         current_url = url
         for _ in range(MAX_REDIRECTS + 1):
@@ -462,7 +463,7 @@ async def _try_rendered_fetch(url: str) -> PlainFetchResult | None:
     if _content_type_is_document(page.content_type):
         return _document_needed_result(url, page.content_type)
     body = page.html.encode("utf-8", errors="replace")
-    extracted = await asyncio.to_thread(resolution_source._extract_main_text, body, url)
+    extracted = await asyncio.to_thread(classify._extract_main_text, body, url)
     # Links resolve against the document the DOM came from, which after a same-host client-side
     # redirect is not the URL asked for; the memo key and the result's `url` stay the requested URL.
     links = _extract_links_from_html(page.html, page.document_url)
@@ -622,7 +623,7 @@ async def _try_wayback_fetch(
     calibrated on a URL the question cites as its grading source, and a driver-chosen URL carries
     no such guarantee, so the capture date is SURFACED in the served text (``wayback_lead``) for the
     driver to weigh rather than silently enforced. The inner URL a capture is OF is re-guarded
-    (``resolution_source._hop_refusal``) because a capture of a platform page presents
+    (``guard._hop_refusal``) because a capture of a platform page presents
     ``web.archive.org`` as its host and would clear a self-reference check.
     """
     now = now or datetime.now(UTC)
@@ -634,7 +635,7 @@ async def _try_wayback_fetch(
     if parsed is None:
         # Undatable: the archive answered the year request directly, so no dated capture to date-disclose.
         return None
-    if await resolution_source._hop_refusal(innermost_url(parsed.inner_url)) is not None:
+    if await guard._hop_refusal(innermost_url(parsed.inner_url)) is not None:
         return None
     age_days = snapshot_age_days(parsed, now)
     if age_days is None:

@@ -18,8 +18,9 @@ from aiohttp.client_reqrep import ConnectionKey, RequestInfo
 from multidict import CIMultiDict, CIMultiDictProxy
 from yarl import URL
 
-from metaculus_bot.research import resolution_source
-from metaculus_bot.research.resolution_source import _network_failure_class, resolution_source_provider
+from metaculus_bot.research.fetch_ladder import guard
+from metaculus_bot.research.fetch_ladder.classify import _network_failure_class
+from metaculus_bot.research.resolution_source import resolution_source_provider
 from tests.resolution_source_fakes import FakeSession, _mock_question
 
 _KEY = ConnectionKey("host.example.com", 443, True, True, None, None, None)
@@ -89,7 +90,7 @@ class TestNetworkFailureClass:
         rides the FETCH line's `failure_class` and `exc` names the aiohttp class."""
         monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
         session = FakeSession({"https://host.example.com/report": _content_encoding_failure()})
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
         q = _mock_question(resolution_criteria="See https://host.example.com/report")
 
         with caplog.at_level("INFO", logger="metaculus_bot.research.resolution_source"):

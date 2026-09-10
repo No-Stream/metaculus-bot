@@ -29,6 +29,7 @@ from urllib.parse import urlparse
 
 from metaculus_bot.constants import GOOGLE_API_KEY_ENV, RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV
 from metaculus_bot.research import resolution_source
+from metaculus_bot.research.fetch_ladder import classify, context
 from metaculus_bot.research.impersonated_fetch import ImpersonatedResponse
 from metaculus_bot.research.rendered_fetch import RenderedPage
 
@@ -262,8 +263,8 @@ def _mid_band_chart_page() -> bytes:
     `_IOM_PROSE` extracts 425, only 25 chars above the chrome floor — so neither of them
     exercises the middle.
     """
-    js_wall_floor = resolution_source.RESOLUTION_SOURCE_JS_WALL_MIN_CHARS
-    chrome_floor = resolution_source.RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS
+    js_wall_floor = classify.RESOLUTION_SOURCE_JS_WALL_MIN_CHARS
+    chrome_floor = classify.RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS
     # Trafilatura emits the h1 and then the paragraph twice, so the extraction is
     # 13 + 6n chars for an `"ab " * n` paragraph. The tests that use this measure the
     # result rather than trusting that arithmetic.
@@ -468,7 +469,7 @@ def arm_paid_rung(monkeypatch: Any, reader: Any, *, budget_s: float | None = Non
     monkeypatch.setenv(GOOGLE_API_KEY_ENV, "key")
     monkeypatch.setattr(resolution_source, "run_url_context_read", reader)
     if budget_s is not None:
-        monkeypatch.setattr(resolution_source.FetchContext, "rung_budget_s", lambda self: budget_s)
+        monkeypatch.setattr(context.LadderContext, "rung_budget_s", lambda self: budget_s)
 
 
 def refused_page_with_robots(*, robots: bytes = ROBOTS_ALLOW_ALL, extra: _Handlers | None = None) -> FakeSession:

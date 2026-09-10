@@ -29,7 +29,7 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
     URL_CONTEXT_SIZE_GATE_TOKENS,
 )
-from metaculus_bot.research import http_fetch, impersonated_fetch, rendered_fetch, resolution_source, robots_policy
+from metaculus_bot.research import http_fetch, impersonated_fetch, rendered_fetch, robots_policy
 from metaculus_bot.research import providers as research_providers
 from metaculus_bot.research.agentic import fetch_outcomes, local_document, provenance, tool_backends
 from metaculus_bot.research.agentic import tools as agentic_tools
@@ -37,6 +37,7 @@ from metaculus_bot.research.agentic.loop import _harvest_verification_tiers, _me
 from metaculus_bot.research.agentic.tool_descriptions import FETCH_DESCRIPTION
 from metaculus_bot.research.agentic.types import ToolOutcome
 from metaculus_bot.research.document_text import extract_pdf_text
+from metaculus_bot.research.fetch_ladder import classify
 from metaculus_bot.research.gemini_client_config import gemini_retry_sleep_allowance_s
 from metaculus_bot.research.impersonated_fetch import (
     IMPERSONATE_TRIGGER_STATUSES,
@@ -110,8 +111,8 @@ def _serve_pdf(monkeypatch: pytest.MonkeyPatch, body: bytes, *, content_type: st
     """
     session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": content_type}))
     read_body = AsyncMock(return_value=body)
-    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
-    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
     monkeypatch.setattr(agentic_tools, "_read_response_body", read_body)
     return read_body
 
@@ -492,15 +493,15 @@ async def test_search_news_missing_creds(monkeypatch: pytest.MonkeyPatch) -> Non
 @pytest.mark.asyncio
 async def test_fetch_plain_success_path_reuses_fetch_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
     session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/html"}))
-    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
-    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
     monkeypatch.setattr(
         agentic_tools,
         "_read_response_body",
         AsyncMock(return_value=b'<html><body><a href="/a">A</a><p>Long body</p></body></html>'),
     )
     monkeypatch.setattr(
-        "metaculus_bot.research.resolution_source._extract_main_text",
+        "metaculus_bot.research.fetch_ladder.classify._extract_main_text",
         MagicMock(return_value="Rendered plain body " * 40),
     )
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
@@ -657,8 +658,8 @@ async def test_fetch_plain_textual_branch_strips_allowlisted_markup(monkeypatch:
         b"note,a < 5 and b > 3,0.0\n"
     )
     session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/csv"}))
-    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
-    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
     monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=csv_body))
 
     result = await agentic_tools._fetch_plain("https://example.com/data.csv")
@@ -686,15 +687,15 @@ async def test_fetch_plain_follows_redirect_to_public_url(monkeypatch: pytest.Mo
         _FakeResponse(status=302, headers={"Location": "https://example.com/final"}),
         _FakeResponse(status=200, headers={"Content-Type": "text/html"}),
     )
-    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
-    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
     monkeypatch.setattr(
         agentic_tools,
         "_read_response_body",
         AsyncMock(return_value=b"<html><body><p>Final page body</p></body></html>"),
     )
     monkeypatch.setattr(
-        "metaculus_bot.research.resolution_source._extract_main_text",
+        "metaculus_bot.research.fetch_ladder.classify._extract_main_text",
         MagicMock(return_value="Final page body " * 40),
     )
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
@@ -716,8 +717,8 @@ async def test_fetch_plain_blocks_redirect_to_non_public_target(monkeypatch: pyt
     async def is_public(url: str) -> bool:
         return "169.254.169.254" not in url
 
-    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", is_public)
-    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", is_public)
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
 
     result = await agentic_tools._fetch_plain("https://example.com/start")
 
@@ -733,8 +734,8 @@ async def test_fetch_plain_caps_redirect_chain(monkeypatch: pytest.MonkeyPatch) 
     session = _FakeSession(
         *[_FakeResponse(status=302, headers={"Location": f"https://example.com/hop{i}"}) for i in range(hops)]
     )
-    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
-    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
 
     result = await agentic_tools._fetch_plain("https://example.com/start")
 
@@ -746,8 +747,8 @@ async def test_fetch_plain_caps_redirect_chain(monkeypatch: pytest.MonkeyPatch) 
 @pytest.mark.asyncio
 async def test_fetch_plain_redirect_without_location_is_malformed(monkeypatch: pytest.MonkeyPatch) -> None:
     session = _FakeSession(_FakeResponse(status=302, headers={}))
-    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
-    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
 
     result = await agentic_tools._fetch_plain("https://example.com/start")
 
@@ -770,9 +771,9 @@ async def test_fetch_plain_blocks_metaculus_without_network(url: str, monkeypatc
     # is_public_http_url is stubbed True so the platform URL clears the SSRF gate
     # (as it would in prod — both sites are public); the real is_metaculus_self_ref
     # then blocks it. _get_session raises if reached, proving no HTTP is attempted.
-    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True))
     get_session = MagicMock(side_effect=AssertionError("must not open a session for a question-platform URL"))
-    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", get_session)
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", get_session)
 
     result = await agentic_tools._fetch_plain(url)
 
@@ -808,8 +809,8 @@ async def test_fetch_plain_blocks_redirect_to_metaculus(monkeypatch: pytest.Monk
     session = _FakeSession(
         _FakeResponse(status=302, headers={"Location": "https://www.metaculus.com/questions/12345/"}),
     )
-    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
-    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
 
     result = await agentic_tools._fetch_plain("https://example.com/start")
 
@@ -827,8 +828,8 @@ async def test_same_host_plain_and_rendered_fetches_serialize(monkeypatch: pytes
     release_plain = asyncio.Event()
 
     session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/html"}))
-    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
-    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
 
     async def blocking_read(resp: object, label: str, *, max_bytes: int = 0) -> bytes:
         events.append("plain_read_started")
@@ -838,7 +839,7 @@ async def test_same_host_plain_and_rendered_fetches_serialize(monkeypatch: pytes
 
     monkeypatch.setattr(agentic_tools, "_read_response_body", blocking_read)
     monkeypatch.setattr(
-        "metaculus_bot.research.resolution_source._extract_main_text",
+        "metaculus_bot.research.fetch_ladder.classify._extract_main_text",
         MagicMock(return_value="body text " * 60),
     )
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
@@ -899,9 +900,9 @@ async def test_rendered_fetch_drains_routes_and_guard_tolerates_teardown_race(
     async def _is_public(url: str) -> bool:
         return "evil" not in url
 
-    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", _is_public)
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", _is_public)
     monkeypatch.setattr(
-        "metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value="body text " * 60)
+        "metaculus_bot.research.fetch_ladder.classify._extract_main_text", MagicMock(return_value="body text " * 60)
     )
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
 
@@ -955,7 +956,7 @@ async def test_rendered_fetch_drains_routes_and_guard_tolerates_teardown_race(
 
 @pytest.mark.asyncio
 async def test_fetch_ssrf_reject_returns_blocked(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=False))
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=False))
 
     outcome = await agentic_tools.fetch("http://127.0.0.1")
 
@@ -1003,11 +1004,11 @@ async def test_fetch_plain_empty_extraction_returns_empty_status(
     report status="empty", not "ok" — while still flagging escalation so the
     ladder tries the rendered rung next."""
     session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/html"}))
-    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
-    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
     monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=b"<html><body></body></html>"))
     monkeypatch.setattr(
-        "metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value=extracted)
+        "metaculus_bot.research.fetch_ladder.classify._extract_main_text", MagicMock(return_value=extracted)
     )
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
 
@@ -1024,13 +1025,13 @@ async def test_fetch_plain_thin_extraction_is_ok_not_empty(monkeypatch: pytest.M
     (fetched-tierable) even though it's below the escalation floor. Thin != empty
     — demoting real short sources would harm legitimate official statements."""
     session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/html"}))
-    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
-    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
     monkeypatch.setattr(
         agentic_tools, "_read_response_body", AsyncMock(return_value=b"<html><body><p>hi</p></body></html>")
     )
     monkeypatch.setattr(
-        "metaculus_bot.research.resolution_source._extract_main_text",
+        "metaculus_bot.research.fetch_ladder.classify._extract_main_text",
         MagicMock(return_value="Short but real official statement."),
     )
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
@@ -1049,8 +1050,8 @@ async def test_fetch_plain_honors_declared_charset_on_textual_body(monkeypatch: 
     mojibake to the driver as status="ok"."""
     body = "date,séries\n2026-08-01,0.42\n".encode("windows-1252")
     session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/csv; charset=windows-1252"}))
-    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
-    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
     monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=body))
 
     result = await agentic_tools._fetch_plain("https://example.com/data.csv")
@@ -1067,8 +1068,8 @@ async def test_fetch_plain_refuses_an_undecodable_textual_body(monkeypatch: pyte
     "ok") and escalate, so the rendered rung's browser sniffing gets a try."""
     body = "date,value\n2026-08-01,0.42\n".encode("utf-16-le")
     session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/plain"}))
-    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
-    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
     monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=body))
 
     result = await agentic_tools._fetch_plain("https://example.com/data.txt")
@@ -1091,8 +1092,10 @@ class TestFetchPlainTerminalStatuses:
     @pytest.mark.parametrize("status", sorted(fetch_outcomes._RETRYABLE_FETCH_BLOCK_STATUSES))
     async def test_anti_bot_status_is_blocked(self, status: int, monkeypatch: pytest.MonkeyPatch) -> None:
         session = _FakeSession(_FakeResponse(status=status, headers={"Content-Type": "text/html"}))
-        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
-        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+        monkeypatch.setattr(
+            "metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True)
+        )
+        monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
 
         result = await agentic_tools._fetch_plain("https://example.com/gated")
 
@@ -1104,8 +1107,10 @@ class TestFetchPlainTerminalStatuses:
     @pytest.mark.asyncio
     async def test_server_error_status_is_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         session = _FakeSession(_FakeResponse(status=503, headers={"Content-Type": "text/html"}))
-        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
-        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+        monkeypatch.setattr(
+            "metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True)
+        )
+        monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
 
         result = await agentic_tools._fetch_plain("https://example.com/down")
 
@@ -1159,8 +1164,10 @@ class TestFetchPlainTerminalStatuses:
     @pytest.mark.asyncio
     async def test_oversized_body_is_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/html"}))
-        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
-        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+        monkeypatch.setattr(
+            "metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True)
+        )
+        monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
         monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=None))
 
         result = await agentic_tools._fetch_plain("https://example.com/huge")
@@ -1171,8 +1178,10 @@ class TestFetchPlainTerminalStatuses:
     @pytest.mark.asyncio
     async def test_unsupported_content_type_is_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "application/zip"}))
-        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
-        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+        monkeypatch.setattr(
+            "metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True)
+        )
+        monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
         monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=b"PK\x03\x04payload"))
 
         result = await agentic_tools._fetch_plain("https://example.com/bundle.zip")
@@ -1189,8 +1198,10 @@ class TestFetchPlainTerminalStatuses:
                 raise aiohttp.ClientConnectorError(MagicMock(), OSError("refused"))
 
         session = _RaisingSession(_FakeResponse(status=200))
-        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
-        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+        monkeypatch.setattr(
+            "metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True)
+        )
+        monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
 
         result = await agentic_tools._fetch_plain("https://example.com/unreachable")
 
@@ -1206,10 +1217,10 @@ async def test_fetch_plain_redirect_to_empty_page_returns_empty(monkeypatch: pyt
         _FakeResponse(status=302, headers={"Location": "https://example.com/final"}),
         _FakeResponse(status=200, headers={"Content-Type": "text/html"}),
     )
-    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
-    monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
     monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=b"<html><body></body></html>"))
-    monkeypatch.setattr("metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value=None))
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.classify._extract_main_text", MagicMock(return_value=None))
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
 
     result = await agentic_tools._fetch_plain("https://example.com/start")
@@ -1628,9 +1639,9 @@ async def test_try_rendered_fetch_uses_playwright_objects(monkeypatch: pytest.Mo
     # leaning on the autouse fixture + import order — asyncio.Semaphore binds to the
     # running loop on first await, so a stale cross-file binding would raise here.
     monkeypatch.setattr(rendered_fetch, "_RENDERED_FETCH_GLOBAL_SEMAPHORE", asyncio.Semaphore(2))
-    monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: RecordingSemaphore())
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._sem_for_host", lambda *_: RecordingSemaphore())
     monkeypatch.setattr(
-        "metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value="Rendered body")
+        "metaculus_bot.research.fetch_ladder.classify._extract_main_text", MagicMock(return_value="Rendered body")
     )
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
 
@@ -1689,10 +1700,10 @@ async def test_rendered_fetch_launches_bounded_by_global_semaphore(monkeypatch: 
 
     page = FakePage(html="<html><body><p>rendered body</p></body></html>")
     install_fake_playwright(monkeypatch, page, chromium=_BarrierChromium(page))
-    monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: asyncio.Semaphore(1))
-    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._sem_for_host", lambda *_: asyncio.Semaphore(1))
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True))
     monkeypatch.setattr(
-        "metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value="rendered body")
+        "metaculus_bot.research.fetch_ladder.classify._extract_main_text", MagicMock(return_value="rendered body")
     )
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
 
@@ -1761,10 +1772,10 @@ async def test_rendered_fetch_route_guard_blocks_private_redirect_target(monkeyp
     # Self-sufficient global semaphore bound in this test's loop (see the sibling
     # rendered-fetch test) — avoids a cross-file stale-loop-binding RuntimeError.
     monkeypatch.setattr(rendered_fetch, "_RENDERED_FETCH_GLOBAL_SEMAPHORE", asyncio.Semaphore(2))
-    monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: asyncio.Semaphore(1))
-    monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", fake_is_public)
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._sem_for_host", lambda *_: asyncio.Semaphore(1))
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", fake_is_public)
     monkeypatch.setattr(
-        "metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value="public content only")
+        "metaculus_bot.research.fetch_ladder.classify._extract_main_text", MagicMock(return_value="public content only")
     )
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
 
@@ -1882,7 +1893,7 @@ async def test_rendered_fetch_skips_launch_when_host_not_pinnable(monkeypatch: p
     """Vetting fails (disallowed / unresolvable host) → Chromium is NOT launched
     and the rung returns the graceful-failure ``None`` the ladder degrades on."""
     chromium = install_fake_playwright(monkeypatch, FakePage(), pinned=None)
-    monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: asyncio.Semaphore(1))
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._sem_for_host", lambda *_: asyncio.Semaphore(1))
 
     outcome = await agentic_tools._try_rendered_fetch("https://rebind.example.com/page")
 
@@ -1899,9 +1910,9 @@ async def test_rendered_fetch_launches_with_host_resolver_pin(monkeypatch: pytes
         FakePage(html="<html><body><p>Rendered body</p></body></html>"),
         pinned=("example.com", "93.184.216.34"),
     )
-    monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: asyncio.Semaphore(1))
+    monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._sem_for_host", lambda *_: asyncio.Semaphore(1))
     monkeypatch.setattr(
-        "metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value="Rendered body")
+        "metaculus_bot.research.fetch_ladder.classify._extract_main_text", MagicMock(return_value="Rendered body")
     )
     monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
 
@@ -2060,7 +2071,9 @@ class TestReadDocumentRefusesQuestionPlatformPages:
     async def test_the_refusal_is_the_one_fetch_gives(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """One contract for the driver: the same URL refused by either tool reads identically."""
         url = "https://competitions.mantic.com/questions/650/"
-        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+        monkeypatch.setattr(
+            "metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True)
+        )
         _no_paid_reader(monkeypatch)
 
         assert await agentic_tools.read_document(url, "anything") == await agentic_tools.fetch(url)
@@ -2071,8 +2084,10 @@ class TestReadDocumentRefusesQuestionPlatformPages:
         session = _FakeSession(
             _FakeResponse(status=302, headers={"Location": "https://competitions.mantic.com/questions/650/"}),
         )
-        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
-        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+        monkeypatch.setattr(
+            "metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True)
+        )
+        monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
         return session
 
     @pytest.mark.asyncio
@@ -2503,8 +2518,10 @@ class TestLocalPdfRung:
     ) -> None:
         """Too big to read locally is also too big to be worth having a model retrieve."""
         session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "application/pdf"}))
-        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
-        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+        monkeypatch.setattr(
+            "metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True)
+        )
+        monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
         monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=None))
         reader = _no_paid_reader(monkeypatch)
 
@@ -2745,8 +2762,10 @@ class TestReadDocumentAcquiresBeforePaying:
         must not spend a Chromium launch to find that out.
         """
         session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "image/png"}))
-        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
-        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+        monkeypatch.setattr(
+            "metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True)
+        )
+        monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
         rendered = AsyncMock()
         monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", rendered)
         monkeypatch.setenv("GOOGLE_API_KEY", "key")
@@ -2929,7 +2948,9 @@ class TestTheDocumentedEscalationDoesNotRepeatItself:
     @staticmethod
     def _wire_launch_counting_playwright(monkeypatch: pytest.MonkeyPatch) -> FakeChromium:
         """A Chromium that renders every page to an empty DOM; the returned launcher counts launches."""
-        monkeypatch.setattr("metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value=""))
+        monkeypatch.setattr(
+            "metaculus_bot.research.fetch_ladder.classify._extract_main_text", MagicMock(return_value="")
+        )
         return install_fake_playwright(
             monkeypatch, FakePage(html="<html><body></body></html>"), pinned=("example.gov", "93.184.216.34")
         )
@@ -2945,8 +2966,10 @@ class TestTheDocumentedEscalationDoesNotRepeatItself:
         """
         session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "image/png"}))
         read_body = AsyncMock(return_value=b"")
-        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
-        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+        monkeypatch.setattr(
+            "metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True)
+        )
+        monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
         monkeypatch.setattr(agentic_tools, "_read_response_body", read_body)
         rendered = AsyncMock()
         monkeypatch.setattr(agentic_tools, "_try_rendered_fetch", rendered)
@@ -3093,7 +3116,7 @@ class TestRenderedRungSalvagesATimedOutNavigation:
         )
         self._wire_playwright(monkeypatch, page)
         monkeypatch.setattr(
-            "metaculus_bot.research.resolution_source._extract_main_text",
+            "metaculus_bot.research.fetch_ladder.classify._extract_main_text",
             MagicMock(return_value="The tracker reports 41 cases this week."),
         )
 
@@ -3120,7 +3143,9 @@ class TestRenderedRungSalvagesATimedOutNavigation:
                 html="<html><head></head><body></body></html>",
             ),
         )
-        monkeypatch.setattr("metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value=None))
+        monkeypatch.setattr(
+            "metaculus_bot.research.fetch_ladder.classify._extract_main_text", MagicMock(return_value=None)
+        )
 
         result = await agentic_tools._try_rendered_fetch("https://example.com/gone")
 
@@ -3213,9 +3238,9 @@ class TestRenderedRungTimeoutAtTheV2Wrapper:
         page = FakePage(html="<html><body><p>internal status page</p></body></html>", land_on="http://10.0.0.8/status")
         install_fake_playwright(monkeypatch, page, pinned=("example.com", "93.184.216.34"))
         monkeypatch.setattr(rendered_fetch, "_RENDERED_FETCH_GLOBAL_SEMAPHORE", asyncio.Semaphore(2))
-        monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: asyncio.Semaphore(1))
+        monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._sem_for_host", lambda *_: asyncio.Semaphore(1))
         extract = MagicMock(return_value="internal status page")
-        monkeypatch.setattr("metaculus_bot.research.resolution_source._extract_main_text", extract)
+        monkeypatch.setattr("metaculus_bot.research.fetch_ladder.classify._extract_main_text", extract)
 
         result = await agentic_tools._try_rendered_fetch("https://example.com/page")
 
@@ -3292,9 +3317,9 @@ class TestGapFillV2RendersThePlainRungsFinalUrl:
         )
         install_fake_playwright(monkeypatch, page)
         monkeypatch.setattr(rendered_fetch, "_RENDERED_FETCH_GLOBAL_SEMAPHORE", asyncio.Semaphore(2))
-        monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: asyncio.Semaphore(1))
+        monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._sem_for_host", lambda *_: asyncio.Semaphore(1))
         monkeypatch.setattr(
-            "metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value="Rendered body")
+            "metaculus_bot.research.fetch_ladder.classify._extract_main_text", MagicMock(return_value="Rendered body")
         )
         monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
 
@@ -3314,15 +3339,17 @@ class TestGapFillV2RendersThePlainRungsFinalUrl:
             _FakeResponse(status=302, headers={"Location": self._FINAL}),
             _FakeResponse(status=200, headers={"Content-Type": "text/html"}),
         )
-        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
-        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+        monkeypatch.setattr(
+            "metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True)
+        )
+        monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
         monkeypatch.setattr(
             agentic_tools,
             "_read_response_body",
             AsyncMock(return_value=b"<html><body><p>Menu. Home.</p></body></html>"),
         )
         monkeypatch.setattr(
-            "metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value="Menu. Home.")
+            "metaculus_bot.research.fetch_ladder.classify._extract_main_text", MagicMock(return_value="Menu. Home.")
         )
         monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
 
@@ -3617,8 +3644,10 @@ class TestGapFillV2ImpersonatedRetry:
     @pytest.mark.parametrize("status", [403, 406, 429, 503])
     async def test_a_non_200_plain_result_carries_its_http_status(self, status: int, monkeypatch) -> None:
         session = _FakeSession(_FakeResponse(status=status, headers={"Content-Type": "text/html"}))
-        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
-        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+        monkeypatch.setattr(
+            "metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True)
+        )
+        monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
 
         result = await agentic_tools._fetch_plain("https://example.com/gated")
 
@@ -3631,9 +3660,9 @@ class TestGapFillV2ImpersonatedRetry:
         async def is_public(url: str) -> bool:
             return "metaculus.com" in url
 
-        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", is_public)
+        monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", is_public)
         get_session = MagicMock(side_effect=AssertionError("neither refusal opens a session"))
-        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", get_session)
+        monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", get_session)
 
         non_public = await agentic_tools._fetch_plain("http://169.254.169.254/latest/meta-data/")
         self_reference = await agentic_tools._fetch_plain("https://www.metaculus.com/questions/1/")
@@ -3686,7 +3715,7 @@ class TestGapFillV2ImpersonatedRetry:
         async def is_public(url: str) -> bool:
             return "metaculus.com" in url
 
-        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", is_public)
+        monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", is_public)
 
         non_public = await agentic_tools.fetch("http://169.254.169.254/latest/meta-data/")
         self_reference = await agentic_tools.fetch("https://www.metaculus.com/questions/1/")
@@ -3970,7 +3999,7 @@ class TestGapFillV2ImpersonatedRetry:
 class TestPlainHtmlExtractionPolicy:
     """Item A: the loop's HTML path now runs Tier 1's free extraction steps.
 
-    `_plain_html_outcome` routes an HTML body through `resolution_source._extract_page_text`
+    `_plain_html_outcome` routes an HTML body through `classify._extract_page_text`
     (the ARIA-table rewrite plus the two-pass default/precision policy) and prepends the inline
     chart-data read, and follows a `<meta http-equiv=refresh>` stub as a hop. Ported from the
     resolution-source fetcher, where 33 of 80 rendered reads served under 500 chars because the
@@ -3979,8 +4008,10 @@ class TestPlainHtmlExtractionPolicy:
     @staticmethod
     def _serve_html(monkeypatch: pytest.MonkeyPatch, body: bytes) -> None:
         session = _FakeSession(_FakeResponse(status=200, headers={"Content-Type": "text/html"}))
-        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
-        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+        monkeypatch.setattr(
+            "metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True)
+        )
+        monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
         monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(return_value=body))
         monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
 
@@ -3990,10 +4021,8 @@ class TestPlainHtmlExtractionPolicy:
         precision fallback), not a single default `_extract_main_text` call."""
         body = b"<html><body><p>page</p></body></html>"
         self._serve_html(monkeypatch, body)
-        spy = MagicMock(
-            return_value=resolution_source._PageExtraction(text="A calibrated extraction of the page body. " * 3)
-        )
-        monkeypatch.setattr("metaculus_bot.research.resolution_source._extract_page_text", spy)
+        spy = MagicMock(return_value=classify._PageExtraction(text="A calibrated extraction of the page body. " * 3))
+        monkeypatch.setattr("metaculus_bot.research.fetch_ladder.classify._extract_page_text", spy)
 
         result = await agentic_tools._fetch_plain("https://example.com/page")
 
@@ -4022,7 +4051,7 @@ class TestPlainHtmlExtractionPolicy:
         def fake_extract(source: Any, url: str, *, favor_precision: bool = False) -> str:
             return content if favor_precision else chrome
 
-        monkeypatch.setattr("metaculus_bot.research.resolution_source._extract_main_text", fake_extract)
+        monkeypatch.setattr("metaculus_bot.research.fetch_ladder.classify._extract_main_text", fake_extract)
 
         result = await agentic_tools._fetch_plain("https://example.com/report")
 
@@ -4040,7 +4069,9 @@ class TestPlainHtmlExtractionPolicy:
             f'<div class="charts-highchart" data-chart="{_escape_config(config)}"></div></body></html>'
         ).encode()
         self._serve_html(monkeypatch, body)
-        monkeypatch.setattr("metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value=None))
+        monkeypatch.setattr(
+            "metaculus_bot.research.fetch_ladder.classify._extract_main_text", MagicMock(return_value=None)
+        )
 
         result = await agentic_tools._fetch_plain("https://example.com/tracker")
 
@@ -4075,11 +4106,13 @@ class TestPlainHtmlExtractionPolicy:
             _FakeResponse(status=200, headers={"Content-Type": "text/html"}),
             _FakeResponse(status=200, headers={"Content-Type": "text/html"}),
         )
-        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
-        monkeypatch.setattr("metaculus_bot.research.resolution_source._get_session", lambda: session)
+        monkeypatch.setattr(
+            "metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True)
+        )
+        monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._get_session", lambda: session)
         monkeypatch.setattr(agentic_tools, "_read_response_body", AsyncMock(side_effect=[stub, target]))
         monkeypatch.setattr(
-            "metaculus_bot.research.resolution_source._extract_main_text",
+            "metaculus_bot.research.fetch_ladder.classify._extract_main_text",
             MagicMock(side_effect=[None, "Resolving content read from the refresh target. " * 3]),
         )
         monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
@@ -4124,7 +4157,9 @@ class TestGapFillV2WaybackRung:
         )
 
     def _public(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+        monkeypatch.setattr(
+            "metaculus_bot.research.fetch_ladder.guard.is_public_http_url", AsyncMock(return_value=True)
+        )
 
     @pytest.mark.parametrize(
         ("result", "applies"),
@@ -4292,8 +4327,10 @@ class TestGapFillV2DerivedApiOnEmptyRender:
         )
 
     def _empty_dom(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr("metaculus_bot.research.resolution_source._extract_main_text", MagicMock(return_value=None))
-        monkeypatch.setattr("metaculus_bot.research.resolution_source._sem_for_host", lambda *_: asyncio.Semaphore(1))
+        monkeypatch.setattr(
+            "metaculus_bot.research.fetch_ladder.classify._extract_main_text", MagicMock(return_value=None)
+        )
+        monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard._sem_for_host", lambda *_: asyncio.Semaphore(1))
         monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args: fn(*args)))
 
     def test_the_derived_api_serve_earns_the_fetched_tier(self) -> None:

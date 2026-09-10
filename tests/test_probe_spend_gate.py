@@ -42,6 +42,7 @@ from google.genai import types as genai_types
 
 from metaculus_bot.constants import RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV
 from metaculus_bot.research import resolution_source
+from metaculus_bot.research.fetch_ladder import guard
 from metaculus_bot.research.http_fetch import reset_host_semaphores
 from metaculus_bot.research.impersonated_fetch import reset_impersonation_memo
 from metaculus_bot.research.resolution_fetch_result import FetchRoute, FetchStatus, RungAttempt, RungSkipReason
@@ -194,13 +195,13 @@ class TestFetchDiagnosticForcesThePaidRungOff:
             del host, port, args, kwargs
             return [(0, 0, 0, "", ("8.8.8.8", 0))]
 
-        monkeypatch.setattr(resolution_source.socket, "getaddrinfo", _getaddrinfo)
+        monkeypatch.setattr(guard.socket, "getaddrinfo", _getaddrinfo)
 
         reader, calls = paid_reader()
         arm_paid_rung(monkeypatch, reader, budget_s=30.0)
 
         session = refused_page_with_robots()
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         async def _still_refused(url: str, **kwargs: Any) -> Any:
             """The impersonated retry fires on the 403; decline without a network dial (``**kwargs`` absorbs

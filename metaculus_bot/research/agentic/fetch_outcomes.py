@@ -31,10 +31,12 @@ from urllib.parse import urljoin, urlparse
 import aiohttp
 
 from metaculus_bot.constants import GAP_FILL_V2_MIN_CONTENT_CHARS, MANTIC_HOST, METACULUS_HOST
-from metaculus_bot.research import resolution_source
+from metaculus_bot.research.fetch_ladder import classify, guard
 from metaculus_bot.research.http_fetch import MAX_UNDECODABLE_CHAR_RATIO, meta_refresh_target
+from metaculus_bot.research.resolution_body_text import strip_html_tags
 from metaculus_bot.research.resolution_chart_data import render_inline_chart_data
 from metaculus_bot.research.resolution_fetch_result import PDF_CONTENT_TYPES
+from metaculus_bot.research.resolution_url_scan import is_metaculus_self_ref
 
 _FETCH_LINK_CAP = 25
 _FETCH_MIN_CONTENT_CHARS = GAP_FILL_V2_MIN_CONTENT_CHARS
@@ -223,7 +225,7 @@ def _fetch_plain_url_block(url: str) -> PlainFetchResult | None:
     # resolution-source pre-filter never cites one, so the driver only meets a platform URL
     # it picked out of a search result. The resolution-source ladder's own paid rung is
     # closed to a self-reference the same way (`resolution_source._url_context_rung_applies`).
-    if resolution_source.is_metaculus_self_ref(url):
+    if is_metaculus_self_ref(url):
         return PlainFetchResult(
             status="blocked",
             method="plain",
@@ -283,9 +285,9 @@ async def _plain_redirect_outcome(
 async def _vet_hop_target(target: str, current_url: str, content_type: str) -> PlainFetchResult | str:
     """The absolute next URL for a derived hop (a ``Location`` header or a meta-refresh tag), or
     the terminal refusal it earns — one home for the SSRF + platform re-guard every derived hop
-    owes before the redirect loop dials it, mirroring ``resolution_source._vetted_hop_target``."""
+    owes before the redirect loop dials it, mirroring ``guard._vetted_hop_target``."""
     next_url = urljoin(current_url, target)
-    if not await resolution_source.is_public_http_url(next_url):
+    if not await guard.is_public_http_url(next_url):
         return PlainFetchResult(
             status="blocked",
             method="plain",
@@ -312,7 +314,7 @@ async def _plain_html_outcome(
 ) -> PlainFetchResult | str:
     """Outcome for an HTML body: Tier 1's calibrated extraction plus the page's links.
 
-    The extraction is ``resolution_source._extract_page_text`` (ARIA-role tables rewritten to
+    The extraction is ``classify._extract_page_text`` (ARIA-role tables rewritten to
     real tables first, default recall then a precision fallback scored by line shape), and the
     page's inline chart configuration is read on every page (``render_inline_chart_data``, led,
     the resolving series lives only there on some dashboards). A page the policy judges chrome
@@ -320,9 +322,7 @@ async def _plain_html_outcome(
     ``<meta http-equiv=refresh>`` stub with nothing else is followed as a next hop through this
     ladder's own re-guarded redirect loop (a ``str``), the cdc.gov surveillance-stub rescue.
     """
-    extraction = await asyncio.to_thread(
-        resolution_source._extract_page_text, html, body, current_url, undecodable_ratio
-    )
+    extraction = await asyncio.to_thread(classify._extract_page_text, html, body, current_url, undecodable_ratio)
     chart_block = await asyncio.to_thread(render_inline_chart_data, html)
     links = _extract_links_from_html(html, current_url)
     published = "" if extraction.chrome_metric_withheld else (extraction.text or "").strip()
@@ -380,7 +380,7 @@ def _plain_textual_outcome(
     # without it the driver's max_result_chars budget buys tags
     # instead of rows, and the inflated length also defeats the
     # short-content escalation heuristic below.
-    text = resolution_source.strip_html_tags(html).strip()
+    text = strip_html_tags(html).strip()
     if not text:
         return PlainFetchResult(
             status="empty",

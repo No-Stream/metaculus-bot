@@ -9,15 +9,12 @@ import time
 import pytest
 
 from metaculus_bot.research import rendered_fetch, resolution_presentation, resolution_source
+from metaculus_bot.research.fetch_ladder import classify, guard
+from metaculus_bot.research.fetch_ladder.context import LadderContext
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail
 from metaculus_bot.research.rendered_fetch import HarvestedJson, RenderedPage
 from metaculus_bot.research.resolution_fetch_result import FetchResult
-from metaculus_bot.research.resolution_source import (
-    FetchContext,
-    _fetch_one,
-    _rung_counts,
-    resolution_source_provider,
-)
+from metaculus_bot.research.resolution_source import _fetch_one, _rung_counts, resolution_source_provider
 from tests.resolution_source_fakes import (
     _FEED_URL,
     _INFOGRAM_EMBED_MARKUP,
@@ -58,7 +55,7 @@ def _admit_a_render_with(monkeypatch: pytest.MonkeyPatch, budget_s: float) -> No
     """Let the rung fire on a sub-second budget. The production floor is 12 s, and a test that
     waited it out would cost more than the suite's whole rendered-rung coverage."""
     monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_RENDER_MIN_BUDGET_S", 0.01)
-    monkeypatch.setattr(FetchContext, "rung_budget_s", lambda self: budget_s)
+    monkeypatch.setattr(LadderContext, "rung_budget_s", lambda self: budget_s)
 
 
 def _assert_the_direct_result_stands_after_a_cut(result: FetchResult, skipped_reason: str) -> dict[str, int]:
@@ -126,7 +123,7 @@ class TestRenderedRungTriggers:
         thin = _prose_page(_TAB_LIST_CHROME)
         session = FakeSession({_URL: FakeResponse(200, body=thin, content_type="text/html")})
 
-        direct_only = await resolution_source._classify_html_body(thin, _URL, "text/html", http_status=200)
+        direct_only = await classify._classify_html_body(thin, _URL, "text/html", http_status=200)
         assert direct_only.result.status_reason == "thin_page"
 
         result = await _fetch_one(session, _URL, {})
@@ -184,7 +181,7 @@ class TestRenderedRungBudget:
     async def test_it_is_skipped_below_the_floor(self, monkeypatch):
         calls: list[dict[str, object]] = []
         monkeypatch.setattr(resolution_source, "render_page", _fake_render(_rendered("<html></html>"), calls))
-        monkeypatch.setattr(FetchContext, "rung_budget_s", lambda self: 4.0)
+        monkeypatch.setattr(LadderContext, "rung_budget_s", lambda self: 4.0)
         session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
 
         result = await _fetch_one(session, _URL, {})
@@ -205,7 +202,7 @@ class TestRenderedRungBudget:
         """A render admitted with 20 s left may not then help itself to the full 35 s cap."""
         calls: list[dict[str, object]] = []
         monkeypatch.setattr(resolution_source, "render_page", _fake_render(None, calls))
-        monkeypatch.setattr(FetchContext, "rung_budget_s", lambda self: 20.0)
+        monkeypatch.setattr(LadderContext, "rung_budget_s", lambda self: 20.0)
         session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
 
         await _fetch_one(session, _URL, {})
@@ -215,7 +212,7 @@ class TestRenderedRungBudget:
     async def test_a_generous_budget_is_still_capped_at_the_transport_ceiling(self, monkeypatch):
         calls: list[dict[str, object]] = []
         monkeypatch.setattr(resolution_source, "render_page", _fake_render(None, calls))
-        monkeypatch.setattr(FetchContext, "rung_budget_s", lambda self: 600.0)
+        monkeypatch.setattr(LadderContext, "rung_budget_s", lambda self: 600.0)
         session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
 
         await _fetch_one(session, _URL, {})
@@ -413,7 +410,7 @@ class TestRenderedRungLandedOffHost:
         monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
         monkeypatch.setattr(resolution_source, "render_page", self._off_host_render)
         session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
         question = _mock_question(resolution_criteria=f"Resolves per {_URL}")
 
         section = await resolution_source_provider(is_benchmarking=False)(question)
@@ -502,7 +499,7 @@ class TestRenderedRungRendersTheFinalUrl:
         calls: list[dict[str, object]] = []
         monkeypatch.setattr(resolution_source, "render_page", _fake_render(_rendered("<html></html>"), calls))
         direct = FetchResult(url=landed, status="js_wall", text="", http_status=200, content_type="text/html")
-        ctx = FetchContext()
+        ctx = LadderContext()
 
         with caplog.at_level("WARNING", logger="metaculus_bot.research.resolution_source"):
             result = await resolution_source._rendered_rung(_URL, direct, {}, ctx)
@@ -530,7 +527,7 @@ class TestASlowRenderLeavesTheSiblingPagesStanding:
                 self._NEWS_URL: FakeResponse(200, body=article_html, content_type="text/html"),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
         question = _mock_question(resolution_criteria=f"Resolves per {_URL} and {self._NEWS_URL}")
 
         started = time.monotonic()

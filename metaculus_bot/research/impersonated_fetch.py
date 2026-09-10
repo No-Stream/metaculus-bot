@@ -26,7 +26,7 @@ The SSRF invariants are carried here, because libcurl never touches aiohttp's co
 address is disallowed. The hop is then pinned to that address with ``CURLOPT_RESOLVE``, so
 libcurl cannot resolve it again, and checked after the fact against the address libcurl
 reports it connected to. No automatic redirects: every hop is re-guarded through
-``resolution_source._hop_refusal``, re-resolved and re-pinned, under the shared ``MAX_REDIRECTS``
+``guard._hop_refusal``, re-resolved and re-pinned, under the shared ``MAX_REDIRECTS``
 cap. A guard here fails SHUT: every refusal raises, and nothing from a refused response is
 returned.
 
@@ -68,7 +68,7 @@ import logging
 import time
 from collections.abc import Coroutine
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import certifi
@@ -85,11 +85,9 @@ from metaculus_bot.constants import (
     env_flag_enabled,
 )
 from metaculus_bot.research import rendered_fetch
+from metaculus_bot.research.fetch_ladder import guard
 from metaculus_bot.research.http_fetch import MAX_REDIRECTS, REDIRECT_STATUSES, semaphore_for_host
 from metaculus_bot.research.resolution_fetch_result import _NON_OK_FETCH_STATUS, PDF_CONTENT_TYPES
-
-if TYPE_CHECKING:
-    from metaculus_bot.research.resolution_source import HopRefusal
 
 logger = logging.getLogger(__name__)
 
@@ -216,7 +214,7 @@ class ImpersonatePinNotHeld(ImpersonateDeclined):
 
 
 class ImpersonateHopRefused(ImpersonateDeclined):
-    """A redirect target failed ``resolution_source._hop_refusal``.
+    """A redirect target failed ``guard._hop_refusal``.
 
     ``refusal`` is the ``HopRefusal`` token (``ssrf_blocked`` or ``metaculus_self_ref``);
     ``hop_url`` is the refused target and ``from_url`` the hop that redirected to it, so the
@@ -224,11 +222,11 @@ class ImpersonateHopRefused(ImpersonateDeclined):
     fetch's own outcome standing, never a terminal result of its own.
     """
 
-    def __init__(self, refusal: HopRefusal, *, hop_url: str, from_url: str) -> None:
+    def __init__(self, refusal: guard.HopRefusal, *, hop_url: str, from_url: str) -> None:
         super().__init__(
             f"impersonated redirect refused ({refusal}): {urlparse(from_url).netloc} -> {urlparse(hop_url).netloc}"
         )
-        self.refusal: HopRefusal = refusal
+        self.refusal: guard.HopRefusal = refusal
         self.hop_url = hop_url
         self.from_url = from_url
 
@@ -788,18 +786,10 @@ def _redirect_target(hop: _Hop) -> str:
 async def _refuse_derived_hop(next_url: str, *, from_url: str) -> None:
     """Re-guard a URL that came out of a ``Location`` header before it is pinned or dialed.
 
-    The ``resolution_source`` import is function-scoped for the two reasons
-    :func:`rendered_fetch.resolve_pinned_host` states, and both must hold: it is a REAL circular
-    import (that module imports this one at module scope for its rung), and it is the LATE
-    BINDING the suites rely on, because the guard's predicates are monkeypatched on THAT module
-    by both fetch paths' tests and it has exactly one patch surface because every reader resolves
-    it there.
+    The refusal is read off the ``guard`` module at call time for the reason
+    :func:`rendered_fetch.resolve_pinned_host` states: one patch surface for the whole guard.
     """
-    from metaculus_bot.research import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # real cycle + the guard's single patch surface, per the docstring
-        resolution_source,
-    )
-
-    refusal = await resolution_source._hop_refusal(next_url)
+    refusal = await guard._hop_refusal(next_url)
     if refusal is not None:
         raise ImpersonateHopRefused(refusal, hop_url=next_url, from_url=from_url)
 
@@ -807,7 +797,7 @@ async def _refuse_derived_hop(next_url: str, *, from_url: str) -> None:
 def _curl_failure_class(exc: CurlError) -> str:
     """Bucket a curl-cffi failure into the direct path's ``failure_class`` vocabulary.
 
-    Mirrors ``resolution_source._network_failure_class`` so the two fetchers speak the same
+    Mirrors ``classify._network_failure_class`` so the two fetchers speak the same
     six-token set. In the non-stream mode the transport uses, curl-cffi maps the libcurl code to
     its typed subclass through ``code2error`` before raising, so the ladder below sees ``Timeout``
     for code 28, ``SSLError`` for the TLS codes, ``DNSError`` for 6 and ``IncompleteRead`` for

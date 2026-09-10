@@ -19,12 +19,15 @@ import pytest
 
 from metaculus_bot.constants import RESOLUTION_SOURCE_WAYBACK_MAX_AGE_DAYS
 from metaculus_bot.research import resolution_presentation, resolution_source
+from metaculus_bot.research.fetch_ladder import classify
+from metaculus_bot.research.fetch_ladder.classify import looks_like_js_wall
 from metaculus_bot.research.http_fetch import (
     MAX_UNDECODABLE_CHAR_RATIO,
     decode_text_body,
     meta_refresh_target,
     rewrite_aria_tables,
 )
+from metaculus_bot.research.resolution_body_text import strip_html_tags
 from metaculus_bot.research.resolution_fetch_result import (
     _SERVER_HEADER_MAX_CHARS,
     ROUTE_CAVEATS,
@@ -40,9 +43,7 @@ from metaculus_bot.research.resolution_source import (
     is_metaculus_self_ref,
     is_yahoo_ticker_url,
     looks_like_csv_rows,
-    looks_like_js_wall,
     select_fetchable_urls,
-    strip_html_tags,
     strip_markdown_escapes,
     vacuous_body_status,
 )
@@ -411,12 +412,12 @@ class TestSelectFetchableUrls:
 
 class TestLooksLikeJsWall:
     def test_short_text_flagged(self, monkeypatch):
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_JS_WALL_MIN_CHARS", 100)
-        assert resolution_source.looks_like_js_wall("only a few chars") is True
+        monkeypatch.setattr(classify, "RESOLUTION_SOURCE_JS_WALL_MIN_CHARS", 100)
+        assert classify.looks_like_js_wall("only a few chars") is True
 
     def test_long_text_not_flagged(self, monkeypatch):
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_JS_WALL_MIN_CHARS", 20)
-        assert resolution_source.looks_like_js_wall("x" * 30) is False
+        monkeypatch.setattr(classify, "RESOLUTION_SOURCE_JS_WALL_MIN_CHARS", 20)
+        assert classify.looks_like_js_wall("x" * 30) is False
 
     def test_whitespace_only_flagged(self):
         assert looks_like_js_wall("       \n\n   ") is True
@@ -987,10 +988,8 @@ class TestAriaTableRewrite:
     def test_the_hospitalization_count_arrives_with_its_label(self):
         body = cdc_aria_stat_block_page()
 
-        before = resolution_source._extract_main_text(body, "https://www.cdc.gov/cyclosporiasis/")
-        after = resolution_source._extract_page_text(
-            body.decode(), body, "https://www.cdc.gov/cyclosporiasis/", 0.0
-        ).text
+        before = classify._extract_main_text(body, "https://www.cdc.gov/cyclosporiasis/")
+        after = classify._extract_page_text(body.decode(), body, "https://www.cdc.gov/cyclosporiasis/", 0.0).text
 
         assert before is not None
         assert after is not None
@@ -1007,9 +1006,9 @@ class TestAriaTableRewrite:
         that already worked byte-identical — including its encoding detection."""
         assert rewrite_aria_tables(article_html.decode()) is None
 
-        assert resolution_source._extract_page_text(
+        assert classify._extract_page_text(
             article_html.decode(), article_html, "https://news.example.com/report", 0.0
-        ).text == resolution_source._extract_main_text(article_html, "https://news.example.com/report")
+        ).text == classify._extract_main_text(article_html, "https://news.example.com/report")
 
     def test_an_unclosed_role_element_is_still_rewritten(self):
         """A truncated capture (and plenty of live HTML) never closes its outer divs. Leaving
@@ -1064,7 +1063,7 @@ class TestAriaTableRewrite:
         assert 0.0 < ratio < MAX_UNDECODABLE_CHAR_RATIO, "pins that the old gate admitted this page"
         assert "�" in html_text, "our own decode is what mangled it"
 
-        out = resolution_source._extract_page_text(html_text, body, "https://sante.example.com/qc", ratio).text
+        out = classify._extract_page_text(html_text, body, "https://sante.example.com/qc", ratio).text
 
         assert out is not None
         assert "Résumé" in out
@@ -1077,16 +1076,16 @@ class TestAriaTableRewrite:
         threshold now hand trafilatura the original bytes."""
         body = cdc_aria_stat_block_page()
 
-        assert resolution_source._extract_page_text(
+        assert classify._extract_page_text(
             body.decode(), body, "https://www.cdc.gov/cyclosporiasis/", ratio
-        ).text == resolution_source._extract_main_text(body, "https://www.cdc.gov/cyclosporiasis/")
+        ).text == classify._extract_main_text(body, "https://www.cdc.gov/cyclosporiasis/")
 
     def test_a_cleanly_decoded_page_still_gets_the_rewrite(self):
         """Non-vacuity for the two cases above: at 0.0 the labelled row is present, so they
         are asserting a real fallback rather than an extraction that never differs."""
         body = cdc_aria_stat_block_page()
 
-        out = resolution_source._extract_page_text(body.decode(), body, "https://www.cdc.gov/cyclosporiasis/", 0.0).text
+        out = classify._extract_page_text(body.decode(), body, "https://www.cdc.gov/cyclosporiasis/", 0.0).text
 
         assert out is not None
         assert "| Hospitalizations | 922 |" in out
