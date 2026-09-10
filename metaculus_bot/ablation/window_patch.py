@@ -3,14 +3,15 @@
 For ablation backtests on resolved questions, the production prompts'
 ``_forecasting_window_str`` reveals the resolution status by computing
 "days from now" against ``datetime.now()``. These helpers monkey-patch
-the prompt builders for the duration of a single question's forecast,
-restoring the originals on exit.
+the prompt builders and restore the originals on exit: the window patch
+for the duration of one question's forecast, the gap-fill year patch for
+a whole concurrent batch, routed per call.
 """
 
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any
@@ -23,6 +24,7 @@ from metaculus_bot.research import targeted
 __all__ = [
     "compute_mid_window_today",
     "patched_gap_fill_year_for_question",
+    "patched_gap_fill_year_for_questions",
     "patched_window_and_year_for_question",
     "patched_window_for_question",
 ]
@@ -99,39 +101,51 @@ def patched_window_for_question(question: MetaculusQuestion | Any) -> Iterator[N
         _window_patch_active = False
 
 
-@contextmanager
-def patched_gap_fill_year_for_question(question: MetaculusQuestion | Any) -> Iterator[None]:
-    """Patch ``gap_fill_analyzer_prompt`` to neutralize the ``{datetime.now(UTC).year}`` leak.
+def _replacement_years_by_question_text(questions: Sequence[MetaculusQuestion | Any]) -> dict[str, int]:
+    """Map each question's text to the year its analyzer prompt should claim as "now".
 
-    The analyzer prompt interpolates the current year into a "stale info"
-    rubric ("e.g., no 2026 data on a near-term question"). For ablation
-    backtests we substitute a year that does not leak the question's
-    resolution timing: ``scheduled_resolution_time.year - 1``.
-
-    ``research.targeted`` does ``from metaculus_bot.prompts import
-    gap_fill_analyzer_prompt`` at module scope, binding the function in its own
-    namespace; patching only ``prompts`` would leave the production call in
-    ``run_gap_fill_pass`` un-intercepted. Patch both and restore both in
-    ``finally`` (same pattern as ``_patched_gap_fill_max_gaps`` in
-    ``ablation/research.py``).
+    ``scheduled_resolution_time.year - 1`` cannot leak the resolution timing. Two questions
+    sharing a text take the earlier year, which leaks neither one's.
     """
-    assert question.scheduled_resolution_time is not None, "question.scheduled_resolution_time is required"
-    replacement_year = question.scheduled_resolution_time.year - 1
+    years: dict[str, int] = {}
+    for question in questions:
+        assert question.scheduled_resolution_time is not None, "question.scheduled_resolution_time is required"
+        year = question.scheduled_resolution_time.year - 1
+        years[question.question_text] = min(year, years.get(question.question_text, year))
+    return years
+
+
+@contextmanager
+def patched_gap_fill_year_for_questions(questions: Sequence[MetaculusQuestion | Any]) -> Iterator[None]:
+    """Patch ``gap_fill_analyzer_prompt`` for a BATCH, neutralizing the ``{datetime.now(UTC).year}`` leak.
+
+    The analyzer prompt interpolates the current year into a "stale info" rubric ("e.g., no
+    2026 data on a near-term question"), which tells the forecaster the question has resolved;
+    each question's prompt is rewritten to its own replacement year instead. ONE wrapper serves
+    the whole batch, routed on the ``question_text`` argument, because a batch runs
+    concurrently: a per-question patch captured the previous question's wrapper as its original,
+    so the later rewrite found nothing left to match, and a non-LIFO exit left the globals
+    stale. Either raise below lands in ``run_gap_fill_pass``'s soft-fail, which logs
+    GAP_FILL_ANALYZER_FAILED and continues the question without gap-fill.
+
+    ``research.targeted`` from-imports the prompt at module scope, so patching only ``prompts``
+    would leave ``run_gap_fill_pass`` calling an un-intercepted copy; both bindings are patched
+    and restored in ``finally`` (as ``_patched_gap_fill_max_gaps`` in ``ablation/research.py``).
+    """
+    replacement_years = _replacement_years_by_question_text(questions)
     original = prompts_module.gap_fill_analyzer_prompt
     original_targeted = targeted.gap_fill_analyzer_prompt
 
-    def _patched(*args: Any, **kwargs: Any) -> str:
-        rendered = original(*args, **kwargs)
-        # The year must match whatever ``prompts.gap_fill_analyzer_prompt`` interpolated,
-        # which is the UTC year (rubric item 8 renders ``datetime.now(UTC).year``).
+    def _patched(question_text: str, *args: Any, **kwargs: Any) -> str:
+        replacement_year = replacement_years.get(question_text)
+        if replacement_year is None:
+            raise RuntimeError(f"gap-fill year patch has no question in this batch matching {question_text!r}")
+        rendered = original(question_text, *args, **kwargs)
+        # Rubric item 8 renders the UTC year, so that is the year to look for.
         pattern = rf"\bno {datetime.now(UTC).year} data\b"
         rendered, substitutions = re.subn(pattern, f"no {replacement_year} data", rendered)
         if substitutions == 0:
-            # Rubric item 8 is unconditional in the prompt template, so zero matches
-            # always means the template and this guard have drifted apart. Raise
-            # rather than silently leak the real current year; run_gap_fill_pass's
-            # soft-fail turns this into a GAP_FILL_ANALYZER_FAILED WARN and the
-            # ablation continues without gap-fill.
+            # Rubric item 8 is unconditional, so no match means template drift; raising beats leaking.
             raise RuntimeError(f"gap-fill year leak not neutralized: {pattern!r} did not match the analyzer prompt")
         return rendered
 
@@ -142,6 +156,13 @@ def patched_gap_fill_year_for_question(question: MetaculusQuestion | Any) -> Ite
     finally:
         prompts_module.gap_fill_analyzer_prompt = original
         targeted.gap_fill_analyzer_prompt = original_targeted
+
+
+@contextmanager
+def patched_gap_fill_year_for_question(question: MetaculusQuestion | Any) -> Iterator[None]:
+    """Batch-of-one form of ``patched_gap_fill_year_for_questions``."""
+    with patched_gap_fill_year_for_questions([question]):
+        yield
 
 
 @contextmanager

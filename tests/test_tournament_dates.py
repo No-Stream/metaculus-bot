@@ -92,10 +92,10 @@ class TestManticTournamentDates:
     """check_tournament_dates on the Mantic kwargs, against the REAL function.
 
     ``--mode mantic`` passes ``MANTIC_TOURNAMENT_ID`` / ``MANTIC_TOURNAMENT_END_DATE`` (cli.py),
-    and test_cli pins that call against a MagicMock, so nothing else proves the callee honors
-    the kwargs. The negative assertions are the point: the Mantic and Metaculus end dates
-    differ, so a dropped substitution in the function body either fires nothing at all or
-    names the Metaculus id and date, and both fail here.
+    and ``tests/cli/test_cli_season_guards.py`` pins that call against a MagicMock, so nothing
+    else proves the callee honors the kwargs. The negative assertions are the point: the Mantic
+    and Metaculus end dates differ, so a dropped substitution in the function body either fires
+    nothing at all or names the Metaculus id and date, and both fail here.
 
     The verdict is asserted on every case because it is the whole mechanism of the stale-slug
     red exit (``cli._check_tournament_dates`` -> ``sys.exit(1)``): with the warning kept and the

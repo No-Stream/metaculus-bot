@@ -139,8 +139,11 @@ out-of-range base rates, the tail-floor decision and the day-bin evidence below)
 `units_investigation_2026-09-08.md` and `mantic_wave_c_plan_2026-09-08.md` (the Wave C design,
 reviewed in `mantic_wave_c_plan_review_2026-09-08.md` and built on 2026-09-09; the two items it
 shipped and the four it left for live data are below). The `MANTIC_TOKEN` repository secret was set by the operator on
-2026-09-08 (`gh secret list --repo No-Stream/metaculus-bot` shows it), so the one operator step
-left is the merge; the schedule is live once the file is on `main`.
+2026-09-08 (`gh secret list --repo No-Stream/metaculus-bot` shows it) and the post-651 per-bin
+smoke ran and passed on 2026-09-09, so two operator steps are left: the merge (the schedule is
+live once the file is on `main`), then enabling the cron-job.org Mantic dispatcher job with
+`make cronjob_dispatch_setup ARGS="--apply --enable-mantic"` (the steps list in
+`docs/operations.md` "Running it").
 
 **Wave C** (plan `mantic_wave_c_plan_2026-09-08.md`; items C1 and C2 SHIPPED 2026-09-09, C3 to
 C6 await live data, each with its read-only command):
@@ -185,9 +188,9 @@ C6 await live data, each with its read-only command):
   identical). The flat 0.59 max step in Mantic's OpenAPI text is slider text, not a server rule:
   34 of 4,318 stored competitor forecasts exceed it, none exceed `0.2 * 200 / N`, and the
   upstream validator has no such constant, so a certain per-bin forecast is legal on every grid
-  this covers. **Operator step, paid:** ONE per-bin smoke on post 651 (`make run_mantic_one
-  POST=651`, about $3, publishes), verified with the authenticated `with_cp=true` read; the
-  checklist is in `docs/operations.md` "Running it".
+  this covers. **The per-bin smoke on post 651 RAN and PASSED 2026-09-09** (`make run_mantic_one
+  POST=651`, $2.28), verified with the authenticated `with_cp=true` read against the checklist in
+  `docs/operations.md` "Running it", which records what it showed.
 - **Rejected alternative to C1: an `excluded_bins` list on the percentile block** (raised in
   `mantic_wave_c_plan_review_2026-09-08.md`, item 7). Keep the thirteen-percentile ask, let the
   block name the bins the criteria exclude (the weekend days of a trading-day window), zero them
@@ -2535,10 +2538,22 @@ them OUT of feature work, land as their own PRs.
   that anchor block twice, at the cost of one extra yfinance call (free, and the render is the
   actual cost). Skipped as a corner case; the fix is a dedupe in the job builder, natural to do
   when the peg table moves out to its own `currency_pegs.py` per the split above.
-- **Hoist `tests/test_cli.py`'s 17 redundant function-level imports (added 2026-09-09).** Each
-  carries a `HARNESS-SCAN-EXEMPT-function-level-import` marker, and the standing rule forbids
-  deleting a marker, so the hoist needs the operator's sign-off on the marker rule first; it rides
-  the file-split PR rather than the Mantic merge.
+- **~~Hoist `tests/test_cli.py`'s 17 redundant function-level imports~~ (added 2026-09-09; DONE
+  2026-09-09).** The operator reversed the marker rule the same evening (deleting a marker by
+  fixing the code it excused is always welcome), `8b77859` hoisted the 17 imports, and the
+  1,927-line file was then split into the `tests/cli/` package in `0f4ffa3` (eight themed
+  modules, fixtures in its `conftest.py`, the shared harness in `tests/cli_test_helpers.py`;
+  `tests/test_cli_run_summary.py` joined the package as the ninth module in `9479084`).
+- **Remaining broad excepts in `metaculus_bot/ablation/` (added 2026-09-10).** The 2026-09-09
+  housekeeping pass converted only `ablation/research.py` (its brief named those two sites). Still
+  carrying a blanket `except Exception`: `run_stacker.py` lines 617, 639 and 670 (three
+  `HARNESS-SCAN-EXEMPT-broad-except` markers, each translating a stacker failure into a cached
+  error payload), `forecasters.py` lines 493, 591 and 842 (`# noqa: BLE001`), `prune.py` line 597
+  and `qa_iterate.py` line 497. Each is a per-question or per-arm soft-fail boundary in the paid
+  harness, so convert them in one pass on the shape `research.py` now has (`asyncio.gather` with
+  `return_exceptions=True`, non-`Exception` outcomes re-raised, the rest logged with the traceback
+  and mapped to the failure payload), with the operator's say, since each moves where a paid run
+  stops.
 
 ## Medium-term (requires more exploration)
 

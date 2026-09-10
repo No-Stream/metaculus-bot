@@ -345,6 +345,12 @@ have hidden the fix's own verification. The mechanism exists to give the operato
 dated lever instead of reaching for a code deletion when a venue is genuinely dead for good. A venue
 with no entry is always alertable.
 
+A suppressed run is loud rather than quiet on purpose. The `PROVIDER_DEGRADATION` marker shows the
+arithmetic (`findings=1 alertable=0 suppressed=1`), names the resume date, and says the run stays
+green, and the per-finding line still fires. A run reading `alertable=0` beside real degradation is
+the shape that most needs a written record: the 2026-07-26 drained-donated-key run is the precedent
+for how quietly such a run goes unrecorded.
+
 ## Forecasting clamps and numeric smoothing
 
 ### BINARY_PROB_MIN, BINARY_PROB_MAX

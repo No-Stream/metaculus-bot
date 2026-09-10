@@ -698,7 +698,8 @@ per-question cost is about $3 (the post-650 smoke spent $3.17), all of it on the
 personal keys.
 `--mode mantic` runs the whole per-question pipeline unchanged and swaps only the
 platform client. Everything in this section was verified against the live API on
-2026-09-08.
+2026-09-08, and the post-651 per-bin smoke of 2026-09-09 re-verified the publish path (see
+"Running it" below).
 
 The current target is Preseason 2: slug `preseason-2` (`MANTIC_TOURNAMENT_ID`),
 project id 4, forecasting closes 2026-09-20 12:00 UTC (`MANTIC_TOURNAMENT_END_DATE`),
@@ -1128,7 +1129,7 @@ its snapshot names the bot (`docs/supply_probe.md` "The Mantic mode" has the num
 ### Running it, and what is left for the operator
 
 The local QA run is paid and publishes. It spends about $3 per question (the post-650 smoke
-spent $3.17) on the personal OpenRouter, AskNews, Exa and Google keys, posts a forecast for every open
+spent $3.17, the post-651 per-bin smoke $2.28) on the personal OpenRouter, AskNews, Exa and Google keys, posts a forecast for every open
 question the bot has not yet forecast to Mantic, and goes through the ask-first
 gate like every other live mode:
 
@@ -1157,18 +1158,25 @@ among the open questions; when none are, the run logs a warning and forecasts no
 rather than the whole tournament. The re-spend guard still applies, so a listed post the
 bot has already forecast is skipped like any other.
 
-The per-bin smoke (Wave C) is the same command on the preseason's date question, post 651
-(twelve daily bins, both bounds closed), which the gate now elicits per bin. About $3, it
-publishes, and like every paid run it fires once per approval. The forecast-permission
-preflight it runs first passes against the live token: on 2026-09-09 the tournament route read
-`user_permission` `forecaster`, `is_ongoing` true and `bot_leaderboard_status` `bots_only`.
+The per-bin smoke (Wave C) was the same command on the preseason's date question, post 651
+(twelve daily bins, both bounds closed), which the gate elicits per bin. It ran and passed on
+2026-09-09 at 11:24 PT for $2.28 of personal spend (the sum of the run's `CREDIT_ROLE_SPEND`
+lines; run log `~/logs/mantic-smoke-651.log` on the operator's laptop) and was verified with
+the authenticated read below: a 13-value CDF with `cdf[0] == 0.0` and `cdf[12] == 1.0`, the
+three weekend bins at the platform minimum because all three members declared 0 there, the
+modal bin on 2026-09-16 (FOMC day) at 27.0%, three `MEMBER_FORECAST ... elicitation=pmf` lines,
+one `NUMERIC_AGGREGATE ... method=mean` line, one `CLOSE_MARGIN` line and a clean exit. The
+forecast-permission preflight it runs first passed against the live token: the tournament route
+read `user_permission` `forecaster`, `is_ongoing` true and `bot_leaderboard_status` `bots_only`.
+Like every paid run it fires once per approval; the command, for the record and for any later
+smoke on another question:
 
 ```bash
 DONATED_OPENROUTER_KEY_ENABLED=false uv run python main.py --mode mantic --only-posts 651
 # or: make run_mantic_one POST=651
 ```
 
-Verify it afterwards. The authoritative confirmation is the authenticated read
+Verify any smoke afterwards. The authoritative confirmation is the authenticated read
 `curl -s -H "Authorization: Token $MANTIC_TOKEN" "https://competitions.mantic.com/api/posts/651/?with_cp=true"`;
 the run log is the second witness, with one trap: forecasting-tools logs
 `Posted prediction on question 651` and `Posted comment on post 651` BEFORE it checks the HTTP
@@ -1198,10 +1206,10 @@ Operator steps, in order:
 
 1. Done 2026-09-08: the token is stored as the `MANTIC_TOKEN` repository secret
    (`gh secret list --repo No-Stream/metaculus-bot` shows it, set 2026-09-08 20:32 UTC).
-2. Fire the per-bin smoke once, `make run_mantic_one POST=651` (about $3, publishes), and
-   check the five points above.
-3. Merge to `main`. The schedule is live from that moment; there is nothing to
-   enable in the Actions UI. Then enable the Mantic dispatcher job with
+2. Done 2026-09-09: the per-bin smoke on post 651 ran once, passed the five checks above and
+   was verified on the API ($2.28; the paragraph above has the readings).
+3. Merge `mantic-competition` to `main`. The schedule is live from that moment; there is
+   nothing to enable in the Actions UI. Then enable the Mantic dispatcher job with
    `make cronjob_dispatch_setup ARGS="--apply --enable-mantic"` (paid, ask-first; see
    "Scheduling reliability" above).
 4. When Series 2 opens, update `MANTIC_TOURNAMENT_ID` and `MANTIC_TOURNAMENT_END_DATE`;
@@ -2373,7 +2381,8 @@ the telemetry markers:
   channel. Note that a lost catalogue pull bumps BOTH this counter and
   `prediction_market_source_losses`, so one outage adds 2 to `alertable_count`;
   that is deliberate over-counting (the two carry different marker fields) and not
-  two separate failures.
+  two separate failures. `prediction_market_source_losses` is alertable by operator
+  decision: any prediction-market source losing a fetch reddens CI.
 
 **One analysis hazard from ranked market retrieval, worth knowing before you diff
 `providers_used` across eras.** The ranker may legitimately return zero rows, in

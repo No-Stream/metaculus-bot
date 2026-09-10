@@ -9,7 +9,7 @@ Three rules, one class each, all in ``metaculus_bot/mantic.py``:
 - **Parse drops** (item 12). A post the framework cannot parse is caught by its per-post loop, logged
   as one warning and forfeited silently on every run. The client counts the drop and emits one
   ``MANTIC_POST_DROPPED`` line before re-raising, keeping fail-fast; cli reads the counter into the
-  alertable arithmetic (pinned in ``tests/test_cli.py``).
+  alertable arithmetic (pinned in ``tests/cli/test_cli_exit_status.py``).
 - **The tournament preflight** (items 5 and 20). Two authenticated GETs before any spend, neither
   retried: the tournament list logs ``MANTIC_TOURNAMENTS`` (Series 2 discovery), then the configured
   tournament's own route decides whether the token's ``user_permission`` allows forecasting. The

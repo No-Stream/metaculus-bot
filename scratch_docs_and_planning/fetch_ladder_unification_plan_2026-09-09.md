@@ -310,5 +310,7 @@ bucket answering JSON under an unlisted type were all refused at HTTP 200 with t
 the body. The unified classifier must treat structured-data types (JSON and every `+json` suffix,
 XML, CSV) as readable content routed to the harvested-JSON and derived-feed path, the way Tier 1's
 `is_json_content_type` already admits `+json`; neither path reads XML today. One item outside this
-plan for the prediction-market provider's owner: the repo dials `api.elections.kalshi.com` while
-Kalshi's current docs name `external-api.kalshi.com`, so that venue's host may have drifted.
+plan was checked and closed on 2026-09-09: the repo dials `api.elections.kalshi.com` while
+Kalshi's current docs name `external-api.kalshi.com`, but both hosts answer byte-identical
+payloads for the same market and event endpoints, so nothing has drifted and the code keeps the
+elections host (recorded in `docs/research.md`, the prediction-market catalogue prefetch).
