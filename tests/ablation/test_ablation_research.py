@@ -100,7 +100,10 @@ class _RecordingAnalyzerLlm:
         self.prompts.append(prompt)
         self.max_gaps_seen.append(targeted.GAP_FILL_MAX_GAPS)
         await asyncio.sleep(_ANALYZER_OVERLAP_SLEEP_S)
-        return '```json\n{"gaps": [{"gap": "the missing figure", "why_matters": "it decides the question"}]}\n```'
+        return (
+            '```json\n{"gaps": [{"gap": "the missing figure", "why_matters": "it decides the question", '
+            '"answerable_now": true, "already_in_first_pass": false, "same_need_as": null}]}\n```'
+        )
 
 
 def _install_real_gap_fill(monkeypatch: pytest.MonkeyPatch, *, first_pass: str) -> _RecordingAnalyzerLlm:
