@@ -134,7 +134,7 @@ def yahoo_symbols(text: str) -> list[str]:
             quote = _YAHOO_QUOTE_PATH_RE.search(parsed.path)
             if quote:
                 symbols.append(quote.group(1))
-    return _dedupe(symbol.rstrip(".") for symbol in symbols)
+    return _dedupe([symbol.rstrip(".") for symbol in symbols])
 
 
 def kalshi_ticker(url: str) -> str | None:
