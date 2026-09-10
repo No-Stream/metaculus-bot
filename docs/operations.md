@@ -1281,6 +1281,25 @@ The paid run is the operator's last step.
   jobs that dispatch the bot workflows, so every firing it adds is a paid, publishing bot
   run; `--enable-mantic` turns the Mantic job on and waits for `run_bot_on_mantic.yaml` to
   be on `main`. See "Scheduling reliability" above.
+- `make probe_resolver QUESTION=<id>`: replays the gaps the archive recorded for one
+  question through the production gap-fill v1 resolver path at every model and
+  search-context cell of a grid (default: the current resolver model and `gpt-5.6-luna`,
+  each at high, medium and low) and writes the answers beside OpenRouter's per-call cost
+  to `scratch/probes/`. Up to about $0.20 a call on the operator's personal OpenRouter key
+  (the donated key is forced off); the script prints its ceiling first and refuses without
+  `ARGS="--i-accept-spend"`. Narrow with `ARGS="--grid current:high luna:low"` or
+  `ARGS="--gaps 1,2"`.
+- `make strip_bench`: the paired section-strip bench forecasts every resolved gap-fill
+  pair four ways (the bundle as published, minus v1, minus v2, minus both) with one cheap
+  model on the personal OpenRouter key and scores the arms against the resolutions. No
+  research runs and nothing publishes; the estimate at the default three replicates is
+  about $1.25, under `--max-spend-usd` (default 10). A bare call prints the plan and
+  refuses, `ARGS="--dry-run"` is the free view, `ARGS="--i-accept-spend"` runs it, and
+  `ARGS="--rescore <run dir>"` rebuilds results offline. The default model is Meta's Muse
+  Spark 1.3 Contributor tier, which may train on prompts (accepted by the operator for this
+  open-source repo); the run stays blocked until the operator's OpenRouter account allows
+  training providers and confirms the 18+ attestation, which the first reachability call on
+  2026-09-09 hit as a 403 naming `age_18plus`.
 - Any script that invokes a research provider or the ensemble against real
   questions, including one an agent writes on the spot.
 
@@ -1304,6 +1323,12 @@ The paid run is the operator's last step.
   scheduled versus dispatched runs. The bare `make cronjob_dispatch_setup` is a dry run:
   one read-only GET of the cron-job.org account when both secrets are set, no request at
   all otherwise, and never a write.
+- `make cost_report`: cost per question off the telemetry archive (run
+  `make sync_telemetry` first): per run (questions, charged dollars, dollars a question),
+  per role (dollars a question, prompt and output tokens a question, prompt-cache share,
+  largest single prompt) and the week-over-week median. The question denominator is
+  `CREDIT_RUN_SUMMARY` where a run has one, else its `FORECASTERS_SURVIVED` lines.
+  `ARGS="--days 7"` narrows the default 30-day window.
 - `make benchmark_display`: views saved benchmark results, no forecasting.
 - `make check_credits`: reads the `/auth/key` balance for both OpenRouter keys.
 
