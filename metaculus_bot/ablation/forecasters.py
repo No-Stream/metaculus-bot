@@ -76,48 +76,22 @@ EXPECTED_LLM_CALL_FAILURES: tuple[type[Exception], ...] = (
     ValueExtractionError,  # every rung of the extraction ladder failed
 )
 
-# Maximum sleep duration for exponential backoff fallback when ``retry_after_seconds``
-# is missing from the 429 payload. OpenRouter docs recommend 1s/2s/4s/8s; this caps
-# the worst case at 60s so a stuck attempt doesn't park the runner indefinitely.
+# Caps the backoff fallback (no ``retry_after_seconds`` in the 429) so a stuck attempt can't park the runner.
 _RATE_LIMIT_BACKOFF_CAP_SECONDS: float = 60.0
 
-# Maximum sleep when honoring an explicit ``retry_after_seconds`` from the 429
-# payload. Free-tier providers occasionally signal long recovery windows (90s+)
-# on hot-tail throttles, and we want to honor those — capping below them sheds
-# forecasters that would otherwise succeed on the next attempt. The cap exists
-# only as a backstop against a misbehaving upstream sending Retry-After: 3600
-# (one hour) on a transient throttle, which would park the runner for the rest
-# of the batch. 120s is the calibrated middle: comfortably above observed
-# legitimate Retry-After values, well below catastrophic.
+# Above the 90s+ free-tier Retry-Afters seen (a lower cap sheds forecasters), below a 3600s one that parks the batch.
 _MAX_RATE_LIMIT_SLEEP_SECONDS: float = 120.0
 
-# Default max retries on RateLimitError. Matches the "gentle" preset in cli.py;
-# the CLI always passes an explicit value, so this default is just for direct
-# unit-test invocation and other ad-hoc callers.
+# Matches the "gentle" preset in cli.py; the CLI always passes an explicit value, so this only serves ad-hoc callers.
 _DEFAULT_MAX_RETRIES: int = 3
 
-# Pulled from a litellm-wrapped OpenRouter 429 in /tmp/ablation_phase_a1_v3.log:
-#     ..."retry_after_seconds":13,"retry_after_seconds_raw":12.315,...
-# The integer key is what we want — ``retry_after_seconds_raw`` is a more precise
-# float but ``retry_after_seconds`` matches the upstream Retry-After header. Using
-# regex (rather than json.loads) is deliberate: the litellm prefix wraps a JSON
-# blob that itself contains nested braces and string-escaped JSON, so a substring
-# json.loads is brittle. The regex matches a int or float and returns the first hit.
+# Live OpenRouter 429 shape: "retry_after_seconds":13,"retry_after_seconds_raw":12.315; the int key mirrors Retry-After.
 _RETRY_AFTER_REGEX = re.compile(r'"retry_after_seconds"\s*:\s*(\d+(?:\.\d+)?)')
 
-# Companion to ``_RETRY_AFTER_REGEX`` for HTTP-date-form Retry-After headers
-# (RFC 7231). OpenRouter occasionally proxies upstream date-form values
-# (e.g. "Wed, 21 Oct 2026 07:28:00 GMT"); without parsing this form, the
-# retry path falls through to the 60s exponential backoff cap and burns the
-# retry budget while the real recovery window is much longer.
+# OpenRouter sometimes proxies a date-form (RFC 7231) Retry-After; unparsed it would fall to the 60s backoff cap.
 _RETRY_AFTER_DATE_REGEX = re.compile(r'"Retry-After"\s*:\s*"([^"\d][^"]*)"')
 
-# Same regex shape as ``_RETRY_AFTER_REGEX`` but for the upstream provider name.
-# Real OpenRouter 429 payload carries ``"provider_name":"Venice"`` (or
-# OpenInference, etc.); surfacing this in retry logs lets the operator see
-# which upstream is causing pain when several free-tier forecasters share one.
-# Quoted-string match — values are short alphanumeric/dash, no need for
-# exhaustive escape handling.
+# OpenRouter 429s carry "provider_name":"Venice" and the like; the retry log names which shared upstream is throttling.
 _PROVIDER_NAME_REGEX = re.compile(r'"provider_name"\s*:\s*"([^"]+)"')
 
 
@@ -194,19 +168,12 @@ def _backoff_seconds(attempt: int) -> float:
     return min(_RATE_LIMIT_BACKOFF_CAP_SECONDS, (2**attempt) + random.uniform(0.0, 1.0))  # noqa: S311  # non-cryptographic backoff jitter
 
 
-# The window patch monkey-patches `_forecasting_window_str` GLOBALLY, and its
-# context manager guards against nested entry with a RuntimeError. When two
-# `run_forecasters_for_question` invocations are concurrent (per_question_concurrency>1),
-# the second entry would collide with the first's patch state. Serializing the
-# patched section with an asyncio.Lock keeps all forecasters within ONE patched
-# region per question while still letting other batch work (cache reads, write
-# atomic file ops, gathers) overlap across questions.
+# The window patch is a global monkey-patch that refuses nested entry, so concurrent questions take turns inside it.
 _WINDOW_PATCH_LOCK: asyncio.Lock | None = None
 
 
 def _get_window_patch_lock() -> asyncio.Lock:
-    # The lock guards a MODULE-level monkey-patch, so it has to be module-scoped too,
-    # and it must be built lazily inside a running loop.
+    """Return the module-wide lock, built lazily so it binds to the running event loop."""
     global _WINDOW_PATCH_LOCK  # noqa: PLW0603  # deliberate module-global: lazily-built lock for a module-level monkey-patch
     if _WINDOW_PATCH_LOCK is None:
         _WINDOW_PATCH_LOCK = asyncio.Lock()
@@ -228,54 +195,26 @@ __all__ = [
 
 
 def _infer_failure_stage(exc: Exception, forecaster_model_slug: str) -> str:
-    """Heuristically tag which stage of ``_make_prediction`` raised.
+    """Heuristically tag which stage of ``_make_prediction`` raised: ``forecaster``, ``parser`` or ``unknown``.
 
-    ``_make_prediction`` calls (1) the forecaster LLM via
-    ``_run_forecast_on_<type>``, then (2) the value_extraction ladder (which
-    subsumes the old parser LLM stage — see ``metaculus_bot.value_extraction``).
-    The exception message rarely identifies which model raised — exception
-    types are litellm-generic. We use textual heuristics that survived
-    first-light:
-
-    * :class:`ValueExtractionError` → parser. The extraction ladder is the
-      successor to the parser stage, so its typed terminal failure is a
-      "parser"-stage failure. Checked first so the typed signal wins before
-      any textual heuristic can miscategorize it.
-    * ``"no allowed providers"`` → almost always the parser. The donated-key
-      allowed-providers 404 hits the parser specifically (the parser is the
-      OAI-prefixed model in the ablation; production forecasters route via
-      the donated key too but typically don't 404 at this scale).
-    * Rate-limit text → forecaster. Free-tier rate limits are model-specific;
-      since forecasters run before the parser is invoked, a rate limit on
-      the forecaster prevents the parser from ever being called. The parser
-      runs once per forecaster call and shares one parser model across all
-      forecasters, so its rate-limit footprint is bounded.
-
-    Returns one of ``"forecaster"``, ``"parser"``, or ``"unknown"``. The full
-    exception is always preserved in the payload's ``errors`` list — this tag
-    is purely advisory for log readers.
+    Exception types are litellm-generic and rarely name the model, so the tag rests on the
+    heuristics that survived first-light. :class:`ValueExtractionError` is the extraction ladder's
+    typed terminal failure (the ladder replaced the parser LLM stage) and wins before any text is
+    read. "no allowed providers" is the donated-key 404, which only the OAI-prefixed parser takes.
+    A 429 status or rate-limit wording is the forecaster, because a throttled forecaster never
+    reaches the parser; the wording covers SDKs that report no status. The tag is advisory for
+    log readers; the full exception stays in the payload's ``errors`` list.
     """
-    # Typed extraction-ladder failure — ranks above textual heuristics.
     if isinstance(exc, ValueExtractionError):
         return "parser"
     msg = str(exc).lower()
-    # Donated-key allowed-providers 404. Parser uses the OAI-prefixed model
-    # in production llm_configs (and historically did in the ablation, before
-    # task #16 switched to plain GeneralLlm); forecasters in the ablation
-    # are now plain GeneralLlm so they don't 404 on this code path.
+    # The donated-key allowed-providers 404 hits only the OAI-prefixed parser; forecasters here are plain GeneralLlm.
     if "no allowed providers" in msg:
         return "parser"
-    # Rate limits: provider-throttled before parser is invoked. The reported status is
-    # the only numeric evidence consulted — litellm formats the message as
-    # ``f"APIError: {provider} - {body}"`` and an OpenRouter body embeds a 64-hex key hash
-    # plus, on a moderation refusal, ~100 chars of our own prompt, so a bare ``"429" in msg``
-    # read coincidental digits as a status. English wording stays as the statusless
-    # fallback (AskNews-shaped SDKs and non-litellm callers report no status).
+    # Never ``"429" in msg``: the body embeds a 64-hex key hash and prompt text, so bare digits matched by accident.
     if llm_status_code(exc) == 429 or "rate limit" in msg or "too many requests" in msg:
         return "forecaster"
-    # Model-specific text: if the exception names the forecaster slug, the
-    # forecaster invoke itself raised. Parser-side errors typically wrap
-    # the parser model's name instead.
+    # Parser-side errors name the parser model, so the forecaster slug in the text means the forecaster call raised.
     if forecaster_model_slug.lower() in msg:
         return "forecaster"
     return "unknown"
@@ -330,13 +269,7 @@ def serialize_prediction_value(value: Any, question_type: str) -> dict[str, Any]
             ],
         }
     if question_type == "numeric":
-        # Iterating a NumericDistribution (Pydantic BaseModel) yields
-        # ``(field_name, value)`` tuples — that was the bug. Pull declared_percentiles
-        # explicitly. The .cdf property returns a list of Percentile objects whose
-        # ``percentile`` field carries the probability and ``value`` field carries the
-        # corresponding question value (lower_bound + i * (upper-lower)/(N-1)).
-        # We only persist the probabilities; the value axis is fully determined by
-        # bounds + cdf_size and reconstructed at deserialize time.
+        # Never iterate the distribution: a Pydantic model yields (field, value) tuples, which was the original bug.
         if not isinstance(value, NumericDistribution):
             raise TypeError(f"Expected NumericDistribution for numeric, got {type(value).__name__}")
         cdf_points = value.cdf
@@ -373,9 +306,7 @@ def deserialize_prediction_value(payload: dict[str, Any], question: MetaculusQue
     if payload_type == "binary":
         return float(payload["prob"])
     if payload_type == "multiple_choice":
-        # Clamp + renormalize cached probabilities BEFORE construction so ft 0.2.92's
-        # clamp-and-renormalize validator is a no-op on old-era payloads that may carry
-        # sub-0.01 options (which would otherwise fire the >0.05 raise on reload).
+        # Clamp first: ft 0.2.92's validator raises above 0.05 on the sub-0.01 options some old-era payloads carry.
         options_payload = payload["options"]
         clamped = clamp_and_renormalize_probs([float(opt["probability"]) for opt in options_payload])
         return PredictedOptionList(
@@ -396,11 +327,7 @@ def deserialize_prediction_value(payload: dict[str, Any], question: MetaculusQue
             for p in payload["declared_percentiles"]
         ]
         cdf_probabilities: list[float] = [float(p) for p in payload["cdf_probabilities"]]
-        # ``create_pchip_numeric_distribution`` reads bounds/zero_point/cdf_size
-        # from ``question`` — but for the ablation, ``question`` is the
-        # rehydrated Pydantic shim, which carries those fields verbatim. Using
-        # the live question's bounds keeps the .cdf property's value axis
-        # consistent with what the forecaster actually computed.
+        # Bounds and cdf_size come off ``question``; the rehydrated shim carries them verbatim, keeping the value axis.
         return create_pchip_numeric_distribution(
             pchip_cdf=cdf_probabilities,
             percentile_list=declared,
@@ -434,10 +361,7 @@ def _build_bot(
     qid = question.id_of_question
     if qid is None:
         raise ValueError("Question must have id_of_question for ablation forecasting")
-    # ``forecasters`` legitimately holds a ``list[GeneralLlm]`` (unpacked by
-    # ``prepare_llm_config``), which the parent ``llms`` param type
-    # (``dict[str, str | GeneralLlm]``) doesn't model. Annotate ``dict[str, Any]``
-    # to match ``prepare_llm_config``'s own input type.
+    # ``forecasters`` holds a list, which the parent ``llms`` type ``dict[str, str | GeneralLlm]`` cannot express.
     llms: dict[str, Any] = {
         "forecasters": [forecaster_llm],
         "parser": parser_llm,
@@ -490,11 +414,7 @@ async def _predict_with_rate_limit_retries(
     errors: list[str] = []
     for attempt in range(max_retries + 1):
         try:
-            # Soft deadline mirrors production at main.py:1063: a single stuck
-            # forecaster used to be able to hold a question for litellm
-            # timeout(480) * allowed_tries(3) ≈ 24 min. Bound each attempt at
-            # FORECASTER_SOFT_DEADLINE (10 min in prod); the asyncio.TimeoutError is
-            # treated as a non-rate-limit failure below so it doesn't retry.
+            # Mirrors prod's soft deadline: a stuck forecaster once held a question for 480s x 3 litellm tries, ~24 min.
             prediction = await asyncio.wait_for(
                 bot._make_prediction(question, research_blob, forecaster_llm),
                 timeout=FORECASTER_SOFT_DEADLINE,
@@ -504,9 +424,7 @@ async def _predict_with_rate_limit_retries(
         except EXPECTED_LLM_CALL_FAILURES as exc:
             errors.append(f"{type(exc).__name__}: {exc}")
             if not _is_rate_limit_error(exc):
-                # Not a rate limit — log with stage heuristic and stop. Original
-                # misdirection cost (parser 404 mis-tagged as forecaster) was the
-                # whole reason ``_infer_failure_stage`` exists.
+                # A parser 404 once mis-tagged as the forecaster is why ``_infer_failure_stage`` exists.
                 stage = _infer_failure_stage(exc, forecaster_llm.model)
                 logger.warning(
                     "ablation forecaster failed | qid=%s | forecaster_model=%s | "
@@ -601,10 +519,7 @@ def _serialize_prediction_or_record_error(
         return serialize_prediction_value(prediction.prediction_value, qtype), prediction.reasoning
     except (TypeError, ValueError) as exc:  # the serializer's own shape guards; a bug type propagates instead
         errors.append(f"{type(exc).__name__}: {exc}")
-        # We know the stage here — no heuristic needed. The original tuple bug
-        # surfaced as ``AttributeError: 'tuple' object has no attribute 'percentile'``
-        # in this exact code path, and tagging it ``serialize`` saves the operator the
-        # 30-minute detour of grep-ing through forecaster vs. parser code.
+        # Tag the stage outright: the original tuple AttributeError raised here and cost a 30-minute grep detour.
         logger.warning(
             "ablation forecaster failed | qid=%s | forecaster_model=%s | "
             "likely_stage=serialize | parser_model=%s | %s: %s",
@@ -655,13 +570,7 @@ async def _run_one_forecaster(
 
         logger.info("ablation forecaster start | qid=%s | model=%s", qid, forecaster_llm.model)
         start = time.monotonic()
-        # Mirror the framework's notepad lifecycle from
-        # ``ForecastBot._run_individual_question`` (lines 352-354 + 414): every
-        # call to ``_make_prediction`` first reads ``_get_notepad(question)``,
-        # which raises if no notepad has been registered. ``_run_individual_question``
-        # is the framework's normal entry; we bypass it for cache-friendly per-(qid,
-        # model) granularity, so we own the lifecycle here. The ``finally`` block
-        # ensures notepads don't accumulate across calls when the prediction raises.
+        # ``_make_prediction`` needs a notepad registered first; we skip ``_run_individual_question``, so that is ours.
         notepad = await bot._initialize_notepad(question)
         async with bot._note_pad_lock:
             bot._note_pads.append(notepad)
@@ -697,10 +606,7 @@ async def _run_one_forecaster(
             "ran_at": datetime.now(UTC).isoformat(),
             "duration_seconds": float(duration),
         }
-        # Even on serialize failure, persist the (failure) payload so partial-success
-        # cases preserve the diagnostic record. Cache-write failures (rare — disk
-        # full, permissions) are intentionally NOT caught here; they're a fatal
-        # environmental signal the operator needs to see.
+        # A cache-write error (disk full, permissions) is deliberately not caught; it is a fatal environmental signal.
         cache.write_forecaster_output(qid=qid, model_slug=model_slug, payload=payload)
         logger.info(
             "ablation forecaster done | qid=%s | model=%s | duration=%.1fs | errors=%d",
@@ -725,19 +631,12 @@ async def run_forecasters_for_question(
 ) -> dict[str, dict[str, Any]]:
     """Run all forecasters against one question; cache + return per-model payloads.
 
-    Returns a dict keyed by ``model_slug_filename`` (filesystem-safe slug).
-
-    For each forecaster:
-
-    * If a cached payload exists and ``force`` is False, the cached payload is
-      returned without calling ``_make_prediction``.
-    * Otherwise the forecaster is invoked under
-      :func:`patched_window_for_question` so prompt-injected dates are anchored
-      to the question's mid-window.
-
-    An expected per-forecaster failure is recorded in that payload's ``errors`` list
-    and persisted to cache with ``prediction_value=None``, and the other forecasters
-    continue. A bug propagates out of this function instead.
+    Returns a dict keyed by ``model_slug_filename`` (filesystem-safe slug). A forecaster with a
+    cached payload is served from cache unless ``force`` is set; the rest run under
+    :func:`patched_window_for_question` so prompt-injected dates anchor to the question's
+    mid-window. An expected per-forecaster failure is recorded in that payload's ``errors`` list
+    and persisted with ``prediction_value=None`` while the other forecasters continue; a bug
+    propagates out of this function instead.
     """
     if forecaster_llms is None:
         forecaster_llms = build_free_forecaster_llms()
@@ -761,21 +660,8 @@ async def run_forecasters_for_question(
 
     if to_run:
         semaphore = asyncio.Semaphore(per_forecaster_concurrency)
-        # Window patch wraps the entire fan-out so prompts inside _make_prediction
-        # see the question-anchored "today". The context manager guards against
-        # nested entry; the module-level asyncio.Lock serializes patched sections
-        # across concurrent batch runs so two questions can't try to enter
-        # simultaneously.
-        #
-        # ``probabilistic_tools_enabled(False)`` disables the env flag for the
-        # duration of the fan-out so an operator-shell ``PROBABILISTIC_TOOLS_ENABLED=1``
-        # does NOT contaminate the cached rationales. Forecaster rationales are
-        # shared across both ablation arms; if ``_make_prediction`` were to append
-        # ``## Computed quantities`` while caching, BOTH arms would inherit that
-        # contamination and the A/B comparison would be invalid. The original
-        # env value is restored on exit so anything outside the forecast stage
-        # observes the operator's setting unchanged.
         async with _get_window_patch_lock():
+            # Tools off while caching: both arms reuse the rationales; a leaked "Computed quantities" voids the A/B.
             with patched_window_for_question(question), probabilistic_tools_enabled(enabled=False):
                 tasks = [
                     _run_one_forecaster(
@@ -830,9 +716,8 @@ async def run_forecasters_batch(
         parser_llm = build_free_parser_llm()
 
     semaphore = asyncio.Semaphore(per_question_concurrency)
-    # Late binding via module attribute so tests can monkeypatch
-    # `run_forecasters_for_question` on the module and have it observed here.
-    from metaculus_bot.ablation import forecasters as _self_module  # noqa: PLC0415, PLW0406  # deliberate; see above
+    # Late binding through the module attribute so a test monkeypatch of ``run_forecasters_for_question`` is observed.
+    from metaculus_bot.ablation import forecasters as _self_module  # noqa: PLC0415, PLW0406  # late-bound patch surface
 
     async def _run_one(question: MetaculusQuestion, blob: str) -> dict[str, dict[str, Any]]:
         async with semaphore:
