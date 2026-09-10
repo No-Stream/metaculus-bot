@@ -16,6 +16,7 @@ probability per labelled bin, and its distribution is built straight from that d
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 
 from forecasting_tools import (
     BinaryQuestion,
@@ -96,6 +97,27 @@ def _forecaster_input(prompt: str, chart_b64: str | None) -> str | VisionMessage
     if chart_b64 is None:
         return prompt
     return VisionMessageData(prompt=prompt, b64_image=chart_b64, image_resolution="low")
+
+
+# The parser LLM's extraction instructions for a binary rationale (the salvage rung of the ladder).
+BINARY_PARSE_NOTES: str = (
+    "Return a single JSON object only. Set `prediction_in_decimal` strictly as a decimal in [0,1] "
+    "(e.g., 0.17 for 17%). If the text contains 'Probability: NN%' or 'NN %', set `prediction_in_decimal` to NN/100. "
+    "Do not return percentages, strings, or any extra fields."
+)
+
+
+def build_mc_parse_notes(options: Sequence[str]) -> str:
+    """The parser LLM's extraction instructions for a multiple-choice rationale, naming the question's options."""
+    return clean_indents(
+        f"""
+        Output a JSON array of objects with exactly these two keys per item: `option_name` (string) and `probability` (decimal in [0,1]).
+        Use option names exactly from this list (case-insensitive match is OK, but prefer canonical spelling):
+        {list(options)}
+        Do not include any options beyond this list. If the source text prefixes with words like 'Option A:' remove the prefix.
+        Ensure the probabilities approximately sum to 1.0; slight floating-point drift is OK.
+        """
+    )
 
 
 def build_parse_notes(question: NumericQuestion) -> str:
@@ -230,15 +252,10 @@ async def run_binary_forecast(
     )
     _log_llm_output(forecaster_llm.model, question.id_of_question, reasoning)
 
-    binary_parse_instructions = (
-        "Return a single JSON object only. Set `prediction_in_decimal` strictly as a decimal in [0,1] "
-        "(e.g., 0.17 for 17%). If the text contains 'Probability: NN%' or 'NN %', set `prediction_in_decimal` to NN/100. "
-        "Do not return percentages, strings, or any extra fields."
-    )
     outcome = await extract_binary(
         reasoning,
         parser_llm,
-        prompt_notes=binary_parse_instructions,
+        prompt_notes=BINARY_PARSE_NOTES,
         question_id=question.id_of_question,
         model_name=forecaster_llm.model,
     )
@@ -275,21 +292,11 @@ async def run_mc_forecast(
     )
     _log_llm_output(forecaster_llm.model, question.id_of_question, reasoning)
 
-    parsing_instructions = clean_indents(
-        f"""
-        Output a JSON array of objects with exactly these two keys per item: `option_name` (string) and `probability` (decimal in [0,1]).
-        Use option names exactly from this list (case-insensitive match is OK, but prefer canonical spelling):
-        {question.options}
-        Do not include any options beyond this list. If the source text prefixes with words like 'Option A:' remove the prefix.
-        Ensure the probabilities approximately sum to 1.0; slight floating-point drift is OK.
-        """
-    )
-
     outcome = await extract_mc(
         reasoning,
         list(question.options),
         parser_llm,
-        prompt_notes=parsing_instructions,
+        prompt_notes=build_mc_parse_notes(question.options),
         question_id=question.id_of_question,
         model_name=forecaster_llm.model,
     )

@@ -1,4 +1,4 @@
-.PHONY: install lock test test_verbose all lint lint_imports deps format typecheck typecheck_ty cov audit run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research sync_telemetry sync_raw_research sync_all resync_from_store backfill_research download_research download_run_logs download_raw_research backfill_comments score_ghosts close_margin_watch supply_probe supply_probe_mantic dispatch_watch cronjob_dispatch_setup backtest_with_cache run_mantic run_mantic_one
+.PHONY: install lock test test_verbose all lint lint_imports deps format typecheck typecheck_ty cov audit run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research sync_telemetry sync_raw_research sync_all resync_from_store backfill_research download_research download_run_logs download_raw_research backfill_comments score_ghosts close_margin_watch supply_probe supply_probe_mantic dispatch_watch cronjob_dispatch_setup backtest_with_cache run_mantic run_mantic_one strip_bench
 
 # Stream logs live from recipes; avoid per-target buffering
 MAKEFLAGS += --output-sync=none
@@ -382,3 +382,12 @@ backtest_with_cache:
 # to limit which key is queried (default: both).
 check_credits:
 	@uv run python -m metaculus_bot.check_openrouter_credits $(ARGS)
+
+# PAID, PERSONAL KEY ONLY (ask-first gate, see AGENTS.md): the paired section-strip bench forecasts
+# every resolved gap-fill pair four ways (full bundle, minus v1, minus v2, minus both) with one cheap
+# model on OPENROUTER_API_KEY and scores the arms against the resolutions. Nothing publishes and no
+# research runs; the estimate at the default 3 replicates is about $1.25. A bare `make strip_bench`
+# prints the plan and refuses; ARGS="--dry-run" is the free view; ARGS="--i-accept-spend" runs it
+# under --max-spend-usd (default 10); ARGS="--rescore <run dir>" rebuilds results offline.
+strip_bench:
+	uv run python -m scripts.probes.section_strip_bench $(ARGS)
