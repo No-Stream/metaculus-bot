@@ -2690,7 +2690,7 @@ class TestReadDocumentAcquiresBeforePaying:
         """
         interstitial = "Limit for old data queries exceeded. Permitted a query per 20 seconds per IP"
         _serve_direct(monkeypatch, _ogimet_page(interstitial, escalate_rendered=True))
-        # The interstitial is thin, so the browser is tried; the text it leaves standing holds nothing.
+        # The shared ladder marks the interstitial terminal; read_document still uses its paid reader fallback.
         rendered_on = _serve_rendered(monkeypatch, None)
         monkeypatch.setenv("GOOGLE_API_KEY", "key")
         monkeypatch.setattr(
@@ -2700,7 +2700,7 @@ class TestReadDocumentAcquiresBeforePaying:
 
         outcome = await agentic_tools.read_document(_OGIMET_URL, "the 2022-08-31 maximum")
 
-        assert rendered_on == [_OGIMET_URL]
+        assert rendered_on == []
         assert outcome.method == "document"
         assert "Limit for old data queries" not in outcome.content_markdown
 
