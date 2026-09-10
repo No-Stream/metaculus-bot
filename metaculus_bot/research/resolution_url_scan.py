@@ -19,6 +19,7 @@ import re
 from urllib.parse import urlparse
 
 from metaculus_bot.constants import QUESTION_PLATFORM_HOSTS
+from metaculus_bot.research.known_api import parse as known_api_parse
 from metaculus_bot.research.wayback import innermost_url
 
 # Metaculus-injected markdown escapes: `\_`, `\.`, `\&`, `\-`, `\#`, `\(`, `\)`.
@@ -210,21 +211,14 @@ def is_metaculus_self_ref(url: str) -> bool:
 
 def is_fred_url(url: str) -> bool:
     """FRED series URLs are already served by the financial-data provider."""
-    try:
-        host = (urlparse(url).hostname or "").lower()
-    except ValueError:
-        return False
-    return host == "fred.stlouisfed.org"
+    return known_api_parse.is_fred_url(url)
 
 
 def is_yahoo_ticker_url(url: str) -> bool:
-    """Yahoo Finance `/quote/…` URLs are yfinance-served; skip.
+    """Yahoo Finance ``/quote/…`` pages are yfinance-served; skip, regional hosts included.
 
-    Generic Yahoo article / news URLs remain fetchable — only the ticker
-    quote pages overlap with the financial-data provider.
+    Generic Yahoo article/news URLs remain fetchable. Shares the predicate with the known-API
+    registry (``known_api.parse``) so the fetcher's skip and the registry's translation cannot
+    drift on what counts as a Yahoo quote page.
     """
-    try:
-        parsed = urlparse(url)
-    except ValueError:
-        return False
-    return (parsed.hostname or "").lower() == "finance.yahoo.com" and parsed.path.startswith("/quote/")
+    return known_api_parse.is_yahoo_ticker_url(url)

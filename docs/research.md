@@ -1953,6 +1953,76 @@ also swallow the four unrelated invariant asserts in the same forecasting-tools 
 seat wants that shape degraded, the fix is a typed exception upstream or the seat's own boundary,
 not a broader catch here.
 
+### Known-API registry (`research/known_api/`; wiring pending)
+
+A URL whose host the registry recognises is answered by that host's public API rather than
+fetched as a web page: no LLM, no paid key, the same client code the research providers already
+use. It was built to fill rung 0 of the shared fetch ladder (the `policy.known_api` seat) and to
+give the gap-fill v2 driver three explicit tools for a date window the URL forms cannot express.
+The registry is built and tested; the wiring into the ladder's rung-0 seat and the loop's tool
+list lands in a follow-up once both branches merge.
+
+**What translates to what.** `translate(url)` (`known_api/translate.py`) reads one URL into one
+`KnownApiCall`, or returns `None` when the registry does not own the host (which leaves the later
+ladder rungs to try the page). The shapes it covers, all drawn from the 2026-09-09 cost pass's
+observed driver fetches:
+
+| Host and shape | Call |
+|---|---|
+| `fred.stlouisfed.org/series/{id}`, `/data/{id}` | `fred_series(id)` |
+| `fred.stlouisfed.org/graph/fredgraph.csv`/`.xls?id=A,B` with `cosd`/`coed` or `observation_start`/`observation_end` | `fred_series` per id, at most two, window from the params |
+| `alfred.stlouisfed.org/series?seid=`, `alfredgraph.csv?id=&vintage_date=` | `fred_series(id, first_release=true)` |
+| `api.stlouisfed.org/fred/series/observations?series_id=` | `fred_series(id)` |
+| `finance.yahoo.com/quote/{sym}` (regional `uk.`/`ca.` hosts, URL-encoded symbols, optional `period1`/`period2`) | `yahoo_history(sym, start, end)` |
+| `query1.finance.yahoo.com/v8/finance/chart/{sym}` | `yahoo_history(sym, start, end)` |
+| `kalshi.com/markets/{ticker}`, `/markets/{series}/{slug}/{ticker}`, `/api/v#/markets/{ticker}` | `market_snapshot("kalshi", ticker)` |
+| `www.sec.gov/Archives/edgar/data/...` | EDGAR `filing_document` |
+| `www.sec.gov/cgi-bin/browse-edgar?CIK=...` | EDGAR `company_submissions` |
+
+Yahoo help pages, Yahoo/other news articles, the Kalshi contract-terms PDF on S3, and the FRED
+release calendar are not translatable and stay on the page ladder.
+
+**The backends** (`known_api/backends.py`) each return a neutral `KnownApiResult`
+(`known_api/result.py`: a status in the `ok`/`empty`/`not_found`/`error` family, the rendered
+markdown, the canonical source URL, and its links) and never raise to the caller: an unknown id
+is `not_found` with the provider's message, an empty window is `empty`, a transport or quota
+failure is `error` naming the exception class.
+
+- `fred_series` reads one series over a date window through the keyed API (`fred_rendering.Fred`)
+  when `FRED_API_KEY` is set, with the initial-release table on `first_release`, and through the
+  keyless `fredgraph` CSV (`ts_fetch.fetch_series`) otherwise; free text runs `Fred.search`.
+- `yahoo_history` reads one symbol's adjusted price history through `ts_fetch.fetch_series`
+  (yfinance), column in Close/High/Low/Open.
+- `market_snapshot` reads a venue plus market: Kalshi by ticker through the event endpoint falling
+  to the market endpoint, Kalshi free text over the run's already-pulled catalogue with zero new
+  requests, Polymarket and Manifold search, and PredictIt from the run's cached dump; it renders
+  through the prediction-market snapshot renderer.
+- `edgar` reads a translated EDGAR URL, and declines (returns `None`, so the ladder falls through
+  to the page fetch) when `SEC_EDGAR_CONTACT_EMAIL` is unset; a company page renders its filings
+  table and an Archives document its extracted text.
+
+**The bounds** (`known_api/backends.py` constants): one series or ticker per call; a windowed read
+capped at 400 observations, newest kept, with a line saying so, and a 30-observation default;
+15 s per FRED or Yahoo call, because fredapi's `urlopen` carries no timeout of its own so
+`asyncio.wait_for` bounds the await; five market rows; at most four Kalshi detail GETs per
+question, through a `KalshiGetBudget` counting budget the caller constructs per question (a
+semaphore would cap concurrency, not the sequential total; the seam the loop wiring fills, since
+the loop has no per-question object yet); `PLATFORM_HTTP_TIMEOUT` per venue call.
+
+**The two adapters** (`known_api/adapters.py`) are the whole coupling to the two callers:
+`to_tool_outcome` returns the gap-fill loop's `ToolOutcome` with method `known_api`, and
+`to_fetch_result` returns the resolution-source fetcher's `FetchResult` with a success carrying
+the rendered text and route `known_api`. The `known_api` method tier and the `known_api`
+`FetchRoute` member are additive edits the wiring step makes; until it does, the route is a
+parameter so the adapter compiles against the unedited types.
+
+**No drift with the extraction seams.** The financial-data provider's identifier extraction
+(`financial_data.extract_financial_identifiers_from_criteria`) and the resolution-source
+fetcher's Yahoo skip (`resolution_url_scan.is_yahoo_ticker_url`) both consume `known_api.parse`,
+so the fetcher's skip, the provider's extraction and the rung-0 translation cannot disagree about
+what counts as a FRED, Yahoo or Kalshi URL. The provider now reads ids out of the `fredgraph`
+CSV/XLS and the `query1` chart endpoint, and the fetcher's skip accepts the regional Yahoo hosts.
+
 ## Gap-fill (two passes, both concurrent, both on in prod)
 
 After the primary + add-on bundle is assembled, two independent gap-fill passes
