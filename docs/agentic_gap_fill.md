@@ -184,11 +184,12 @@ paid reads however many URLs the driver picks — a cap this loop did not have b
 shared ladder. Everything per call (the ask, the wall origin, the rung list) is derived off it in
 `tools._per_call_ctx`, because one tool call is one wall.
 
-**What stays in `tools.py`.** The window cache that serves `start_char` continuations with no network
-call; the question-platform refusal, which runs before the ladder because it is this caller's own
+**What stays in `tools.py`.** The `start_char` window presentation over the ladder's complete
+process-run artifact; the question-platform refusal, which runs before the ladder because it is this caller's own
 policy and must refuse before anything is dialed (the resolution-source fetcher drops those URLs when
 it selects them); the throttle-phrase check on a body the ladder read
-(`fetch_outcomes.matched_throttle_phrase`, still this caller's alone); the auto-escalation to
+(`fetch_ladder.throttle.matched_throttle_phrase`, also used to keep refusals out of the shared cache);
+the auto-escalation to
 `read_document` for a document no local rung can turn into text; and the two shared fetch markers,
 emitted after each tool call with `question=None`.
 
@@ -238,7 +239,7 @@ summaries tripped that host's spacing rule and two came back as a 304-character 
 reference class it published came to 4 years instead of 6 and the forecast under-committed to the
 winner it had already named.
 
-Detection needs BOTH halves of `fetch_outcomes.matched_throttle_phrase`, and the size half is why it
+Detection needs BOTH halves of `fetch_ladder.throttle.matched_throttle_phrase`, and the size half is why it
 is safe: the phrases alone would demote a real page that merely discusses rate limits, while a size
 floor alone would demote every legitimately short source (a one-line official statement), which the
 ladder deliberately keeps as `ok`. Bare "slow down" is left out on purpose, being ordinary English
@@ -717,7 +718,7 @@ level up:
 | `agentic/provenance.py` | URL and quote normalization, the quote-grounding span logic, and the per-call harvesters behind the provenance gate and the W4 verification tiers. |
 | `agentic/gates.py` | The W1 plan gate's nudge and gap coercion, the W2 conclude gate, the W3 `source_url` check, and W4 tier stamping plus idempotent findings banking. |
 | `agentic/dispatch.py` | One assistant turn's tool calls in, one tool message each out: batch admission (plan gate, call budget, duplicate detection), provenance absorption, and the tool-message/rejection rendering. |
-| `agentic/tools.py` | `build_gap_fill_tools`, `question_ladder_context` and the four tool handlers, plus `_fetch_via_ladder`, the one seam onto the shared fetch ladder, and the throttle check and window cache this caller keeps. |
+| `agentic/tools.py` | `build_gap_fill_tools`, `question_ladder_context` and the four tool handlers, plus `_fetch_via_ladder`, the one seam onto the shared fetch ladder, and this caller's window presentation and throttle outcome. |
 | `agentic/ladder_adapter.py` | One `FetchResult` read as this ladder's own `PlainFetchResult`: the status and method tables, and the message the driver is told for every non-read. |
 | `agentic/local_document.py` | What the free ladder holds for one URL (`HeldDocument`), the passage digest `read_document` serves, the url_context size gate, and the `AGENTIC_FETCH_LOCAL_DOC` marker. The parses themselves are held in `research/document_cache.py`, shared with the ladder's document verdict. |
 | `agentic/fetch_outcomes.py` | This ladder's result type (`PlainFetchResult`), the question-platform self-reference refusal (metaculus.com and `competitions.mantic.com`), the escalate-to-a-reader outcome, and the throttle-interstitial check. Its per-body-shape builders are dead since the loop moved onto the shared classifier and are deleted with the rest of the loop's own rungs. |

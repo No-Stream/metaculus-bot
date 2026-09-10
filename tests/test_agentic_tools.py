@@ -48,7 +48,7 @@ from metaculus_bot.research.agentic.loop import _harvest_verification_tiers, _me
 from metaculus_bot.research.agentic.tool_descriptions import FETCH_DESCRIPTION
 from metaculus_bot.research.agentic.types import ToolOutcome
 from metaculus_bot.research.document_text import extract_pdf_text
-from metaculus_bot.research.fetch_ladder import classify, context, direct_fetch, rungs, verdict
+from metaculus_bot.research.fetch_ladder import classify, context, direct_fetch, run_cache, rungs, throttle, verdict
 from metaculus_bot.research.fetch_ladder.policy import (
     GAP_FILL_DIRECT_POLICY,
     GAP_FILL_DOCUMENT_POLICY,
@@ -185,11 +185,25 @@ def _serve_direct(monkeypatch: pytest.MonkeyPatch, answer: FetchResult | dict[st
     asked: list[str] = []
 
     async def _fake_direct(session: Any, url: str, host_sems: Any, ctx: Any) -> FetchResult:
-        del session, host_sems, ctx
+        del session, host_sems
         await asyncio.sleep(0)
         asked.append(url)
         canned = answers.get(url)
-        return canned if canned is not None else replace(_DIRECT_FALLBACK, url=url)
+        result = canned if canned is not None else replace(_DIRECT_FALLBACK, url=url)
+        if result.status == "success":
+            artifact = run_cache.HtmlRead(
+                url=result.url,
+                http_status=result.http_status,
+                content_type=result.content_type,
+                extraction=verdict.PageExtraction(text=result.text),
+                chart_block="",
+                datawrapper_charts=(),
+                unreadable_embeds=(),
+                links=tuple(result.links),
+                routing_body=b"<html",
+            )
+            ctx.capture_read(result, artifact)
+        return result
 
     monkeypatch.setattr(direct_fetch, "_fetch_direct", _fake_direct)
     return asked
@@ -245,8 +259,6 @@ def _reset_tool_state() -> None:
     """Drop every piece of run-scoped state the tools share, so no test inherits another's."""
     document_cache.clear_document_cache()
     http_fetch.reset_pdf_parse_semaphore()
-    agentic_tools._FETCH_TEXT_CACHE.clear()
-    agentic_tools._FETCH_LINKS_CACHE.clear()
     agentic_tools._FETCH_HOST_SEMAPHORES.clear()
     # Shared with the Tier-1 reader and the Tier-1 rungs, so both reset through their own modules.
     robots_policy.reset_robots_cache()
@@ -704,7 +716,7 @@ async def test_fetch_pagination_second_call_uses_cache(monkeypatch: pytest.Monke
     assert "[truncated at 8000 of 8005 chars — call again with start_char=8000]" in first.content_markdown
     assert second.method == "cache"
     assert second.content_markdown == "A" * 5
-    assert asked == [_URL], "the continuation is served from the window cache, with no second request"
+    assert asked == [_URL], "the continuation is served from the shared read cache, with no second request"
 
 
 @pytest.mark.asyncio
@@ -1303,9 +1315,6 @@ async def test_fetch_empty_plain_failed_render_returns_empty_not_ok(monkeypatch:
     # Legible to a probabilistic consumer: it must read as "nothing was read",
     # not as a thin-but-valid page it can confabulate around.
     assert "was read" in outcome.content_markdown.lower()
-    # Never cached: a cached placeholder would resurface as method="cache" (a
-    # fetched-tier method) on a later paginated fetch and re-launder the tier.
-    assert "https://companiesmarketcap.com/berkshire-hathaway/marketcap/" not in agentic_tools._FETCH_TEXT_CACHE
 
 
 @pytest.mark.asyncio
@@ -1428,7 +1437,7 @@ class TestThrottleInterstitialIsNotASuccess:
     """A host that throttles us answers 200 with a sentence instead of the page.
 
     q45191 (2026-08-10): three parallel ogimet.com fetches tripped that host's one-query-per-
-    20-seconds rule, two came back as the interstitial under ``status: ok``, the window cache
+    20-seconds rule, two came back as the interstitial under ``status: ok``, the run cache
     stored it, and the driver's own retry of the same URL was served the stored copy
     (``method: cache``) — so the retry it correctly made could not have succeeded. The
     exact-date reference class it published came to 4 years instead of 6, and the forecast
@@ -1482,8 +1491,6 @@ class TestThrottleInterstitialIsNotASuccess:
 
         first = await agentic_tools.fetch(_OGIMET_URL)
         assert first.status == "throttled"
-        assert agentic_tools._FETCH_TEXT_CACHE == {}
-
         # The host has since let us through: the retry gets the page, not the stored refusal.
         served = _serve_direct(monkeypatch, _ogimet_page("31/08/2022  41.1  Phoenix Sky Harbor"))
         second = await agentic_tools.fetch(_OGIMET_URL)
@@ -1503,22 +1510,24 @@ class TestThrottleInterstitialIsNotASuccess:
         cost more than the throttle it is trying to catch.
         """
         body = "The Ministry confirmed the vote will be held on 12 October 2026."
-        assert len(body) < fetch_outcomes.FETCH_THROTTLE_PAGE_MAX_CHARS
+        assert len(body) < throttle.FETCH_THROTTLE_PAGE_MAX_CHARS
         url = "https://example.gov/statement"
-        _serve_direct(monkeypatch, _ogimet_page(body, url=url))
+        served = _serve_direct(monkeypatch, _ogimet_page(body, url=url))
 
         outcome = await agentic_tools.fetch(url)
+        replayed = await agentic_tools.fetch(url)
 
         assert outcome.status == "ok"
         assert outcome.method == "plain"
         assert outcome.content_markdown == body
-        assert agentic_tools._FETCH_TEXT_CACHE[url] == body
+        assert replayed.method == "cache"
+        assert served == [url]
 
     @pytest.mark.asyncio
     async def test_a_long_page_about_rate_limits_is_still_a_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The phrase half alone would demote a page that merely discusses throttling."""
         body = "This API returns 429 Too Many Requests once you exceed the rate limit. " * 40
-        assert len(body) > fetch_outcomes.FETCH_THROTTLE_PAGE_MAX_CHARS
+        assert len(body) > throttle.FETCH_THROTTLE_PAGE_MAX_CHARS
         url = "https://example.com/api-docs"
         _serve_direct(monkeypatch, _ogimet_page(body, url=url))
 
@@ -1563,7 +1572,7 @@ class TestMatchedThrottlePhrase:
     """The predicate itself, anchored on the receipt and on the shapes it must not claim."""
 
     def test_the_q45191_body_matches_on_the_hosts_own_wording(self) -> None:
-        assert fetch_outcomes.matched_throttle_phrase(_OGIMET_THROTTLE_BODY) == "query per"
+        assert throttle.matched_throttle_phrase(_OGIMET_THROTTLE_BODY) == "query per"
 
     @pytest.mark.parametrize(
         "body",
@@ -1575,7 +1584,7 @@ class TestMatchedThrottlePhrase:
         ],
     )
     def test_common_interstitial_wordings_match(self, body: str) -> None:
-        assert fetch_outcomes.matched_throttle_phrase(body) is not None
+        assert throttle.matched_throttle_phrase(body) is not None
 
     @pytest.mark.parametrize(
         "body",
@@ -1589,14 +1598,14 @@ class TestMatchedThrottlePhrase:
         ],
     )
     def test_ordinary_prose_does_not_trip_the_rule(self, body: str) -> None:
-        assert fetch_outcomes.matched_throttle_phrase(body) is None
+        assert throttle.matched_throttle_phrase(body) is None
 
     def test_a_body_over_the_cap_is_a_page_whatever_it_says(self) -> None:
         # An interstitial is a sentence. A long body carrying the same words is a page about
         # throttling, and demoting it would discard content we really did read.
         body = "Rate limit exceeded. " * 200
-        assert len(body) > fetch_outcomes.FETCH_THROTTLE_PAGE_MAX_CHARS
-        assert fetch_outcomes.matched_throttle_phrase(body) is None
+        assert len(body) > throttle.FETCH_THROTTLE_PAGE_MAX_CHARS
+        assert throttle.matched_throttle_phrase(body) is None
 
 
 @pytest.mark.asyncio

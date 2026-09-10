@@ -14,7 +14,7 @@ import logging
 import time
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from metaculus_bot.constants import (
@@ -31,7 +31,18 @@ from metaculus_bot.research.resolution_fetch_result import (
     RungSkipReason,
 )
 
+if TYPE_CHECKING:
+    from metaculus_bot.research.fetch_ladder.run_cache import ReadArtifact
+
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class ReadCapture:
+    """A result and the complete read it was presented from, tied by object identity."""
+
+    result: FetchResult
+    artifact: ReadArtifact
 
 
 @dataclass
@@ -112,6 +123,13 @@ class LadderContext:
     policy: LadderPolicy = RESOLUTION_SOURCE_POLICY
     session: Any = None
     host_sems: dict[str, asyncio.Semaphore] | None = None
+    read_captures: list[ReadCapture] = field(default_factory=list, repr=False)
+
+    def capture_read(self, result: FetchResult, artifact: ReadArtifact) -> None:
+        self.read_captures.append(ReadCapture(result=result, artifact=artifact))
+
+    def artifact_for(self, result: FetchResult) -> ReadArtifact | None:
+        return next((capture.artifact for capture in reversed(self.read_captures) if capture.result is result), None)
 
     def rung_budget_s(self) -> float:
         """Wall-clock seconds a rung may spend before the outer ``wait_for`` fires.
@@ -198,7 +216,7 @@ def _aux_ctx(ctx: LadderContext) -> LadderContext:
     URL the question never cited. Its attempts are deliberately NOT merged back: that would put
     ``pdf_local`` last again and the route would still be wrong.
     """
-    return replace(ctx, rungs=[])
+    return replace(ctx, rungs=[], read_captures=[])
 
 
 def _skip_for_fast_path(ctx: LadderContext, rung: FetchRoute, direct: FetchResult, url: str) -> None:

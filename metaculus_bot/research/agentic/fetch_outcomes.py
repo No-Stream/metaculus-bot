@@ -7,11 +7,6 @@ body's trafilatura main text, a raw text/CSV/JSON body). The ``status`` values t
 are load-bearing downstream — only ``"ok"`` grants the loop's ``fetched`` verification tier,
 so a page we could not read is ``"empty"`` or ``"blocked"``, never ``"ok"``.
 
-``matched_throttle_phrase`` lives here for the same reason even though its caller is the
-fetch handler rather than this module's dispatcher: recognising a host's rate-limit
-interstitial is the same "is this body actually the page" judgment, and it has to run on
-the rendered rung's text too, which never passes through here.
-
 Split out of ``tools.py`` to leave that module the ladder spine (hop loop, rendered rung,
 the four tool handlers, registration). The dispatcher choosing between these builders,
 ``tools._plain_response_outcome``, deliberately stays there: it calls
@@ -45,38 +40,6 @@ _IMAGE_CONTENT_TYPE_PREFIXES = ("image/",)
 _RETRYABLE_FETCH_BLOCK_STATUSES = {403, 406, 429}
 _TEXTUAL_CONTENT_TYPE_TOKENS = ("text/plain", "text/csv", "application/json")
 _HTML_CONTENT_TYPE_TOKENS = ("text/html", "application/xhtml+xml")
-
-# A throttled host answers 200 with an interstitial: docs/agentic_gap_fill.md, the throttle check.
-FETCH_THROTTLE_PAGE_MAX_CHARS = 1200
-FETCH_THROTTLE_PHRASES: tuple[str, ...] = (
-    "rate limit",
-    "rate-limit",
-    "ratelimit",
-    "limit exceeded",
-    "too many requests",
-    "query per",
-    "queries per",
-    "requests per",
-    "per second per ip",
-    "retry after",
-    "try again later",
-    "please slow down",
-)
-
-
-def matched_throttle_phrase(text: str) -> str | None:
-    """The throttle phrase in ``text`` when it reads as a host's rate-limit interstitial.
-
-    Returns the matched phrase (evidence, so the caller can log WHICH rule fired and the
-    list can be retuned on real prod fires) or ``None`` when the body is a page. A body
-    longer than :data:`FETCH_THROTTLE_PAGE_MAX_CHARS` is always a page: an interstitial is
-    a sentence, and a long page containing throttle vocabulary is a page about throttling.
-    """
-    stripped = text.strip()
-    if not stripped or len(stripped) > FETCH_THROTTLE_PAGE_MAX_CHARS:
-        return None
-    lowered = stripped.lower()
-    return next((phrase for phrase in FETCH_THROTTLE_PHRASES if phrase in lowered), None)
 
 
 @dataclass(slots=True)

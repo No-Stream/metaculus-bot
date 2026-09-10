@@ -656,16 +656,15 @@ min-forecasters guard is the sole arbiter of a degraded publish (section 4 above
 Two code paths fetch web pages: the resolution-source fetcher, which reads the URLs a question
 names as its grading source, and the gap-fill v2 agentic loop, which reads URLs a driver model
 picks itself. The ladder they run lives in `metaculus_bot/research/fetch_ladder/`, and each caller
-is an adapter over it. The fetcher is on it today; the loop still calls its own subset of the same
-transports and moves onto `fetch_url` over the remaining steps of the unification plan
-(`scratch_docs_and_planning/fetch_ladder_unification_plan_2026-09-09.md`), so the gap-fill column
-in the knob table below is the target rather than today's reading. The package's modules depend on
+is an adapter over it. Both callers use `fetch_url`; the package's modules depend on
 each other in one direction:
 `guard.py` (the SSRF preflight, the vetted DNS resolve, the aiohttp session, the per-host
 politeness gate), then `digest.py` and `verdict.py` (what a caller makes of a body it read), then
-`policy.py` and `context.py`, then `classify.py` (the one classification path for a body), then
+`policy.py` and `context.py`, then `run_cache.py` (complete reusable reads), then
+`classify.py` (the one classification path for a body), then
 `direct_fetch.py` (the bounded redirect loop and the single hop), then `rungs.py` (the seven
-escalation rungs), then `ladder.py` (the dispatcher and the entry point). The status, reason, route and skip vocabularies stay in
+escalation rungs), then `ladder.py` (the dispatcher
+and the entry point). The status, reason, route and skip vocabularies stay in
 `research/resolution_fetch_result.py`, where they were, because every string in that module is a
 telemetry contract the archive matches on.
 
@@ -677,6 +676,25 @@ no rung signature carries a second argument. The session and the per-host semaph
 context for a related reason: a session per URL would change the fetcher's connector limits, so a
 caller that already holds one passes it down, and a caller that holds none gets one opened and
 closed for that URL alone.
+
+The process-run cache sits after known-API rung 0 and before caller verdict and presentation. It
+holds at most 50 URL keys in LRU order. HTML entries retain the full extraction, chart and embed
+facts, and links; raw-text entries retain the complete decoded text; PDF entries retain only a
+reference to the parsed-document side cache. A hit therefore reapplies the current caller's body
+route, verdict, query, disclosure, link collection and character cap. An incompatible body route
+declines the entry and fetches normally. A direct read that the current caller rejects or judges
+too thin enters that caller's ordinary escalation without repeating the direct request. Cached
+rendered, derived-feed and Wayback reads are terminal products of their acquisition routes, while
+the paid `url_context` model answer is never cached. Errors, empty reads and throttle interstitials
+are also excluded so retries remain real requests. Redirects are indexed by both the requested and
+final URL.
+
+Cache presentation is bounded by the current context's remaining wall and runs in a worker thread,
+which keeps a PDF's query-specific BM25 verdict off the event loop. Hits carry no old rung attempts
+and do not change the current context's clock or per-question counters. `FetchResult.cache_hit` is
+an additive, default-false serialized field used by the loop adapter to emit `method=cache`; the
+cached object is a separate typed read artifact, never a `FetchResult`, raw PDF bytes or `PdfText`
+payload.
 
 ### The policy knobs
 
@@ -1016,7 +1034,7 @@ welcome.
 | Drop attribution / degradation counters | `metaculus_bot/drop_telemetry.py`; `degradation_counters.py` formats immutable snapshots built by `forecaster.py` |
 | Research fan-out | `metaculus_bot/research/orchestrator.py`, `research/providers.py` |
 | Outbound fetch transports | `research/http_fetch.py` (plain HTTP, redirects, per-host gates), `research/fetch_ladder/guard.py` (the SSRF preflight, the vetted DNS resolve, the aiohttp session), `research/impersonated_fetch.py` (the `curl_cffi` TLS-impersonating retry of a 403, with its own DNS pin and per-hop re-guard), `research/rendered_fetch.py` (headless Chromium), `research/url_context_reader.py` (one paid Gemini `url_context` read), `research/robots_policy.py` (the `Google-Extended` pre-check in front of that read) |
-| The shared fetch ladder and its `fetch_url` entry point | `research/fetch_ladder/` (`policy.py` the per-caller knobs, `verdict.py` what a caller makes of a body it read, `context.py` the per-URL and per-question bookkeeping, `classify.py` one body's classification, `direct_fetch.py` the redirect loop, `rungs.py` the seven rungs, `ladder.py` the dispatcher and the `fetch_url` entry point, `digest.py` the digest seat, `guard.py` the outbound guard), `research/resolution_fetch_result.py` (the status, reason and route vocabularies), `research/document_cache.py` (the parses a run holds, which never ride a `FetchResult`), `research/derived_api.py`, `research/wayback.py` |
+| The shared fetch ladder and its `fetch_url` entry point | `research/fetch_ladder/` (`policy.py` the per-caller knobs, `verdict.py` what a caller makes of a body it read, `context.py` the per-URL and per-question bookkeeping, `run_cache.py` the complete process-run read artifacts, `classify.py` one body's classification, `direct_fetch.py` the redirect loop, `rungs.py` the seven rungs, `ladder.py` the dispatcher and the `fetch_url` entry point, `throttle.py` the shared interstitial detector, `digest.py` the digest seat, `guard.py` the outbound guard), `research/resolution_fetch_result.py` (the status, reason and route vocabularies), `research/document_cache.py` (the parses a run holds, which never ride a `FetchResult`), `research/derived_api.py`, `research/wayback.py` |
 | Resolution-source fetcher: its adapter over that ladder | `research/resolution_source.py` (URL selection, the Datawrapper second phase, the provider factory, the telemetry emitter and the rung counts) |
 | Resolution-source text and section budgets | `research/resolution_presentation.py` |
 | Datawrapper response classification, freshness and dataset ordering | `research/resolution_datawrapper.py`; requests and question budgets remain in `research/resolution_source.py` |

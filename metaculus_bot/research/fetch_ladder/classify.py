@@ -12,6 +12,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlparse
 
@@ -28,15 +29,14 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_PDF_MIN_BUDGET_S,
     RESOLUTION_SOURCE_PRECISION_RETRY_MIN_BUDGET_S,
 )
-from metaculus_bot.research import resolution_presentation
+from metaculus_bot.research import document_cache
 from metaculus_bot.research.document_text import PdfText, extract_pdf_text, is_pdf_body
-from metaculus_bot.research.fetch_ladder import context, guard
+from metaculus_bot.research.fetch_ladder import context, guard, run_cache
 from metaculus_bot.research.fetch_ladder.policy import RESOLUTION_SOURCE_POLICY, LadderPolicy
 from metaculus_bot.research.fetch_ladder.verdict import (
     _RAW_TEXT_CONTENT_TYPES,
     BodyRoute,
     DocumentVerdict,
-    HtmlVerdict,
     PageExtraction,
     content_share,
     looks_like_page_chrome,
@@ -52,7 +52,7 @@ from metaculus_bot.research.http_fetch import (
     rewrite_aria_tables,
     unreadable_data_embed_providers,
 )
-from metaculus_bot.research.resolution_body_text import _truncate_with_marker, strip_html_tags
+from metaculus_bot.research.resolution_body_text import strip_html_tags
 from metaculus_bot.research.resolution_chart_data import render_inline_chart_data
 from metaculus_bot.research.resolution_fetch_result import (
     _NON_OK_FETCH_STATUS,
@@ -236,6 +236,24 @@ class _HtmlClassification:
 
     result: FetchResult
     html_text: str
+    artifact: run_cache.HtmlRead
+
+
+def capture_html_read(ctx: context.LadderContext, classified: _HtmlClassification) -> None:
+    if classified.result.status == "success":
+        ctx.capture_read(classified.result, classified.artifact)
+
+
+def _routing_body(body: bytes) -> bytes:
+    """Small body probe retaining every byte-level route fact the two verdicts inspect."""
+    stripped = body.lstrip()
+    if stripped.startswith(b"%PDF-"):
+        return b"%PDF-"
+    if stripped.startswith((b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a")):
+        return stripped[:8]
+    if b"<html" in body.lower():
+        return b"<html"
+    return b""
 
 
 async def _classify_html_body(
@@ -272,69 +290,37 @@ async def _classify_html_body(
     # In a thread for the same reason the extraction is: sync CPU work over a capped body.
     chart_block = await asyncio.to_thread(render_inline_chart_data, html_text)
     # Against the DOCUMENT url, which after a client-side redirect is not the URL asked for.
-    links = extract_page_links(html_text, current_url) if pol.collect_links else []
-    read = pol.verdict.html(extraction, chart_block=chart_block, unreadable_embeds=unreadable_embeds)
-    escalate = _escalates_on_thin_content(read, chart_block, pol)
-    if read.status != "success":
-        # A walled page still exposes its embeds, so the charts ride along on every withhold.
-        return _HtmlClassification(
-            result=FetchResult(
-                url=current_url,
-                status=read.status,
-                text="",
-                http_status=http_status,
-                content_type=content_type or None,
-                status_reason=read.status_reason,
-                datawrapper_charts=charts,
-                unreadable_embeds=unreadable_embeds,
-                chrome_metric_withheld=extraction.chrome_metric_withheld,
-                links=links,
-                escalate_rendered=escalate,
-            ),
-            html_text=html_text,
-        )
-    # A blank published text needs a chart block, so the blank-success guard cannot trip.
+    links = extract_page_links(html_text, current_url)
+    artifact = run_cache.HtmlRead(
+        url=current_url,
+        http_status=http_status,
+        content_type=content_type or None,
+        extraction=extraction,
+        chart_block=chart_block,
+        datawrapper_charts=tuple(charts),
+        unreadable_embeds=tuple(unreadable_embeds),
+        links=tuple(links),
+        routing_body=_routing_body(body),
+    )
+    result = artifact.present(pol, query="", route="direct", now=datetime.now(UTC))
+    if result is None:
+        raise RuntimeError("fresh HTML artifact was rejected by the policy that classified it")
     return _HtmlClassification(
-        result=FetchResult(
-            url=current_url,
-            status="success",
-            text=resolution_presentation._page_text_with_leads(
-                read.published_text,
-                current_url,
-                unreadable_embeds if pol.disclose_unreadable_embeds else [],
-                chart_block,
-                cap=pol.per_url_max_chars,
-            ),
-            http_status=http_status,
-            content_type=content_type or None,
-            datawrapper_charts=charts,
-            unreadable_embeds=unreadable_embeds,
-            chrome_metric_withheld=extraction.chrome_metric_withheld,
-            precision_rescued=extraction.precision_rescued,
-            links=links,
-            escalate_rendered=escalate,
-        ),
+        result=result,
         html_text=html_text,
+        artifact=artifact,
     )
 
 
-def _escalates_on_thin_content(read: HtmlVerdict, chart_block: str, pol: LadderPolicy) -> bool:
-    """Whether this caller wants the browser tried on what it just read.
-
-    Off entirely for a caller with no thin-content floor (the fetcher escalates on status alone).
-    For one that has a floor: every non-success, and a success under the floor. A chart block pins
-    it OFF either way, because a render replaces the client-side series with a DOM lacking it
-    (question 43949).
-    """
-    floor = pol.thin_content_escalation_chars
-    if floor is None or chart_block:
-        return False
-    return read.status != "success" or len(read.published_text.strip()) < floor
+@dataclass(frozen=True, slots=True)
+class _TextClassification:
+    result: FetchResult
+    artifact: run_cache.TextRead | None
 
 
 def _raw_body_outcome(
     body: bytes, current_url: str, content_type: str, *, http_status: int, pol: LadderPolicy
-) -> FetchResult:
+) -> _TextClassification:
     """Classify a raw JSON / plain-text / CSV body we already hold: the one copy of the rule.
 
     Reached from :func:`_classify_body`, so a body the impersonated retry read goes through the
@@ -356,26 +342,25 @@ def _raw_body_outcome(
             f"resolution_source {netloc}: 200 body carries no usable content "
             f"({vacuous}, {len(body)} bytes, undecodable={undecodable_ratio:.2f})"
         )
-        return FetchResult(
-            url=current_url,
-            status=vacuous,
-            text="",
-            http_status=http_status,
-            content_type=content_type or None,
-            # What we hold is replacement characters rather than the page, which a caller that
-            # escalates says differently to the driver than a type it does not read at all.
-            status_reason="undecodable_body" if vacuous == "unsupported_type" else None,
-            escalate_rendered=floor is not None,
+        return _TextClassification(
+            result=FetchResult(
+                url=current_url,
+                status=vacuous,
+                text="",
+                http_status=http_status,
+                content_type=content_type or None,
+                # What we hold is replacement characters rather than the page, which a caller that
+                # escalates says differently to the driver than a type it does not read at all.
+                status_reason="undecodable_body" if vacuous == "unsupported_type" else None,
+                escalate_rendered=floor is not None,
+            ),
+            artifact=None,
         )
-    cap = pol.per_url_max_chars
-    return FetchResult(
-        url=current_url,
-        status="success",
-        text=raw if cap is None else _truncate_with_marker(raw, cap, current_url),
-        http_status=http_status,
-        content_type=content_type or None,
-        escalate_rendered=floor is not None and len(raw) < floor,
-    )
+    artifact = run_cache.TextRead(current_url, raw, http_status, content_type or None, routing_body=_routing_body(body))
+    result = artifact.present(pol, query="", route="direct", now=datetime.now(UTC))
+    if result is None:
+        raise RuntimeError("fresh text artifact was rejected by the policy that classified it")
+    return _TextClassification(result=result, artifact=artifact)
 
 
 @dataclass(frozen=True, slots=True)
@@ -504,7 +489,7 @@ async def _finish_document(pending: _PendingDocument, ctx: context.LadderContext
             f"resolution_source {netloc}: PDF carried no readable text ({read.status_reason}, "
             f"{pdf.page_count} pages, {pdf.pages_read} read)"
         )
-    return FetchResult(
+    result = FetchResult(
         url=pending.url,
         status=read.status,
         text=read.text,
@@ -512,6 +497,10 @@ async def _finish_document(pending: _PendingDocument, ctx: context.LadderContext
         content_type=pending.content_type or None,
         status_reason=read.status_reason,
     )
+    if result.status == "success":
+        document_cache.cache_document(pending.url, pdf)
+        ctx.capture_read(result, run_cache.PdfRead(pending.url, pending.http_status, pending.content_type or None))
+    return result
 
 
 def _document_not_parsed(pending: _PendingDocument, reason: FetchStatusReason) -> FetchResult:
@@ -599,9 +588,13 @@ async def _classify_body(
             remaining_wall_s=ctx.rung_budget_s(),
             pol=ctx.policy,
         )
+        capture_html_read(ctx, classified)
         return classified.result
     if route == "text":
-        return _raw_body_outcome(body, current_url, content_type, http_status=http_status, pol=ctx.policy)
+        classified = _raw_body_outcome(body, current_url, content_type, http_status=http_status, pol=ctx.policy)
+        if classified.artifact is not None:
+            ctx.capture_read(classified.result, classified.artifact)
+        return classified.result
     if route in ("image", "unsupported"):
         return _unread_body_outcome(route, current_url, content_type, http_status=http_status)
     return _document_outcome(
@@ -625,6 +618,7 @@ async def _classify_body_or_hop(
     classified = await _classify_html_body(
         body, current_url, content_type, http_status=http_status, remaining_wall_s=ctx.rung_budget_s(), pol=ctx.policy
     )
+    capture_html_read(ctx, classified)
     if classified.result.status == "success":
         return classified.result
     hop = await _meta_refresh_hop(

@@ -517,6 +517,9 @@ class FetchResult:
     failure_class: str | None = None
     exc: str | None = None
     server: str | None = None
+    # True only on a freshly presented process-run cache hit. The cached payload itself is a
+    # separate policy-neutral artifact and never rides this archive-facing result.
+    cache_hit: bool = False
 
     def __post_init__(self) -> None:
         """Enforce the ``text`` invariant the field comment states.

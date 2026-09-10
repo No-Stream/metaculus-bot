@@ -620,10 +620,24 @@ lightly edited: `rungs.py` (46), `resolution_source.py` (32), `resolution_fetch_
 `local_document.py` (4), `direct_fetch.py` (3), `tests/test_agentic_tools.py` (34). Every one of
 those counts is unchanged from the baseline at `6169965`; step 3 added no finding anywhere.
 
-## Next
+## Step 5a: shared process-run cache
 
-Step 5 (the run cache, the throttle check shared with the fetcher, the digest through the
-`policy.digest` seat), step 6 (the deletions above, without the host-semaphore fold).
+`fetch_ladder/run_cache.py` now owns one bounded 50-key LRU of complete typed read
+artifacts below caller verdict and presentation. HTML, decoded text, local PDF, derived-feed,
+rendered and Wayback successes can be replayed; paid `url_context` answers, errors, empty reads and
+throttle interstitials cannot. Known API remains ahead of the cache. Hits apply the current body
+route, verdict, PDF query, disclosure, links and cap; incompatible entries fall through to a fresh
+fetch, and a newly rejected or thin direct artifact enters the current caller's escalation without
+repeating the direct request. Redirects have requested-URL and final-URL aliases.
+
+The loop's former text/link LRU is deleted. Its pagination now reruns `fetch_url`, receives the full
+shared artifact under the uncapped gap-fill policy and labels the result `method=cache` through the
+additive default-false `FetchResult.cache_hit` field. Parsed PDFs remain solely in
+`research/document_cache.py`; neither a parse nor raw PDF bytes ride a `FetchResult` or the run
+cache. Presentation runs off the event loop and inside the current URL's remaining wall. A timed-out
+presentation becomes that URL's error result so a concurrent sibling survives.
+
+Next: step 5b throttle status, then step 5c digest through the existing `policy.digest` seat.
 
 ### Step 2: the smell findings in the two files it edited are FIXED, not carried
 

@@ -169,8 +169,6 @@ _RESETS: tuple[Callable[[], None], ...] = (
     robots_policy.reset_robots_cache,
     reset_host_semaphores,
     document_cache.clear_document_cache,
-    agentic_tools._FETCH_TEXT_CACHE.clear,
-    agentic_tools._FETCH_LINKS_CACHE.clear,
     agentic_tools._FETCH_HOST_SEMAPHORES.clear,
 )
 

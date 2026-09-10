@@ -81,7 +81,7 @@ def as_plain_result(result: FetchResult, *, requested_url: str) -> PlainFetchRes
     if result.status == "success":
         return PlainFetchResult(
             status="ok",
-            method=_LOOP_METHOD[result.route],
+            method="cache" if result.cache_hit else _LOOP_METHOD[result.route],
             text=result.text,
             links=list(result.links),
             url=result.url,

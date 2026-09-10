@@ -8,7 +8,7 @@ of the three gap-fill presets and maps what comes back through ``ladder_adapter`
 former rungs (``_fetch_plain`` and friends) are unreferenced and are deleted with the rest of the
 duplication.
 
-What stays this caller's: the window cache that serves ``start_char`` continuations, the
+What stays this caller's: the window presentation that serves ``start_char`` continuations, the
 question-platform refusal that runs before anything is dialed, the throttle-phrase check on a body
 the ladder read, the auto-escalation to ``read_document``, the paid reader and its robots pre-check,
 and the two shared fetch markers emitted after each tool call. Support pieces live next door:
@@ -29,7 +29,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from collections import OrderedDict
 from dataclasses import replace
 from datetime import UTC, datetime
 from time import monotonic
@@ -70,7 +69,6 @@ from metaculus_bot.research.agentic.fetch_outcomes import (
     _plain_html_outcome,
     _plain_redirect_outcome,
     _plain_textual_outcome,
-    matched_throttle_phrase,
 )
 from metaculus_bot.research.agentic.tool_backends import (
     _call_asknews_search,
@@ -101,6 +99,7 @@ from metaculus_bot.research.fetch_ladder.policy import (
     LADDER_CALLER_GAP_FILL_V2,
     LadderPolicy,
 )
+from metaculus_bot.research.fetch_ladder.throttle import matched_throttle_phrase
 from metaculus_bot.research.http_fetch import (
     MAX_REDIRECTS,
     REDIRECT_STATUSES,
@@ -135,28 +134,15 @@ logger = logging.getLogger(__name__)
 _RENDER_MEMO_SCOPE: MemoScope = "gap_fill_v2"
 
 _FETCH_WINDOW_CHARS = 8000
-_FETCH_CACHE_MAX_ENTRIES = 50
 _READ_DOCUMENT_TIMEOUT_S = 60.0
 # Two rungs share this: the free local ladder, then the paid reader on what the total leaves it.
 _LOCAL_DOCUMENT_BUDGET_S = 25.0
 _READ_DOCUMENT_TOTAL_BUDGET_S = 65.0
 _FETCH_HOST_SEMAPHORES: dict[str, asyncio.Semaphore] = {}
-_FETCH_TEXT_CACHE: OrderedDict[str, str] = OrderedDict()
-_FETCH_LINKS_CACHE: OrderedDict[str, list[str]] = OrderedDict()
 
 
 def _host_gate(url: str) -> asyncio.Semaphore:
     return guard._sem_for_host(_FETCH_HOST_SEMAPHORES, url)
-
-
-def _cache_fetch_result(url: str, text: str, links: list[str]) -> None:
-    _FETCH_TEXT_CACHE[url] = text
-    _FETCH_TEXT_CACHE.move_to_end(url)
-    _FETCH_LINKS_CACHE[url] = list(links)
-    _FETCH_LINKS_CACHE.move_to_end(url)
-    while len(_FETCH_TEXT_CACHE) > _FETCH_CACHE_MAX_ENTRIES:
-        evicted_url, _ = _FETCH_TEXT_CACHE.popitem(last=False)
-        _FETCH_LINKS_CACHE.pop(evicted_url, None)
 
 
 def _slice_fetch_window(text: str, start_char: int) -> tuple[str, bool]:
@@ -171,22 +157,11 @@ def _slice_fetch_window(text: str, start_char: int) -> tuple[str, bool]:
     return window + marker, True
 
 
-def _fetch_from_cache(url: str, start_char: int) -> ToolOutcome | None:
-    cached = _FETCH_TEXT_CACHE.get(url)
-    if cached is None:
-        return None
-    _FETCH_TEXT_CACHE.move_to_end(url)
-    links = list(_FETCH_LINKS_CACHE.get(url, []))
-    window, truncated = _slice_fetch_window(cached, start_char)
-    return ToolOutcome(content_markdown=window, links=links, method="cache", truncated=truncated)
-
-
 def _format_fetch_error(message: str, *, status: str = "error", method: str = "plain") -> ToolOutcome:
     return ToolOutcome(content_markdown=message, method=method, status=status)
 
 
 def _render_fetch_outcome(url: str, text: str, links: list[str], *, method: str, start_char: int) -> ToolOutcome:
-    _cache_fetch_result(url, text, links)
     window, truncated = _slice_fetch_window(text, start_char)
     return ToolOutcome(content_markdown=window, links=links, method=method, truncated=truncated)
 
@@ -662,7 +637,7 @@ def _per_call_ctx(question_ctx: LadderContext | None, *, query: str) -> LadderCo
     suite drives) gets a fresh budget, so it behaves exactly as one call always did.
     """
     base = LadderContext(host_sems=_FETCH_HOST_SEMAPHORES) if question_ctx is None else question_ctx
-    return replace(base, query=query, rungs=[], started=monotonic())
+    return replace(base, query=query, rungs=[], read_captures=[], started=monotonic())
 
 
 async def _fetch_via_ladder(
@@ -775,8 +750,6 @@ def _held_from_result(url: str, result: PlainFetchResult) -> local_document.Held
     if held.has_text and matched_throttle_phrase(held.text) is not None:
         # An interstitial is not the document (q45191), so the paid reader gets its turn.
         return local_document.HeldDocument()
-    if held.has_text:
-        _cache_fetch_result(url, held.text, result.links)
     return held
 
 
@@ -814,10 +787,6 @@ async def _acquire_local_document(url: str, *, ctx: LadderContext | None = None)
     cached_pdf = document_cache.cached_document(url)
     if cached_pdf is not None:
         return local_document.held_pdf(cached_pdf)
-    cached_text = _FETCH_TEXT_CACHE.get(url)
-    if cached_text is not None:
-        _FETCH_TEXT_CACHE.move_to_end(url)
-        return local_document.HeldDocument(text=cached_text)
     try:
         return await asyncio.wait_for(_run_local_document_ladder(url, ctx=ctx), timeout=_LOCAL_DOCUMENT_BUDGET_S)
     except TimeoutError:
@@ -860,7 +829,7 @@ async def _local_digest_outcome(url: str, ask: str, held: local_document.HeldDoc
 async def fetch(
     url: str, start_char: int = 0, *, question_topic: str = "", ctx: LadderContext | None = None
 ) -> ToolOutcome:
-    """Read ``url`` for the driver: this run's window cache, else the whole shared fetch ladder.
+    """Read ``url`` for the driver through the shared ladder, then return its requested window.
 
     The rungs — the impersonated retry on a host's 403, the browser on a page too thin to be the
     page, the archive on one our address never reached — all run inside ``fetch_url`` under
@@ -870,10 +839,6 @@ async def fetch(
     ``empty`` and NEVER as a plain success, because the loop grants the ``fetched`` tier on status
     alone (docs/agentic_gap_fill.md).
     """
-    cached = _fetch_from_cache(url, start_char)
-    if cached is not None:
-        return cached
-
     plain = await _fetch_via_ladder(url, query=question_topic, pol=GAP_FILL_FETCH_POLICY, ctx=ctx)
     if plain.status == "blocked":
         return _blocked_outcome(plain)

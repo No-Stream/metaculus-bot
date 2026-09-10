@@ -24,7 +24,6 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS,
     RESOLUTION_SOURCE_JS_WALL_MIN_CHARS,
 )
-from metaculus_bot.research.document_cache import cache_document
 from metaculus_bot.research.document_text import PdfText, digest_pdf, disclosed_page_text, has_text_layer
 from metaculus_bot.research.rendered_fetch import is_json_content_type
 from metaculus_bot.research.resolution_fetch_result import (
@@ -249,7 +248,6 @@ class GapFillVerdict:
         if not has_text_layer(pdf):
             return DocumentVerdict("unreadable_document", _pdf_unreadable_reason(pdf), "")
         # Held rather than digested here: the driver's own ask arrives later, in `read_document`.
-        cache_document(source_url, pdf)
         return DocumentVerdict("success", None, disclosed_page_text(pdf))
 
 

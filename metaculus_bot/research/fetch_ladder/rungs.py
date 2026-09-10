@@ -36,7 +36,7 @@ from metaculus_bot.constants import (
     env_flag_enabled,
 )
 from metaculus_bot.research import derived_api, impersonated_fetch, resolution_presentation
-from metaculus_bot.research.fetch_ladder import classify, context, direct_fetch, guard
+from metaculus_bot.research.fetch_ladder import classify, context, direct_fetch, guard, run_cache
 from metaculus_bot.research.fetch_ladder.policy import LadderPolicy
 from metaculus_bot.research.http_fetch import decode_text_body
 from metaculus_bot.research.impersonated_fetch import (
@@ -74,6 +74,7 @@ from metaculus_bot.research.resolution_fetch_result import (
 from metaculus_bot.research.robots_policy import ROBOTS_FETCH_TIMEOUT_S, google_extended_blocks_url
 from metaculus_bot.research.url_context_reader import NOT_ADDRESSED_SENTINEL, run_url_context_read
 from metaculus_bot.research.wayback import (
+    WaybackSnapshot,
     innermost_url,
     parse_snapshot_url,
     snapshot_age_days,
@@ -592,6 +593,7 @@ async def _rendered_rung(
         remaining_wall_s=ctx.rung_budget_s(),
         pol=ctx.policy,
     )
+    classify.capture_html_read(ctx, classified)
     if classified.result.chrome_metric_withheld:
         # The metric withheld the rendered DOM's extraction. `chrome_metric_withholds` counts a
         # withhold anywhere on the URL's ladder, and a js_wall direct fetch had nothing for the
@@ -635,11 +637,11 @@ def _derived_api_from_harvest(
     derived_api.remember_endpoint(url, harvested.url)
     endpoint = derived_api.DerivedEndpoint(endpoint_url=harvested.url, discovered_on=url)
     ctx.start_rung("derived_api", direct.status, url)
-    return _derived_api_result(url, endpoint, raw, http_status=direct.http_status, cap=ctx.policy.per_url_max_chars)
+    return _derived_api_result(url, endpoint, raw, http_status=direct.http_status, ctx=ctx)
 
 
 def _derived_api_result(
-    url: str, endpoint: derived_api.DerivedEndpoint, raw: str, *, http_status: int | None, cap: int | None
+    url: str, endpoint: derived_api.DerivedEndpoint, raw: str, *, http_status: int | None, ctx: context.LadderContext
 ) -> FetchResult:
     """One derived-feed result: the provenance lead, then the budgeted JSON.
 
@@ -648,13 +650,18 @@ def _derived_api_result(
     because a feed served with its provenance line trimmed off is a JSON blob nobody can check.
     """
     lead = derived_api.derived_api_lead(endpoint, url)
-    return FetchResult(
+    result = FetchResult(
         url=url,
         status="success",
-        text=resolution_presentation._lead_then_capped_body(lead, raw, url, cap=cap),
+        text=resolution_presentation._lead_then_capped_body(lead, raw, url, cap=ctx.policy.per_url_max_chars),
         http_status=http_status,
         content_type="application/json",
     )
+    ctx.capture_read(
+        result,
+        run_cache.TextRead(url=url, text=raw, http_status=http_status, content_type="application/json", lead=lead),
+    )
+    return result
 
 
 async def _derived_api_rung(
@@ -701,7 +708,7 @@ async def _derived_api_rung(
             feed.content_type,
         )
         return None
-    return _derived_api_result(url, endpoint, feed.text, http_status=feed.http_status, cap=ctx.policy.per_url_max_chars)
+    return _derived_api_result(url, endpoint, feed.text, http_status=feed.http_status, ctx=ctx)
 
 
 # A page the archive can plausibly substitute for: the host refused us, never answered, or says the
@@ -759,8 +766,9 @@ async def _wayback_snapshot_result(
     ``RESOLUTION_SOURCE_FETCH`` line it replaces the direct result on still says which host
     refused us and from which CDN.
     """
+    snapshot_ctx = context._aux_ctx(ctx)
     snapshot = await direct_fetch._fetch_direct(
-        session, wayback_snapshot_url(url, now=ctx.now), host_sems, context._aux_ctx(ctx)
+        session, wayback_snapshot_url(url, now=ctx.now), host_sems, snapshot_ctx
     )
     parsed = parse_snapshot_url(snapshot.url)
     captured_of = None if parsed is None else innermost_url(parsed.inner_url)
@@ -821,8 +829,10 @@ async def _wayback_snapshot_result(
     # The lead LEADS and its cost comes out of the per-URL cap
     # (:func:`resolution_presentation._lead_then_capped_body`):
     # an archived page whose age line has been trimmed off is being passed off as the live one.
+    assert parsed is not None
+    assert age_days is not None
     lead = wayback_lead(parsed, age_days, direct.status)
-    return FetchResult(
+    result = FetchResult(
         url=url,
         status="success",
         text=resolution_presentation._lead_then_capped_body(lead, snapshot.text, url, cap=ctx.policy.per_url_max_chars),
@@ -832,6 +842,43 @@ async def _wayback_snapshot_result(
         unreadable_embeds=snapshot.unreadable_embeds,
         precision_rescued=snapshot.precision_rescued,
         links=snapshot.links,
+    )
+    _capture_wayback_read(
+        ctx,
+        result=result,
+        snapshot_ctx=snapshot_ctx,
+        snapshot=snapshot,
+        direct=direct,
+        parsed=parsed,
+    )
+    return result
+
+
+def _capture_wayback_read(
+    ctx: context.LadderContext,
+    *,
+    result: FetchResult,
+    snapshot_ctx: context.LadderContext,
+    snapshot: FetchResult,
+    direct: FetchResult,
+    parsed: WaybackSnapshot,
+) -> None:
+    snapshot_artifact = snapshot_ctx.artifact_for(snapshot)
+    if snapshot_artifact is None:
+        return
+    ctx.capture_read(
+        result,
+        run_cache.WaybackRead(
+            url=result.url,
+            snapshot=parsed,
+            artifact=snapshot_artifact,
+            live_status=direct.status,
+            live_http_status=direct.http_status,
+            live_content_type=direct.content_type,
+            live_failure_class=direct.failure_class,
+            live_exc=direct.exc,
+            live_server=direct.server,
+        ),
     )
 
 

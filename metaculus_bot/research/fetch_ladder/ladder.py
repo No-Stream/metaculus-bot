@@ -10,14 +10,17 @@ request. Why the rungs sit in this order: ``docs/architecture.md``, "The shared 
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable
 from dataclasses import replace
 from typing import Any
 
-from metaculus_bot.research.fetch_ladder import context, direct_fetch, guard, rungs
+from metaculus_bot.research.fetch_ladder import context, direct_fetch, guard, run_cache, rungs
 from metaculus_bot.research.fetch_ladder.policy import LadderPolicy
 from metaculus_bot.research.http_fetch import host_semaphores
 from metaculus_bot.research.resolution_fetch_result import FetchResult, FetchRoute, FetchStatus
+
+logger = logging.getLogger(__name__)
 
 
 async def _run_rung(
@@ -170,6 +173,17 @@ async def _fetch_one(
     return context._stamped_with_route(escalated, ctx)
 
 
+def _store_successful_read(url: str, result: FetchResult, ctx: context.LadderContext) -> None:
+    artifact = ctx.artifact_for(result)
+    if (
+        result.status == "success"
+        and result.route != "url_context"
+        and artifact is not None
+        and run_cache.cacheable(artifact)
+    ):
+        run_cache.put(url, artifact, route=result.route)
+
+
 async def fetch_url(url: str, *, policy: LadderPolicy, ctx: context.LadderContext) -> FetchResult:
     """Fetch one URL through the whole ladder under ``policy``: the entry point both callers use.
 
@@ -187,9 +201,43 @@ async def fetch_url(url: str, *, policy: LadderPolicy, ctx: context.LadderContex
         translated = await policy.known_api(url)
         if translated is not None:
             return translated
+    try:
+        cached = await run_cache.get(
+            url,
+            policy=policy,
+            query=ctx.query,
+            now=ctx.now,
+            budget_s=replace(ctx, policy=policy).rung_budget_s(),
+        )
+    except TimeoutError:
+        logger.warning("fetch cache presentation exceeded this URL's remaining wall budget: %s", url)
+        return FetchResult(
+            url=url,
+            status="error",
+            text="",
+            http_status=None,
+            content_type=None,
+            cache_hit=True,
+        )
+    if cached is not None:
+        if cached.route != "direct" or (cached.status == "success" and not cached.escalate_rendered):
+            return cached
+        host_sems = ctx.host_sems if ctx.host_sems is not None else host_semaphores()
+        bound = replace(ctx, policy=policy, host_sems=host_sems)
+        if bound.session is not None:
+            escalated = await _escalate_unresolved(bound.session, url, cached, host_sems=host_sems, ctx=bound)
+        else:
+            async with guard._get_session() as session:
+                escalated = await _escalate_unresolved(session, url, cached, host_sems=host_sems, ctx=bound)
+        result = context._stamped_with_route(escalated, bound)
+        _store_successful_read(url, result, bound)
+        return result
     host_sems = ctx.host_sems if ctx.host_sems is not None else host_semaphores()
     bound = replace(ctx, policy=policy, host_sems=host_sems)
     if bound.session is not None:
-        return await _fetch_one(bound.session, url, host_sems, bound)
-    async with guard._get_session() as session:
-        return await _fetch_one(session, url, host_sems, replace(bound, session=session))
+        result = await _fetch_one(bound.session, url, host_sems, bound)
+    else:
+        async with guard._get_session() as session:
+            result = await _fetch_one(session, url, host_sems, replace(bound, session=session))
+    _store_successful_read(url, result, bound)
+    return result

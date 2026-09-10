@@ -14,10 +14,19 @@ from forecasting_tools import BinaryQuestion, GeneralLlm, MultipleChoiceQuestion
 # checkout is fine. See `_block_native_egress` for why the guard needs this class specifically.
 from playwright._impl._browser_type import BrowserType as PlaywrightBrowserType
 
+from metaculus_bot.research.fetch_ladder import run_cache
 from scripts import gha_artifacts
 
 _OPEN = datetime(2026, 1, 1)
 _RESOLVE = datetime(2026, 5, 1)
+
+
+@pytest.fixture(autouse=True)
+def _clear_fetch_ladder_run_cache() -> Iterator[None]:
+    """Give every test a fresh process-run cache while preserving reuse inside one test."""
+    run_cache.clear()
+    yield
+    run_cache.clear()
 
 
 # ---------------------------------------------------------------------------
