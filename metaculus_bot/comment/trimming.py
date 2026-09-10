@@ -1,3 +1,24 @@
+"""Trim an assembled Metaculus comment, and its individual sections, to the platform's char limits.
+
+Two entry points. ``trim_section`` shrinks one section of the framework's unified comment to its
+own budget (``_section_budget`` maps the section name to it), and ``trim_comment`` shrinks the
+whole assembled comment through an ordered strategy chain: shrink ``# RESEARCH`` alone
+(``_trim_research_section_first``), else keep the summary head and the tail
+(``_trim_preserving_summary_and_tail``), else fall back to a plain header-preserving trim
+(``_trim_with_notice``).
+
+Two invariants every path holds. The output keeps its leading ``#``, which the publish validator
+requires. And the bytes ``performance_analysis`` later parses out of the published comment survive:
+each rationale's ``Model: openrouter/...`` attribution line and its trailing fenced json forecast
+block, the per-model ``*Forecaster N*:`` bullets in the summary, the trailing ``STACKED=<bool>``
+marker, and the provider-diagnostics ``lost=`` token. That is why the over-budget paths trim from
+*within* each rationale block rather than keeping a header plus one long tail: a naive
+header-and-tail trim ate Forecaster 1's ``Model:`` line in 29 of 29 measured July 2026 trims.
+
+The section budgets, that measurement, and the stacker-combined misattribution this file exists to
+prevent: docs/architecture.md "Comment trimming".
+"""
+
 from __future__ import annotations
 
 import logging
@@ -19,32 +40,21 @@ logger = logging.getLogger(__name__)
 
 TRIM_NOTICE: Final[str] = "[... trimmed for length]"
 
-# Top-level h1 section headers in the framework's unified comment
-# (forecast_bot.py:538-550). The section-aware trim splits on these; see
-# ``_trim_research_section_first`` for the priority rationale.
+# The h1 headers ForecastBot._create_comment emits; the section-aware trim splits on them.
 _RESEARCH_HEADER_RE: Final[re.Pattern[str]] = re.compile(r"^# RESEARCH$", re.MULTILINE)
 _FORECASTS_HEADER_RE: Final[re.Pattern[str]] = re.compile(r"^# FORECASTS$", re.MULTILINE)
 
-# Marker that ends the summary section of a bot comment. When trimming the
-# whole comment, we want to preserve everything up to and including the
-# summary so the residual-analysis parsers (which match *Forecaster N*: value
-# bullets in the summary) keep working. This marker is chosen because the
-# framework consistently emits "### Research Summary" immediately after the
-# summary bullets and before the first R1 rationale.
+# The framework emits this right after the per-model bullets the residual parsers read.
 _SUMMARY_END_MARKER: Final[str] = "### Research Summary"
 
-# Max chars reserved for the summary head when the comment must be trimmed.
-# Sized so it fits the summary + a safety margin while only nibbling a small
-# fraction of the total budget; the rest goes to the tail (which holds the
-# STACKED=<bool> marker and as many R1 rationales as fit).
+# Fits the summary with margin, leaving most of the budget to the tail; see docs/architecture.md.
 _COMMENT_HEAD_BUDGET: Final[int] = 10_000
 
 
 @dataclass(frozen=True, slots=True)
 class TrimConfig:
     notice: str = TRIM_NOTICE
-    # Generic per-section fallback (unknown section names). Set to the most
-    # permissive section budget so a bare trim_section never over-trims.
+    # Fallback for unknown section names: the most permissive budget, so a bare trim never over-trims.
     section_limit: int = FORECASTS_SECTION_CHAR_LIMIT
     summary_limit: int = SUMMARY_SECTION_CHAR_LIMIT
     research_limit: int = RESEARCH_SECTION_CHAR_LIMIT
@@ -63,10 +73,7 @@ def _trim_with_notice(text: str, limit: int, notice: str, *, preserve_header: bo
         return notice[:limit], True
 
     if preserve_header:
-        # Strip leading newlines so the header is the first non-empty line.
-        # The framework's clean_indents output starts with "\n# SUMMARY"; without
-        # this, partition("\n") would yield an empty header and the output would
-        # lose its leading "#", breaking the validator invariant.
+        # clean_indents output opens with a newline, which would leave an empty header and lose the "#".
         text = text.lstrip("\n")
         header, separator, remainder = text.partition("\n")
         if separator:
@@ -77,11 +84,9 @@ def _trim_with_notice(text: str, limit: int, notice: str, *, preserve_header: bo
             truncated_header = header[: max(0, limit - len(notice) - 1)]
             if truncated_header:
                 return f"{truncated_header}\n{notice}", True
-            # Header alone exceeds the budget. Truncate it but keep the leading
-            # character so a '#'-leading input stays '#'-leading.
+            # Header alone overflows; truncate it but keep the leading "#".
             return text[:limit], True
-        # Single-line blob (no newline). Truncate from the front, appending the
-        # notice when there's room, so the leading character is preserved.
+        # Single-line blob: truncate from the front so the leading character survives.
         if limit > len(notice) + 1:
             return f"{text[: limit - len(notice) - 1]}\n{notice}", True
         return text[:limit], True
@@ -93,44 +98,28 @@ def _trim_with_notice(text: str, limit: int, notice: str, *, preserve_header: bo
     return f"{notice}\n{tail}", True
 
 
-# A single forecaster's rationale header inside the FORECASTS section, e.g.
-# "## R1: Forecaster 3 Reasoning". report_number is always 1 in production
-# (single report), but \d+ keeps this robust to multi-report comments. The
-# block-aware trim splits the section on these so each forecaster keeps its own
-# attribution when the section overflows.
+# The report number is always 1 in prod, but the pattern stays robust to multi-report comments.
 _RATIONALE_HEADER_RE: Final[re.Pattern[str]] = re.compile(r"(?m)^##\s+R\d+:\s+Forecaster\s+\d+\s+Reasoning[ \t]*$")
 
-# The bot-injected "Model: openrouter/<provider>/<name>" attribution line that
-# opens each rationale body. Kept byte-stable because the per-model attribution
-# regexes in performance_analysis/comment_sections.py — named _R1_MODEL_RE and
-# _REASONING_MODEL_PREFIX_RE — key on it: the exact line a naive header+tail trim
-# destroyed (measured: Forecaster 1's Model: line eaten in 29/29 July trims).
+# Byte-stable because performance_analysis/comment_sections.py keys on it; see docs/architecture.md.
 _MODEL_PREFIX_RE: Final[re.Pattern[str]] = re.compile(r"(?m)^Model:[ \t]*[^\n]*$")
 
-# A fenced ```json STRUCTURED FORECAST block. Each rationale ends with one (the
-# block-last prompt requirement); it carries the per-model forecast values the
-# residual pipeline parses, so a within-block trim keeps it in the kept tail.
+# Ends every rationale and carries the values the residual pipeline parses, so trims keep it.
 _JSON_BLOCK_RE: Final[re.Pattern[str]] = re.compile(r"```json\b.*?```", re.DOTALL)
 
 
 def _pin_summarizer_banner(text: str, limit: int, notice: str) -> tuple[str, bool]:
-    """Header + degradation banner + trimmed tail, for a research section carrying
+    """Header, degradation banner and trimmed tail, for a research section carrying
     the summarizer soft-fail banner.
 
-    The plain header-preserving trim keeps header + TAIL, which drops the banner —
-    and a summarizer soft-fail is itself what pushes a bundle over the research
-    budget (raw articles run longer than the briefing), so the banner was most likely
-    dropped precisely on the questions where it fired. Pinning it mirrors what
-    ``_trim_single_body`` already does for each rationale's ``Model:`` line: keep the
-    few bytes that carry the disclosure, sacrifice prose.
-
-    The banner is located by search rather than assumed to lead the body: the
-    orchestrator prepends it to the AskNews provider's own text, so in an assembled
-    bundle it sits after that provider's ``## News Articles (AskNews)`` header, not
-    at the body's first byte.
-
-    Returns ``(text, False)`` when the section carries no banner or the budget can't
-    seat header + banner + notice, so the caller falls back to the plain trim.
+    The plain header-preserving trim keeps header plus TAIL, which drops the banner,
+    and a soft-fail is itself what pushes a bundle over the research budget, so the
+    disclosure was most likely dropped precisely on the questions where it fired.
+    The banner is located by search rather than assumed to lead the body, because
+    the orchestrator prepends it to the AskNews provider's own text. Returns
+    ``(text, False)`` when the section carries no banner or the budget cannot seat
+    header, banner and notice, so the caller falls back to the plain trim. Why the
+    pin at all: docs/architecture.md "Comment trimming".
     """
     stripped = text.lstrip("\n")
     header, separator, remainder = stripped.partition("\n")
@@ -175,8 +164,7 @@ def trim_section(text: str, section_name: str, *, config: TrimConfig | None = No
     if block_aware:
         trimmed, did_trim = _trim_rationales_within_blocks(text, limit, cfg.notice)
     else:
-        # A summarizer-degradation banner is pinned ahead of the tail; every other
-        # section shape falls through to the plain header-preserving trim.
+        # The summarizer-degradation banner is pinned ahead of the tail; every other shape falls through.
         trimmed, did_trim = _pin_summarizer_banner(text, limit, cfg.notice) if len(text) > limit else (text, False)
         if not did_trim:
             trimmed, did_trim = _trim_with_notice(text, limit, cfg.notice, preserve_header=True)
@@ -282,34 +270,20 @@ def _trim_single_body(block: str, budget: int, notice: str) -> str:
 def _trim_stacker_combined_block(block: str, budget: int, notice: str) -> str:
     """Trim a stacker-combined R1 body, keeping every base model's attribution.
 
-    When stacking fires, ``combine_stacker_and_base_reasoning`` folds the
-    stacker's meta-analysis and all N base reasonings into a single
-    ``## R1: Forecaster 1 Reasoning`` block: a stacker portion (which itself
-    ends with the stacker's own json forecast block), the
-    ``STACKED_BASE_REASONING_HEADER`` delimiter, then one
-    ``Model: openrouter/...`` sub-block per base model, each ending with its own
-    fenced json forecast block.
-
-    Trimming this as a single body keeps only the LAST json block in the whole
-    combined body and orphans it from its ``Model:`` line — so
-    ``performance_analysis.parsing._split_stacker_combined_body`` re-attributes
-    that trailing model's forecast values to the last SURVIVING base model
-    (silent misattribution, not just loss). Instead we split on the same
-    delimiter + ``Model:`` regex the parser uses, water-fill ``budget`` across
-    the stacker portion and each base sub-block with ``_allocate_block_budgets``,
-    and trim each from within via ``_trim_single_body`` — so every base model
-    keeps its ``Model:`` line paired with its own json block, sacrificing only
-    per-sub-block prose. The delimiter is re-emitted verbatim so the parser's
-    stacker-body detection still fires. The return value never exceeds
-    ``budget``.
+    ``combine_stacker_and_base_reasoning`` folds the stacker's meta-analysis and all
+    N base reasonings into one ``## R1: Forecaster 1 Reasoning`` block, separated by
+    ``STACKED_BASE_REASONING_HEADER``, each part ending with its own fenced json
+    forecast block. So this splits on the same delimiter and ``Model:`` regex the
+    parser uses, water-fills ``budget`` across the parts with
+    ``_allocate_block_budgets``, trims each from within via ``_trim_single_body``,
+    and re-emits the delimiter verbatim; the return value never exceeds ``budget``.
+    The misattribution a single-body trim causes instead: docs/architecture.md
+    "Comment trimming".
     """
     stacker_portion, base_portion = block.split(STACKED_BASE_REASONING_HEADER, 1)
     matches = list(BASE_MODEL_SUBBLOCK_SPLIT_RE.finditer(base_portion))
     if not matches:
-        # Delimiter present but no base ``Model:`` sub-blocks (e.g. a body
-        # already truncated inside the stacker portion). Nothing to attribute
-        # per base model, so fall back to the single-body trim — it still keeps
-        # the R1 header and a trailing json block.
+        # Delimiter but no base sub-blocks: nothing to attribute per base model.
         return _trim_single_body(block, budget, notice)
 
     stacker_unit = stacker_portion.rstrip()
@@ -319,17 +293,11 @@ def _trim_stacker_combined_block(block: str, budget: int, notice: str) -> str:
     ]
     units = [stacker_unit, *base_units]
 
-    # Reassembly:
-    #   {stacker_unit}\n{DELIMITER}\n{base_0}\n\n{base_1}\n\n...
-    # Fixed overhead the per-unit budgets can't touch: the delimiter, the
-    # newline before it, the newline after it, and the blank line between
-    # consecutive base sub-blocks.
+    # The delimiter, its two newlines and the blank lines between base sub-blocks sit outside the budgets.
     fixed = len(STACKED_BASE_REASONING_HEADER) + 2 + 2 * (len(base_units) - 1)
     usable = budget - fixed
     if usable <= 0:
-        # Budget too small to seat the delimiter + units. Does not occur in prod
-        # (the single stacked R1 block gets the whole FORECASTS section budget),
-        # but keep the block coherent rather than emit a headerless fragment.
+        # Unreachable in prod, but keep the block coherent rather than emit a headerless fragment.
         return _trim_single_body(block, budget, notice)
 
     budgets = _allocate_block_budgets([len(u) for u in units], usable)
@@ -377,28 +345,13 @@ def _trim_rationales_within_blocks(text: str, limit: int, notice: str) -> tuple[
 def _trim_preserving_summary_and_tail(text: str, cfg: TrimConfig) -> tuple[str, bool]:
     """Trim the middle, keep the summary head and the tail.
 
-    The bot's published comment has the structure:
-
-        # SUMMARY
-        ...
-        ## Report 1 Summary
-        ### Forecasts
-        *Forecaster 1*: ...          <- residual-analysis parsers read these
-        *Forecaster 2*: ...
-        ### Research Summary         <- ``cfg.summary_end_marker``
-        ...
-        ## R1: Forecaster 1 Reasoning
-        ...
-        <!-- STACKED=true -->        <- residual-analysis marker
-
-    If the comment overflows ``cfg.comment_limit``, we carve up to
-    ``cfg.head_budget`` chars for the head (everything up to and including
-    the summary-end marker) and use the remaining budget for the tail
-    (which preserves the STACKED marker and as many R1 rationales as fit).
-    The middle gets replaced with the trim notice.
-
-    Falls back to (text, False) if the marker isn't present — caller should
-    then use the plain tail-only trim.
+    The head runs to ``cfg.summary_end_marker`` ("### Research Summary"), which the
+    framework emits right after the per-model ``*Forecaster N*:`` bullets the
+    residual parsers read; the tail carries the trailing ``STACKED`` marker and as
+    many R1 rationales as fit. On overflow, up to ``cfg.head_budget`` chars go to
+    the head, the remaining budget to the tail, and the middle becomes the trim
+    notice. Returns ``(text, False)`` when the marker is absent, so the caller falls
+    back to the plain tail-only trim.
     """
     marker_idx = text.find(cfg.summary_end_marker)
     if marker_idx < 0:
@@ -411,8 +364,7 @@ def _trim_preserving_summary_and_tail(text: str, cfg: TrimConfig) -> tuple[str, 
     # Reserve head, newline, notice, newline before giving the rest to tail.
     tail_budget = cfg.comment_limit - len(head) - len(notice) - 2
     if len(head) > cfg.head_budget or tail_budget <= 0:
-        # Head is pathologically large, or no room left for tail + notice.
-        # Let caller fall back to plain tail-only trim.
+        # Pathologically large head, or no room for tail plus notice: let the caller fall back.
         return text, False
 
     tail = text[-tail_budget:]
@@ -423,25 +375,15 @@ def _trim_preserving_summary_and_tail(text: str, cfg: TrimConfig) -> tuple[str, 
 def _trim_research_section_first(text: str, cfg: TrimConfig) -> tuple[str, bool]:
     """Absorb the overflow by shrinking only the ``# RESEARCH`` section.
 
-    Priority is model reasoning > research, so when the comment overflows we
-    deterministically shrink the research middle before touching anything else.
-    The comment is split on its top-level headers into::
+    Model reasoning outranks research, so an overflowing comment shrinks the research
+    middle first and keeps ``# SUMMARY`` (bullets and the summary-end marker) and
+    ``# FORECASTS`` (rationales and the trailing markers) whole. Research is
+    summary-style and front-loaded, so the *front* of its body is what survives.
 
-        # SUMMARY ...        <- head: bullets + ### Research Summary marker
-        # RESEARCH ...        <- middle: summary-style, front-loaded research
-        # FORECASTS ...       <- tail: rationales + trailing STACKED/TOOLS markers
-
-    We keep SUMMARY and FORECASTS whole and shrink RESEARCH to fit. Research is
-    summary-style and front-loaded, so we keep the *front* of its body (header +
-    notice + as much head as the budget allows).
-
-    Returns ``(text, False)`` (caller falls back to ``summary_and_tail``) when
-    the comment lacks the recognizable ``# RESEARCH`` / ``# FORECASTS``
-    structure, OR when shrinking research alone can't cover the overflow (a
-    pathologically large SUMMARY head or FORECASTS tail). In that case the
-    summary-and-tail path — which anchors on ``### Research Summary`` and drops
-    everything between it and the tail — handles it correctly while still
-    preserving the leading ``#`` and the per-model bullets.
+    Returns ``(text, False)`` when the comment lacks the ``# RESEARCH`` /
+    ``# FORECASTS`` structure, or when shrinking research alone cannot cover the
+    overflow; ``_trim_preserving_summary_and_tail`` handles those correctly and still
+    preserves the leading ``#`` and the per-model bullets.
     """
     research_match = _RESEARCH_HEADER_RE.search(text)
     forecasts_match = _FORECASTS_HEADER_RE.search(text)
@@ -453,30 +395,20 @@ def _trim_research_section_first(text: str, cfg: TrimConfig) -> tuple[str, bool]
     research_body = text[research_match.end() : forecasts_match.start()]
     tail = text[forecasts_match.start() :]  # "# FORECASTS" onward (incl. markers)
 
-    # The provider-diagnostics block is APPENDED to the research body, so keeping
-    # only the front drops it — and with it the ``lost=summarizer:error(...)`` token
-    # that names which source degraded. It is the one part of the research body that
-    # is bounded and non-narrative, so pin it after the kept front rather than
-    # letting front-truncation decide whether the reader learns what was lost.
+    # Appended, so a front-only keep would drop the lost= token naming which source degraded.
     diagnostics_idx = research_body.find(PROVIDER_DIAGNOSTICS_HEADER)
     pinned_diagnostics = "" if diagnostics_idx < 0 else research_body[diagnostics_idx:].rstrip("\n")
 
     notice = cfg.notice
     fixed = len(head) + len(research_header) + len(tail)
 
-    # Budget left for the research body after the fixed head/header/tail. The 3
-    # joining newlines: after the header, after the notice, and before the tail
-    # (so "# FORECASTS" stays on its own line even when research is truncated).
-    # When this is < 0, head + tail alone overflow, so shrinking research can't
-    # help — defer to the summary-and-tail path.
+    # Three joining newlines; the last keeps "# FORECASTS" on its own line when research is cut.
     research_budget = cfg.comment_limit - fixed - len(notice) - 3
     if research_budget < 0:
+        # Head plus tail already overflow, so shrinking research cannot help.
         return text, False
 
-    # Reserve the pinned block (plus its own joining newline) out of the research
-    # budget. When it cannot fit, drop the pin rather than the whole strategy — a
-    # trimmed comment without the diagnostics line still beats deferring to
-    # summary_and_tail, which discards the entire research body.
+    # Drop the pin rather than the strategy: summary_and_tail would discard the whole research body.
     pin_reservation = len(pinned_diagnostics) + 1 if pinned_diagnostics else 0
     if pin_reservation >= research_budget:
         pinned_diagnostics = ""
@@ -495,10 +427,7 @@ def trim_comment(text: str, *, config: TrimConfig | None = None) -> str:
     if len(text) <= cfg.comment_limit:
         return text
 
-    # Ordered fallback chain. Each strategy preserves the leading "#", so the
-    # validator invariant holds regardless of which one fires. The last resort
-    # (plain header-preserving trim) handles comments with no recognizable
-    # section structure at all.
+    # Every strategy in this chain preserves the leading "#", so the validator invariant holds.
     trimmed, used = _trim_research_section_first(text, cfg)
     if used:
         strategy = "research_first"

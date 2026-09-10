@@ -563,6 +563,48 @@ under "# RESEARCH", so setting both to the research text duplicated it and bloat
 past the character limit. The "### Research Summary" heading is emitted regardless of body, so
 the trim anchor and the parser markers survive.
 
+#### Comment trimming
+
+`metaculus_bot/comment/trimming.py` enforces the platform's character limits: `trim_section` for
+one section, `trim_comment` for the assembled whole. The budgets come from `constants.py`
+(`SUMMARY_SECTION_CHAR_LIMIT`, `RESEARCH_SECTION_CHAR_LIMIT`, `FORECASTS_SECTION_CHAR_LIMIT`,
+`COMMENT_CHAR_LIMIT`), and `_section_budget` maps a section name to its own budget so the
+parser-critical FORECASTS section is not starved by a uniform cap. The module-private
+`_COMMENT_HEAD_BUDGET` (10,000 chars) is sized to seat the summary with a safety margin while
+leaving most of the budget to the tail, which is where the `STACKED=<bool>` marker and as many R1
+rationales as fit live.
+
+Everything the trim protects is something `performance_analysis` later parses back out of the
+published comment: each rationale's `Model: openrouter/<provider>/<name>` line (keyed on by
+`_R1_MODEL_RE` and `_REASONING_MODEL_PREFIX_RE` in `performance_analysis/comment_sections.py`), the
+fenced json STRUCTURED FORECAST block that closes each rationale, the `*Forecaster N*:` bullets in
+the summary, the trailing `STACKED` marker, and the provider-diagnostics `lost=summarizer:error(...)`
+token naming which source degraded. A naive header-and-tail trim ate Forecaster 1's `Model:` line in
+29 of 29 measured July 2026 trims, which is why the FORECASTS path shrinks each rationale block from
+within (`_trim_rationales_within_blocks`, `_trim_block`, `_trim_single_body`) instead of keeping one
+header and one long tail.
+
+The stacker-combined shape is the sharpest case. When stacking fires,
+`combine_stacker_and_base_reasoning` folds the stacker's meta-analysis and every base model's
+reasoning into a single `## R1: Forecaster 1 Reasoning` block, each part ending with its own json
+forecast block. Trimming that as one body keeps only the last json block and orphans it from its
+`Model:` line, at which point `performance_analysis.parsing._split_stacker_combined_body`
+re-attributes those forecast values to the last SURVIVING base model, which is silent
+misattribution rather than plain loss. `_trim_stacker_combined_block` therefore splits on the same
+delimiter and `Model:` regex the parser uses, water-fills the budget across the stacker portion and
+each base sub-block with `_allocate_block_budgets`, trims each from within, and re-emits the
+delimiter verbatim so the parser's stacker-body detection still fires.
+
+Two smaller pins. The summarizer soft-fail banner is kept ahead of the tail by
+`_pin_summarizer_banner`, because a soft-fail is itself what pushes a research bundle over budget
+(raw articles run longer than the briefing), so a plain header-and-tail trim would have dropped the
+disclosure precisely on the questions where it fired. That banner is located by search rather than
+assumed to lead the body, since the orchestrator prepends it to the AskNews provider's own text and
+it therefore sits after that provider's `## News Articles (AskNews)` header. And the
+provider-diagnostics block is appended to the research body, so keeping only the front would drop
+it; being the one bounded, non-narrative part of that body, it is pinned after the kept front and
+dropped only when it cannot fit at all.
+
 #### Ensemble-size disclosure (`FORECASTERS_USED`)
 
 The comment trailer carries `FORECASTERS_USED=<used>/<configured>`: forecasters that
