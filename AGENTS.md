@@ -372,8 +372,9 @@ Each of these has cost real work at least once. The pointer is where the reasoni
 - **A function-scoped import needs one of exactly three justifications**, named in its
   `# noqa: PLC0415` comment: a genuinely optional dependency, late binding for a patch surface,
   or a real circular import. Cold start and "the formatter would strip it" are not
-  justifications. Never delete a `HARNESS-SCAN-EXEMPT-function-level-import` marker. Detail:
-  `docs/architecture.md` "Import conventions".
+  justifications. Never add a `# noqa` or a `HARNESS-SCAN-EXEMPT` marker to silence a linter or
+  the smell scanner without one of those justifications. Deleting a marker by fixing the import
+  it excused is always welcome. Detail: `docs/architecture.md` "Import conventions".
 - **Patch a name on the module where it is USED, not where it is defined.** Two live traps:
   every `Fred` / `fetch_series` patch target is `metaculus_bot.research.fred_rendering`, not
   `financial_data` (fredapi's real class carries the identical literals, so a patch at the wrong

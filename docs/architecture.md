@@ -690,8 +690,10 @@ milliseconds, not ten.
 "The formatter would strip it" is also not a justification. Ruff only strips an import
 with no usage, so add the import and its usage in the SAME edit and it survives.
 
-Whichever applies, keep the `# noqa: PLC0415`, state the reason inline, and never delete a
-`HARNESS-SCAN-EXEMPT-function-level-import` marker.
+Whichever applies, keep the `# noqa: PLC0415` and state the reason inline. Never add a
+`# noqa` or a `HARNESS-SCAN-EXEMPT` marker to silence a linter or the smell scanner without one
+of these three justifications. Deleting a marker by fixing the import it excused is always
+welcome.
 
 ## Where the pieces live
 
