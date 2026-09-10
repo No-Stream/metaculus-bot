@@ -280,7 +280,7 @@ reason. The moved log lines do change their `%(name)s` prefix in production run 
 archive cannot see: `scripts/telemetry/markers.py` matches every marker with `re.search` on the
 message text and its own docstring says a spec is agnostic to the log-line prefix.
 
-## Step 3 cannot be a preset: the design, awaiting the lead's confirmation
+## Step 3 cannot be a preset: the design, CONFIRMED by the lead and built as `b059275` + `e0a8164`
 
 The plan makes step 3 "point the loop at `fetch_url` with a preset that encodes today's gaps". A
 preset cannot do it. The fetcher's classifier does not merely READ a body, it JUDGES it, and its
@@ -349,11 +349,270 @@ hop, the two-pass extraction, the ARIA rewrite (inside the extraction, which is 
 Only the derived-feed REUSE half is genuinely absent, and most of that arrives with the shared
 read. Size it after step 3 rather than assuming now.
 
+## Step 3 as built: `b059275` (3a, additive) and `e0a8164` (3b, the switch)
+
+Both green on the full gate set at the tip: `make test` 9,807 passed / 41 skipped / 5 deselected,
+lint clean, typecheck 0 errors, 6 import contracts kept, deptry clean. The count is the baseline's
+9,766 plus the corpus's 21 and the 20 the replay-script sibling added in `ba328f1` / `06666e3`; step
+3 added no test to the loop's own suite, because what it did there was move seams.
+
+### The verdict seat's shape
+
+`fetch_ladder/verdict.py`, a leaf importing only `constants`, `document_cache`, `document_text`,
+`rendered_fetch` and `resolution_fetch_result`. It holds a `LadderVerdict` Protocol with four
+methods, two frozen implementations (`ResolutionSourceVerdict`, `GapFillVerdict`) and their two
+module instances, plus the content floors that moved out of `classify.py` to keep the dependency
+one-way: `looks_like_js_wall`, `looks_like_page_chrome`, `content_share`, `_no_content_verdict`,
+`_pdf_unreadable_reason` and the extraction record, renamed `PageExtraction`. `policy.verdict` is
+the ONE field, as the lead approved.
+
+The four methods, and why it is four rather than the two the design named:
+
+- `unread_route(content_type)` — the branch a content type earns with no body read, or None. Only
+  the gap-fill verdict uses it, for a declared image, whose bytes buy nothing a local rung can read.
+- `body_route(content_type, body)` — which branch a body takes. This is the addition the design did
+  not anticipate, and it is load-bearing: the fetcher routes on the Content-Type header with the
+  `%PDF-` sniff inside the fallback branch, while the loop routes on the BYTES first. Without it the
+  loop loses `test_pdf_magic_bytes_behind_html_content_type_are_read_locally` (a mislabeled document
+  read locally), its declared-image escalation to `read_document`, and its permissive
+  empty-Content-Type textual read. All three are pinned behaviour, so the read's ROUTING is a
+  verdict decision even though the read itself is shared and byte-identical.
+- `html(extraction, chart_block, unreadable_embeds)` — the fetcher's two functions unchanged; the
+  loop publishes any non-empty extraction and calls an empty one `js_wall`.
+- `document(pdf, query, max_chars, source_url)` — runs inside the parse's own single thread hop
+  (`classify._parse_and_read`). The fetcher's is today's digest-or-withhold; the loop's joins the
+  pages, holds the parse in `research/document_cache.py` and never withholds on a non-matching ask.
+
+`escalate_rendered` is NOT a verdict method: the rule ("a non-success, or a success under the floor,
+with no chart block") is uniform, so `classify._escalates_on_thin_content` computes it from
+`policy.thin_content_escalation_chars` and the verdict returns only the status and the text.
+
+### The presets, and where each value comes from
+
+`RESOLUTION_SOURCE_POLICY` is unchanged in every knob it already had. Three gap-fill presets:
+
+| Knob | `GAP_FILL_FETCH_POLICY` | `GAP_FILL_DOCUMENT_POLICY` | `GAP_FILL_DIRECT_POLICY` |
+|---|---|---|---|
+| `total_wall_s` | 90.0 (the `fetch` ToolSpec ceiling) | 25.0 (`_LOCAL_DOCUMENT_BUDGET_S`) | 90.0 |
+| `rung_wall_margin_s` | 0.0 | 0.0 | 0.0 |
+| `rungs_enabled` | impersonate, rendered, wayback | impersonate, rendered | none |
+| `verdict` | `GAP_FILL_VERDICT` | same | same |
+| `render_memo_scope` | `gap_fill_v2` | same | same |
+| `per_url_max_chars` | None | same | same |
+| `wayback_max_age_days` | None | same | same |
+| `wayback_extra_trigger_statuses` | `{unsupported_type}` | same | same |
+| `wayback_needs_host_refusal` | True | same | same |
+| `impersonate_dial_wall_s` | `RESOLUTION_SOURCE_HTTP_TIMEOUT` | same | same |
+| `disclose_unreadable_embeds` | False | same | same |
+| `thin_content_escalation_chars` | `GAP_FILL_V2_MIN_CONTENT_CHARS` | same | same |
+| `collect_links` | True | same | same |
+
+`rung_wall_margin_s` is 0.0 because the old code's admission rule was literally
+`deadline_monotonic_s - now < RESOLUTION_SOURCE_IMPERSONATE_MIN_BUDGET_S` against a deadline of
+`monotonic() + _LOCAL_DOCUMENT_BUDGET_S`. With `total_wall_s = 25` and no margin,
+`rung_budget_s()` is `25 - elapsed`, so the rung's own floor check reproduces that decision exactly;
+any margin would decline a dial the loop admits today. The loop's outer bounds (the ToolSpec ceiling
+and the acquisition `wait_for`) are the cut, which is what a margin would otherwise be protecting.
+
+`impersonate_dial_wall_s` is the eleventh knob and it exists for the strictly-safer rule. The old
+loop capped the WHOLE retry at one plain hop's `RESOLUTION_SOURCE_HTTP_TIMEOUT`, tightened by its
+caller's deadline; the shared rung hands the transport its entire remaining rung budget, which for
+the fetcher is one question's worth and for the loop's 90 s `fetch` would be up to 90 s of dialing
+on a slow redirect chain. The knob restores the 20 s cap for the loop and leaves the fetcher's
+behaviour byte-identical.
+
+### The mapping table, verbatim
+
+Status, then route for a success; `research/agentic/ladder_adapter.py` is the one copy.
+
+| `FetchStatus` (+ reason) | loop `status` | loop `method` | text the driver reads |
+|---|---|---|---|
+| `success` | `ok` | route: `direct`/`meta_refresh`→`plain`, `pdf_local`, `impersonate`, `derived_api`, `rendered`, `wayback`, `url_context`→`document` | the ladder's text |
+| `js_wall` / `empty_body` / `no_resolving_content` | `empty` | `plain` | "Plain fetch returned no extractable text." |
+| `unsupported_type` + `undecodable_body` | `empty` | `plain` | "Plain fetch could not decode the body as text." |
+| `unsupported_type` + `image_needs_reader` | `ok` | `document_needed` | the use-`read_document` placeholder |
+| `unsupported_type` (other) | `error` | `plain` | "Unsupported content type: X" |
+| `unreadable_document` (any reason) | `ok` | `document_needed` | the same placeholder |
+| `blocked`, `http_status` set | `blocked` | `plain` | "Fetch blocked with HTTP N." |
+| `blocked`, `http_status` None | `blocked` | `plain` | the platform-block message, hosts named |
+| `ssrf_blocked`, url == requested | `blocked` | `plain` | "Blocked non-public or unsupported URL." |
+| `ssrf_blocked`, url != requested | `blocked` | `plain` | "Blocked non-public redirect target." |
+| `not_found` | `error` | `plain` | "Fetch failed with HTTP N." |
+| `error` + `oversize_document` | `error` | `oversize_document` | the too-large-to-read message |
+| `error`, `http_status` a 3xx | `error` | `plain` | "Malformed redirect from URL" |
+| `error`, `http_status` 200 | `error` | `plain` | "Fetch body exceeded the size limit." |
+| `error`, other `http_status` | `error` | `plain` | "Fetch failed with HTTP N." |
+| `error` with `exc` | `error` | `plain` | "Fetch error: ClassName" |
+| `error`, nothing else | `error` | `plain` | "Redirect limit exceeded." |
+| `stale_data` / `ungrounded` | `error` | `plain` | the cited host's own status; unreachable under these presets |
+
+Three new `FetchStatusReason` tokens carry cells nothing else could: `oversize_document`,
+`image_needs_reader`, `undecodable_body`. One new `RungSkipReason`: `rung_not_enabled`, with its own
+`_rung_counts` key, which a suite guard requires (every skip reason must move a counts key).
+
+### Condition (d): the fetcher-visible delta of nulling a self-produced `http_status`
+
+`guard._vetted_hop_target` no longer takes an `http_status` at all, and both refusals it builds
+(`ssrf_blocked`, and `blocked` + `metaculus_self_ref`) carry None. Verified against every rung's
+trigger: `rungs._impersonate_rung_applies` keys on 403 and a 301/302 was never in that set;
+`_rendered_rung_applies` keys on `js_wall` / `thin_page` / `escalate_rendered`;
+`_WAYBACK_TRIGGER_STATUSES` and `_url_context_rung_applies` key on the status and reason, not the
+number. So NO fetcher rung decision changes, which the corpus's `blocked_self_ref` row proves: it
+still reads `('wayback', 'route=wayback', 'status=blocked')` before and after. The only visible
+change is the marker: `RESOLUTION_SOURCE_FETCH ... http=302` becomes `http=n/a` for a refused hop,
+which is the honest record. Two fetcher tests changed, both by dropping the argument rather than an
+assertion: `test_the_terminal_site_keeps_its_status_strings` and the meta-refresh hop's caller.
+
+### Patch sites moved
+
+Fetcher side: 11 `RESOLUTION_SOURCE_PER_URL_MAX_CHARS` monkeypatches (9 on `resolution_presentation`,
+2 on `classify`) became `capped_ctx(cap)` in `tests/resolution_source_fakes.py`, which hands the
+ladder `replace(RESOLUTION_SOURCE_POLICY, per_url_max_chars=cap)` on the context. All 11 verified
+LIVE by breaking the helper three ways (999,999 fails 10 of them; 500 fails the eleventh, the
+no-marker one, which is one-directional by construction). 6 moved-name imports repointed to
+`verdict` (`looks_like_js_wall`, `looks_like_page_chrome`, `content_share`, `_PageExtraction` and two
+constant reads), 42 marker-line literals gained ` caller=resolution_source`, and 5 document-cache
+call sites moved to `research/document_cache.py`.
+
+Loop side, in `tests/test_agentic_tools.py`: 46 `_fetch_plain` stubs and 29 `_fetch_plain` SUT calls
+went to `_serve_direct` / `_fetch_direct_only`; 24 `_try_rendered_fetch` stubs and 3 direct calls to
+`_serve_rendered` or `rungs.render_page`; 7 `_try_impersonated_fetch` calls to `rungs._impersonate_rung`
+or through `fetch`; 3 `_fetch_plain_with_impersonated_retry` to `_serve_direct` plus
+`rungs.fetch_impersonated`; 18 `_read_response_body` patches to `classify.read_body_capped`; 5
+`_try_wayback_fetch` sites to `_serve_direct` with the archive URL or `rungs._wayback_rung`; 1
+`fetch_impersonated` and 2 `render_page` to their `rungs` twins; and the `_wayback_applies` predicate
+test to `rungs._wayback_rung_applies`. Zero patches remain on a dead loop function.
+
+### Trigger-set comparison
+
+**Impersonate: identical.** Both callers read `impersonated_fetch.IMPERSONATE_TRIGGER_STATUSES` at
+call time and both require `blocked`. The loop's `_RETRYABLE_FETCH_BLOCK_STATUSES` {403, 406, 429} is
+the set that MAPS to `blocked`, which is the fetcher's `_NON_OK_FETCH_STATUS` blocked rows exactly,
+not the retry trigger. No knob needed.
+
+**Wayback: three differences, two knobs.** The loop fires on `error` or on `blocked` with a host
+status; the fetcher on {`blocked`, `error`, `not_found`} with no status test. (i) The loop's `error`
+covers the fetcher's `unsupported_type`, so the gap-fill preset adds it
+(`wayback_extra_trigger_statuses`). (ii) The loop declines a `blocked` it made itself, which two of
+its tests pin, so `wayback_needs_host_refusal` restores that. (iii) `not_found` needed nothing: the
+loop maps a 404 to `error` with the status set, so both callers already tried the archive. One
+universal exclusion was added on top for both callers, `image_needs_reader`, because an archived copy
+of an image is no more readable than the live one; the fetcher's verdict never produces that reason,
+so it is a no-op there.
+
+### Content types: no loop test was rewritten to pin admission
+
+The one test pinning a refusal, `test_unsupported_content_type_is_error` on `application/zip`, still
+passes: the gap-fill verdict routes an unlisted type with no `<html` in it to `unsupported`, and the
+adapter renders the same message. The `+json` and empty-Content-Type admissions the plan's sixth
+constraint names are simply untested on the loop side, so nothing needed rewriting. What DID need
+re-expressing was the parity test `test_the_body_classification_is_the_same_whichever_transport_read_it`,
+now `direct_fetch._fetch_direct` against `rungs._impersonated_body_outcome` compared as whole
+`FetchResult`s, because that is where the one copy of the classification rule now lives.
+
+### What step 4 turns out to be
+
+Delivered already by the shared read, so step 4 owes none of it: the ARIA-table rewrite, the
+calibrated two-pass extraction with its line-shape metric, the inline chart read, the meta-refresh
+hop, the local document read with its parse gate, the Wayback rung with its per-question cap, the
+`+json` and empty-Content-Type admission, and per-rung wall floors on everything.
+
+What remains for step 4, and it is one line: add `derived_api` to
+`GAP_FILL_FETCH_POLICY.rungs_enabled`, which turns the REUSE half on for the loop (a feed an earlier
+render on the host recorded). The rung, its per-host memo and its budget gate all already run for the
+fetcher; the loop's `rung_not_enabled` skip is the only thing keeping it off. Worth one commit with a
+test that a remembered endpoint is GET-ed for a second URL on the host, and with the render memo
+scopes still separate (the plan's fourth constraint), because "rendered to nothing" still means
+different things to the two verdicts.
+
+The Datawrapper dataset hop stays a second phase of the fetcher's provider, as the plan says.
+
+### The step-6 deletion list
+
+Production, all unreferenced today: `tools._fetch_plain`, `_fetch_one_hop`,
+`_plain_response_outcome`, `_plain_body_outcome`, `_read_response_body`, `_body_too_large_result`,
+`_try_impersonated_fetch`, `_fetch_plain_with_impersonated_retry`, `_try_rendered_fetch`,
+`_derived_api_outcome`, `_try_wayback_fetch`, `_wayback_applies`, `_RENDER_MEMO_SCOPE`, `_host_gate`
+(once `_FETCH_HOST_SEMAPHORES` has no other reader); and in `fetch_outcomes`,
+`_plain_redirect_outcome`, `_vet_hop_target`, `_plain_html_outcome`, `_plain_textual_outcome`,
+`_non_ok_status_result`, `_content_type_is_document`, `_content_type_is_pdf`, `_content_type_is_image`,
+`_body_is_document`, `_RETRYABLE_FETCH_BLOCK_STATUSES`, `_TEXTUAL_CONTENT_TYPE_TOKENS`,
+`_HTML_CONTENT_TYPE_TOKENS`, `_FETCH_MIN_CONTENT_CHARS`; and `local_document.pdf_fetch_result`,
+`oversize_result`. Deleting them takes `tools.py` from 1,079 lines to well under the monolithic
+threshold and clears the last 5 smell findings there, all of which sit on those functions.
+
+Tests to delete or migrate with them: 13 in `tests/test_agentic_tools.py` still call
+`agentic_tools._try_rendered_fetch` as their subject
+(`test_rendered_fetch_drains_routes_and_guard_tolerates_teardown_race`,
+`test_try_rendered_fetch_uses_playwright_objects`,
+`test_rendered_fetch_launches_bounded_by_global_semaphore`,
+`test_rendered_fetch_route_guard_blocks_private_redirect_target`,
+`test_rendered_fetch_skips_launch_when_host_not_pinnable`,
+`test_rendered_fetch_launches_with_host_resolver_pin`, the two in
+`TestRenderedRungSalvagesATimedOutNavigation`, the four in `TestRenderedRungTimeoutAtTheV2Wrapper`,
+and `test_links_resolve_against_the_documents_landing_url`), plus one in `tests/test_rendered_fetch.py`
+at line 483. Every claim they make is transport-level and already covered for the shared path by
+`tests/test_rendered_fetch.py` (89 tests: the pins, the off-host landings, the DOM-read bound, the
+deadline, teardown, the memos, and the Tier-1 rung's skip reasons) and by
+`tests/resolution_source/test_resolution_source_rendered_rung.py`, so the deletion step can most
+likely drop them rather than migrate them. Verify that claim per test before deleting, not in bulk.
+
+Also for step 6: about a dozen tests are still named `test_fetch_plain_*` while driving
+`_fetch_direct_only`; renaming them is churn with no coverage change and belongs with the deletion.
+
+### Deviations from the plan and the design, all reported
+
+1. **The verdict seat has four methods, not two.** The body ROUTING is a verdict decision, because
+   the two callers disagree about whether a body's bytes or its header decide its branch, and three
+   pinned loop behaviours depend on the bytes winning. Reported above.
+2. **Eleven policy knobs, not nine.** `impersonate_dial_wall_s` (the strictly-safer rule) and the two
+   Wayback knobs are the additions; `rungs_enabled` was in the brief.
+3. **`_WAYBACK_TRIGGER_STATUSES` stayed in `rungs.py`** rather than moving onto the verdict, so the
+   `tests/resolution_source/conftest.py` autouse fixture that empties it to decline the rung keeps
+   working. The per-caller difference rides two policy knobs instead.
+4. **`resolution_source.py` was touched in three places, not one**: the marker emitter (now two calls
+   into the shared formatter), a `rung_not_enabled_skips` key in `_rung_counts` (a suite guard
+   requires every skip reason to move a counts key), and the import block. Its module docstring was
+   not touched, as briefed.
+5. **A shared marker formatter, `research/fetch_markers.py`.** Two emitters spelling the same
+   contract by hand is the drift the telemetry rule exists to prevent, so the format string has one
+   home and each caller keeps its own logger and its own `question=` ref.
+6. **`research/document_cache.py` is a new module**, because the gap-fill document verdict has to hold
+   a parse and `fetch_ladder/verdict.py` cannot import `agentic/`. It is the same cache, moved out of
+   `local_document` with all five call sites repointed.
+7. **`document_text.disclosed_page_text`** moved out of `local_document` for the same reason, and
+   `digest_pdf` / `digest_text` / `_truncate_digest` now take `max_chars: int | None`, where None is
+   unbounded, rather than forcing the caller to invent a cap.
+8. **One capability lost, recorded in `FUTURE.md`**: the loop's own browser rung escalated a rendered
+   page whose Content-Type was a document to `read_document`, and the shared rung classifies every
+   rendered DOM as HTML. Restoring it means a caller-dependent branch inside the rung for a case
+   nobody has measured, which the proportion rule refuses.
+9. **`fetch_url` still opens the aiohttp session before the SSRF preflight.** No egress happens, and
+   moving the preflight up would mean resolving DNS twice per URL, so it stays. One loop test that
+   proved "no session was opened" now proves "no request was issued", which is the same claim one
+   layer out.
+
+### The comment sweep, and what is left
+
+`classify.py` went from 25 findings to ZERO: the extractor-policy calibration, the classification
+path's three ordering receipts, the raw-body markup-strip rule and the transport-failure bucketing
+all moved into two new `docs/architecture.md` subsections with one-line pointers left at the code.
+`fetch_outcomes.py` went from 6 to 0 (the throttle receipt and the platform-refusal reasoning are
+now `docs/agentic_gap_fill.md` sections). `tools.py` went from 24 to 5, and all 5 sit on the dead
+functions step 6 deletes, as does its monolithic-file finding. `ladder.py`, `policy.py`, `verdict.py`,
+`ladder_adapter.py`, `fetch_markers.py` and `document_cache.py` carry none.
+
+Left for the operator's scheduled repo-wide sweep, following the step-2 precedent for a file only
+lightly edited: `rungs.py` (46), `resolution_source.py` (32), `resolution_fetch_result.py` (20),
+`http_fetch.py` (24), `document_text.py` (16), `resolution_presentation.py` (6), `guard.py` (5),
+`local_document.py` (4), `direct_fetch.py` (3), `tests/test_agentic_tools.py` (34). Every one of
+those counts is unchanged from the baseline at `6169965`; step 3 added no finding anywhere.
+
 ## Next
 
-Step 3 as designed above, once the lead confirms the verdict seat. Then step 4 (the derived-feed
-reuse half, sized after step 3), step 5 (the run cache, the throttle check, the digest through the
-`policy.digest` seat), step 6 (the deletions only, without the semaphore fold).
+Step 4 (the one-line derived-feed REUSE enable, plus its test), step 5 (the run cache, the throttle
+check shared with the fetcher, the digest through the `policy.digest` seat), step 6 (the deletions
+above, without the host-semaphore fold).
 
 ### Step 2: the smell findings in the two files it edited are FIXED, not carried
 
