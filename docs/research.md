@@ -785,6 +785,13 @@ Four stages per question:
    share its outcome, a failure included, since re-asking a rate limiter from three
    more questions is a second violation rather than a retry. One lost pull therefore
    bumps `kalshi_catalogue_fetch_failures` once rather than once per waiting question.
+   The catalogue is read from `api.elections.kalshi.com`, while Kalshi's current docs name
+   `external-api.kalshi.com`. A read-only check on 2026-09-09 found no drift: both hosts
+   returned byte-identical payloads for the same market and event endpoints and both
+   answered the catalogue endpoint, so the code keeps the elections host. If that host is
+   ever retired, the provider's Kalshi `error(...)` source token (an `http_` status or the
+   connection error's class name) and the `kalshi_catalogue_fetch_failures` counter will
+   show it on the first run.
    PredictIt's whole ~197-market dump is one GET, and all ~197 go into the pool
    UNFILTERED: its old fuzzy pre-filter ranked "Will the Pope visit Cuba" above the
    on-topic market. Neither venue needs a query, which is
