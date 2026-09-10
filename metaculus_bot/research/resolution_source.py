@@ -1,41 +1,32 @@
 """The resolution-source provider: an adapter over the shared fetch ladder.
 
-Reads the pages a question names as its own grading source, so every forecaster sees the
-ground truth the question will be scored against. ``select_fetchable_urls`` pulls the cited
-URLs out of the resolution criteria and the fine print, drops the ones that belong to another
-provider or point back at the question platform, and caps what is left at
-``RESOLUTION_SOURCE_MAX_URLS``. ``fetch_resolution_sources`` then fans one task per URL out to
-``fetch_ladder.ladder.fetch_url`` under ``RESOLUTION_SOURCE_POLICY``, each with its own
-``LadderContext`` and all of them sharing one aiohttp session, the process-wide per-host
-politeness map and one per-question rung budget. ``_document_query`` is the text a cited PDF's
-passages are ranked against, the question's title plus its resolution criteria. What comes back
-is rendered by ``resolution_presentation.format_resolution_sections``; the orchestrator prepends
-the ``## Resolution Source Snapshot`` header.
+Reads the pages a question names as its own grading source, so every forecaster sees the ground
+truth the question will be scored against. ``select_fetchable_urls`` picks the cited URLs worth a
+fetch, ``fetch_resolution_sources`` fans one task per URL out to ``fetch_ladder.ladder.fetch_url``
+under ``RESOLUTION_SOURCE_POLICY`` with one shared aiohttp session, the process-wide per-host
+politeness map and one per-question rung budget, and ``resolution_presentation`` renders the result.
+A page embedding a Datawrapper chart earns one more phase here, the dataset hop, since trafilatura drops it.
 
 Two hard gates, both in the factory. ``is_benchmarking=True`` returns ``""``, because a page read
-today post-dates any backtest window, the same leakage guard the prediction-market provider
-carries. And ``RESOLUTION_SOURCE_ENABLED`` must be truthy.
+today post-dates any backtest window, the same leakage guard the prediction-market provider carries.
+And ``RESOLUTION_SOURCE_ENABLED`` must be truthy.
 
-Every fetch runs inside one ``asyncio.wait_for`` on ``RESOLUTION_SOURCE_WALL_TIMEOUT``, and that
-wall throws away every page that already fetched when it fires. That is why each rung of the
-ladder bounds itself against the same clock rather than trusting the outer wall to cut it, and
-why ``fast_path``, the question's thin-window mode, rides every context to make the two expensive
-rungs decline instead of dropping this provider, which is cheap and hard-capped.
+Every fetch runs inside one ``asyncio.wait_for`` on ``RESOLUTION_SOURCE_WALL_TIMEOUT``, which throws
+away every page that already fetched when it fires. That is why each rung bounds itself against the
+same clock, and why ``fast_path``, the question's thin-window mode, rides every context to make the
+two expensive rungs decline rather than drop this cheap, hard-capped provider.
 
-The Datawrapper dataset hop is this module's own second network phase inside that same wall
-rather than a ladder rung. Poll trackers lock their resolving daily series inside a chart iframe
-that trafilatura drops, so a fetched page whose raw HTML embeds one earns a fetch of that chart's
-live version-free CSV, on whatever wall the page phase left behind.
-``research/resolution_datawrapper.py`` owns that hop's classification and freshness rules.
+Telemetry is emitted here, at the per-question aggregation point, because that is where the question
+id exists: one ``RESOLUTION_SOURCE_FETCH`` line per fetched URL, one ``RESOLUTION_SOURCE_ESCALATION``
+line per rung that fired, the per-rung counts, and the results into the research archive.
 
-Telemetry is emitted here, at the per-question aggregation point, because that is where the
-question id exists: one ``RESOLUTION_SOURCE_FETCH`` line per fetched URL, one
-``RESOLUTION_SOURCE_ESCALATION`` line per rung that fired, the per-rung counts into the
-provider-diagnostics block, and the results themselves into the research archive.
+``strip_markdown_escapes``, ``looks_like_csv_rows`` and ``format_resolution_sections`` are re-exported
+here under ``noqa: F401`` for the Tier-1 suite, which imports them from this module path; none of the
+three moved in the ladder extraction, so the re-export cannot go stale.
 
-The fetch itself, its escalation rungs, the body classification and the outbound guard all
-live in ``research/fetch_ladder/``. Why the rungs sit in that order and what each policy knob
-buys: ``docs/architecture.md``, "The shared fetch ladder".
+The fetch, its rungs, the body classification and the outbound guard live in ``research/fetch_ladder/``,
+documented in ``docs/architecture.md``, "The shared fetch ladder" and ``docs/research.md``,
+"Resolution-source fetcher".
 """
 
 from __future__ import annotations
