@@ -1449,7 +1449,7 @@ the pipeline spent it: `forecaster:openai` / `forecaster:anthropic` /
 `stacker`, `stacker_fallback`, `parser`, `summarizer`, `crux_analyzer`,
 `native_search`, `targeted_search`, `gap_fill_analyzer`, `gap_fill_resolver`,
 `gap_fill_v2_driver`, `market_query_author`, `market_ranker`,
-`financial_classifier`, `perplexity_research`. The list lives in
+`financial_classifier`, `page_digest_extractor`, `perplexity_research`. The list lives in
 `credit_telemetry.llm_call_metadata`.
 
 How the number is produced, because it decides how to read it:

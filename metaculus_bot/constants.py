@@ -454,6 +454,20 @@ DOCUMENT_DIGEST_WINDOW_CHARS: int = 600
 # Above this the digest serves it, not a paid read. Receipt: docs/constants.md "URL_CONTEXT_SIZE_GATE_TOKENS".
 URL_CONTEXT_SIZE_GATE_TOKENS: int = 100_000
 
+# --- Page digest (`research/page_digest.py`, the `page_digest_extractor` support role) ---
+
+# "Luna is dirt cheap and medium will still be fast enough" (operator). Receipt: docs/constants.md "PAGE_DIGEST_EXTRACTOR_MODEL".
+PAGE_DIGEST_EXTRACTOR_MODEL: str = "openrouter/openai/gpt-5.6-luna"
+PAGE_DIGEST_EXTRACTOR_EFFORT: str = "medium"
+# Luna-medium ran 13-33 s on 20-58k-token prompts. Receipt: docs/constants.md "PAGE_DIGEST_EXTRACTOR_TIMEOUT_S".
+PAGE_DIGEST_EXTRACTOR_TIMEOUT_S: float = 20.0
+# Left to the caller's outer wait_for so the digest returns first. Receipt: docs/constants.md "PAGE_DIGEST_WALL_MARGIN_S".
+PAGE_DIGEST_WALL_MARGIN_S: float = 2.0
+# Under this a paid call cannot finish, so none is made. Receipt: docs/constants.md "PAGE_DIGEST_MIN_CALL_BUDGET_S".
+PAGE_DIGEST_MIN_CALL_BUDGET_S: float = 5.0
+# About 4k tokens, a fifth of the probed prompts. Receipt: docs/constants.md "PAGE_DIGEST_PREFILTER_MAX_CHARS".
+PAGE_DIGEST_PREFILTER_MAX_CHARS: int = 16_000
+
 # --- Resolution-source escalation rungs (free ones: meta-refresh hop, local PDF read) ---
 
 # Every rung self-bounds inside the 45 s wall. Receipt: docs/constants.md "RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S".

@@ -181,6 +181,7 @@ Inside `metaculus_bot/`:
 | Outbound fetch transports (never hand-rolled) | `research/http_fetch.py`, `impersonated_fetch.py` (the `curl_cffi` TLS-impersonating retry), `rendered_fetch.py` (headless Chromium), `url_context_reader.py` (the paid Gemini read), `robots_policy.py` |
 | Resolution-source fetcher and its escalation rungs | `research/resolution_source.py`, `resolution_fetch_result.py`, `derived_api.py`, `wayback.py` |
 | SEC EDGAR client (standalone until the shared fetch ladder wires it in) | `research/sec_edgar.py` |
+| Page digest: LLM-extractive passages of a long page, literal grounding check, BM25 pre-filter and fallback (standalone until the shared fetch ladder wires it in) | `research/page_digest.py` |
 | Gap-fill v1 / v2 | `research/targeted.py`, `research/agentic/` |
 | Model roster (source of truth) | `llm_configs.py` |
 | Prompts | `prompts.py` |

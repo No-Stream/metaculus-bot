@@ -779,6 +779,64 @@ sent to a paid `url_context` read; the digest serves it instead. The nine archiv
 this bound carried 67% of all reader tokens, and the 833k-char case above is the shape that spends
 most: the paid read of it returned nothing, so the spend bought a null answer.
 
+## Page digest (`research/page_digest.py`, the `page_digest_extractor` support role)
+
+A cited HTML page over `RESOLUTION_SOURCE_PER_URL_MAX_CHARS` used to be read from the top, so its tail
+was unreachable, and the gap-fill loop's BM25 digest reached the tail with a lexical ranker the operator
+does not trust as the primary mechanism. The operator's decision of 2026-09-09 (recorded in
+`scratch_docs_and_planning/fetch_ladder_unification_plan_2026-09-09.md`, "The page digest, as agreed")
+was a cheap model reading the page and returning verbatim passages, a literal grounding check, and
+BM25 kept as the pre-filter and the fallback. The fallback is the digest both callers shipped before,
+which is what makes the change strictly safer on the fetch wall. The module is documented in
+docs/research.md "Page digest".
+
+### PAGE_DIGEST_EXTRACTOR_MODEL, PAGE_DIGEST_EXTRACTOR_EFFORT
+
+`openrouter/openai/gpt-5.6-luna` at reasoning effort `medium`, the operator's choice on 2026-09-09:
+"luna is dirt cheap and medium will still be fast enough". `google/gemini-3.8-flash` is the noted
+alternative. The slug carries the `openrouter/` prefix because `build_llm_with_openrouter_fallback`
+routes the donated-versus-personal key off that prefix, exactly as `FINANCIAL_CLASSIFIER_MODEL` does; a
+bare `openai/` slug would dial OpenAI directly on a key this repo does not carry (the plan document
+wrote the slug without the prefix, and `GAP_FILL_RESOLVER_MODEL` can omit it only because
+`build_native_search_llm` adds it). The resolver probe of 2026-09-09
+(`scripts/probes/gap_fill_resolver_probe.py`, three runs on questions 44267 and 45199) priced luna at
+about a fifth of terra's cost per call at either effort, with no failed answers in any cell.
+
+### PAGE_DIGEST_EXTRACTOR_TIMEOUT_S
+
+The ceiling on the one paid call. The same probe measured luna at medium effort at 13 to 33 s of wall
+on prompts of 20k to 58k tokens, with one 76 s call on an 84k-token prompt, and those calls carried
+web-search tool use inside them. The pre-filter below cuts the page to about 4k tokens before the model
+reads it, so a digest call should land well under this, and the constant is the ceiling that keeps a
+slow one inside the fetcher's 45 s `RESOLUTION_SOURCE_WALL_TIMEOUT` regardless. The call is bounded by
+`min(PAGE_DIGEST_EXTRACTOR_TIMEOUT_S, budget_seconds - PAGE_DIGEST_WALL_MARGIN_S)`, so a caller with
+less wall left than this gets a shorter call and never a longer one.
+
+### PAGE_DIGEST_WALL_MARGIN_S
+
+Left to the caller's outer `wait_for` so the digest returns first and the BM25 fallback, the
+presentation cap and the marker line all fit after it. The same 2 s the escalation rungs reserve under
+`RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S`; a separate constant because the digest is called from both the
+fetcher and the gap-fill loop, whose walls differ.
+
+### PAGE_DIGEST_MIN_CALL_BUDGET_S
+
+No call is made with less than this left after the margin. The fastest luna call in the probe at any
+effort was 7.1 s on a 13k-token prompt, so a call handed 3 s of budget would bill its prompt tokens
+and time out every time. Below the floor the BM25 digest is served with no paid request, which is
+today's behaviour. A call attempted at the floor may still time out; that costs one prompt's tokens
+and nothing on the wall.
+
+### PAGE_DIGEST_PREFILTER_MAX_CHARS
+
+About 4k tokens at the chars-over-four estimator, a fifth of the smallest prompts the probe timed. A
+page past it reaches the model as its best BM25 windows for the query (`DOCUMENT_DIGEST_WINDOW_CHARS`
+each, so 26 of them) in page order with `[...]` marking each cut, and a page under it goes whole. A long
+page on which no query token occurs at all sends its head instead, which is what a reader saw before.
+The fetch-gap inventory of 2026-09-09 counted 28% of the loop's plain reads hitting the 8,000-char
+presentation window, and the median plain read was under 4,000 chars, so the pre-filter fires on a
+minority of pages and the model reads most pages complete.
+
 ## Resolution-source escalation rungs (free ones: meta-refresh hop, local PDF read)
 
 Every rung runs inside the unchanged 45 s provider wall, and the outer `asyncio.wait_for` discards
