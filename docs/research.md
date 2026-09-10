@@ -80,6 +80,17 @@ while the orchestrator uses SDK defaults; the Perplexity factory omits `api_key`
 while the orchestrator passes `None` for direct access or resolves the OpenRouter
 key. These distinctions remain part of the call contract.
 
+The Perplexity prompt interpolates `OUTSIDE_VENUE_MARKET_ODDS_POLICY` rather than restating the
+market-odds ask, because a second copy of it drifted once. This provider is the primary whenever
+the AskNews credentials are absent, so its copy is live policy, and it kept the retired blanket
+"consider all relevant prediction markets" wording after the first-pass prompt had been narrowed
+to the venues the live market snapshot does not cover. Both helpers also pass `temperature=None`
+to pin provider-default sampling against a future `GeneralLlm` default flip, and the Perplexity
+model is built at `allowed_tries=1` so the elapsed-gated `invoke_with_transient_retry` wrapper is
+the only retry owner on that path. On the Exa side `temperature` is ignored outright when the
+model is a preconfigured `GeneralLlm`; `None` is what keeps litellm from applying a sampling
+param on the fallback string path.
+
 ### AskNews fallback (primary-only)
 
 AskNews is the only primary that gets a runtime fallback. If the AskNews fetch
@@ -112,14 +123,30 @@ Both phases share a retry budget (`ASKNEWS_MAX_TRIES`) that only retries on
 known-transient rate/concurrency errors (429, "rate limit", "concurrency
 limit"); anything else raises immediately. A process-wide semaphore
 (`ASKNEWS_MAX_CONCURRENCY`) and an RPS gate (`ASKNEWS_MAX_RPS`) throttle calls,
-plus a fixed wait before each phase (`WAIT_FOR_HOT_SEC` /
-`WAIT_FOR_HISTORICAL_SEC`, function-local in `_asknews_provider`), because the
-API rate-limits aggressively even when we stay under our own limits. All three
+plus a fixed wait before each phase (`_ASKNEWS_PHASE_WAIT_SEC`, module-level in
+`research/providers.py`), because the API rate-limits aggressively even when we
+stay under our own limits. All three
 throttles take env overrides, and the shipped `.env.template` deliberately sets a
 *lower* RPS than the `constants.py` default: the constant is the ceiling, not the
 operating point, so the two disagreeing is expected rather than a drift bug. A
 hard wall-clock timeout (`ASKNEWS_WALL_TIMEOUT`) backstops a network hang so a
 stuck AskNews call can't hold the whole phase hostage.
+
+Two details of that machinery are easy to break on a later edit. The retry predicate
+(`_is_asknews_retryable`) matches on the error message rather than on a status code, unlike the
+LLM paths that read `llm_status_code`, because the AskNews SDK raises its own
+`asknews_sdk.errors` classes carrying a `.code` (429000, 429001, 403011) and never subclasses
+`openai.APIError`, so a status-based primitive reads None here and would switch this retry off
+silently. And both process-wide asyncio primitives, the concurrency semaphore
+(`get_asknews_semaphore`) and the lock guarding the RPS clock (`_get_asknews_rate_lock`), are
+created lazily on first use. The lock's laziness is a latent-shape cleanup rather than a fix for
+an observed failure: an `asyncio.Lock` binds to the running loop when it first creates a future,
+and a lock left held at loop close does wedge later loops with "is bound to a different event
+loop", which reproduces in isolation where a cancelled holder leaves a waiter queued. Driving the
+real `_asknews_rate_gate` the same way, though, a second `asyncio.run` succeeds, because the
+cancellation releases the lock before the loop closes. It is deliberately not paired with a
+staleness check: detecting a stale binding needs a private `_get_loop` probe that reads clean in
+exactly the case that later fails, so the check would be reassuring rather than effective.
 
 The two article lists are formatted into two labeled sections, "Historical
 Context & Background" and "Recent Developments & Current News", with within-list
@@ -137,6 +164,12 @@ formatter now logs `ASKNEWS_NO_ARTICLES`, records an `articles: empty(no_article
 source loss so the diagnostics line reads `empty | 0 chars | lost=articles:...`
 rather than a bare `empty`, and the orchestrator skips the summarizer call
 entirely. Gemini's grounded-chunk floor is the same pattern one provider over.
+
+`_format_asknews_dual_sections` stays pure and does none of that reporting itself. The
+`ASKNEWS_NO_ARTICLES` WARN and the `lost=articles:...` registry token belong to
+`_asknews_provider`, which owns the question id; a formatter writing the module-global
+provider-detail registry raced `_degraded_to_raw_articles`' write for the same key only by
+accident of ordering.
 
 The raw pre-summarization article markdown is captured separately and archived
 (the `asknews_raw` field) so a later audit can replay the summarizer or attribute
@@ -205,7 +238,23 @@ reasoning effort and verbosity in `NATIVE_SEARCH_REASONING_EFFORT_DEFAULT` /
 (`NATIVE_SEARCH_WALL_TIMEOUT`) set just above it. Model, effort, and verbosity are
 overridable via `NATIVE_SEARCH_MODEL` / `NATIVE_SEARCH_REASONING_EFFORT` /
 `NATIVE_SEARCH_VERBOSITY`. On the wire the effort goes out as
-`reasoning={"effort": ...}` and the verbosity as `extra_body={"verbosity": ...}`.
+`reasoning={"effort": ...}` and the verbosity as a top-level `verbosity` kwarg, which is the
+canonical litellm and OpenRouter form for gpt-5. An earlier version tucked the verbosity inside
+`extra_body`, which worked because OpenRouter merges the body, but the top-level form matches the
+docs and survives any future `extra_body` validation.
+
+The web plugin itself runs at `NATIVE_SEARCH_CONTEXT_SIZE` (`constants.py`, currently "high"),
+which is OpenAI's `search_context_size`: it sets how much retrieved page text comes back as input
+tokens, and that text is billed. `build_native_search_llm` takes a per-call
+`search_context_size` override the same way it takes `reasoning_effort` and `verbosity`, with no
+env read behind it because production runs a single size. The one consumer of that override is
+`scripts/probes/gap_fill_resolver_probe.py`, a paid, operator-gated probe that compares the
+gap-fill resolver's answers across context sizes and models.
+
+The forecaster-facing text goes through `_strip_utm_source`, which removes the
+`?utm_source=openai` param OpenAI native search tags onto every citation URL. It is pure tracking
+noise that would otherwise be fanned into every forecaster prompt and into the published comment;
+the raw research log keeps the untouched payload, so archival fidelity is unaffected.
 
 The model migrated on 2026-07-09 to `gpt-5.6-sol`, then on 2026-07-17 to
 `gpt-5.6-terra` per the blind research-role audit
@@ -216,8 +265,10 @@ latency reasons; see `constants.py`.
 The model is built at `allowed_tries=1` on purpose: an earlier incident
 (2026-05-20) had OpenRouter drip whitespace keep-alive bytes for over eight
 minutes before returning malformed JSON, and retrying that call just multiplies
-the wait. `NATIVE_SEARCH_WALL_TIMEOUT` plus a single try is what bounds the worst case.
-It routes through `build_llm_with_openrouter_fallback`, so it bills the
+the wait. `NATIVE_SEARCH_WALL_TIMEOUT` plus a single try is what bounds the worst case. That wall
+cap is owned by `invoke_with_transient_retry`, which also recovers instant aiohttp blips (litellm
+issue #14895) on this `allowed_tries=1` LLM without ever retrying a slow stall, which its elapsed
+gate prevents. It routes through `build_llm_with_openrouter_fallback`, so it bills the
 Metaculus-donated `OAI_ANTH_OPENROUTER_KEY` first and falls back to the personal
 `OPENROUTER_API_KEY` on credential/credit errors. That fallback is
 `FallbackOpenRouterLlm` (`metaculus_bot/fallback_openrouter.py`). The donated key

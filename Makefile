@@ -1,4 +1,4 @@
-.PHONY: install lock test test_verbose all lint lint_imports deps format typecheck typecheck_ty cov audit run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research sync_telemetry sync_raw_research sync_all resync_from_store backfill_research download_research download_run_logs download_raw_research backfill_comments score_ghosts close_margin_watch supply_probe supply_probe_mantic dispatch_watch cronjob_dispatch_setup backtest_with_cache run_mantic run_mantic_one strip_bench
+.PHONY: install lock test test_verbose all lint lint_imports deps format typecheck typecheck_ty cov audit run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research sync_telemetry sync_raw_research sync_all resync_from_store backfill_research download_research download_run_logs download_raw_research backfill_comments score_ghosts close_margin_watch supply_probe supply_probe_mantic dispatch_watch cronjob_dispatch_setup backtest_with_cache run_mantic run_mantic_one strip_bench probe_resolver
 
 # Stream logs live from recipes; avoid per-target buffering
 MAKEFLAGS += --output-sync=none
@@ -326,6 +326,19 @@ supply_probe:
 # miss-rate-per-UTC-release-hour table that answers the cron-cadence question.
 supply_probe_mantic:
 	uv run python scripts/supply_probe.py --platform mantic $(ARGS)
+
+# One-question probe of gap-fill v1's per-gap resolver: replays the gaps the archive recorded
+# for question QUESTION=<question id> through the production resolver path
+# (gap_fill_search_prompt + build_native_search_llm) at every model x search_context_size cell
+# of a grid (default: the current resolver model and gpt-5.6-luna, each at high/medium/low),
+# and writes the answers side by side with OpenRouter's per-call cost and tokens to
+# scratch/probes/. PAID (ask-first gate, see AGENTS.md): gaps x cells resolver calls at up to
+# ~$0.20 each on the operator's PERSONAL OpenRouter key (the donated key is forced off); the
+# script prints its ceiling first and refuses without ARGS="--i-accept-spend". Narrow with
+# ARGS="--grid current:high luna:low" or ARGS="--gaps 1,2".
+probe_resolver:
+	$(if $(QUESTION),,$(error probe_resolver needs QUESTION=<question id>, e.g. make probe_resolver QUESTION=44267))
+	uv run python scripts/probes/gap_fill_resolver_probe.py --question $(QUESTION) $(ARGS)
 
 # Trigger-delivery watch: per bot workflow and per UTC day, how many `schedule` and
 # `workflow_dispatch` runs GitHub Actions ran and how they concluded, against the cron entries
