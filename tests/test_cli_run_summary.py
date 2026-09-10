@@ -4,7 +4,7 @@ The summary itself (the ledger folded to dollars per question) is unit tested in
 tests/test_credit_role_spend.py; these pin the cli wiring: the line is logged from the same
 ``finally`` as the role ledger, so a crashed run still reports its money (against zero questions),
 and the denominator counts ``ForecastReport`` objects only, never the exceptions returned beside
-them. The harness (``_cli_main_test_mode``, ``asyncio_run_stub``) is tests/test_cli.py's.
+them. The harness (``_cli_main_test_mode``, ``asyncio_run_stub``) lives in tests/cli_test_helpers.py.
 """
 
 from __future__ import annotations
@@ -23,13 +23,13 @@ from metaculus_bot.fallback_openrouter import (
 )
 from metaculus_bot.mantic import reset_post_drop_count
 from metaculus_bot.research.provider_health import reset_provider_health
-from tests.test_cli import _cli_main_test_mode, asyncio_run_stub
+from tests.cli_test_helpers import _cli_main_test_mode, asyncio_run_stub
 
 
 @pytest.fixture(autouse=True)
 def _reset_process_global_counters() -> None:
-    """The same resets test_cli.py applies: the counters are process-global and a leftover would
-    turn this module's clean-exit path into a SystemExit."""
+    """The same resets tests/cli/conftest.py applies: the counters are process-global and a
+    leftover would turn this module's clean-exit path into a SystemExit."""
     reset_generic_key_fallback_count()
     reset_donated_404_fallback_count()
     reset_credit_key_fallback_count()
