@@ -704,6 +704,66 @@ class TestRenderedDocumentLinks:
         assert attempt.url == _PAGE_URL
 
 
+class TestGapFillRenderedSkipMapping:
+    """The shared rung keeps gap-fill's caller-facing skip tokens distinct."""
+
+    @staticmethod
+    def _direct_trigger() -> FetchResult:
+        return FetchResult(url=_PAGE_URL, status="js_wall", text="", http_status=200, content_type="text/html")
+
+    async def test_a_gap_fill_transport_timeout_is_recorded_as_render_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def _timed_out(url: str, **kwargs: Any) -> None:
+            del kwargs
+            raise rendered_fetch.RenderTimeout(f"rendered fetch timed out for {url}")
+
+        monkeypatch.setattr(rungs, "render_page", _timed_out)
+        context = LadderContext(policy=GAP_FILL_FETCH_POLICY)
+
+        result = await rungs._rendered_rung(_PAGE_URL, self._direct_trigger(), {}, context)
+
+        assert result is None
+        assert [attempt.skipped_reason for attempt in context.rungs] == ["render_timeout"]
+        assert rendered_fetch.rendered_to_nothing(_PAGE_URL, memo_scope=_V2_SCOPE) is False
+
+    async def test_a_gap_fill_dom_over_the_ceiling_is_recorded_as_its_own_skip(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def _too_large(url: str, **kwargs: Any) -> None:
+            del kwargs
+            raise rendered_fetch.RenderDomOverCeiling(f"rendered DOM over the ceiling for {url}")
+
+        monkeypatch.setattr(rungs, "render_page", _too_large)
+        context = LadderContext(policy=GAP_FILL_FETCH_POLICY)
+
+        result = await rungs._rendered_rung(_PAGE_URL, self._direct_trigger(), {}, context)
+
+        assert result is None
+        assert [attempt.skipped_reason for attempt in context.rungs] == ["render_dom_too_large"]
+        assert rendered_fetch.rendered_to_nothing(_PAGE_URL, memo_scope=_V2_SCOPE) is False
+
+    async def test_a_gap_fill_off_host_landing_is_recorded_as_its_own_skip(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def _off_host(url: str, **kwargs: Any) -> None:
+            del kwargs
+            raise rendered_fetch.RenderOffHost(
+                requested_url=url,
+                final_url="http://169.254.169.254/latest/meta-data/",
+                pinned_host="dashboard.example.com",
+            )
+
+        monkeypatch.setattr(rungs, "render_page", _off_host)
+        context = LadderContext(policy=GAP_FILL_FETCH_POLICY)
+
+        result = await rungs._rendered_rung(_PAGE_URL, self._direct_trigger(), {}, context)
+
+        assert result is None
+        assert [attempt.skipped_reason for attempt in context.rungs] == ["render_off_host"]
+        assert rendered_fetch.rendered_to_nothing(_PAGE_URL, memo_scope=_V2_SCOPE) is False
+
+
 class TestTheNavigationBudgetAfterTheGates:
     """The render queues on two unbounded acquires — the caller's loop-wide per-host gate, shared
     by every concurrent question, and the process-global launch cap shared with gap-fill v2 —
