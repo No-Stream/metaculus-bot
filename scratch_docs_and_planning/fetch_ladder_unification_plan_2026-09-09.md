@@ -37,6 +37,16 @@ ARIA rewrite, chart read and harvested-feed check are built for. On question 439
 served about 80,000 characters with none of the resolving figures in them, while its annual series
 sat in a `data-chart` attribute the fetcher reads and the loop ignores.
 
+One caution before you start. When this plan was written, another agent had four of those ported
+rungs in the working tree uncommitted, and they may have landed since. That change teaches the
+loop's `_plain_html_outcome` to call Tier 1's `_extract_page_text` (the ARIA rewrite plus the
+two-pass policy), to read the inline chart configuration on every page, and to follow a
+meta-refresh stub as a next hop through its own re-guarded redirect loop. It also gives both hop
+shapes one vetting helper. Absorb that work rather than redoing it: those four calls become the
+shared classifier's, and step 4 below shrinks to the derived-feed reuse and Wayback. Diff
+`metaculus_bot/research/agentic/fetch_outcomes.py` and `tools.py` against `f120e23` before you
+plan a line of it.
+
 ## Module boundary and entry point
 
 Build a new package `metaculus_bot/research/fetch_ladder/` with five modules, and reduce both
