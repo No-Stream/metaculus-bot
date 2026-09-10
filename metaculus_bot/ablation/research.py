@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -24,12 +23,8 @@ from forecasting_tools import MetaculusQuestion
 
 from metaculus_bot import constants
 from metaculus_bot.ablation.cache import AblationCache
-from metaculus_bot.ablation.window_patch import patched_gap_fill_year_for_question
-from metaculus_bot.constants import (
-    GAP_FILL_MIN_RESEARCH_CHARS,
-    GEMINI_SEARCH_DEFAULT_MODEL,
-    GEMINI_SEARCH_MODEL_ENV,
-)
+from metaculus_bot.ablation.window_patch import patched_gap_fill_year_for_questions
+from metaculus_bot.constants import GAP_FILL_MIN_RESEARCH_CHARS, GEMINI_SEARCH_DEFAULT_MODEL
 from metaculus_bot.research import targeted
 from metaculus_bot.research.gemini_search import gemini_search_provider
 from metaculus_bot.research.targeted import run_gap_fill_pass
@@ -59,32 +54,6 @@ def _patched_gap_fill_max_gaps(value: int) -> Iterator[None]:
     finally:
         constants.GAP_FILL_MAX_GAPS = original_constants
         targeted.GAP_FILL_MAX_GAPS = original_tr
-
-
-@contextmanager
-def _patched_gemini_search_model(model_slug: str | None) -> Iterator[None]:
-    """Override the ``GEMINI_SEARCH_MODEL`` env var for the duration of a call.
-
-    ``gemini_search_provider`` reads ``GEMINI_SEARCH_MODEL`` at request time via
-    ``os.getenv``; the ablation CLI's ``--gemini-model`` flag is canonical, so we
-    patch the env var while the provider runs and restore the original value in
-    ``finally`` regardless of outcome. ``None`` is a no-op so the existing
-    cache-hit path doesn't disturb the env.
-    """
-    if model_slug is None:
-        yield
-        return
-    sentinel = object()
-    original = os.environ.get(GEMINI_SEARCH_MODEL_ENV, sentinel)
-    os.environ[GEMINI_SEARCH_MODEL_ENV] = model_slug
-    try:
-        yield
-    finally:
-        if original is sentinel:
-            os.environ.pop(GEMINI_SEARCH_MODEL_ENV, None)
-        else:
-            assert isinstance(original, str)
-            os.environ[GEMINI_SEARCH_MODEL_ENV] = original
 
 
 def _count_gap_sections(addendum: str) -> int:
@@ -138,10 +107,13 @@ async def run_gemini_only_research(
     gap-fill caches the first-pass blob alone with ``gap_fill_used=False``:
     ``run_gap_fill_pass`` absorbs its own provider and API failures and returns
     ``""`` (production semantics), so anything it does raise is a bug and propagates.
-    ``gemini_model`` overrides the ``GEMINI_SEARCH_MODEL`` env var for the provider
-    call (the CLI flag is canonical, a shell setting cannot leak through), and
-    ``enable_gap_fill=False`` skips the second pass entirely; meta records
-    ``gap_fill_enabled`` beside ``gap_fill_used`` so cached blobs are self-describing.
+    ``gemini_model`` reaches the provider as ``model_slug``, which wins over the
+    ``GEMINI_SEARCH_MODEL`` env var (the CLI flag is canonical), and ``enable_gap_fill=False``
+    skips the second pass entirely; meta records ``gap_fill_enabled`` beside ``gap_fill_used``
+    so cached blobs are self-describing. The module-global patches the gap-fill pass needs (the
+    ``GAP_FILL_MAX_GAPS`` value and the analyzer-prompt year rewrite) belong to
+    ``run_gemini_research_for_qids``, which holds them for the whole batch; ``gap_fill_max_gaps``
+    here only records what the batch requested in the meta payload.
     """
     qid = question.id_of_question
     assert qid is not None, "MetaculusQuestion must have id_of_question set"
@@ -157,24 +129,18 @@ async def run_gemini_only_research(
 
     effective_model = gemini_model or GEMINI_SEARCH_DEFAULT_MODEL
 
-    with _patched_gemini_search_model(gemini_model):
-        provider = gemini_search_provider(is_benchmarking=is_benchmarking)
-        first_pass = await provider(question)
+    provider = gemini_search_provider(model_slug=gemini_model, is_benchmarking=is_benchmarking)
+    first_pass = await provider(question)
 
     gap_fill_blob = ""
     gap_fill_used = False
 
-    if enable_gap_fill and len(first_pass) >= GAP_FILL_MIN_RESEARCH_CHARS:
-        with (
-            patched_gap_fill_year_for_question(question),
-            _patched_gap_fill_max_gaps(gap_fill_max_gaps),
-            _patched_gemini_search_model(gemini_model),
-        ):
-            gap_fill_blob = await run_gap_fill_pass(
-                question,
-                first_pass,
-                is_benchmarking=is_benchmarking,
-            )
+    if enable_gap_fill and len(first_pass.strip()) >= GAP_FILL_MIN_RESEARCH_CHARS:
+        gap_fill_blob = await run_gap_fill_pass(
+            question,
+            first_pass,
+            is_benchmarking=is_benchmarking,
+        )
         gap_fill_used = bool(gap_fill_blob)
         logger.info(f"Gap-fill returned {len(gap_fill_blob)} chars for qid {qid}")
 
@@ -209,7 +175,13 @@ async def run_gemini_research_for_qids(
 
     Each question is its own failure boundary: one that raises caches nothing,
     is logged with its traceback and surfaces as ``None`` in the result dict,
-    while the other questions of the paid run still complete.
+    while the other questions of the paid run still complete. A cancelled child is
+    the loop shutting down rather than a question failing, so it propagates.
+
+    The gap-fill pass reads two module globals, ``GAP_FILL_MAX_GAPS`` and
+    ``gap_fill_analyzer_prompt``; both are patched ONCE here around the whole gather,
+    because a per-question patch of a module global is not concurrency-safe (see
+    ``patched_gap_fill_year_for_questions``).
     """
     semaphore = asyncio.Semaphore(concurrency)
 
@@ -225,12 +197,19 @@ async def run_gemini_research_for_qids(
                 enable_gap_fill=enable_gap_fill,
             )
 
-    outcomes = await asyncio.gather(*(_one(q) for q in questions), return_exceptions=True)
+    with (
+        patched_gap_fill_year_for_questions(questions),
+        _patched_gap_fill_max_gaps(gap_fill_max_gaps),
+    ):
+        outcomes = await asyncio.gather(*(_one(q) for q in questions), return_exceptions=True)
+
     results: dict[int, tuple[str, dict] | None] = {}
     for question, outcome in zip(questions, outcomes, strict=True):
         qid = question.id_of_question
         assert qid is not None, "MetaculusQuestion must have id_of_question set"
         if isinstance(outcome, BaseException):
+            if not isinstance(outcome, Exception):
+                raise outcome
             logger.error(f"Research failed for qid {qid}", exc_info=outcome)
             results[qid] = None
         else:
