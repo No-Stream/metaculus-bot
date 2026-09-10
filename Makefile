@@ -1,4 +1,4 @@
-.PHONY: install lock test test_verbose all lint lint_imports deps format typecheck typecheck_ty cov audit run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research sync_telemetry sync_raw_research sync_all resync_from_store backfill_research download_research download_run_logs download_raw_research backfill_comments score_ghosts close_margin_watch supply_probe supply_probe_mantic dispatch_watch cronjob_dispatch_setup backtest_with_cache run_mantic run_mantic_one strip_bench probe_resolver
+.PHONY: install lock test test_verbose all lint lint_imports deps format typecheck typecheck_ty cov audit run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research sync_telemetry sync_raw_research sync_all resync_from_store backfill_research download_research download_run_logs download_raw_research backfill_comments score_ghosts close_margin_watch supply_probe supply_probe_mantic cost_report dispatch_watch cronjob_dispatch_setup backtest_with_cache run_mantic run_mantic_one strip_bench probe_resolver
 
 # Stream logs live from recipes; avoid per-target buffering
 MAKEFLAGS += --output-sync=none
@@ -326,6 +326,14 @@ supply_probe:
 # miss-rate-per-UTC-release-hour table that answers the cron-cadence question.
 supply_probe_mantic:
 	uv run python scripts/supply_probe.py --platform mantic $(ARGS)
+
+# Cost per question off the telemetry archive (read-only + free; run sync_telemetry first): per
+# run (questions, charged $, $/question), per role ($/question, prompt and output tokens per
+# question, prompt-cache share, largest single prompt) and the week-over-week median $/question.
+# The question denominator is CREDIT_RUN_SUMMARY where a run has one, else its
+# FORECASTERS_SURVIVED lines. ARGS="--days 7" to narrow the window (default 30).
+cost_report:
+	uv run python scripts/cost_report.py $(ARGS)
 
 # One-question probe of gap-fill v1's per-gap resolver: replays the gaps the archive recorded
 # for question QUESTION=<question id> through the production resolver path

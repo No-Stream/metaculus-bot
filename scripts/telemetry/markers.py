@@ -686,6 +686,17 @@ MARKER_SPECS: list[MarkerSpec] = [
         ),
     ),
     MarkerSpec(
+        "credit_run_summary",
+        # Why: one line per run on every path; n/a and none are sentinels. Receipt: docs/telemetry_markers.md "CREDIT_RUN_SUMMARY".
+        re.compile(
+            r"CREDIT_RUN_SUMMARY:\s*n_questions=(?P<n_questions>\d+)\s+charged_usd=(?P<charged_usd>\S+)"
+            r"\s+usd_per_question=(?P<usd_per_question>\S+)\s+donated_usd=(?P<donated_usd>\S+)"
+            r"\s+personal_usd=(?P<personal_usd>\S+)\s+prompt_tokens=(?P<prompt_tokens>\d+)"
+            r"\s+cached_tokens=(?P<cached_tokens>\d+)\s+cached_share=(?P<cached_share>\S+)"
+            r"\s+max_prompt_tokens=(?P<max_prompt_tokens>\d+)\s+max_prompt_role=(?P<max_prompt_role>\S+)"
+        ),
+    ),
+    MarkerSpec(
         "prompt_size_alert",
         # Why: question= is n/a off the v2 driver, the one call site that stamps it. Receipt: docs/telemetry_markers.md "PROMPT_SIZE_ALERT".
         re.compile(

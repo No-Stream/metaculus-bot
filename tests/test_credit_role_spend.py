@@ -39,10 +39,12 @@ from metaculus_bot.credit_telemetry import (
     install_role_spend_tracker,
     llm_call_metadata,
     log_role_spend,
+    log_run_summary,
     plain_llm_key_alias,
     record_llm_call_spend,
     reset_role_spend,
     role_spend_rows,
+    run_spend_summary,
 )
 from metaculus_bot.fallback_openrouter import FallbackOpenRouterLlm, build_llm_with_openrouter_fallback
 from metaculus_bot.llm_configs import (
@@ -655,6 +657,118 @@ class TestPromptSizeAlert:
             "512000",
             str(PROMPT_TOKENS_ALERT_THRESHOLD),
         )
+
+
+def _summary_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith("CREDIT_RUN_SUMMARY:")]
+
+
+@pytest.mark.usefixtures("clean_role_ledger")
+class TestRunSpendSummary:
+    """One ``CREDIT_RUN_SUMMARY`` line per run: the ledger folded down to cost per question.
+
+    The documented per-question figure was wrong by five-fold for two months because the only
+    per-run instrument printed per role with no question denominator (2026-09-09 cost pass,
+    section 6). This line puts the denominator beside the money on every run.
+    """
+
+    def _ledger(self) -> None:
+        record_llm_call_spend(
+            "forecaster:openai",
+            DONATED_KEY_ALIAS,
+            cost_usd=0.0,
+            byok_upstream_usd=1.20,
+            is_byok=True,
+            tokens=TokenCounts(prompt=68_000, completion=9_000, cached=0, reasoning=8_000),
+        )
+        record_llm_call_spend(
+            "forecaster:google",
+            PERSONAL_KEY_ALIAS,
+            cost_usd=0.55,
+            byok_upstream_usd=0.55,
+            is_byok=False,
+            tokens=TokenCounts(prompt=70_000, completion=5_000, cached=0, reasoning=4_000),
+        )
+        for prompt in (3_000, 41_000):
+            record_llm_call_spend(
+                "gap_fill_v2_driver",
+                DONATED_KEY_ALIAS,
+                cost_usd=0.0,
+                byok_upstream_usd=0.25,
+                is_byok=True,
+                tokens=TokenCounts(prompt=prompt, completion=800, cached=prompt - 1_000, reasoning=500),
+            )
+        record_llm_call_spend("perplexity_research", DIRECT_KEY_ALIAS, cost_usd=None, byok_upstream_usd=None)
+
+    def test_summary_folds_the_ledger_down_to_dollars_per_question(self) -> None:
+        self._ledger()
+
+        summary = run_spend_summary(n_questions=4)
+
+        assert summary.n_questions == 4
+        assert summary.charged_usd == pytest.approx(1.20 + 0.55 + 0.50)
+        assert summary.usd_per_question == pytest.approx(2.25 / 4)
+        assert summary.donated_usd == pytest.approx(1.70)
+        assert summary.personal_usd == pytest.approx(0.55)
+        assert summary.prompt_tokens == 68_000 + 70_000 + 44_000
+        assert summary.cached_tokens == 2_000 + 40_000
+        assert summary.cached_share == pytest.approx(42_000 / 182_000)
+        assert (summary.max_prompt_tokens, summary.max_prompt_role) == (70_000, "forecaster:google")
+
+    def test_line_shape_is_the_registry_contract(self, caplog) -> None:
+        self._ledger()
+        spec = next(s for s in MARKER_SPECS if s.name == "credit_run_summary")
+
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.credit_telemetry"):
+            log_run_summary(n_questions=4)
+
+        (line,) = _summary_lines(caplog)
+        assert line == (
+            "CREDIT_RUN_SUMMARY: n_questions=4 charged_usd=2.2500 usd_per_question=0.5625"
+            " donated_usd=1.7000 personal_usd=0.5500 prompt_tokens=182000 cached_tokens=42000 cached_share=0.2308"
+            " max_prompt_tokens=70000 max_prompt_role=forecaster:google"
+        )
+        assert spec.regex.search(line) is not None
+
+    def test_zero_questions_reports_the_money_with_no_fabricated_rate(self, caplog) -> None:
+        """A run that spent and forecast nothing it could publish (or crashed before the reports came
+        back) still reports what it booked; the per-question rate is unknown, not zero."""
+        self._ledger()
+
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.credit_telemetry"):
+            log_run_summary(n_questions=0)
+
+        (line,) = _summary_lines(caplog)
+        assert " n_questions=0 charged_usd=2.2500 usd_per_question=n/a " in line
+
+    def test_a_key_with_no_rows_reads_zero_and_a_key_with_only_uncosted_rows_reads_na(self, caplog) -> None:
+        """A Mantic run never touches the donated key, so its donated total is a true 0.0000; a key
+        whose every call OpenRouter left uncosted has an UNKNOWN total and must not read as free."""
+        record_llm_call_spend("forecaster:openai", PERSONAL_KEY_ALIAS, cost_usd=None, byok_upstream_usd=None)
+
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.credit_telemetry"):
+            log_run_summary(n_questions=1)
+
+        (line,) = _summary_lines(caplog)
+        assert " charged_usd=n/a usd_per_question=n/a donated_usd=0.0000 personal_usd=n/a " in line
+
+    def test_empty_ledger_still_emits_one_line(self, caplog) -> None:
+        """Emitted on every path, like the alertable breakdown, so a run with no completions leaves a
+        record the archive can count rather than an absence it cannot."""
+        spec = next(s for s in MARKER_SPECS if s.name == "credit_run_summary")
+
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.credit_telemetry"):
+            log_run_summary(n_questions=0)
+
+        (line,) = _summary_lines(caplog)
+        assert line == (
+            "CREDIT_RUN_SUMMARY: n_questions=0 charged_usd=n/a usd_per_question=n/a donated_usd=0.0000"
+            " personal_usd=0.0000 prompt_tokens=0 cached_tokens=0 cached_share=n/a max_prompt_tokens=0"
+            " max_prompt_role=none"
+        )
+        match = spec.regex.search(line)
+        assert match is not None
+        assert match.group("max_prompt_role") == "none"
 
 
 class TestProdLlmsAreRoleTagged:

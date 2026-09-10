@@ -208,10 +208,12 @@ of a $2,300 limit**, so a credit shortfall is real news again rather than the
 expected state, and `CREDIT_ALERT_RESUME_DATE` was moved up from 2026-09-10 to
 **2026-09-03** rather than left to expire. `OPENROUTER_CREDIT_FLOOR_USD` moved with
 it, from $1.00 to **$100.00**: the operator cannot refill this key (Metaculus does),
-so the warning has to arrive with runway left to ask, and $100 is roughly 250
-questions at the measured $0.38-0.41 each. A $1 floor would have fired only once
-the key was already dry, which on an hourly cup cron is an hourly red check that
-arrives too late to act on.
+so the warning has to arrive with runway left to ask, and $100 is roughly 56
+questions at the measured $2.07 to $2.21 a question ($1.79 of it on the donated
+key; the "$0.38-0.41" quoted at the time was an OpenRouter-only lower bound on one
+key, see "Per-role spend"). A $1 floor would have fired only once the key was
+already dry, which on an hourly cup cron is an hourly red check that arrives too
+late to act on.
 
 The one step no merge could do is done as well: `run_bot_on_metaculus_cup.yaml` was
 `disabled_manually` on GitHub, a per-workflow state no file in this repo can change,
@@ -1518,8 +1520,8 @@ How the number is produced, because it decides how to read it:
   Field detail: `docs/telemetry_markers.md` "PROMPT_SIZE_ALERT".
 - Not on OpenRouter, so never in this ledger: Gemini grounded search and gap-fill
   v2's `read_document` (google-genai on the personal Google AI Studio key), the
-  AskNews subscription, Exa. The ledger is therefore an OpenRouter-only figure,
-  like the `$0.38–0.41/question` in `FUTURE.md`.
+  AskNews subscription, Exa. The ledger is therefore an OpenRouter-only figure;
+  the all-in $2.07 to $2.21 a question below adds those from their own consoles.
 - The lines are logged from the same `finally` as `CREDIT_SPEND`, after the
   forecast loop has drained litellm's callback queue (`cli.py`
   `_forecast_with_callback_drain`), so a crashed run still reports what it booked.
@@ -1558,21 +1560,37 @@ ratio compares all charged money against a credits-only balance, so a run that
 fell back to the personal key for OpenAI models reads above 100% by exactly the
 BYOK part.
 
-**The per-question spend figure to quote is `$0.38–0.41`**, measured over 29
-triple-era runs across 33 questions, and it is an OpenRouter-only LOWER bound: it
-excludes Google AI Studio prepaid (Gemini grounded search and gap-fill v2 document
-reads), the AskNews subscription, and Exa. The older "~$3.05 → ~$1.65 after the
-6→3 roster drop" estimate was never measured, is an order of magnitude too high,
-and is superseded: it must not appear in a roster re-add decision. `FUTURE.md`'s
-"Cost context for the re-add decision" holds the receipt path, and
-`CREDIT_ROLE_SPEND` plus `scripts/reconcile_credit_spend.py --roles` is how a
-re-add gets priced per role rather than estimated.
+Every run also ends with one `CREDIT_RUN_SUMMARY` line beside the rows: the
+ledger folded to dollars per question, split by key, with the run's prompt-token
+total, cache share and largest single prompt (field detail in
+`docs/telemetry_markers.md`). **`make cost_report` is the instrument for the
+per-question figure**: over the last 30 days of the archive (`--days` to change
+it) it prints each run's questions, charged dollars and dollars per question, each
+role's dollars and tokens per question with its cache share and largest prompt,
+and the median dollars per question this week against the prior week. It takes a
+run's question count from `CREDIT_RUN_SUMMARY` and, on the runs archived before
+that line, from its `FORECASTERS_SURVIVED` lines. Free and offline; run
+`make sync_telemetry` first.
+
+**The per-question spend figure to quote is $2.07 to $2.21 all in** as booked,
+about $2.00 once the ledger's non-BYOK double count is removed, measured on
+2026-09-09 over the 14 question-intakes that carry a role ledger
+(`scratch/cost_pass_2026-09-09/COST_PASS.md`). The three forecaster slots sit
+within 12% of each other at $0.24 to $0.27 a question; gap-fill v1's resolver is
+the largest single line at about $0.80. The `$0.38 to $0.41` quoted here until
+2026-09-09 was an OpenRouter-only LOWER bound read off one key's settled balance,
+and it excluded the BYOK-routed OpenAI spend, Google AI Studio prepaid (Gemini
+grounded search and gap-fill v2 document reads), the AskNews subscription, and
+Exa; it was wrong by five-fold, and neither it nor the older "~$3.05 → ~$1.65
+after the 6→3 roster drop" estimate may appear in a roster re-add decision.
+`CREDIT_ROLE_SPEND` plus `make cost_report` is how a re-add gets priced per role
+rather than estimated.
 
 A floor breach does not abort the run. Forecasting and publishing complete
 normally, and outside a suppression window `cli.py` then exits non-zero so the
 GitHub Actions check turns red as a reminder to ask Metaculus to top the donated
-key up. The floor is an EARLY-WARNING level ($100, roughly 250 questions of
-runway) rather than an empty tank, because only Metaculus can refill this key and a
+key up. The floor is an EARLY-WARNING level ($100, roughly 56 questions of
+runway at $1.79 a question on the donated key) rather than an empty tank, because only Metaculus can refill this key and a
 reminder that arrives when the balance hits $1 arrives too late to act on. The
 floor is only checked against the donated key (the personal key reports no
 `limit_remaining`). Per-run spend prefers the `limit_remaining` drop because the

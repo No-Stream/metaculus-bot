@@ -1796,6 +1796,51 @@ class TestCreditRoleSpend:
         assert len(harvested["credit_role_spend"]) == 1
 
 
+# Verbatim from credit_telemetry.py:log_run_summary; the ledger folded to cost per question, once per run.
+CREDIT_RUN_SUMMARY_LINE = (
+    PFX + "CREDIT_RUN_SUMMARY: n_questions=4 charged_usd=8.9201 usd_per_question=2.2300"
+    " donated_usd=7.5933 personal_usd=1.3268 prompt_tokens=1240000 cached_tokens=870000 cached_share=0.7016"
+    " max_prompt_tokens=41176 max_prompt_role=gap_fill_v2_driver"
+)
+CREDIT_RUN_SUMMARY_EMPTY_LINE = (
+    PFX + "CREDIT_RUN_SUMMARY: n_questions=0 charged_usd=n/a usd_per_question=n/a donated_usd=0.0000"
+    " personal_usd=0.0000 prompt_tokens=0 cached_tokens=0 cached_share=n/a max_prompt_tokens=0 max_prompt_role=none"
+)
+
+
+class TestCreditRunSummary:
+    def test_fields(self):
+        rec = _parse_one(CREDIT_RUN_SUMMARY_LINE)
+        assert rec["marker"] == "credit_run_summary"
+        assert (rec["n_questions"], rec["charged_usd"], rec["usd_per_question"]) == (4, 8.9201, 2.23)
+        assert (rec["donated_usd"], rec["personal_usd"]) == (7.5933, 1.3268)
+        assert (rec["prompt_tokens"], rec["cached_tokens"], rec["cached_share"]) == (1240000, 870000, 0.7016)
+        # The vendor-slot role form carries a colon in other runs; here the role must survive as a string.
+        assert (rec["max_prompt_tokens"], rec["max_prompt_role"]) == (41176, "gap_fill_v2_driver")
+
+    def test_empty_run_reads_unknown_money_and_no_role(self):
+        """A run with no completions still leaves the line; its unknowns are None, never zero, and the
+        ``none`` role sentinel coerces to None like the ``n/a`` dollars."""
+        rec = _parse_one(CREDIT_RUN_SUMMARY_EMPTY_LINE)
+        assert rec["n_questions"] == 0
+        assert (rec["charged_usd"], rec["usd_per_question"], rec["cached_share"]) == (None, None, None)
+        assert (rec["donated_usd"], rec["personal_usd"]) == (0.0, 0.0)
+        assert rec["max_prompt_role"] is None
+
+    def test_no_question_ref(self):
+        rec = _parse_one(CREDIT_RUN_SUMMARY_LINE)
+        assert "qid" not in rec
+        assert "qid_kind" not in rec
+
+    def test_does_not_shadow_the_other_credit_markers(self):
+        harvested = parse_log_text(
+            "\n".join([CREDIT_RUN_SUMMARY_LINE, CREDIT_ROLE_SPEND_LINE, CREDIT_SPEND_LINE]) + "\n", **_META
+        )
+        assert len(harvested["credit_run_summary"]) == 1
+        assert len(harvested["credit_role_spend"]) == 1
+        assert len(harvested["credit_spend"]) == 1
+
+
 # Verbatim from credit_telemetry.py:_alert_on_oversized_prompt; the v2 driver stamps a question, every other role reads n/a.
 PROMPT_SIZE_ALERT_LINE = (
     PFX_WARN + "PROMPT_SIZE_ALERT: role=gap_fill_v2_driver question=https://www.metaculus.com/questions/38975/"

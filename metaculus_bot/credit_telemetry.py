@@ -560,6 +560,84 @@ def log_role_spend() -> None:
 
 
 @dataclass(frozen=True)
+class RunSpendSummary:
+    """The ledger folded down to one ``CREDIT_RUN_SUMMARY`` line: the run's money over its questions.
+
+    ``n_questions`` is the count of forecast reports the run produced. A dollar field is ``None``
+    when no costed call backs it (rendered ``n/a``); a key with no rows at all is a true 0.0,
+    since nothing billed through it. ``max_prompt_role`` names the row holding the run's largest
+    single prompt, ``None`` on an empty ledger.
+    """
+
+    n_questions: int
+    charged_usd: float | None
+    donated_usd: float | None
+    personal_usd: float | None
+    prompt_tokens: int
+    cached_tokens: int
+    max_prompt_tokens: int
+    max_prompt_role: str | None
+
+    @property
+    def usd_per_question(self) -> float | None:
+        if self.charged_usd is None or self.n_questions == 0:
+            return None
+        return self.charged_usd / self.n_questions
+
+    @property
+    def cached_share(self) -> float | None:
+        return None if self.prompt_tokens == 0 else self.cached_tokens / self.prompt_tokens
+
+
+def _charged_total(rows: list[RoleSpendRow]) -> float | None:
+    """Sum of ``charged_usd`` over ``rows``: 0.0 for no rows, ``None`` when rows exist but none is costed."""
+    if not rows:
+        return 0.0
+    costed = [row.charged_usd for row in rows if row.charged_usd is not None]
+    return sum(costed) if costed else None
+
+
+def run_spend_summary(n_questions: int) -> RunSpendSummary:
+    """Fold the current ledger into the per-run summary over ``n_questions`` forecast reports."""
+    rows = role_spend_rows()
+    largest = max(rows, key=lambda row: row.max_prompt_tokens, default=None)
+    return RunSpendSummary(
+        n_questions=n_questions,
+        charged_usd=_charged_total(rows) if rows else None,
+        donated_usd=_charged_total([row for row in rows if row.key_alias == DONATED_KEY_ALIAS]),
+        personal_usd=_charged_total([row for row in rows if row.key_alias == PERSONAL_KEY_ALIAS]),
+        prompt_tokens=sum(row.tokens.prompt for row in rows),
+        cached_tokens=sum(row.tokens.cached for row in rows),
+        max_prompt_tokens=largest.max_prompt_tokens if largest is not None else 0,
+        max_prompt_role=largest.role if largest is not None else None,
+    )
+
+
+def log_run_summary(n_questions: int) -> None:
+    """Emit the one ``CREDIT_RUN_SUMMARY`` line, on every path, after the ``CREDIT_ROLE_SPEND`` rows.
+
+    The per-role rows carry no question denominator, which is how a five-fold-wrong
+    per-question figure stood for two months (docs/operations.md "Per-role spend"); this line
+    puts the denominator beside the money so cost per question falls out of every run log.
+    """
+    summary = run_spend_summary(n_questions)
+    logger.info(
+        "CREDIT_RUN_SUMMARY: n_questions=%d charged_usd=%s usd_per_question=%s donated_usd=%s personal_usd=%s"
+        " prompt_tokens=%d cached_tokens=%d cached_share=%s max_prompt_tokens=%d max_prompt_role=%s",
+        summary.n_questions,
+        _fmt_usd(summary.charged_usd),
+        _fmt_usd(summary.usd_per_question),
+        _fmt_usd(summary.donated_usd),
+        _fmt_usd(summary.personal_usd),
+        summary.prompt_tokens,
+        summary.cached_tokens,
+        _fmt_usd(summary.cached_share),
+        summary.max_prompt_tokens,
+        summary.max_prompt_role or "none",
+    )
+
+
+@dataclass(frozen=True)
 class _CallUsage:
     """What one completion's ``usage`` object says about money, routing and tokens."""
 

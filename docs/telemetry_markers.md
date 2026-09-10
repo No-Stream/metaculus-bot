@@ -83,6 +83,7 @@ incidents behind the design.
 | `AGENTIC_DOCUMENT_UNGROUNDED_SUPPRESSED` | `research/agentic/tools.py:read_document` | The `read_document` twin of `GEMINI_UNGROUNDED_SUPPRESSED`. |
 | `GAP_FILL_ANALYZER_FAILED` | `research/targeted.py:run_gap_fill_pass` | Gap-fill v1's analyzer died. |
 | `CREDIT_BALANCE` / `CREDIT_SPEND` / `CREDIT_ROLE_SPEND` / `CREDIT_FLOOR_BREACH` | `credit_telemetry.py` | OpenRouter credit balance, spend, per-role spend, and floor-breach markers. |
+| `CREDIT_RUN_SUMMARY` | `credit_telemetry.py:log_run_summary` | Per-run, on every path: the role ledger folded to dollars per question, by key, with the run's token totals and largest prompt. |
 | `PROMPT_SIZE_ALERT` | `credit_telemetry.py:_alert_on_oversized_prompt` | Per-call WARN: one LLM call's prompt exceeded `PROMPT_TOKENS_ALERT_THRESHOLD`. |
 | `DONATED_KEY_STATE` | `credit_telemetry.py:classify_donated_key_state` | Per-run, at most once: the `/auth/key` probe's verdict on the donated key. |
 | `LITELLM_CALLBACK_DRAIN_TIMEOUT` | `credit_telemetry.py:drain_litellm_callbacks` | Per-run completeness flag on that run's `CREDIT_ROLE_SPEND` rows. |
@@ -1241,6 +1242,29 @@ prompt among the row's calls. It exists because `prompt_tokens` is a sum: the ga
 question ("is any single prompt approaching the size that degrades the model?") needs the maximum,
 not the sum. `PROMPT_SIZE_ALERT` below is the same measurement fired per call when it crosses the
 threshold; this field is how a run that never fired still reports how close it came.
+
+### CREDIT_RUN_SUMMARY
+
+One INFO line per run from `credit_telemetry.py:log_run_summary`, emitted from the same `finally`
+as the `CREDIT_ROLE_SPEND` rows (`cli.main`), after the callback drain, on every path including a
+crash: the role ledger folded down to cost per question. It exists because the per-role rows carry
+no question denominator, which is how a five-fold-wrong per-question figure ($0.38 to $0.41 against
+a measured $2.07 to $2.21) stood in the docs for two months (2026-09-09 cost pass, section 6).
+
+`n_questions` is the number of `ForecastReport` objects the run returned, one per question that
+reached the publish step; exceptions beside them are not counted, and a run that crashed before its
+reports came back reads `n_questions=0`. `charged_usd` sums every row's `charged_usd` (the money
+actually charged; see `CREDIT_ROLE_SPEND` above) and `usd_per_question` divides it by `n_questions`;
+both read `n/a` when no row carried cost data or when `n_questions` is 0, never a fabricated rate.
+`donated_usd` and `personal_usd` are the same sum restricted to each `KEY_SPECS` key, so they join
+onto `CREDIT_SPEND key=`; a key with no rows at all is a true `0.0000` (a Mantic run never touches
+the donated key), while a key whose every call OpenRouter left uncosted reads `n/a`. `prompt_tokens`
+and `cached_tokens` are the run totals and `cached_share` their ratio (`n/a` on zero prompt tokens).
+`max_prompt_tokens` is the largest single prompt any role sent this run and `max_prompt_role` names
+that role (`none` on an empty ledger; the sentinel coerces to None like `n/a`).
+
+Consumers: `scripts/cost_report.py` (`make cost_report`) takes a run's question count from this line
+and falls back to counting its `FORECASTERS_SURVIVED` lines on the runs archived before it.
 
 ### PROMPT_SIZE_ALERT
 

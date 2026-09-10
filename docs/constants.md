@@ -289,10 +289,13 @@ An early-warning floor for the donated key's remaining balance (`limit_remaining
 `cli.main` logs a loud warning and exits non-zero after all forecasting and publishing complete. It
 is a reminder to ask Metaculus for a top-up, not an abort, and not a claim that the key is empty.
 
-Sizing: $100 is roughly 250 questions of runway at the measured $0.38 to $0.41 per question. The
-lead time is the point, since only Metaculus can refill this key and the operator cannot, so the
-warning has to arrive while there is still time to ask. It was $1.00 until 2026-09-03, which fired
-only once the key was already dry.
+Sizing: $100 is roughly 56 questions of runway. A published question costs $2.07 to $2.21 all in as
+booked ($2.00 after the ledger's non-BYOK double count is removed), of which about $1.79 draws on the
+donated credits (2026-09-09 cost pass; `make cost_report` re-measures it from the archive). The earlier
+"250 questions at $0.38 to $0.41" sizing quoted an OpenRouter-only lower bound on one key. The lead
+time is the point, since only Metaculus can refill this key and the operator cannot, so the warning
+has to arrive while there is still time to ask. It was $1.00 until 2026-09-03, which fired only once
+the key was already dry.
 
 The floor is meaningless for the personal key, which has no `limit_remaining`, so it is only checked
 against the donated key. See `metaculus_bot/credit_telemetry.py`.

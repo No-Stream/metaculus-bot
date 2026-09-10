@@ -6,7 +6,7 @@ import sys
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any, Literal, NamedTuple, get_args
 
-from forecasting_tools import MetaculusApi
+from forecasting_tools import ForecastReport, MetaculusApi
 
 from metaculus_bot.aggregation_strategies import AggregationStrategy
 from metaculus_bot.api_preflight import verify_api_identity, verify_metaculus_api_identity
@@ -34,6 +34,7 @@ from metaculus_bot.credit_telemetry import (
     get_probed_donated_key_state,
     install_role_spend_tracker,
     log_role_spend,
+    log_run_summary,
 )
 from metaculus_bot.fallback_openrouter import (
     check_deprecation_alerts_and_exit,
@@ -429,11 +430,14 @@ def main() -> None:
     credit_telemetry = CreditTelemetry()
     credit_telemetry.log_start()
     donated_below_floor = False
+    # Empty until the forecasts return, so a crashed run's summary reads its money against zero questions.
+    forecast_reports: list[Any] = []
     try:
         forecast_reports = _run_forecasts(template_bot, run_mode, only_posts=only_posts)
     finally:
         donated_below_floor = credit_telemetry.log_end_and_check_floor()
         log_role_spend()
+        log_run_summary(n_questions=sum(isinstance(report, ForecastReport) for report in forecast_reports))
         # Records accumulate in memory all run: without this flush a crash archives nothing.
         if research_writer is not None:
             research_writer.flush()
