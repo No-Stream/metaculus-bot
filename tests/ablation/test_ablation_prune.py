@@ -30,6 +30,7 @@ from metaculus_bot.ablation.prune import (
     REDACTOR_SYSTEM_PROMPT,
     _build_redactor_prompt,
     _extract_inner_result,
+    _invoke_claude_redactor,
     _parse_redactor_response,
     _process_batch,
     run_prune_for_qids,
@@ -476,8 +477,6 @@ async def test_invoke_claude_redactor_uses_correct_flags(monkeypatch: pytest.Mon
     nothing to steer. ``--settings`` force-disables the prompt-caching beta, which
     the headless gateway rejects (diagnosed 2026-05-06).
     """
-    from metaculus_bot.ablation.prune import _invoke_claude_redactor
-
     captured: dict = {}
 
     async def fake_create_subprocess_exec(*args, **kwargs):
@@ -885,8 +884,6 @@ async def test_invoke_claude_redactor_timeout_kills_subprocess(
 
     Mutation: remove proc.kill(); this test fails (kill_calls == 0).
     """
-    from metaculus_bot.ablation.prune import _invoke_claude_redactor
-
     kill_calls = {"n": 0}
     wait_calls = {"n": 0}
 
