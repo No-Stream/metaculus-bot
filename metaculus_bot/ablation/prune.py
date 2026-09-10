@@ -1,34 +1,18 @@
 """Redactor stage: prune resolution-revealing content from cached research blobs.
 
-The Gemini grounded-search step often returns research blobs that literally
-contain the answer for resolved questions. The downstream LLM leakage screen
-flags those at ~100% rate, draining the benchmark of usable questions. This
-stage interposes between research and screen: a headless ``claude -p``
-subagent reads each (question, ground truth, raw blob) tuple and emits a
-sanitized blob with resolution-revealing sentences either removed or
-inline-redacted, plus a list of the redactions it made.
+Gemini grounded-search blobs for resolved questions often contain the literal
+answer, and the downstream LLM leakage screen flags those at ~100%, draining
+the benchmark of usable questions. This stage interposes between research and
+screen: one headless ``claude -p`` call per batch (default 10 questions) reads
+each (question, ground truth, raw blob) tuple and returns strict JSON with a
+sanitized blob per qid plus the redactions it made. Argv construction, and why
+it passes neither ``--bare`` nor ``--allowedTools``, lives in
+``ablation.claude_cli``.
 
-Workflow per batch (default 10 questions per ``claude -p`` invocation):
-
-1. Build a single multi-question prompt describing the redactor's role,
-   showing per-qid {question, resolution criteria, ground truth, raw blob},
-   and demanding strict JSON output.
-2. Spawn ``claude -p`` via the shared driver in ``ablation.claude_cli``
-   (``--max-turns 1``, and deliberately neither ``--bare`` nor
-   ``--allowedTools`` — see ``claude_cli._build_argv`` for why). Send the
-   prompt on stdin.
-3. Parse the JSON, validate per-qid:
-   - qid must be in the input batch (drop unknowns with a warning).
-   - sanitized_blob must be non-empty.
-   - sanitized_blob must NOT contain the ground-truth resolution_string
-     (case-insensitive, whitespace-normalized).
-4. For successful qids, write the sanitized blob + meta to
-   ``research_pruned/<qid>.{md,meta.json}``. For failures, return ``None``
-   so the caller drops the qid.
-
-Per-batch failure (subprocess error, invalid JSON) marks every qid in that
-batch as ``None`` but does not affect other batches. Per-qid validation
-failure inside a successful batch only affects that qid.
+A batch-level failure (subprocess error, invalid JSON) marks every qid in that
+batch ``None`` without touching other batches; a per-qid validation failure
+(empty blob, ground truth still present) drops only that qid. Survivors are
+written to ``research_pruned/<qid>.{md,meta.json}``.
 """
 
 from __future__ import annotations
@@ -60,13 +44,7 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 DEFAULT_BATCH_SIZE = 10
 
-# Approximate cap on combined prompt + system-prompt characters before the
-# redactor invocation is expected to bust Claude's input context window. At
-# ~4 chars/token average for English-with-structure, 720KB chars ≈ 180K
-# tokens, leaving ~20K tokens of headroom for the model's response inside a
-# 200K-token context. Empirically large gemini-grounded blobs are 10-80KB
-# each; a 10-qid batch can push 800KB. When over the cap, recursively
-# binary-split the batch; a singleton over the cap is fail-fast.
+# ~4 chars/token into a 200K context with 20K kept for the response; ten gemini blobs (10-80KB each) can reach 800KB.
 APPROX_PROMPT_CHAR_LIMIT = 4 * (200_000 - 20_000)
 
 
@@ -224,27 +202,16 @@ def verbatim_leak_check_passes(
 ) -> tuple[bool, str | None]:
     """Type-aware verbatim-leak check on the redactor's sanitized blob.
 
-    Returns ``(passes, reject_reason)``. ``passes=True`` means no verbatim
-    leak detected; ``reject_reason`` is a human-readable explanation when
-    ``passes=False``.
-
-    Audit at ``backtests/ablation/audit_smoke_20260515.md:176-194`` documents
-    why the previous unconditional substring check false-positives:
-
-    * binary GTs in {yes, no, true, false}: substring "no" appears in
-      "non-manufacturing" and other non-leak words. Skip the check entirely
-      and rely on the LLM screen + qa_iterate verifier (which check
-      semantic, not surface, leakage).
-    * multiple_choice: the GT may appear as ambient question phrasing
-      (e.g., "March 2026" in "Jan/Feb/March 2026 revenues"). A bare-substring
-      check has no discriminative power. Use a word-boundary regex match;
-      ambient *embedded* mentions (e.g., "Red" inside "Reduction") pass,
-      while standalone occurrences ("the answer is Nikkei 225") reject.
-    * numeric: numeric resolution strings like "66.246" or "-87.9" are
-      unique enough that any verbatim hit is a real leak. Keep the
-      substring check but on the normalized form.
-
-    Uncommon binary GTs (e.g., "draw") fall through to the substring check.
+    Returns ``(passes, reject_reason)``; the reason is set only when ``passes`` is
+    False. The unconditional substring check it replaced false-positived, per
+    ``backtests/ablation/audit_smoke_20260515.md:176-194``: binary {yes, no, true,
+    false} matched "no" inside "non-manufacturing", so those skip the check and
+    rely on the LLM screen and the qa_iterate verifier; a multiple-choice option
+    can be ambient question phrasing ("March 2026"), so it must match at a word
+    boundary ("Red" inside "Reduction" passes, "the answer is Nikkei 225" rejects);
+    a numeric string like "66.246" is unique enough that any normalized substring
+    hit is a real leak. Uncommon binary GTs ("draw") fall through to the
+    substring check.
     """
     gt_str = ground_truth.resolution_string
     if not gt_str:
@@ -452,9 +419,7 @@ async def _write_redactor_failure_dump(
     try:
         await asyncio.to_thread(_write)
     except OSError:
-        # Async-checkpoint on the early-return path so flake8-async ASYNC910
-        # sees a guaranteed cooperative yield. The to_thread call above is
-        # itself a checkpoint on the success path.
+        # flake8-async ASYNC910 needs a checkpoint on this early-return path too; to_thread covers the success path.
         await asyncio.sleep(0)
         return "(failed to write debug file)"
     return str(debug_path)
@@ -572,8 +537,6 @@ async def _process_batch(
         )
         return {**left, **right}
     if total_prompt_chars > APPROX_PROMPT_CHAR_LIMIT:
-        # len(batch) == 1 here; no further split is possible. Fail fast for
-        # this qid so the operator can truncate the upstream blob.
         logger.error(
             "prune | single-qid batch prompt still too large (qid=%d, %d chars > %d); failing this qid",
             qids[0],
@@ -625,15 +588,14 @@ async def run_prune_for_qids(
 ) -> dict[int, tuple[str, dict] | None]:
     """Redact resolution-revealing content from research blobs via headless Claude Code.
 
-    Cache hits short-circuit per qid. Cache-miss qids are batched into
-    groups of ``batch_size`` and dispatched serially (one ``claude -p`` per
-    batch). Per-batch failures (subprocess error, invalid JSON) only affect
-    that batch's qids; other batches still complete. Per-qid validation
-    failures (sanitized blob still contains GT, empty blob, etc.) only
-    affect that qid.
+    Cache hits short-circuit per qid. Cache-miss qids are batched into groups of
+    ``batch_size`` and dispatched serially, one ``claude -p`` per batch. A batch
+    that fails entirely (subprocess error, invalid JSON) is retried one qid at a
+    time, so an intermittent failure drops at most one qid; a per-qid validation
+    failure (ground truth still present, empty blob) drops only that qid.
 
-    Returns ``{qid: (sanitized_blob, meta) | None}`` covering every qid in
-    the input. ``None`` means failure; the caller should drop that qid from
+    Returns ``{qid: (sanitized_blob, meta) | None}`` covering every qid in the
+    input. ``None`` means failure; the caller should drop that qid from
     downstream stages.
     """
     await asyncio.sleep(0)
@@ -657,12 +619,7 @@ async def run_prune_for_qids(
             claude_executable=claude_executable,
             timeout_seconds=timeout_seconds,
         )
-        # Per-qid recovery: if every qid in this batch came back None and the
-        # batch had > 1 qid, the failure was a batch-level subprocess error
-        # (not per-qid validation), so retry each qid in its own 1-qid batch.
-        # A single intermittent failure thereby drops at most 1 qid instead of
-        # ``batch_size``. Only fires when ALL qids failed; mixed-success batches
-        # already provide per-qid isolation via _parse_redactor_response.
+        # An all-None batch is a batch-level subprocess failure, so retrying per qid drops at most one, not batch_size.
         if len(batch) > 1 and all(batch_results.get(qid) is None for qid in batch_results):
             logger.warning(
                 "prune | batch failed entirely for qids=%s; falling back to per-qid recovery",
