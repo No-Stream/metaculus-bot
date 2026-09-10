@@ -56,6 +56,7 @@ from metaculus_bot import stacking, tool_runner
 from metaculus_bot.ablation.cache import AblationCache
 from metaculus_bot.ablation.env import FEATURE_FLAG_ENV, probabilistic_tools_enabled
 from metaculus_bot.ablation.forecasters import (
+    EXPECTED_LLM_CALL_FAILURES,
     deserialize_prediction_value,
     question_type_for_serialization,
     serialize_prediction_value,
@@ -614,7 +615,7 @@ async def _stack_with_fallback(
                     ),
                     timeout=STACKER_SOFT_DEADLINE,
                 )
-            except Exception as primary_exc:  # HARNESS-SCAN-EXEMPT-broad-except  # translated to cached error payload
+            except EXPECTED_LLM_CALL_FAILURES as primary_exc:
                 logger.exception("Primary stacker failed for qid=%s arm=%s", qid, arm)
                 errors.append(f"primary: {type(primary_exc).__name__}: {primary_exc!r}")
             else:
@@ -636,7 +637,7 @@ async def _stack_with_fallback(
                     ),
                     timeout=STACKER_FALLBACK_SOFT_DEADLINE,
                 )
-            except Exception as fallback_exc:  # HARNESS-SCAN-EXEMPT-broad-except  # translated to cached error payload
+            except EXPECTED_LLM_CALL_FAILURES as fallback_exc:
                 logger.exception("Fallback stacker failed for qid=%s arm=%s", qid, arm)
                 errors.append(f"fallback: {type(fallback_exc).__name__}: {fallback_exc!r}")
                 return None, None, errors
@@ -657,7 +658,7 @@ def _median_fallback_payload(
     them: the question gets a degraded-but-publishable forecast instead of being lost
     from both arms. The ``model_used="median_fallback"`` tag lets confounder analysis
     bucket these separately from the regular primary/fallback outcomes. If the median
-    itself fails, an error payload is written instead.
+    itself rejects the surviving predictions, an error payload is written instead.
     """
     try:
         median_prediction = _median_fallback_prediction(question, surviving)
@@ -667,7 +668,7 @@ def _median_fallback_payload(
             model_used="median_fallback",
             errors=errors,
         )
-    except Exception as median_exc:  # HARNESS-SCAN-EXEMPT-broad-except  # degrade gracefully to error payload
+    except (TypeError, ValueError) as median_exc:  # the aggregators' and serializer's own guards; a bug propagates
         logger.exception("Median fallback failed for qid=%s arm=%s", cell.qid, cell.arm)
         errors.append(f"median_fallback: {type(median_exc).__name__}: {median_exc!r}")
         return cell.write_error(reason="stacker_failed", model_used=model_used, errors=errors)

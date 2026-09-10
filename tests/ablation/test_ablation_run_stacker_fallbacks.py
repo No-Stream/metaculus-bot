@@ -498,3 +498,148 @@ class TestMedianFallback:
         cdf = payload["stacker_prediction"]["cdf_probabilities"]
         assert len(cdf) == 201
         assert all(math.isfinite(p) for p in cdf)
+
+
+# ===========================================================================
+# Bugs are not stacker failures
+# ===========================================================================
+
+
+class TestBugPropagatesInsteadOfDegrading:
+    """A bug class is no expected stacker failure, so it must not read as a provider outage.
+
+    The three catches in the chain (primary, fallback, median) each catch only what the call
+    they wrap actually raises, so a KeyError leaves the arm instead of being cached as a
+    degraded result. The batch wrapper deliberately does not absorb it either: an ablation
+    resumes from cache, and a bug is worth stopping for.
+    """
+
+    def test_primary_stacker_bug_propagates_without_trying_the_fallback(
+        self,
+        cache: AblationCache,
+        stacker_llm: MagicMock,
+        fallback_stacker_llm: MagicMock,
+        parser_llm: MagicMock,
+    ) -> None:
+        call_log: list[str] = []
+
+        def _fake_stacker(*args: Any, **_kwargs: Any) -> tuple[float, str]:
+            call_log.append("primary" if args[0] is stacker_llm else "fallback")
+            raise KeyError("stacker bug")
+
+        with (
+            patch(
+                "metaculus_bot.ablation.run_stacker.tool_runner.run_tools_for_forecaster",
+                return_value="",
+            ),
+            patch(
+                "metaculus_bot.ablation.run_stacker.tool_runner.build_cross_model_aggregation",
+                return_value="",
+            ),
+            patch(
+                "metaculus_bot.ablation.run_stacker.stacking.run_stacking_binary",
+                new=AsyncMock(side_effect=_fake_stacker),
+            ),
+            pytest.raises(KeyError, match="stacker bug"),
+        ):
+            _run(
+                run_stacker_for_arm(
+                    question=_make_binary_q(qid=771),
+                    research_blob="R",
+                    forecaster_payloads=_three_binary_forecasters(),
+                    arm=ARM_STACK,
+                    cache=cache,
+                    stacker_llm=stacker_llm,
+                    fallback_stacker_llm=fallback_stacker_llm,
+                    parser_llm=parser_llm,
+                )
+            )
+
+        assert call_log == ["primary"]
+        assert cache.read_stacker_output(qid=771, arm=ARM_STACK) is None
+
+    def test_fallback_stacker_bug_propagates_after_an_expected_primary_failure(
+        self,
+        cache: AblationCache,
+        stacker_llm: MagicMock,
+        fallback_stacker_llm: MagicMock,
+        parser_llm: MagicMock,
+    ) -> None:
+        def _fake_stacker(*args: Any, **_kwargs: Any) -> tuple[float, str]:
+            if args[0] is stacker_llm:
+                raise RuntimeError("primary boom")
+            raise KeyError("fallback bug")
+
+        with (
+            patch(
+                "metaculus_bot.ablation.run_stacker.tool_runner.run_tools_for_forecaster",
+                return_value="",
+            ),
+            patch(
+                "metaculus_bot.ablation.run_stacker.tool_runner.build_cross_model_aggregation",
+                return_value="",
+            ),
+            patch(
+                "metaculus_bot.ablation.run_stacker.stacking.run_stacking_binary",
+                new=AsyncMock(side_effect=_fake_stacker),
+            ),
+            pytest.raises(KeyError, match="fallback bug"),
+        ):
+            _run(
+                run_stacker_for_arm(
+                    question=_make_binary_q(qid=772),
+                    research_blob="R",
+                    forecaster_payloads=_three_binary_forecasters(),
+                    arm=ARM_STACK,
+                    cache=cache,
+                    stacker_llm=stacker_llm,
+                    fallback_stacker_llm=fallback_stacker_llm,
+                    parser_llm=parser_llm,
+                )
+            )
+
+        assert cache.read_stacker_output(qid=772, arm=ARM_STACK) is None
+
+    def test_median_fallback_bug_propagates_instead_of_an_error_payload(
+        self,
+        cache: AblationCache,
+        stacker_llm: MagicMock,
+        fallback_stacker_llm: MagicMock,
+        parser_llm: MagicMock,
+    ) -> None:
+        def _fake_stacker(*_args: Any, **_kwargs: Any) -> tuple[float, str]:
+            raise RuntimeError("both stackers boom")
+
+        with (
+            patch(
+                "metaculus_bot.ablation.run_stacker.tool_runner.run_tools_for_forecaster",
+                return_value="",
+            ),
+            patch(
+                "metaculus_bot.ablation.run_stacker.tool_runner.build_cross_model_aggregation",
+                return_value="",
+            ),
+            patch(
+                "metaculus_bot.ablation.run_stacker.stacking.run_stacking_binary",
+                new=AsyncMock(side_effect=_fake_stacker),
+            ),
+            patch(
+                "metaculus_bot.ablation.run_stacker._median_fallback_prediction",
+                side_effect=KeyError("median bug"),
+            ),
+            pytest.raises(KeyError, match="median bug"),
+        ):
+            _run(
+                run_stacker_for_arm(
+                    question=_make_binary_q(qid=773),
+                    research_blob="R",
+                    forecaster_payloads=_three_binary_forecasters(),
+                    arm=ARM_STACK,
+                    cache=cache,
+                    stacker_llm=stacker_llm,
+                    fallback_stacker_llm=fallback_stacker_llm,
+                    parser_llm=parser_llm,
+                )
+            )
+
+        assert cache.read_stacker_output(qid=773, arm=ARM_STACK) is None

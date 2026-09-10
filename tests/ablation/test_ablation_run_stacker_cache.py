@@ -422,9 +422,11 @@ class TestPerStackerCacheKeying:
             ),
             # Only reached in the median_failed scenario (the nonfinite stacker
             # "succeeds", so no fallback fires); harmless otherwise.
+            # ValueError is what the aggregators actually raise; the narrowed catch
+            # deliberately lets a bug class out instead of degrading.
             patch(
                 "metaculus_bot.ablation.run_stacker._median_fallback_prediction",
-                side_effect=RuntimeError("median boom"),
+                side_effect=ValueError("median boom"),
             ),
         ):
             payload = _run(
