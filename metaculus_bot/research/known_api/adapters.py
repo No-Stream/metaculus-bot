@@ -2,9 +2,7 @@
 
 One returns the gap-fill loop's ``ToolOutcome`` (method ``known_api``); one returns the
 resolution-source fetcher's ``FetchResult`` (a success carries the rendered text, route
-``known_api``). The wiring step adds ``known_api`` to ``provenance._METHOD_TO_TIER`` and to the
-``FetchRoute`` literal; until it does, the route is a parameter so this compiles against the
-unedited types. Detail: docs/research.md "Known-API registry".
+``known_api``). Detail: docs/research.md "Known-API registry".
 """
 
 from __future__ import annotations
@@ -37,12 +35,11 @@ def to_tool_outcome(result: KnownApiResult) -> ToolOutcome:
     )
 
 
-def to_fetch_result(result: KnownApiResult, *, url: str, route: str = KNOWN_API_ROUTE) -> FetchResult:
+def to_fetch_result(result: KnownApiResult, *, url: str, route: FetchRoute = KNOWN_API_ROUTE) -> FetchResult:
     """The resolution-source fetcher's result for a known-API answer; a success carries the text.
 
-    ``route`` is a parameter because the ``FetchRoute`` literal does not yet carry ``known_api``
-    (the wiring step adds it); the default is the intended value and the cast keeps this honest
-    against the unedited type.
+    ``route`` stays injectable for adapter-level tests and future callers, while the production
+    default is the registered ``known_api`` route.
     """
     status = cast(FetchStatus, _STATUS_TO_FETCH_STATUS[result.status])
     return FetchResult(
@@ -51,5 +48,6 @@ def to_fetch_result(result: KnownApiResult, *, url: str, route: str = KNOWN_API_
         text=result.content_markdown if result.status == "ok" else "",
         http_status=None,
         content_type=None,
-        route=cast(FetchRoute, route),
+        route=route,
+        links=list(result.links),
     )

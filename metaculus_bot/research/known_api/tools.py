@@ -3,9 +3,9 @@
 ``build_known_api_tools`` returns three ``ToolSpec`` objects -- ``fred_series``, ``yahoo_history``
 and ``market_snapshot`` -- each pairing a driver-facing description and JSON schema with a handler
 that parses the ISO date window off the model's arguments, calls the backend, and adapts the
-result to the loop's ``ToolOutcome``. The market handler binds the per-question session, the run's
-already-pulled Kalshi catalogue and PredictIt dump, and the per-question Kalshi detail-GET budget
-(the seam the loop wiring fills, since the loop has no per-question object yet). Detail:
+result to the loop's ``ToolOutcome``. The market handler binds the per-question session and
+Kalshi detail-GET budget; optional catalogue and PredictIt-dump arguments are available to
+callers that already have those resources. Detail:
 docs/agentic_gap_fill.md "The known-API tools".
 
 The descriptions steer: these tools return a date window on demand, and the same FRED/Yahoo/Kalshi
@@ -28,8 +28,9 @@ FRED_SERIES_DESCRIPTION = (
     "Read one FRED (Federal Reserve Economic Data) series over a date window, or search FRED's\n"
     "catalogue for a series id. Pass `series_id` (e.g. DGS10, CSUSHPISA) with optional `start`\n"
     "and `end` ISO dates for a windowed table (default: the recent observations), or `search`\n"
-    "with free text to find the right id. `first_release` reads the initial-release vintage\n"
-    "rather than today's revised values. Deterministic, no cost. A `fred.stlouisfed.org` URL\n"
+    "with free text to find the right id. `first_release` requests an initial-release comparison\n"
+    "when the keyed API can provide it; the displayed observations remain current-vintage, while\n"
+    "keyless reads are current-vintage only. Deterministic, no cost. A `fred.stlouisfed.org` URL\n"
     "is translated automatically, so you can also just fetch(url).\n"
     'Example: fred_series(series_id="DGS10", start="2026-06-01", end="2026-07-31")'
 )

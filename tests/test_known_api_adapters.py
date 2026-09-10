@@ -1,7 +1,7 @@
 """The two adapters: a known-API result to the loop's ToolOutcome and to the fetcher's FetchResult.
 
-The adapters are the whole coupling to the two callers; the wiring step adds the ``known_api``
-method tier and the ``known_api`` FetchRoute member. Until then the route is passed in.
+The adapters are the whole coupling to the two callers; the known-API method tier and route are
+part of the production caller contracts.
 """
 
 from __future__ import annotations
@@ -44,6 +44,7 @@ class TestToFetchResult:
         assert fetch.text == "### DGS30\nLatest: 4.85"
         assert fetch.route == "known_api"
         assert fetch.url == "https://fred.stlouisfed.org/series/DGS30"
+        assert fetch.links == ["https://fred.stlouisfed.org/series/DGS30"]
 
     def test_not_found_maps_without_text(self):
         result = KnownApiResult(status="not_found", content_markdown="no such series", source_url="")
@@ -56,6 +57,6 @@ class TestToFetchResult:
         fetch = adapters.to_fetch_result(result, url="https://x")
         assert fetch.status == "no_resolving_content"
 
-    def test_route_is_a_parameter_until_the_enum_gains_the_member(self):
+    def test_route_remains_injectable_for_other_callers(self):
         fetch = adapters.to_fetch_result(_ok(), url="https://x", route="direct")
         assert fetch.route == "direct"

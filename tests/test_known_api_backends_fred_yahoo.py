@@ -8,6 +8,7 @@ nothing). The autouse network guard means an unpatched call fails loudly rather 
 
 from __future__ import annotations
 
+import logging
 from datetime import date
 
 import pandas as pd
@@ -62,8 +63,9 @@ class TestFredSeriesKeyed:
         assert result.source_url == "https://fred.stlouisfed.org/series/DGS30"
         assert result.links == ["https://fred.stlouisfed.org/series/DGS30"]
 
-    async def test_unknown_series_is_not_found(self, monkeypatch: pytest.MonkeyPatch):
+    async def test_unknown_series_is_not_found(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture):
         self._patch_key(monkeypatch)
+        caplog.set_level(logging.WARNING, logger=backends.__name__)
         error = ValueError("Bad Request. The series does not exist.")
         monkeypatch.setattr(fred_rendering, "Fred", lambda api_key: _FakeFred(error))
 
@@ -71,6 +73,7 @@ class TestFredSeriesKeyed:
 
         assert result.status == "not_found"
         assert "does not exist" in result.content_markdown.lower()
+        assert "FRED_UNKNOWN_SERIES: series_id=DEXBOUS proposed_by=gap_fill_driver" in caplog.text
 
     async def test_empty_series_is_empty(self, monkeypatch: pytest.MonkeyPatch):
         self._patch_key(monkeypatch)

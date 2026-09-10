@@ -159,6 +159,47 @@ class TestRungZero:
         assert result.status == "success"
         assert session.requested == [_URL]
 
+    async def test_rung_zero_timeout_is_per_url_and_does_not_cancel_a_sibling(self):
+        slow_url = "https://slow.example.com/source"
+        fast_url = "https://fast.example.com/source"
+        session = FakeSession(
+            {
+                slow_url: FakeResponse(200, body=_PAGE, content_type="text/html"),
+                fast_url: FakeResponse(200, body=_PAGE, content_type="text/html"),
+            }
+        )
+        calls: list[str] = []
+        answered = FetchResult(
+            url=fast_url,
+            status="success",
+            text="known API body",
+            http_status=None,
+            content_type="application/json",
+            route="known_api",
+        )
+
+        async def _known_api(url: str) -> FetchResult | None:
+            calls.append(url)
+            if url == slow_url:
+                await asyncio.sleep(0.05)
+                return None
+            return answered
+
+        policy = replace(RESOLUTION_SOURCE_POLICY, known_api=_known_api, rung_wall_margin_s=0.0, total_wall_s=0.01)
+        started = monotonic() - policy.total_wall_s + 0.005
+        slow_context = replace(LadderContext(session=session, host_sems={}), started=started)
+        fast_context = replace(LadderContext(session=session, host_sems={}), started=started)
+
+        slow_result, fast_result = await asyncio.gather(
+            fetch_url(slow_url, policy=policy, ctx=slow_context),
+            fetch_url(fast_url, policy=policy, ctx=fast_context),
+        )
+
+        assert calls == [slow_url, fast_url]
+        assert slow_result.status == "success"
+        assert fast_result is answered
+        assert session.requested == [slow_url]
+
 
 class TestTheDigestSeat:
     async def test_the_sibling_digest_signature_drops_into_the_seat(self):

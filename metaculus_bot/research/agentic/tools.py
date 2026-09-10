@@ -195,7 +195,10 @@ async def _fetch_via_ladder(
     blocked = _fetch_plain_url_block(url)
     if blocked is not None:
         return blocked
-    result = await fetch_url(url, policy=pol, ctx=_per_call_ctx(ctx, query=query))
+    request_context = _per_call_ctx(ctx, query=query)
+    if request_context.policy.known_api is not None:
+        pol = replace(pol, known_api=request_context.policy.known_api)
+    result = await fetch_url(url, policy=pol, ctx=request_context)
     if record:
         _log_ladder_markers(result)
     return ladder_adapter.as_plain_result(result, requested_url=url)
@@ -588,7 +591,7 @@ async def read_document(
     return ToolOutcome(content_markdown=text, method="document")
 
 
-def question_ladder_context() -> LadderContext:
+def question_ladder_context(*, session: object | None = None) -> LadderContext:
     """The ONE fetch-ladder context a question's tool calls share.
 
     What it carries is the per-question half: a fresh :class:`QuestionRungBudget`, which is what
@@ -597,7 +600,7 @@ def question_ladder_context() -> LadderContext:
     origin, the rung list — is derived off it in :func:`_per_call_ctx`. Its own function so the
     seam that builds it (``agentic_gap_fill.run_gap_fill_v2``) does not have to know the fields.
     """
-    return LadderContext(shared=QuestionRungBudget(), host_sems=_FETCH_HOST_SEMAPHORES)
+    return LadderContext(shared=QuestionRungBudget(), host_sems=_FETCH_HOST_SEMAPHORES, session=session)
 
 
 def build_gap_fill_tools(question_topic: str, *, ctx: LadderContext | None = None) -> list[ToolSpec]:
@@ -621,7 +624,7 @@ def build_gap_fill_tools(question_topic: str, *, ctx: LadderContext | None = Non
         """
         return await read_document(url, ask, ctx=ctx)
 
-    return [
+    tools = [
         ToolSpec(
             name="search_news",
             description=SEARCH_NEWS_DESCRIPTION,
@@ -653,3 +656,26 @@ def build_gap_fill_tools(question_topic: str, *, ctx: LadderContext | None = Non
             timeout_s=70,
         ),
     ]
+
+    # Importing known_api.tools at module scope would complete the agentic package import through
+    # agentic.types while agentic.__init__ is still importing this module.
+    from metaculus_bot.research.known_api import backends, wiring  # noqa: PLC0415  # real circular import
+    from metaculus_bot.research.known_api import tools as known_api_tools  # noqa: PLC0415  # real circular import
+
+    if ctx is None:
+        known_api_budget = backends.KalshiGetBudget()
+        known_api_session = None
+    else:
+        known_api_budget = backends.KalshiGetBudget()
+        known_api_session = ctx.session
+        ctx.policy = replace(
+            ctx.policy,
+            known_api=wiring.build_known_api_fetcher(
+                session=known_api_session,
+                kalshi_detail_budget=known_api_budget,
+            ),
+        )
+    return tools + known_api_tools.build_known_api_tools(
+        session=known_api_session,
+        kalshi_detail_budget=known_api_budget,
+    )

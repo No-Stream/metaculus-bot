@@ -718,10 +718,11 @@ FRED reports as nonexistent raises `UnknownFredSeries`
 `400 "The series does not exist"` body, which fredapi surfaces as a `ValueError`),
 so it reaches diagnostics
 as `unknown_series` rather than the ambiguous `empty` that was q45363's only trace,
-with one `FRED_UNKNOWN_SERIES: series_id=... proposed_by=classifier|resolution_url`
+with one `FRED_UNKNOWN_SERIES: series_id=... proposed_by=classifier|resolution_url|gap_fill_driver`
 WARN harvested as `fred_unknown_series`, non-alertable, since an invented id is
 the classifier's habit rather than a bot crash, and `proposed_by` separates that
-from a question whose own resolution criteria link a dead FRED page. (3) When a
+from a question whose own resolution criteria link a dead FRED page; `gap_fill_driver` identifies
+an unknown id returned by the known-API gap-fill path. (3) When a
 question's exchange-rate identifiers carry nothing, the section is ABSENT, no "we
 looked and found nothing" line, for the same reason AskNews returns `""` rather
 than its old `No articles were found` sentence: any non-empty return flips the
@@ -1821,13 +1822,12 @@ data known at forecast time is the answer without leaking the resolution. The
 text anchor is on in production; the chart-image side-channel
 (`TS_ANCHOR_CHART_ENABLED`) is a separate flag and is off.
 
-### SEC EDGAR client (`research/sec_edgar.py`; standalone, not yet a ladder rung)
+### SEC EDGAR client (`research/sec_edgar.py`; known-API ladder rung)
 
 A client for SEC EDGAR's public JSON APIs, built 2026-09-09 so that sec.gov stops being a
-blocked host. Nothing calls it yet: the wiring belongs to the fetch-ladder unification, where a
-URL whose host is registered gets answered by its API before any page fetch is attempted
-("known API translation"). Until then it is importable, tested against recorded fixtures, and
-inert.
+blocked host. The known-API rung translates registered EDGAR URLs and answers them before any
+page fetch is attempted. It remains inert when `SEC_EDGAR_CONTACT_EMAIL` is unset, so local and
+CI runs without the contact secret still fall through to the ordinary page ladder.
 
 **Why an API client rather than another fetch rung.** The 2026-09-09 fetch-gap inventory counted
 12 blocked events on sec.gov across 5 questions (`Archives/edgar/data/...` filing documents:
@@ -1955,14 +1955,16 @@ also swallow the four unrelated invariant asserts in the same forecasting-tools 
 seat wants that shape degraded, the fix is a typed exception upstream or the seat's own boundary,
 not a broader catch here.
 
-### Known-API registry (`research/known_api/`; wiring pending)
+### Known-API registry (`research/known_api/`; wired into the ladder and gap-fill)
 
 A URL whose host the registry recognises is answered by that host's public API rather than
 fetched as a web page: no LLM, no paid key, the same client code the research providers already
 use. It was built to fill rung 0 of the shared fetch ladder (the `policy.known_api` seat) and to
 give the gap-fill v2 driver three explicit tools for a date window the URL forms cannot express.
-The registry is built and tested; the wiring into the ladder's rung-0 seat and the loop's tool
-list lands in a follow-up once both branches merge.
+`known_api/wiring.py` binds the registry to the ladder's rung-0 callback, and
+`agentic/tools.py` appends the three deterministic tools to the gap-fill tool list. The callback
+is bounded by the current per-URL remaining wall, so a slow API URL can fall through independently
+while sibling URLs keep their completed results.
 
 **What translates to what.** `translate(url)` (`known_api/translate.py`) reads one URL into one
 `KnownApiCall`, or returns `None` when the registry does not own the host (which leaves the later
@@ -1991,14 +1993,17 @@ is `not_found` with the provider's message, an empty window is `empty`, a transp
 failure is `error` naming the exception class.
 
 - `fred_series` reads one series over a date window through the keyed API (`fred_rendering.Fred`)
-  when `FRED_API_KEY` is set, with the initial-release table on `first_release`, and through the
-  keyless `fredgraph` CSV (`ts_fetch.fetch_series`) otherwise; free text runs `Fred.search`.
+  when `FRED_API_KEY` is set, with an initial-release comparison available on `first_release`
+  while the displayed observations remain current-vintage, and through the keyless `fredgraph`
+  CSV (`ts_fetch.fetch_series`) otherwise; free text runs `Fred.search`. Keyless reads are
+  current-vintage only.
 - `yahoo_history` reads one symbol's adjusted price history through `ts_fetch.fetch_series`
   (yfinance), column in Close/High/Low/Open.
 - `market_snapshot` reads a venue plus market: Kalshi by ticker through the event endpoint falling
-  to the market endpoint, Kalshi free text over the run's already-pulled catalogue with zero new
-  requests, Polymarket and Manifold search, and PredictIt from the run's cached dump; it renders
-  through the prediction-market snapshot renderer.
+  to the market endpoint, Kalshi free text over a supplied catalogue with zero new requests,
+  Polymarket and Manifold search, and PredictIt from a supplied cached dump; it renders through
+  the prediction-market snapshot renderer. The gap-fill binding supplies neither optional cache,
+  so free-text Kalshi and PredictIt reads decline unless a caller provides those resources.
 - `edgar` reads a translated EDGAR URL, and declines (returns `None`, so the ladder falls through
   to the page fetch) when `SEC_EDGAR_CONTACT_EMAIL` is unset; a company page renders its filings
   table and an Archives document its extracted text.
@@ -2007,16 +2012,17 @@ failure is `error` naming the exception class.
 capped at 400 observations, newest kept, with a line saying so, and a 30-observation default;
 15 s per FRED or Yahoo call, because fredapi's `urlopen` carries no timeout of its own so
 `asyncio.wait_for` bounds the await; five market rows; at most four Kalshi detail GETs per
-question, through a `KalshiGetBudget` counting budget the caller constructs per question (a
-semaphore would cap concurrency, not the sequential total; the seam the loop wiring fills, since
-the loop has no per-question object yet); `PLATFORM_HTTP_TIMEOUT` per venue call.
+question, through one `KalshiGetBudget` shared by the explicit market tool and the rung-0 callback;
+`PLATFORM_HTTP_TIMEOUT` per venue call. The explicit tools and rung-0 callback also share the
+gap-fill question's HTTP session. The ladder applies the remaining question wall to each callback
+invocation, and a timeout declines that URL so another cited URL can continue.
 
 **The two adapters** (`known_api/adapters.py`) are the whole coupling to the two callers:
 `to_tool_outcome` returns the gap-fill loop's `ToolOutcome` with method `known_api`, and
 `to_fetch_result` returns the resolution-source fetcher's `FetchResult` with a success carrying
-the rendered text and route `known_api`. The `known_api` method tier and the `known_api`
-`FetchRoute` member are additive edits the wiring step makes; until it does, the route is a
-parameter so the adapter compiles against the unedited types.
+the rendered text, route `known_api`, and the backend's canonical source links. The route is
+recorded as a fetched provenance method, so the normal ladder and agentic provenance paths retain
+the API source explicitly.
 
 **No drift with the extraction seams.** The financial-data provider's identifier extraction
 (`financial_data.extract_financial_identifiers_from_criteria`) and the resolution-source

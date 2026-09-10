@@ -54,6 +54,7 @@ _LOOP_STATUS: dict[FetchStatus, str] = {
 # Which rung produced a success, as the method the tier map reads (`_failure_method` for the rest).
 _LOOP_METHOD: dict[FetchRoute, str] = {
     "direct": "plain",
+    "known_api": "known_api",
     # The hop's target was read as an ordinary page, which is what the driver is being handed.
     "meta_refresh": "plain",
     "impersonate": "impersonate",

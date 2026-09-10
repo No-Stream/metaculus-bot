@@ -292,6 +292,10 @@ async def fred_series(
             )
         except ValueError as exc:
             if fred_rendering.is_unknown_fred_series_error(exc):
+                logger.warning(
+                    "FRED_UNKNOWN_SERIES: series_id=%s proposed_by=gap_fill_driver",
+                    series_id,
+                )
                 return KnownApiResult(
                     status="not_found",
                     content_markdown=f"FRED has no series {series_id!r}: {exc}",

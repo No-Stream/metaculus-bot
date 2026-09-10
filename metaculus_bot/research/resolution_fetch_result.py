@@ -271,6 +271,7 @@ RungSkipReason = Literal[
 # the marker, so every line the archive already holds stays byte-identical.
 FetchRoute = Literal[
     "direct",
+    "known_api",
     "meta_refresh",
     "impersonate",
     "pdf_local",
@@ -295,6 +296,10 @@ FetchRoute = Literal[
 # grading evidence, so a rung that quietly substituted one artifact for another would overstate
 # what was retrieved by exactly the amount that decides a forecast.
 ROUTE_CAVEATS: dict[FetchRoute, str] = {
+    "known_api": (
+        "One or more sections below came from a deterministic public API for a cited URL rather "
+        "than from the cited page's HTML; the API response is the source shown in the section."
+    ),
     "meta_refresh": (
         "One or more sections below came from the page a cited URL redirected to through a "
         "`<meta refresh>` tag rather than an HTTP redirect; the content is the target page's, "
@@ -492,7 +497,8 @@ class FetchResult:
     # `precision_fallback_rescues`), so no status or reason token moved.
     chrome_metric_withheld: bool = False
     precision_rescued: bool = False
-    # Empty unless `policy.collect_links`, so an archived record stays byte-identical (see the doc).
+    # Page results are empty unless `policy.collect_links`; deterministic known-API results may
+    # carry their backend canonical sources even when the page policy leaves link collection off.
     links: list[str] = field(default_factory=list)
     # The caller's thin-content signal (`policy.thin_content_escalation_chars`); False for the fetcher.
     escalate_rendered: bool = False

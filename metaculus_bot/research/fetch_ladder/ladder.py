@@ -208,6 +208,21 @@ def _store_successful_read(url: str, result: FetchResult, ctx: context.LadderCon
         run_cache.put(url, capture.artifact, route=capture.route)
 
 
+async def _try_known_api(url: str, ctx: context.LadderContext) -> FetchResult | None:
+    """Run rung 0 inside the current URL's remaining wall, or decline it."""
+    callback = ctx.policy.known_api
+    if callback is None:
+        return None
+    remaining_s = ctx.rung_budget_s()
+    if remaining_s <= 0:
+        return None
+    try:
+        return await asyncio.wait_for(callback(url), timeout=remaining_s)
+    except TimeoutError:
+        logger.warning("known_api rung exceeded the remaining wall budget for %s", url)
+        return None
+
+
 async def fetch_url(url: str, *, policy: LadderPolicy, ctx: context.LadderContext) -> FetchResult:
     """Fetch one URL through the whole ladder under ``policy``: the entry point both callers use.
 
@@ -221,17 +236,18 @@ async def fetch_url(url: str, *, policy: LadderPolicy, ctx: context.LadderContex
     would change. A context naming neither gets a session opened and closed for this URL alone
     and the process-wide map, which is what a caller with one fetch in hand wants.
     """
-    if policy.known_api is not None:
-        translated = await policy.known_api(url)
-        if translated is not None:
-            return translated
+    host_sems = ctx.host_sems if ctx.host_sems is not None else host_semaphores()
+    bound = replace(ctx, policy=policy, host_sems=host_sems)
+    translated = await _try_known_api(url, bound)
+    if translated is not None:
+        return translated
     try:
         cached = await run_cache.get(
             url,
             policy=policy,
             query=ctx.query,
             now=ctx.now,
-            budget_s=replace(ctx, policy=policy).rung_budget_s(),
+            budget_s=bound.rung_budget_s(),
         )
     except TimeoutError:
         logger.warning("fetch cache presentation exceeded this URL's remaining wall budget: %s", url)
@@ -248,8 +264,6 @@ async def fetch_url(url: str, *, policy: LadderPolicy, ctx: context.LadderContex
             cached.status == "success" and not cached.escalate_rendered
         ):
             return cached
-        host_sems = ctx.host_sems if ctx.host_sems is not None else host_semaphores()
-        bound = replace(ctx, policy=policy, host_sems=host_sems)
         if bound.session is not None:
             escalated = await _escalate_unresolved(bound.session, url, cached, host_sems=host_sems, ctx=bound)
         else:
@@ -258,8 +272,6 @@ async def fetch_url(url: str, *, policy: LadderPolicy, ctx: context.LadderContex
         result = context._stamped_with_route(escalated, bound)
         _store_successful_read(url, result, bound)
         return result
-    host_sems = ctx.host_sems if ctx.host_sems is not None else host_semaphores()
-    bound = replace(ctx, policy=policy, host_sems=host_sems)
     if bound.session is not None:
         result = await _fetch_one(bound.session, url, host_sems, bound)
     else:

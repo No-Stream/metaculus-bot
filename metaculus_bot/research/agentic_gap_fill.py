@@ -51,6 +51,7 @@ from metaculus_bot.research.agentic.driver_prompt import (
     build_user_brief,
 )
 from metaculus_bot.research.agentic.tools import question_ladder_context
+from metaculus_bot.research.fetch_ladder import guard
 
 __all__ = ["run_gap_fill_v2", "run_gap_fill_v2_ghost_v1"]
 
@@ -100,26 +101,31 @@ async def run_gap_fill_v2(
         today = datetime.now(UTC).strftime("%Y-%m-%d")
         system_prompt = build_system_prompt(today)
         user_brief = build_user_brief(question, bundle_markdown)
-        # ONE fetch-ladder context per question, so its rung caps count across the tool calls.
-        tools = build_gap_fill_tools(question.question_text, ctx=question_ladder_context())
-        question_ref = _question_ref(question)
-        config = LoopConfig(
-            model=GAP_FILL_V2_DRIVER_MODEL,
-            reasoning_effort=GAP_FILL_V2_DRIVER_EFFORT,
-            max_tool_calls=GAP_FILL_V2_MAX_TOOL_CALLS,
-            wall_deadline_s=GAP_FILL_V2_WALL_DEADLINE,
-            conclude_threshold_s=GAP_FILL_V2_CONCLUDE_THRESHOLD,
-            max_gaps=GAP_FILL_V2_MAX_GAPS,
-            question_ref=question_ref,
-        )
-        result = await run_agentic_loop(
-            system_prompt,
-            user_brief,
-            tools,
-            config,
-            ghost_prompt=build_ghost_prompt(),
-            log_prefix=f"question={question_ref} ",
-        )
+        # ONE fetch-ladder session and context per question, so known-API tools and rung 0 share
+        # both the connector and the Kalshi detail-GET budget across the driver's tool calls.
+        async with guard._get_session() as session:
+            tools = build_gap_fill_tools(
+                question.question_text,
+                ctx=question_ladder_context(session=session),
+            )
+            question_ref = _question_ref(question)
+            config = LoopConfig(
+                model=GAP_FILL_V2_DRIVER_MODEL,
+                reasoning_effort=GAP_FILL_V2_DRIVER_EFFORT,
+                max_tool_calls=GAP_FILL_V2_MAX_TOOL_CALLS,
+                wall_deadline_s=GAP_FILL_V2_WALL_DEADLINE,
+                conclude_threshold_s=GAP_FILL_V2_CONCLUDE_THRESHOLD,
+                max_gaps=GAP_FILL_V2_MAX_GAPS,
+                question_ref=question_ref,
+            )
+            result = await run_agentic_loop(
+                system_prompt,
+                user_brief,
+                tools,
+                config,
+                ghost_prompt=build_ghost_prompt(),
+                log_prefix=f"question={question_ref} ",
+            )
         if archive_sink is not None:
             archive_sink(
                 {

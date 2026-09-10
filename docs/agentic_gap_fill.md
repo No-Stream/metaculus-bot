@@ -152,10 +152,10 @@ and turns a breach into an error `ToolOutcome` rather than a crash.
   otherwise reach, and on Mantic the page it would read carries the other bots'
   forecasts.
 
-### The three known-API tools (built, wiring pending)
+### The three known-API tools (built and wired)
 
-Three more tools are built in `research/known_api/tools.py` (`build_known_api_tools`) and wait on
-the shared fetch-ladder merge before they are appended to the driver's list. They answer a
+Three more tools are built in `research/known_api/tools.py` (`build_known_api_tools`) and are
+appended to the driver's list by `build_gap_fill_tools`. They answer a
 FRED/Yahoo/Kalshi read deterministically, no LLM and no paid key, and return a date window on
 demand that the URL forms cannot express. The registry also translates those URL shapes at the
 ladder's rung 0, so the driver can still just `fetch` the URL and get the API answer. Detail:
@@ -170,10 +170,12 @@ ladder's rung 0, so the driver can still just `fetch` the URL and get the API an
   manifold, predictit) and `market` given as a venue id/ticker or free text.
 
 Each handler adapts its backend's result to a `ToolOutcome` with method `known_api`; the market
-handler binds the per-question session, the run's Kalshi catalogue and PredictIt dump, and the
-per-question Kalshi detail-GET budget. The bounds (window cap, per-call timeouts, five market
-rows, four Kalshi GETs) live with the backends, documented in `docs/research.md`
-"Known-API registry".
+handler binds the per-question session and per-question Kalshi detail-GET budget. Optional
+catalogue and PredictIt-dump arguments remain available for callers that already have those
+resources; the gap-fill binding does not create a new catalogue fetch. The same session and
+detail budget are bound to the fetch-ladder rung-0 callback for that question. The bounds (window
+cap, per-call timeouts, five market rows, four Kalshi GETs) live with the backends, documented in
+`docs/research.md` "Known-API registry".
 
 ### The fetch ladder
 
@@ -746,7 +748,7 @@ level up:
 | `agentic/provenance.py` | URL and quote normalization, the quote-grounding span logic, and the per-call harvesters behind the provenance gate and the W4 verification tiers. |
 | `agentic/gates.py` | The W1 plan gate's nudge and gap coercion, the W2 conclude gate, the W3 `source_url` check, and W4 tier stamping plus idempotent findings banking. |
 | `agentic/dispatch.py` | One assistant turn's tool calls in, one tool message each out: batch admission (plan gate, call budget, duplicate detection), provenance absorption, and the tool-message/rejection rendering. |
-| `agentic/tools.py` | `build_gap_fill_tools`, `question_ladder_context` and the four tool handlers, plus `_fetch_via_ladder`, the one seam onto the shared fetch ladder, and this caller's window presentation and throttle outcome. |
+| `agentic/tools.py` | `build_gap_fill_tools`, `question_ladder_context` and the seven advertised tool handlers, plus `_fetch_via_ladder`, the one seam onto the shared fetch ladder, and this caller's window presentation and throttle outcome. |
 | `agentic/ladder_adapter.py` | One `FetchResult` read as this ladder's own `PlainFetchResult`: the status and method tables, and the message the driver is told for every non-read. |
 | `agentic/local_document.py` | What the free ladder holds for one URL (`HeldDocument`), the passage digest `read_document` serves, the url_context size gate, and the `AGENTIC_FETCH_LOCAL_DOC` marker. The parses themselves are held in `research/document_cache.py`, shared with the ladder's document verdict. |
 | `agentic/fetch_outcomes.py` | This ladder's result type (`PlainFetchResult`), the question-platform self-reference refusal (metaculus.com and `competitions.mantic.com`), and the escalate-to-a-reader outcome. Its per-body-shape builders are dead since the loop moved onto the shared classifier and are deleted with the rest of the loop's own rungs. |

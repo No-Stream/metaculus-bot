@@ -21,6 +21,7 @@ import asyncio
 import logging
 import time
 from collections import Counter
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -141,7 +142,9 @@ async def _fetch_datawrapper_dataset(
             )
 
 
-async def fetch_resolution_sources(urls: list[str], *, query: str = "", fast_path: bool = False) -> list[FetchResult]:
+async def fetch_resolution_sources(
+    urls: list[str], *, query: str = "", fast_path: bool = False, fetch_policy: policy.LadderPolicy | None = None
+) -> list[FetchResult]:
     """Fetch each URL under per-netloc Semaphore(1) politeness, then hop to
     the live datasets of any Datawrapper charts the fetched pages embed.
 
@@ -151,6 +154,8 @@ async def fetch_resolution_sources(urls: list[str], *, query: str = "", fast_pat
     document renders its header and outline with no passages. ``fast_path`` is the
     question's time-budget thin-window mode; it rides every URL's :class:`LadderContext`
     and makes the two expensive rungs decline (see there).
+    ``fetch_policy`` optionally replaces the production policy for focused diagnostics; the
+    known-API rung is added to whichever policy is selected.
 
     Distinct hosts run concurrently up to the connector limit; same-host
     requests serialize (politeness — e.g. StatCan asks Crawl-delay: 2). The
@@ -182,6 +187,10 @@ async def fetch_resolution_sources(urls: list[str], *, query: str = "", fast_pat
     — pages and datasets alike — so we can cancel + drain them in a
     ``finally`` before the session closes.
     """
+    # backends imports market_retrieval settlement helpers, which import this module's public URL
+    # extractor. Keep the known-API wiring at the call boundary to break that genuine cycle.
+    from metaculus_bot.research.known_api import backends, wiring  # noqa: PLC0415  # real circular import
+
     host_sems = host_semaphores()
     tasks: list[asyncio.Task[FetchResult]] = []
     started = time.monotonic()
@@ -195,11 +204,18 @@ async def fetch_resolution_sources(urls: list[str], *, query: str = "", fast_pat
             # the Wayback cap is per question (every snapshot shares one host gate), while the
             # rung attempts belong to the URL they were spent on.
             shared_budget = context.QuestionRungBudget()
+            known_api_policy = replace(
+                policy.RESOLUTION_SOURCE_POLICY if fetch_policy is None else fetch_policy,
+                known_api=wiring.build_known_api_fetcher(
+                    session=session,
+                    kalshi_detail_budget=backends.KalshiGetBudget(),
+                ),
+            )
             page_tasks = [
                 asyncio.create_task(
                     ladder.fetch_url(
                         u,
-                        policy=policy.RESOLUTION_SOURCE_POLICY,
+                        policy=known_api_policy,
                         ctx=context.LadderContext(
                             query=query,
                             started=started,

@@ -656,28 +656,25 @@ floor, dated re-run plan) and `scratch/ensemble_3member_audit_2026-07-20/synthes
 bootstrap audit). Era boundary: **2026-07-21T17:07:37Z** (`b4e9df0`) = the triple config live in prod;
 2026-07-20 is only its authoring date.
 
-### SEC EDGAR client: BUILT standalone 2026-09-09, wiring waits on the ladder and a contact secret
+### SEC EDGAR client: BUILT 2026-09-09, wired 2026-09-10, gated by a contact secret
 
 `metaculus_bot/research/sec_edgar.py` (`f692c0c`) reaches EDGAR's public JSON APIs (a filer's
 submissions, its XBRL company facts, one concept across all filers for a period, full-text search
 since 2001, and the raw filing document) under SEC's fair-access policy, because sec.gov answered
 the browser-shaped fetch with 403 on 12 blocked events across 5 questions and that 403 is a policy
-asking for a name and an address, not a fingerprint verdict. Nothing calls it yet: the wiring is
-the "known API translation" step of the shared fetch ladder. Before that wiring,
+asking for a name and an address, not a fingerprint verdict. The known-API translation step of the
+shared fetch ladder calls it for registered EDGAR URLs. When enabled, the
 `SEC_EDGAR_CONTACT_EMAIL` must be set in `.env` and as a GitHub Actions secret; it is the contact
 in the fair-access User-Agent, and `edgar_session()` refuses to open a socket without it. Detail:
 `docs/research.md` "SEC EDGAR client". The ranked list of public APIs for the other blocked hosts
 is `scratch/cost_pass_2026-09-09/public_apis/PUBLIC_APIS.md`.
 
-### Known-API registry: BUILT 2026-09-10, wiring and the heavy EDGAR tools deferred
+### Known-API registry: BUILT and wired 2026-09-10, heavy EDGAR tools deferred
 
 `metaculus_bot/research/known_api/` turns FRED, Yahoo Finance, Kalshi and SEC EDGAR URLs into
 deterministic API calls (`translate` plus the `fred_series` / `yahoo_history` / `market_snapshot`
 backends and their three gap-fill tools, and an `edgar` backend that declines without a contact),
-built to fill the fetch ladder's rung-0 seat. Two things stay deferred. **The wiring**: appending
-the three tools to the loop's tool list, wiring `translate` into `policy.known_api`, and the
-additive `known_api` `FetchRoute` / `_METHOD_TO_TIER` / `proposed_by=gap_fill_driver` edits, all a
-few lines once the shared-fetch-ladder branch merges. **The heavy EDGAR driver tools**: a
+built to fill the fetch ladder's rung-0 seat. The heavy EDGAR driver tools remain deferred: a
 `full_text_search` tool ("has any filer mentioned X since date D") and a `company_facts` tool
 ("what did the filer report for concept C") answer the S-1 and 10-K reads without pulling a 3-7 MB
 document, but they are new driver-facing tools with their own schemas and token cost, so they wait
