@@ -21,12 +21,6 @@ from tests.cli_test_helpers import _cli_main_test_mode, asyncio_run_stub
 
 
 class TestCliRoleSpendWiring:
-    """cli.main installs the CREDIT_ROLE_SPEND tracker before the first completion and logs
-    the ledger from the same ``finally`` as the balance telemetry, so a crashed run still
-    reports where its money went. The ledger itself is unit tested in
-    test_credit_telemetry.py; these pin the wiring.
-    """
-
     def test_tracker_installed_and_ledger_logged_on_a_clean_run(self) -> None:
         with (
             _cli_main_test_mode(alertable_count=0),

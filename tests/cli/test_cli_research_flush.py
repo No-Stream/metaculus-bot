@@ -9,13 +9,13 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
 from metaculus_bot.cli import main as cli_main
 from metaculus_bot.constants import PERSIST_RESEARCH_ENABLED_ENV
-from tests.cli_test_helpers import _cli_main_test_mode, asyncio_run_stub
+from tests.cli_test_helpers import _cli_main_test_mode, _forecaster_class, asyncio_run_stub
 
 
 class TestCliResearchFlush:
@@ -33,19 +33,6 @@ class TestCliResearchFlush:
     forecaster, so they cover the whole write path (sink -> accumulate -> flush -> JSONL)
     rather than asserting that a mock got called.
     """
-
-    @staticmethod
-    def _forecaster_class() -> MagicMock:
-        """A ``TemplateForecaster`` class stub that also exposes the constructor kwargs.
-
-        The helper's own patch discards its mock, and these tests need the
-        ``research_sink`` cli built and passed in. ``alertable_count`` is pinned to a real
-        int because the normal-path test runs off the end of ``main``, into the
-        ``alertable > 0`` comparison.
-        """
-        forecaster_class = MagicMock()
-        forecaster_class.return_value.alertable_count = 0
-        return forecaster_class
 
     @staticmethod
     def _record_two(sink: Callable[..., None]) -> None:
@@ -71,7 +58,7 @@ class TestCliResearchFlush:
         monkeypatch.setenv(PERSIST_RESEARCH_ENABLED_ENV, "true")
         monkeypatch.chdir(tmp_path)  # writer.flush() writes research_outputs/ under CWD
 
-        forecaster_class = self._forecaster_class()
+        forecaster_class = _forecaster_class()
 
         def _record_then_crash(*_args: object, **_kwargs: object) -> None:
             """Two questions researched, then the run dies before returning: the shape that lost the batch."""
@@ -79,8 +66,7 @@ class TestCliResearchFlush:
             raise RuntimeError("forecast loop blew up")
 
         with (
-            _cli_main_test_mode(alertable_count=0),
-            patch("metaculus_bot.cli.TemplateForecaster", forecaster_class),
+            _cli_main_test_mode(alertable_count=0, forecaster_class=forecaster_class),
             patch("metaculus_bot.cli.asyncio.run", side_effect=asyncio_run_stub(_record_then_crash)),
             pytest.raises(RuntimeError, match="forecast loop blew up"),
         ):
@@ -93,15 +79,14 @@ class TestCliResearchFlush:
         monkeypatch.setenv(PERSIST_RESEARCH_ENABLED_ENV, "true")
         monkeypatch.chdir(tmp_path)
 
-        forecaster_class = self._forecaster_class()
+        forecaster_class = _forecaster_class()
 
         def _record_then_return(*_args: object, **_kwargs: object) -> list[object]:
             self._record_two(forecaster_class.call_args.kwargs["research_sink"])
             return []
 
         with (
-            _cli_main_test_mode(alertable_count=0),
-            patch("metaculus_bot.cli.TemplateForecaster", forecaster_class),
+            _cli_main_test_mode(alertable_count=0, forecaster_class=forecaster_class),
             patch("metaculus_bot.cli.asyncio.run", side_effect=asyncio_run_stub(_record_then_return)),
         ):
             cli_main()
@@ -116,10 +101,9 @@ class TestCliResearchFlush:
         def _crash(*_args: object, **_kwargs: object) -> None:
             raise RuntimeError("boom")
 
-        forecaster_class = self._forecaster_class()
+        forecaster_class = _forecaster_class()
         with (
-            _cli_main_test_mode(alertable_count=0),
-            patch("metaculus_bot.cli.TemplateForecaster", forecaster_class),
+            _cli_main_test_mode(alertable_count=0, forecaster_class=forecaster_class),
             patch("metaculus_bot.cli.asyncio.run", side_effect=asyncio_run_stub(_crash)),
             pytest.raises(RuntimeError, match="boom"),
         ):

@@ -1,7 +1,7 @@
 """Shared harness for the ``tests/cli`` package: the cli-under-test stubs and its date pins.
 
-Plain functions and context managers only, so ``tests/test_cli_run_summary.py`` can reuse the
-harness without inheriting the package's fixtures. The autouse counter reset lives in
+Plain functions and context managers, at the tests root like ``tests/resolution_source_fakes.py``
+and ``tests/pipeline_test_helpers.py``; the package's autouse counter reset lives in
 ``tests/cli/conftest.py``.
 """
 
@@ -27,7 +27,6 @@ from metaculus_bot.constants import (
 )
 from metaculus_bot.forecaster import TemplateForecaster
 from metaculus_bot.research.orchestrator import ResearchOrchestrator
-from metaculus_bot.research.provider_health import VenueObservation, record_venue_observation
 
 # Injected rather than read from the clock, so both suppression branches keep running forever.
 DURING_SUPPRESSION = date(2026, 7, 25)
@@ -73,6 +72,7 @@ def _cli_main_test_mode(
     tournament_stale: bool = False,
     today: date | None = None,
     stub_bot: MagicMock | None = None,
+    forecaster_class: MagicMock | None = None,
     mode: str = "test_questions",
     only_posts: str | None = None,
 ) -> Iterator[MagicMock]:
@@ -84,16 +84,21 @@ def _cli_main_test_mode(
 
     ``today`` pins the credit-suppression window through cli's own ``credit_alerts_active``
     reference, and ``None`` leaves the real clock (the production path). ``stub_bot`` replaces the
-    whole bot, for tests needing ``alertable_count`` COMPUTED through the real property chain (see
-    ``_bot_with_real_alertable_count``), and makes the ``alertable_count`` argument moot. ``mode``
-    (default ``test_questions``, the cheapest path through ``_question_source``) and ``only_posts``
-    go onto argv; ``fall_cup_reminder`` and ``tournament_stale`` pin verdicts read off the prod clock.
+    whole bot, for ``alertable_count`` COMPUTED through the real property chain (see
+    ``_bot_with_real_alertable_count``); ``forecaster_class`` (see ``_forecaster_class``) replaces
+    the CLASS mock, for tests reading the constructor kwargs cli passed, and its ``return_value``
+    is then the bot. Either makes the ``alertable_count`` argument moot. ``mode`` (default
+    ``test_questions``, the cheapest path through ``_question_source``) and ``only_posts`` go onto
+    argv; ``fall_cup_reminder`` and ``tournament_stale`` pin verdicts read off the prod clock.
     """
-    if stub_bot is None:
-        stub_bot = MagicMock()
-        stub_bot.alertable_count = alertable_count
-    stub_bot.forecast_questions = AsyncMock(return_value=[])
-    stub_bot.forecast_on_tournament = AsyncMock(return_value=[])
+    if forecaster_class is None:
+        if stub_bot is None:
+            stub_bot = MagicMock()
+            stub_bot.alertable_count = alertable_count
+        forecaster_class = MagicMock(return_value=stub_bot)
+    bot_stub = forecaster_class.return_value
+    bot_stub.forecast_questions = AsyncMock(return_value=[])
+    bot_stub.forecast_on_tournament = AsyncMock(return_value=[])
 
     stub_telemetry = MagicMock()
     stub_telemetry.log_end_and_check_floor.return_value = donated_below_floor
@@ -110,7 +115,7 @@ def _cli_main_test_mode(
         with (
             pinned_clock,
             # TemplateForecaster(...) call returns our stub
-            patch("metaculus_bot.cli.TemplateForecaster", return_value=stub_bot),
+            patch("metaculus_bot.cli.TemplateForecaster", forecaster_class),
             # ``get_question_by_url`` hands back a Mock so list construction doesn't explode.
             patch("metaculus_bot.cli.MetaculusApi", MagicMock()),
             # The real hardening permanently mutates MetaculusClient, leaking into every later test in the session.
@@ -125,7 +130,7 @@ def _cli_main_test_mode(
             # The Mantic tournament preflight is an authenticated GET on the real client main builds.
             patch("metaculus_bot.cli.preflight_mantic_tournaments"),
             # A classmethod that iterates forecast_reports; our stub returns [], so keep the surface small.
-            patch.object(type(stub_bot), "log_report_summary", create=True, return_value=None),
+            patch.object(type(bot_stub), "log_report_summary", create=True, return_value=None),
             patch("metaculus_bot.cli.CreditTelemetry", return_value=stub_telemetry),
             # The real install leaks a RoleSpendTracker into litellm's process-global callbacks for the session.
             patch("metaculus_bot.cli.install_role_spend_tracker"),
@@ -133,6 +138,18 @@ def _cli_main_test_mode(
             yield stub_telemetry
     finally:
         sys.argv = argv_backup
+
+
+def _forecaster_class() -> MagicMock:
+    """A ``TemplateForecaster`` class stub whose constructor kwargs stay inspectable.
+
+    Hand it to ``_cli_main_test_mode`` as ``forecaster_class`` when a test reads what cli built and
+    passed in (``research_sink``, ``metaculus_client``) or pins when the class was called at all.
+    ``alertable_count`` is a real int because a run reaching the end of ``main`` compares it.
+    """
+    forecaster_class = MagicMock()
+    forecaster_class.return_value.alertable_count = 0
+    return forecaster_class
 
 
 _FAKE_MANTIC_TOKEN = "m" * 40
@@ -197,7 +214,8 @@ class _RealAlertableCountBot(MagicMock):
 
     EVERY adapter property used by the snapshot has to be listed below (aggregation counters come from
     the real pipeline the fixture installs): a missing owner leaves a ``MagicMock`` in the sum, so
-    ``alertable_count`` stops being an int and every exit-code test in this file fails at once.
+    ``alertable_count`` stops being an int and every exit-code test in ``test_cli_exit_status.py``
+    and ``test_cli_provider_degradation.py`` (both under ``tests/cli/``) fails at once.
     """
 
     alertable_count = TemplateForecaster.alertable_count
@@ -233,15 +251,3 @@ def _bot_with_real_alertable_count() -> _RealAlertableCountBot:
     ):
         setattr(stub_bot, counter, 0)
     return stub_bot
-
-
-def _observe_venue(venue: str, *, candidates: int, rows: int, fields: frozenset[str]) -> None:
-    record_venue_observation(
-        VenueObservation(
-            qid=45082,
-            venue=venue,
-            candidates_pre_filter=candidates,
-            rows_post_filter=rows,
-            liquidity_fields_present=fields,
-        )
-    )

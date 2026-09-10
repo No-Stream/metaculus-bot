@@ -44,15 +44,14 @@ from metaculus_bot.research.provider_health import (
     SIGNAL_CATALOGUE_EMPTY,
     SIGNAL_MARKET_FIELD_CONTRACT,
     VENUE_EXPECTED_LIQUIDITY_FIELDS,
-    VenueObservation,
     log_provider_degradation_summary,
     provider_degradation_count,
     provider_degradation_findings,
     record_catalogue_size,
-    record_venue_observation,
     recorded_observations,
     reset_provider_health,
 )
+from tests.provider_health_fakes import observe_venue
 
 _PAYLOADS_PATH = Path(__file__).parent / "data" / "prediction_market_venue_payloads.json"
 _MULTI_CLOSE_PATH = Path(__file__).parent / "data" / "kalshi_multi_close_event_2026_08_04.json"
@@ -200,28 +199,6 @@ def test_the_manifold_multi_outcome_fixture_is_committed_and_still_splits_search
     assert payload["detail_binary"]["probability"] is not None
 
 
-def _observe(
-    venue: str,
-    *,
-    qid: int = 1,
-    candidates: int = 3,
-    rows: int = 3,
-    fields_present: frozenset[str] | None = None,
-) -> None:
-    """Record one venue observation, defaulting to a healthy shape."""
-    if fields_present is None:
-        fields_present = frozenset(VENUE_EXPECTED_LIQUIDITY_FIELDS[venue])
-    record_venue_observation(
-        VenueObservation(
-            qid=qid,
-            venue=venue,
-            candidates_pre_filter=candidates,
-            rows_post_filter=rows,
-            liquidity_fields_present=fields_present,
-        )
-    )
-
-
 def _kalshi_rows(events: list[dict]) -> list[MarketMatch]:
     """A candidate row per catalogue event. No query and no floor.
 
@@ -287,7 +264,7 @@ class TestSignalMarketFieldContract:
         rows = _kalshi_rows(captured_payloads["kalshi_events"]["events"])
         assert rows, "captured payload must yield at least one Kalshi row"
 
-        _observe("kalshi", rows=len(rows), fields_present=_fields_present(rows, "kalshi"))
+        observe_venue("kalshi", rows=len(rows), fields=_fields_present(rows, "kalshi"))
         every_row_blank = all(_liquidity_label(row) == "no-liquidity-data" for row in rows)
         fired = bool([f for f in provider_degradation_findings() if f.signal == SIGNAL_MARKET_FIELD_CONTRACT])
         assert fired == every_row_blank
@@ -305,7 +282,7 @@ class TestSignalMarketFieldContract:
         rows = parse_polymarket_matches(captured_payloads["polymarket_search"], width=RETRIEVAL_WIDTH["polymarket"])
         assert rows, "captured payload must yield at least one Polymarket row"
 
-        _observe("polymarket", rows=len(rows), fields_present=_fields_present(rows, "polymarket"))
+        observe_venue("polymarket", rows=len(rows), fields=_fields_present(rows, "polymarket"))
         dead_fields = {
             name
             for name in VENUE_EXPECTED_LIQUIDITY_FIELDS["polymarket"]
@@ -325,7 +302,7 @@ class TestSignalMarketFieldContract:
         rows = parse_manifold_matches(captured_payloads["manifold_search"], width=RETRIEVAL_WIDTH["manifold"])
         assert rows, "captured payload must yield at least one Manifold row"
 
-        _observe("manifold", rows=len(rows), fields_present=_fields_present(rows, "manifold"))
+        observe_venue("manifold", rows=len(rows), fields=_fields_present(rows, "manifold"))
         assert provider_degradation_findings() == []
 
     def test_predictit_declares_no_fields_and_populates_none(self, captured_payloads: dict) -> None:
@@ -379,13 +356,13 @@ class TestSignalMarketFieldContract:
     def test_predictit_all_none_rows_are_exempt(self) -> None:
         """The honest-blank case. PredictIt genuinely exposes no liquidity fields, so
         its 141/141 archived blanks are a fact about PredictIt, not a defect."""
-        _observe("predictit", rows=3, fields_present=frozenset())
+        observe_venue("predictit", rows=3, fields=frozenset())
         assert provider_degradation_findings() == []
 
     def test_a_dead_field_fires_once_per_venue(self) -> None:
         """Both Kalshi fields dead across three rows is ONE defect, not six events:
         the count carries no diagnostic weight, the log line carries all of it."""
-        _observe("kalshi", rows=3, fields_present=frozenset())
+        observe_venue("kalshi", rows=3, fields=frozenset())
         findings = provider_degradation_findings()
 
         assert len(findings) == 1
@@ -417,7 +394,7 @@ class TestSignalMarketFieldContract:
         )
         assert _liquidity_label(row) == "thin"
 
-        _observe("kalshi", rows=1, fields_present=_fields_present([row], "kalshi"))
+        observe_venue("kalshi", rows=1, fields=_fields_present([row], "kalshi"))
         assert provider_degradation_findings() == []
 
     def test_a_venue_with_an_empty_pool_is_never_evaluated(self) -> None:
@@ -425,7 +402,7 @@ class TestSignalMarketFieldContract:
         at venues that put at least one candidate in the pool. This is the whole
         false-positive defence, and it is a statement about the POOL — nothing about
         the render can silence the rule."""
-        _observe("kalshi", candidates=0, rows=0, fields_present=frozenset())
+        observe_venue("kalshi", candidates=0, rows=0, fields=frozenset())
         assert provider_degradation_findings() == []
 
     def test_a_dead_field_fires_even_when_the_ranker_rendered_nothing(self) -> None:
@@ -438,7 +415,7 @@ class TestSignalMarketFieldContract:
         dead parser alert or stay silent purely on the model's pick — which is the
         2026-07-12 Kalshi hole (labels blank on 100% of rows for weeks) reopened.
         """
-        _observe("kalshi", candidates=40, rows=0, fields_present=frozenset())
+        observe_venue("kalshi", candidates=40, rows=0, fields=frozenset())
         findings = provider_degradation_findings()
 
         assert len(findings) == 1
@@ -468,7 +445,7 @@ class TestSignalMarketFieldContract:
         assert len(predictit) == len(payload["predictit_all"]["markets"])
         for venue, rows in (("kalshi", kalshi), ("predictit", predictit)):
             assert rows, f"{venue}: a healthy catalogue must always reach the pool"
-            _observe(venue, candidates=len(rows), rows=0, fields_present=_fields_present(rows, venue))
+            observe_venue(venue, candidates=len(rows), rows=0, fields=_fields_present(rows, venue))
 
         # Zero RENDERED rows on both, and the signal still reads the real parser state:
         # these captured payloads populate every declared field, so nothing fires.
@@ -486,21 +463,13 @@ class TestSignalMarketFieldContract:
         — and would alert on any venue whose thinly-traded markets happen to omit a
         field on one question of a two-question run.
         """
-        _observe("kalshi", qid=1, rows=3, fields_present=frozenset({"total_volume", "open_interest"}))
-        _observe("kalshi", qid=2, rows=3, fields_present=frozenset())
+        observe_venue("kalshi", qid=1, rows=3, fields=frozenset({"total_volume", "open_interest"}))
+        observe_venue("kalshi", qid=2, rows=3, fields=frozenset())
         assert provider_degradation_findings() == []
 
     def test_partial_presence_within_a_question_does_not_fire(self) -> None:
         """One row carrying the field is enough to prove the upstream key exists."""
-        record_venue_observation(
-            VenueObservation(
-                qid=1,
-                venue="kalshi",
-                candidates_pre_filter=3,
-                rows_post_filter=3,
-                liquidity_fields_present=frozenset({"total_volume", "open_interest"}),
-            )
-        )
+        observe_venue("kalshi", fields=frozenset({"total_volume", "open_interest"}))
         assert provider_degradation_findings() == []
 
     def test_one_dead_field_of_two_still_fires(self) -> None:
@@ -508,7 +477,7 @@ class TestSignalMarketFieldContract:
         while ``open_interest`` was None on all 41. A per-field rule catches that; a
         rule keyed on "the label went blank" would not, because
         ``_liquidity_label`` falls back to whichever field survived."""
-        _observe("polymarket", rows=3, fields_present=frozenset({"total_volume"}))
+        observe_venue("polymarket", rows=3, fields=frozenset({"total_volume"}))
         findings = provider_degradation_findings()
 
         assert len(findings) == 1
@@ -569,7 +538,7 @@ class TestPerRunReset:
         """Without a per-run reset the observations leak across runs sharing a
         process and across tests, poisoning every later ``alertable == 0``
         assertion — the footgun ``reset_source_loss_counter`` already exists for."""
-        _observe("kalshi", rows=3, fields_present=frozenset())
+        observe_venue("kalshi", rows=3, fields=frozenset())
         assert provider_degradation_findings()
 
         reset_provider_health()
@@ -581,7 +550,7 @@ class TestPerRunReset:
         what ``forecast_questions`` calls, so the reset has to be reachable from
         there."""
         orch = ResearchOrchestrator(default_llm=MagicMock(), summarizer_llm=MagicMock())
-        _observe("kalshi", rows=3, fields_present=frozenset())
+        observe_venue("kalshi", rows=3, fields=frozenset())
         assert orch.provider_degradation_count == 1
 
         orch.reset_run_degradation_counters()
@@ -608,10 +577,10 @@ class TestSuppression:
     ) -> None:
 
         monkeypatch.setitem(PROVIDER_DEGRADATION_SUPPRESSED_UNTIL, "manifold", date(2026, 9, 10))
-        _observe("kalshi")
-        _observe("predictit")
-        _observe("polymarket")
-        _observe("manifold", fields_present=frozenset())
+        observe_venue("kalshi")
+        observe_venue("predictit")
+        observe_venue("polymarket")
+        observe_venue("manifold", fields=frozenset())
 
         findings = provider_degradation_findings(DURING_SUPPRESSION)
         assert len(findings) == 1
@@ -636,10 +605,10 @@ class TestSuppression:
         """Both dates injected, never read from the clock, so both branches keep
         running after the real date passes."""
         monkeypatch.setitem(PROVIDER_DEGRADATION_SUPPRESSED_UNTIL, "manifold", date(2026, 9, 10))
-        _observe("kalshi")
-        _observe("predictit")
-        _observe("polymarket")
-        _observe("manifold", fields_present=frozenset())
+        observe_venue("kalshi")
+        observe_venue("predictit")
+        observe_venue("polymarket")
+        observe_venue("manifold", fields=frozenset())
 
         assert provider_degradation_count(AFTER_RESUME_DATE) == 1
 
@@ -647,10 +616,10 @@ class TestSuppression:
         """Per-venue rather than global: accepting a dead Manifold must not hide a
         dead Kalshi."""
         monkeypatch.setitem(PROVIDER_DEGRADATION_SUPPRESSED_UNTIL, "manifold", date(2026, 9, 10))
-        _observe("kalshi", rows=3, fields_present=frozenset())
-        _observe("predictit")
-        _observe("polymarket")
-        _observe("manifold", fields_present=frozenset())
+        observe_venue("kalshi", rows=3, fields=frozenset())
+        observe_venue("predictit")
+        observe_venue("polymarket")
+        observe_venue("manifold", fields=frozenset())
 
         findings = provider_degradation_findings(DURING_SUPPRESSION)
         assert {(f.venue, f.is_alertable) for f in findings} == {("kalshi", True), ("manifold", False)}
@@ -679,10 +648,10 @@ class TestSummaryLine:
         vacuous kind (2026-08-24 residual round). The denominators make the zero
         readable: venues_observed counts venue observations, catalogues_observed the
         prefetch observations, pool_rows the summed pre-filter candidates."""
-        _observe("kalshi", candidates=100)
-        _observe("polymarket", candidates=60)
-        _observe("manifold", candidates=59)
-        _observe("predictit", candidates=197)
+        observe_venue("kalshi", candidates=100)
+        observe_venue("polymarket", candidates=60)
+        observe_venue("manifold", candidates=59)
+        observe_venue("predictit", candidates=197)
         record_catalogue_size(qid=1, source="kalshi_events", entries=12355, fetch_ok=True)
         record_catalogue_size(qid=1, source="predictit_markets", entries=197, fetch_ok=True)
 
@@ -695,7 +664,7 @@ class TestSummaryLine:
 
     def test_marker_detail_round_trips_through_json(self, caplog: pytest.LogCaptureFixture) -> None:
 
-        _observe("kalshi", rows=3, fields_present=frozenset())
+        observe_venue("kalshi", rows=3, fields=frozenset())
         with caplog.at_level(logging.INFO, logger="metaculus_bot.research.provider_health"):
             log_provider_degradation_summary()
 
@@ -739,7 +708,7 @@ class TestSummaryLine:
         column, so the WARN the operator reads first has to name the likely cause and
         the file to open."""
 
-        _observe("kalshi", rows=3, fields_present=frozenset())
+        observe_venue("kalshi", rows=3, fields=frozenset())
         with caplog.at_level(logging.WARNING, logger="metaculus_bot.research.provider_health"):
             log_provider_degradation_summary()
 
@@ -773,7 +742,7 @@ class TestRemedyPathsPointAtRealFiles:
     def test_every_venues_field_contract_remedy_names_its_own_module(self, venue: str) -> None:
         if not VENUE_EXPECTED_LIQUIDITY_FIELDS[venue]:
             pytest.skip(f"{venue} declares no liquidity fields, so Signal A never evaluates it")
-        _observe(venue, rows=2, fields_present=frozenset())
+        observe_venue(venue, rows=2, fields=frozenset())
 
         findings = provider_degradation_findings()
 

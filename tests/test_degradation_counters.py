@@ -24,6 +24,7 @@ from metaculus_bot.degradation_counters import (
     format_degradation_summary,
 )
 from metaculus_bot.research import prediction_market, provider_health
+from tests.provider_health_fakes import observe_venue
 
 
 def _bot(mock_general_llm, *, with_stacker: bool = False, **kwargs: Any) -> TemplateForecaster:
@@ -223,15 +224,7 @@ async def test_run_start_resets_provider_health_observations(mock_general_llm):
     """
     bot = _bot(mock_general_llm)
 
-    provider_health.record_venue_observation(
-        provider_health.VenueObservation(
-            qid=1,
-            venue="kalshi",
-            candidates_pre_filter=3,
-            rows_post_filter=3,
-            liquidity_fields_present=frozenset(),
-        )
-    )
+    observe_venue("kalshi", fields=frozenset())
     assert bot.alertable_count == 1
 
     await bot.forecast_questions([])

@@ -9,14 +9,14 @@ is covered in ``tests/test_tournament_dates.py``.
 from __future__ import annotations
 
 import logging
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
 from metaculus_bot.cli import RunMode, _check_tournament_dates
 from metaculus_bot.cli import main as cli_main
 from metaculus_bot.constants import MANTIC_TOURNAMENT_END_DATE, MANTIC_TOURNAMENT_ID, TournamentExpiredError
-from tests.cli_test_helpers import _cli_main_test_mode, _mantic_env
+from tests.cli_test_helpers import _cli_main_test_mode, _forecaster_class, _mantic_env
 
 
 class TestCliFallCupReminderExit:
@@ -114,10 +114,9 @@ class TestTournamentDateCheck:
         check_dates.assert_not_called()
 
     def test_the_shared_hard_stop_still_raises_before_the_forecaster_is_built(self) -> None:
-        forecaster_class = MagicMock()
+        forecaster_class = _forecaster_class()
         with (
-            _cli_main_test_mode(alertable_count=0, mode="tournament"),
-            patch("metaculus_bot.cli.TemplateForecaster", forecaster_class),
+            _cli_main_test_mode(alertable_count=0, mode="tournament", forecaster_class=forecaster_class),
             patch("metaculus_bot.cli.check_tournament_dates", side_effect=TournamentExpiredError("stale")),
             pytest.raises(TournamentExpiredError),
         ):

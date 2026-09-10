@@ -42,6 +42,7 @@ from tests.cli_test_helpers import (
     _cli_main_test_mode,
     _configure_process_stubs,
     _filterable_bot,
+    _forecaster_class,
     _mantic_env,
 )
 
@@ -284,23 +285,10 @@ class TestManticClientWiring:
     builds its default Metaculus client) otherwise. The client is built only after the fail-shut
     check and the identity preflight, so the Mantic token is not even read before the host is vetted."""
 
-    @staticmethod
-    def _forecaster_class() -> MagicMock:
-        """A ``TemplateForecaster`` class stub that keeps the constructor kwargs inspectable (the
-        harness's own patch discards its mock) and whose instance forecasts nothing."""
-        forecaster_class = MagicMock()
-        forecaster_class.return_value.alertable_count = 0
-        forecaster_class.return_value.forecast_on_tournament = AsyncMock(return_value=[])
-        forecaster_class.return_value.forecast_questions = AsyncMock(return_value=[])
-        return forecaster_class
-
     def test_mantic_mode_injects_a_mantic_client(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _mantic_env(monkeypatch)
-        forecaster_class = self._forecaster_class()
-        with (
-            _cli_main_test_mode(alertable_count=0, mode="mantic"),
-            patch("metaculus_bot.cli.TemplateForecaster", forecaster_class),
-        ):
+        forecaster_class = _forecaster_class()
+        with _cli_main_test_mode(alertable_count=0, mode="mantic", forecaster_class=forecaster_class):
             cli_main()
         client = forecaster_class.call_args.kwargs["metaculus_client"]
         assert isinstance(client, ManticClient)
@@ -308,11 +296,8 @@ class TestManticClientWiring:
 
     @pytest.mark.parametrize("run_mode", sorted(set(get_args(RunMode)) - {"mantic"}))
     def test_metaculus_modes_leave_the_framework_default_client(self, run_mode: RunMode) -> None:
-        forecaster_class = self._forecaster_class()
-        with (
-            _cli_main_test_mode(alertable_count=0, mode=run_mode),
-            patch("metaculus_bot.cli.TemplateForecaster", forecaster_class),
-        ):
+        forecaster_class = _forecaster_class()
+        with _cli_main_test_mode(alertable_count=0, mode=run_mode, forecaster_class=forecaster_class):
             cli_main()
         assert forecaster_class.call_args.kwargs["metaculus_client"] is None
 
@@ -320,10 +305,9 @@ class TestManticClientWiring:
         """The switch at its default: the guard raises, so no preflight GET, token read, forecaster or spend."""
         monkeypatch.delenv(DONATED_OPENROUTER_KEY_ENABLED_ENV, raising=False)
         monkeypatch.setenv(MANTIC_TOKEN_ENV, _FAKE_MANTIC_TOKEN)
-        forecaster_class = self._forecaster_class()
+        forecaster_class = _forecaster_class()
         with (
-            _cli_main_test_mode(alertable_count=0, mode="mantic"),
-            patch("metaculus_bot.cli.TemplateForecaster", forecaster_class),
+            _cli_main_test_mode(alertable_count=0, mode="mantic", forecaster_class=forecaster_class),
             patch("metaculus_bot.cli.build_mantic_client") as build_client,
             patch("metaculus_bot.cli.verify_api_identity") as verify_api,
             pytest.raises(RuntimeError, match=DONATED_OPENROUTER_KEY_ENABLED_ENV),
@@ -339,10 +323,9 @@ class TestManticClientWiring:
         the token read before the host was vetted."""
         _mantic_env(monkeypatch)
         manager = MagicMock()
-        forecaster_class = self._forecaster_class()
+        forecaster_class = _forecaster_class()
         with (
-            _cli_main_test_mode(alertable_count=0, mode="mantic"),
-            patch("metaculus_bot.cli.TemplateForecaster", forecaster_class),
+            _cli_main_test_mode(alertable_count=0, mode="mantic", forecaster_class=forecaster_class),
             patch("metaculus_bot.cli._assert_personal_keys_only") as guard,
             patch("metaculus_bot.cli.verify_api_identity") as verify_api,
             patch("metaculus_bot.cli.build_mantic_client") as build_client,
@@ -367,10 +350,9 @@ class TestManticClientWiring:
         GET on THAT client, then the forecaster. Nothing has been spent when the preflight raises."""
         _mantic_env(monkeypatch)
         manager = MagicMock()
-        forecaster_class = self._forecaster_class()
+        forecaster_class = _forecaster_class()
         with (
-            _cli_main_test_mode(alertable_count=0, mode="mantic"),
-            patch("metaculus_bot.cli.TemplateForecaster", forecaster_class),
+            _cli_main_test_mode(alertable_count=0, mode="mantic", forecaster_class=forecaster_class),
             patch("metaculus_bot.cli.build_mantic_client") as build_client,
             patch("metaculus_bot.cli.preflight_mantic_tournaments") as preflight,
         ):
@@ -391,10 +373,9 @@ class TestManticClientWiring:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _mantic_env(monkeypatch)
-        forecaster_class = self._forecaster_class()
+        forecaster_class = _forecaster_class()
         with (
-            _cli_main_test_mode(alertable_count=0, mode="mantic"),
-            patch("metaculus_bot.cli.TemplateForecaster", forecaster_class),
+            _cli_main_test_mode(alertable_count=0, mode="mantic", forecaster_class=forecaster_class),
             patch("metaculus_bot.cli.preflight_mantic_tournaments", side_effect=ApiIdentityError("viewer")),
             pytest.raises(ApiIdentityError, match="viewer"),
         ):

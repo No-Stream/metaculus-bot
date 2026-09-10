@@ -15,15 +15,14 @@ import pytest
 import metaculus_bot.research.prediction_market as pmp
 from metaculus_bot.cli import main as cli_main
 from metaculus_bot.constants import PROVIDER_DEGRADATION_SUPPRESSED_UNTIL
-from metaculus_bot.research.provider_health import VENUE_EXPECTED_LIQUIDITY_FIELDS
 from tests.cli_test_helpers import (
     AFTER_RESUME_DATE,
     PERMANENTLY_FUTURE_RESUME,
     PERMANENTLY_PAST_RESUME,
     _bot_with_real_alertable_count,
     _cli_main_test_mode,
-    _observe_venue,
 )
+from tests.provider_health_fakes import observe_venue
 
 
 class TestCliProviderDegradationExit:
@@ -40,7 +39,7 @@ class TestCliProviderDegradationExit:
     def _degrade_kalshi_liquidity_fields() -> None:
         """Record the shape the Kalshi defect produced: three rows with both declared
         liquidity fields absent, so every row renders ``no-liquidity-data``."""
-        _observe_venue("kalshi", candidates=3, rows=3, fields=frozenset())
+        observe_venue("kalshi", fields=frozenset())
 
     def test_one_finding_exits_non_zero(self) -> None:
         """The end-to-end wiring, with alertable_count computed rather than pinned."""
@@ -70,7 +69,7 @@ class TestCliProviderDegradationExit:
         """
         bot = _bot_with_real_alertable_count()
         for venue in ("polymarket", "kalshi", "manifold", "predictit"):
-            _observe_venue(venue, candidates=0, rows=0, fields=frozenset())
+            observe_venue(venue, candidates=0, rows=0, fields=frozenset())
         assert bot.alertable_count == 0
 
         with _cli_main_test_mode(alertable_count=0, stub_bot=bot, today=AFTER_RESUME_DATE):
@@ -88,9 +87,8 @@ class TestCliProviderDegradationExit:
         calls would pass just as happily if the exit came first.
 
         ``log_report_summary`` is invoked as ``TemplateForecaster.log_report_summary``
-        on the CLASS, so it lands on the class mock cli holds, not on the bot instance.
-        This test re-patches that name to keep a handle on it — the helper's own patch
-        discards it.
+        on the CLASS, so the spy that records it belongs on the class mock the harness is
+        handed, not on the bot instance.
         """
         bot = _bot_with_real_alertable_count()
         self._degrade_kalshi_liquidity_fields()
@@ -99,17 +97,16 @@ class TestCliProviderDegradationExit:
         forecaster_class = MagicMock(return_value=bot)
         forecaster_class.log_report_summary.side_effect = lambda *a, **k: events.append("report_summary")
 
-        with _cli_main_test_mode(alertable_count=0, stub_bot=bot, today=AFTER_RESUME_DATE):
-            # Set INSIDE the context: the helper installs its own forecast stub on entry.
+        with _cli_main_test_mode(alertable_count=0, forecaster_class=forecaster_class, today=AFTER_RESUME_DATE):
+            # Set INSIDE the context: the harness installs its own forecast stub on entry.
             async def _record_forecast(*_args: object, **_kwargs: object) -> list[object]:
                 events.append("forecast")
                 return []
 
             bot.forecast_questions = AsyncMock(side_effect=_record_forecast)
-            with patch("metaculus_bot.cli.TemplateForecaster", forecaster_class):
-                with pytest.raises(SystemExit) as exc_info:
-                    cli_main()
-                assert exc_info.value.code == 1
+            with pytest.raises(SystemExit) as exc_info:
+                cli_main()
+            assert exc_info.value.code == 1
 
         events.append("exit")
         assert events == ["forecast", "report_summary", "exit"]
@@ -126,9 +123,9 @@ class TestCliProviderDegradationExit:
         """
         bot = _bot_with_real_alertable_count()
         for venue in ("kalshi", "predictit", "polymarket"):
-            _observe_venue(venue, candidates=3, rows=3, fields=frozenset(VENUE_EXPECTED_LIQUIDITY_FIELDS[venue]))
+            observe_venue(venue)
         # Manifold's declared `num_bettors` absent from every row: one finding, on the venue under test.
-        _observe_venue("manifold", candidates=3, rows=3, fields=frozenset())
+        observe_venue("manifold", fields=frozenset())
 
         with patch.dict(PROVIDER_DEGRADATION_SUPPRESSED_UNTIL, {"manifold": PERMANENTLY_FUTURE_RESUME}):
             assert bot.alertable_count == 0

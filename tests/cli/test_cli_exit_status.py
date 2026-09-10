@@ -160,8 +160,7 @@ class TestAlertableSummarySurvivesForecastFailure:
         forecaster_class.log_report_summary.side_effect = RuntimeError("1 errors occurred while forecasting")
 
         with (
-            _cli_main_test_mode(alertable_count=0, stub_bot=bot, today=AFTER_RESUME_DATE),
-            patch("metaculus_bot.cli.TemplateForecaster", forecaster_class),
+            _cli_main_test_mode(alertable_count=0, forecaster_class=forecaster_class, today=AFTER_RESUME_DATE),
             caplog.at_level(logging.WARNING, logger="metaculus_bot.cli"),
             pytest.raises(RuntimeError, match="errors occurred while forecasting"),
         ):
@@ -183,8 +182,7 @@ class TestAlertableSummarySurvivesForecastFailure:
         forecaster_class.log_report_summary.side_effect = RuntimeError("2 errors occurred while forecasting")
 
         with (
-            _cli_main_test_mode(alertable_count=0, stub_bot=bot, today=AFTER_RESUME_DATE),
-            patch("metaculus_bot.cli.TemplateForecaster", forecaster_class),
+            _cli_main_test_mode(alertable_count=0, forecaster_class=forecaster_class, today=AFTER_RESUME_DATE),
             caplog.at_level(logging.WARNING, logger="metaculus_bot.cli"),
             pytest.raises(RuntimeError),
         ):

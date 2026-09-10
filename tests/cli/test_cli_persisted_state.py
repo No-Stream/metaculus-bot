@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import ClassVar, get_args
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from forecasting_tools import MetaculusApi
@@ -22,7 +22,7 @@ from metaculus_bot.constants import (
     PERSIST_RESEARCH_ENABLED_ENV,
     TOURNAMENT_ID,
 )
-from tests.cli_test_helpers import _cli_main_test_mode, _mantic_env, asyncio_run_stub
+from tests.cli_test_helpers import _cli_main_test_mode, _forecaster_class, _mantic_env, asyncio_run_stub
 
 
 class TestPersistedTournamentId:
@@ -70,8 +70,7 @@ class TestPersistedTournamentId:
         monkeypatch.setenv(PERSIST_RESEARCH_ENABLED_ENV, "true")
         monkeypatch.chdir(tmp_path)  # writer.flush() writes research_outputs/ under CWD
 
-        forecaster_class = MagicMock()
-        forecaster_class.return_value.alertable_count = 0
+        forecaster_class = _forecaster_class()
 
         def _record_then_return(*_args: object, **_kwargs: object) -> list[object]:
             forecaster_class.call_args.kwargs["research_sink"](
@@ -85,8 +84,7 @@ class TestPersistedTournamentId:
             return []
 
         with (
-            _cli_main_test_mode(alertable_count=0, mode="metaculus_cup"),
-            patch("metaculus_bot.cli.TemplateForecaster", forecaster_class),
+            _cli_main_test_mode(alertable_count=0, mode="metaculus_cup", forecaster_class=forecaster_class),
             patch("metaculus_bot.cli.asyncio.run", side_effect=asyncio_run_stub(_record_then_return)),
         ):
             cli_main()
@@ -107,8 +105,7 @@ class TestPersistedTournamentId:
         monkeypatch.setenv(PERSIST_RESEARCH_ENABLED_ENV, "true")
         monkeypatch.chdir(tmp_path)
 
-        forecaster_class = MagicMock()
-        forecaster_class.return_value.alertable_count = 0
+        forecaster_class = _forecaster_class()
 
         def _record_then_return(*_args: object, **_kwargs: object) -> list[object]:
             forecaster_class.call_args.kwargs["research_sink"](
@@ -122,8 +119,7 @@ class TestPersistedTournamentId:
             return []
 
         with (
-            _cli_main_test_mode(alertable_count=0, mode="mantic"),
-            patch("metaculus_bot.cli.TemplateForecaster", forecaster_class),
+            _cli_main_test_mode(alertable_count=0, mode="mantic", forecaster_class=forecaster_class),
             patch("metaculus_bot.cli.asyncio.run", side_effect=asyncio_run_stub(_record_then_return)),
         ):
             cli_main()
