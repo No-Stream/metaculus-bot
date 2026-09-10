@@ -152,6 +152,28 @@ and turns a breach into an error `ToolOutcome` rather than a crash.
   otherwise reach, and on Mantic the page it would read carries the other bots'
   forecasts.
 
+### The three known-API tools (built, wiring pending)
+
+Three more tools are built in `research/known_api/tools.py` (`build_known_api_tools`) and wait on
+the shared fetch-ladder merge before they are appended to the driver's list. They answer a
+FRED/Yahoo/Kalshi read deterministically, no LLM and no paid key, and return a date window on
+demand that the URL forms cannot express. The registry also translates those URL shapes at the
+ladder's rung 0, so the driver can still just `fetch` the URL and get the API answer. Detail:
+`docs/research.md` "Known-API registry".
+
+- **`fred_series`**: one FRED (Federal Reserve Economic Data) series over a date window, or a
+  free-text search over FRED's catalogue. `series_id` with optional `start`/`end` ISO dates and
+  `first_release`, or `search`.
+- **`yahoo_history`**: one Yahoo Finance symbol's price history over a date window. `ticker` with
+  optional `start`/`end` and `column` in Close/High/Low/Open.
+- **`market_snapshot`**: a prediction-market snapshot for one `venue` (kalshi, polymarket,
+  manifold, predictit) and `market` given as a venue id/ticker or free text.
+
+Each handler adapts its backend's result to a `ToolOutcome` with method `known_api`; the market
+handler binds the per-question session, the run's Kalshi catalogue and PredictIt dump, and the
+Kalshi detail semaphore. The bounds (window cap, per-call timeouts, five market rows, four Kalshi
+GETs) live with the backends, documented in `docs/research.md` "Known-API registry".
+
 ### The fetch ladder
 
 `fetch` (`tools.py` `fetch`) tries progressively heavier methods and only

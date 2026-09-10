@@ -666,6 +666,22 @@ in the fair-access User-Agent, and `edgar_session()` refuses to open a socket wi
 `docs/research.md` "SEC EDGAR client". The ranked list of public APIs for the other blocked hosts
 is `scratch/cost_pass_2026-09-09/public_apis/PUBLIC_APIS.md`.
 
+### Known-API registry: BUILT 2026-09-10, wiring and the heavy EDGAR tools deferred
+
+`metaculus_bot/research/known_api/` turns FRED, Yahoo Finance, Kalshi and SEC EDGAR URLs into
+deterministic API calls (`translate` plus the `fred_series` / `yahoo_history` / `market_snapshot`
+backends and their three gap-fill tools, and an `edgar` backend that declines without a contact),
+built to fill the fetch ladder's rung-0 seat. Two things stay deferred. **The wiring**: appending
+the three tools to the loop's tool list, wiring `translate` into `policy.known_api`, and the
+additive `known_api` `FetchRoute` / `_METHOD_TO_TIER` / `proposed_by=gap_fill_driver` edits, all a
+few lines once the shared-fetch-ladder branch merges. **The heavy EDGAR driver tools**: a
+`full_text_search` tool ("has any filer mentioned X since date D") and a `company_facts` tool
+("what did the filer report for concept C") answer the S-1 and 10-K reads without pulling a 3-7 MB
+document, but they are new driver-facing tools with their own schemas and token cost, so they wait
+until the registry has run and shown demand. `sec_edgar.py` already carries `full_text_search` and
+`company_facts`, so these are a thin tool wrapper when wanted. Detail: `docs/research.md`
+"Known-API registry"; the design is `scratch/cost_pass_2026-09-09/api_tools/API_TOOLS.md`.
+
 ### Screenshot plus vision read for pages whose rendered DOM carries no text (2026-09-09)
 
 **Status:** not started. Bottom of high priority by the operator's call: heavy, and rare in the record.

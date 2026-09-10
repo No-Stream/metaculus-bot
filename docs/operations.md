@@ -288,6 +288,15 @@ Other keys, all personal, no shared variants: `METACULUS_TOKEN`, `MANTIC_TOKEN`
 if you bypass OpenRouter; most flows route through OpenRouter and don't need
 them.
 
+`SEC_EDGAR_CONTACT_EMAIL` is not a key but a contact address (also personal): the SEC EDGAR
+client puts it in the fair-access User-Agent, and the client declines to dial without it. The
+operator created it as a GitHub Actions repository secret on 2026-09-09, and the four
+`run_bot_on_*.yaml` prod workflows now pass it into their `env:` blocks as
+`SEC_EDGAR_CONTACT_EMAIL: ${{ secrets.SEC_EDGAR_CONTACT_EMAIL }}`. Its `.env.template` placeholder
+stays commented; the real address lives only in the untracked local `.env`. Until the known-API
+registry is wired into the fetch ladder nothing reads it at run time, so an unset value is
+harmless (the EDGAR client simply stays inert).
+
 Diagnosing auth errors: an OpenRouter 401/402 on an OpenAI or Anthropic call
 means suspect the donated key first (it's always tried first for those
 providers). A 401/402/credit error on an OpenRouter Gemini call also means the
