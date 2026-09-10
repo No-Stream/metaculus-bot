@@ -66,6 +66,8 @@ _METHOD_TO_TIER: dict[str, str] = {
     # absent from here a page it really did retrieve would stay untiered and its discrepancy
     # silently demoted below the briefing, the 131.3 failure mode above.
     "impersonate": "fetched",
+    # The archive served the host's own bytes with the age disclosed in-text (tools._try_wayback_fetch).
+    "wayback": "fetched",
     "cache": "fetched",
     "pdf_local": "fetched",
     "digest_local": "fetched",

@@ -36,6 +36,7 @@ import asyncio
 import logging
 import os
 from collections import OrderedDict
+from datetime import UTC, datetime
 from time import monotonic
 from urllib.parse import urlparse
 
@@ -112,6 +113,13 @@ from metaculus_bot.research.rendered_fetch import (
     render_page,
 )
 from metaculus_bot.research.robots_policy import ROBOTS_FETCH_TIMEOUT_S, google_extended_blocks_url, robots_host
+from metaculus_bot.research.wayback import (
+    innermost_url,
+    parse_snapshot_url,
+    snapshot_age_days,
+    wayback_lead,
+    wayback_snapshot_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -559,6 +567,61 @@ async def _fetch_plain_with_impersonated_retry(
     return plain
 
 
+def _wayback_applies(plain: PlainFetchResult) -> bool:
+    """Whether the archive is a plausible substitute for this failed fetch.
+
+    True for a host that refused us (403/406/429, ``http_status`` set) or never answered
+    (``error``), never for a URL WE refused: a non-public target or a question-platform
+    self-reference comes back ``blocked`` with no ``http_status``, and handing that to the archive
+    is the SSRF bypass Tier 1's ``ssrf_blocked`` exclusion prevents. A JS wall is ``empty``/``ok``,
+    not here, so the unrendered shell the archive stores is never tried where the browser rung is
+    the right rescue.
+    """
+    if plain.status == "error":
+        return True
+    return plain.status == "blocked" and plain.http_status is not None
+
+
+async def _try_wayback_fetch(
+    url: str, direct: PlainFetchResult, *, now: datetime | None = None
+) -> PlainFetchResult | None:
+    """The Wayback Machine as the last free rung: fetch the freshest capture, or decline.
+
+    Reuses ``research.wayback``'s pure helpers and this ladder's own ``_fetch_plain`` for the
+    snapshot GET, so the 5 MiB body cap, the redirect vetting and the classification are the same
+    a live page gets. Unlike Tier 1's rung it applies NO age bound: Tier 1's 30-day cutoff is
+    calibrated on a URL the question cites as its grading source, and a driver-chosen URL carries
+    no such guarantee, so the capture date is SURFACED in the served text (``wayback_lead``) for the
+    driver to weigh rather than silently enforced. The inner URL a capture is OF is re-guarded
+    (``resolution_source._hop_refusal``) because a capture of a platform page presents
+    ``web.archive.org`` as its host and would clear a self-reference check.
+    """
+    now = now or datetime.now(UTC)
+    snapshot = await _fetch_plain(wayback_snapshot_url(url, now=now))
+    if snapshot.status != "ok":
+        # No capture served, or a capture we could not read (a JS-wall shell extracts to nothing).
+        return None
+    parsed = parse_snapshot_url(snapshot.url)
+    if parsed is None:
+        # Undatable: the archive answered our year request directly rather than a dated capture, so
+        # the copy cannot carry the age disclosure that makes it admissible.
+        return None
+    if await resolution_source._hop_refusal(innermost_url(parsed.inner_url)) is not None:
+        return None
+    age_days = snapshot_age_days(parsed, now)
+    if age_days is None:
+        return None
+    lead = wayback_lead(parsed, age_days, direct.status)
+    return PlainFetchResult(
+        status="ok",
+        method="wayback",
+        text=f"{lead}\n\n{snapshot.text}",
+        links=snapshot.links,
+        url=url,
+        content_type=snapshot.content_type,
+    )
+
+
 async def search_news(query: str) -> ToolOutcome:
     client_id = os.getenv(ASKNEWS_CLIENT_ID_ENV)
     secret = os.getenv(ASKNEWS_SECRET_ENV)
@@ -762,6 +825,12 @@ async def fetch(url: str, start_char: int = 0, *, question_topic: str = "") -> T
         return cached
 
     plain = await _fetch_plain_with_impersonated_retry(url)
+    if _wayback_applies(plain):
+        # A host that refused us or never answered: the archive is the one free route whose egress
+        # is not ours. A rescue serves with its capture date disclosed; a decline leaves plain as-is.
+        rescued = await _try_wayback_fetch(url, plain)
+        if rescued is not None:
+            return _read_content_outcome(url, rescued.text, rescued.links, method="wayback", start_char=start_char)
     if plain.status == "blocked":
         return _blocked_outcome(plain)
     if plain.method == local_document.PDF_LOCAL_METHOD:

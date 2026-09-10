@@ -59,6 +59,8 @@ CALL_RETRIES = 2
 FORECASTER_ROLE = "strip_bench_forecaster"
 PARSER_ROLE = "parser"
 ERROR_TEXT_LIMIT = 500
+# Bad key, no credit, or a model gate on the account (OpenRouter's 18+ attestation answers 403); never a per-call fault.
+ACCOUNT_REFUSAL_STATUSES = frozenset({401, 402, 403})
 
 
 @dataclass(frozen=True)
@@ -155,6 +157,7 @@ class SpendMeter:
     cap_usd: float
     forecaster_usd: float = 0.0
     unpriced_calls: int = 0
+    refusal: str | None = None
 
     def add(self, reply_charged_usd: float | None) -> None:
         if reply_charged_usd is None:
@@ -162,12 +165,18 @@ class SpendMeter:
         else:
             self.forecaster_usd += reply_charged_usd
 
+    def refuse(self, error: str) -> None:
+        """A 401/402/403 is the account, not the call: every later call would fail the same way, so stop now."""
+        self.refusal = error
+
     @property
     def measured_usd(self) -> float:
         return self.forecaster_usd + parser_ledger_usd()
 
     @property
     def stop_reason(self) -> str | None:
+        if self.refusal is not None:
+            return f"the provider refused the key or the model: {self.refusal}"
         if self.unpriced_calls:
             return f"{self.unpriced_calls} reply(ies) carried no charge, so spend cannot be measured against the cap"
         if self.measured_usd >= self.cap_usd:
@@ -230,6 +239,9 @@ async def run_item(
             reply = await call(item.prompt)
         except openai.OpenAIError as exc:  # litellm's whole exception family derives from openai's
             row.error = f"{type(exc).__name__}: {exc}"[:ERROR_TEXT_LIMIT]
+            # litellm's own APIError carries status_code without being an APIStatusError, so read it by name.
+            if getattr(exc, "status_code", None) in ACCOUNT_REFUSAL_STATUSES:
+                meter.refuse(row.error)
         else:
             meter.add(reply.charged_usd)
             await _score_into(row, item, reply, parser_llm, model_name=model_name)

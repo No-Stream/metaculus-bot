@@ -5,6 +5,7 @@ import io
 import logging
 import socket
 import sys
+from datetime import UTC, datetime
 from time import monotonic
 from types import SimpleNamespace
 from typing import Any
@@ -4080,3 +4081,170 @@ class TestPlainHtmlExtractionPolicy:
         assert result.url == "https://example.com/real/page"
         assert "Resolving content read from the refresh target." in result.text
         assert session.calls == [("https://example.com/stub", False), ("https://example.com/real/page", False)]
+
+
+class TestGapFillV2WaybackRung:
+    """Item B: the Wayback Machine as v2 `fetch`'s last free rung after the impersonated retry.
+
+    Reuses `research/wayback.py`'s pure helpers and this ladder's own `_fetch_plain`, so the
+    snapshot GET inherits the 5 MiB body cap, the redirect vetting and the classification a live
+    page gets. Unlike Tier 1 it applies NO age bound and SURFACES the capture date instead, because
+    a driver-chosen URL is not a cited grading source. 133 never-read blocked URLs before the
+    impersonated retry existed, plus 7 paywalled (fetch-gap inventory, 2026-09-09)."""
+
+    _URL = "https://www.bls.gov/wsp/"
+    _NOW = datetime(2026, 9, 9, tzinfo=UTC)
+
+    @staticmethod
+    def _snapshot(
+        url: str, *, text: str = "ARCHIVED BODY of the stoppages table.", status: str = "ok"
+    ) -> fetch_outcomes.PlainFetchResult:
+        return fetch_outcomes.PlainFetchResult(
+            status=status, method="plain", text=text, links=["https://www.bls.gov/a"], url=url, content_type="text/html"
+        )
+
+    @staticmethod
+    def _blocked(url: str, http_status: int | None) -> fetch_outcomes.PlainFetchResult:
+        return fetch_outcomes.PlainFetchResult(
+            status="blocked",
+            method="plain",
+            text=f"Fetch blocked with HTTP {http_status}.",
+            links=[],
+            url=url,
+            http_status=http_status,
+        )
+
+    def _public(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("metaculus_bot.research.resolution_source.is_public_http_url", AsyncMock(return_value=True))
+
+    @pytest.mark.parametrize(
+        ("result", "applies"),
+        [
+            (_blocked.__func__("https://x/y", 403), True),
+            (_blocked.__func__("https://x/y", 429), True),
+            (
+                fetch_outcomes.PlainFetchResult(
+                    status="error", method="plain", text="Fetch error", links=[], url="https://x/y"
+                ),
+                True,
+            ),
+            (_blocked.__func__("https://x/y", None), False),
+            (
+                fetch_outcomes.PlainFetchResult(status="ok", method="plain", text="page", links=[], url="https://x/y"),
+                False,
+            ),
+            (
+                fetch_outcomes.PlainFetchResult(status="empty", method="plain", text="", links=[], url="https://x/y"),
+                False,
+            ),
+        ],
+    )
+    def test_wayback_applies_only_to_a_host_refusal_or_error_never_our_own(
+        self, result: fetch_outcomes.PlainFetchResult, applies: bool
+    ) -> None:
+        assert agentic_tools._wayback_applies(result) is applies
+
+    def test_wayback_method_maps_to_the_fetched_tier(self) -> None:
+        assert _method_to_tier("wayback") == "fetched"
+
+    @pytest.mark.asyncio
+    async def test_the_capture_date_is_surfaced_and_no_age_bound_is_applied(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A 251-day-old capture — far past Tier 1's 30-day cutoff — is still served, with its age
+        disclosed for the driver to weigh."""
+        self._public(monkeypatch)
+        cap = "https://web.archive.org/web/20260101000000id_/https://www.bls.gov/wsp/"
+        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=self._snapshot(cap)))
+
+        rescued = await agentic_tools._try_wayback_fetch(self._URL, self._blocked(self._URL, 403), now=self._NOW)
+
+        assert rescued is not None
+        assert rescued.method == "wayback"
+        assert "captured 2026-01-01" in rescued.text
+        assert "251 days before this forecast" in rescued.text
+        assert "ARCHIVED BODY of the stoppages table." in rescued.text
+
+    @pytest.mark.asyncio
+    async def test_a_host_refused_page_is_served_from_the_archive(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._public(monkeypatch)
+        monkeypatch.setattr(
+            agentic_tools, "_fetch_plain_with_impersonated_retry", AsyncMock(return_value=self._blocked(self._URL, 403))
+        )
+        cap = "https://web.archive.org/web/20250401000000id_/https://www.bls.gov/wsp/"
+        monkeypatch.setattr(
+            agentic_tools,
+            "_fetch_plain",
+            AsyncMock(return_value=self._snapshot(cap, text="12 major work stoppages in 2024.")),
+        )
+
+        outcome = await agentic_tools.fetch(self._URL)
+
+        assert outcome.method == "wayback"
+        assert "12 major work stoppages in 2024." in outcome.content_markdown
+        assert "captured 2025-04-01" in outcome.content_markdown
+
+    @pytest.mark.asyncio
+    async def test_the_archive_is_not_tried_for_a_url_we_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A `blocked` with no `http_status` is our own refusal (non-public or platform self-ref);
+        handing it to the archive is the SSRF bypass the exclusion prevents."""
+        monkeypatch.setattr(
+            agentic_tools,
+            "_fetch_plain_with_impersonated_retry",
+            AsyncMock(return_value=self._blocked(self._URL, None)),
+        )
+        spy = AsyncMock()
+        monkeypatch.setattr(agentic_tools, "_try_wayback_fetch", spy)
+
+        outcome = await agentic_tools.fetch(self._URL)
+
+        assert outcome.status == "blocked"
+        spy.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_undatable_capture_declines(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The archive answered the year request directly rather than a dated capture, so the copy
+        cannot carry the age disclosure that makes it admissible."""
+        self._public(monkeypatch)
+        undated = "https://web.archive.org/web/2026id_/https://www.bls.gov/wsp/"
+        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=self._snapshot(undated)))
+
+        assert await agentic_tools._try_wayback_fetch(self._URL, self._blocked(self._URL, 403), now=self._NOW) is None
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_capture_declines(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A capture whose body extracts to nothing (a JS-wall shell) is not served."""
+        self._public(monkeypatch)
+        cap = "https://web.archive.org/web/20260101000000id_/https://www.bls.gov/wsp/"
+        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=self._snapshot(cap, status="empty")))
+
+        assert await agentic_tools._try_wayback_fetch(self._URL, self._blocked(self._URL, 403), now=self._NOW) is None
+
+    @pytest.mark.asyncio
+    async def test_a_capture_that_wraps_a_platform_page_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A capture of a metaculus.com page presents web.archive.org as its host but is refused on
+        the re-guard of the inner URL (a question quoting itself)."""
+        self._public(monkeypatch)
+        platform = "https://www.metaculus.com/questions/1/"
+        cap = f"https://web.archive.org/web/20260101000000id_/{platform}"
+        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=self._snapshot(cap)))
+
+        assert await agentic_tools._try_wayback_fetch(platform, self._blocked(platform, 403), now=self._NOW) is None
+
+    @pytest.mark.asyncio
+    async def test_the_served_capture_is_windowed_to_the_fetch_window(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The archived body is served through the same 8,000-char window every fetch uses (and the
+        snapshot GET went through `_fetch_plain`, so the 5 MiB body cap applies)."""
+        self._public(monkeypatch)
+        monkeypatch.setattr(
+            agentic_tools, "_fetch_plain_with_impersonated_retry", AsyncMock(return_value=self._blocked(self._URL, 403))
+        )
+        cap = "https://web.archive.org/web/20250401000000id_/https://www.bls.gov/wsp/"
+        long_body = "x" * (agentic_tools._FETCH_WINDOW_CHARS + 5000)
+        monkeypatch.setattr(agentic_tools, "_fetch_plain", AsyncMock(return_value=self._snapshot(cap, text=long_body)))
+
+        outcome = await agentic_tools.fetch(self._URL)
+
+        assert outcome.method == "wayback"
+        assert outcome.truncated is True
+        assert "truncated at" in outcome.content_markdown

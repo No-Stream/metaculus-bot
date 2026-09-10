@@ -505,6 +505,26 @@ class TestScoringPlumbing:
         assert rows[0].error is not None
         assert "Unit mismatch" in rows[0].error
 
+    def test_an_account_refusal_stops_the_run_after_the_first_call(self, dataset: dict[str, Path]) -> None:
+        """The shape the first live reachability call returned: a 403 gate on the account (the 18+ attestation),
+        which every later call would hit identically, so the run stops with the body on the console."""
+        body = '{"error":{"message":"This model requires you to complete the following before use: 18+ age confirmation."}}'
+
+        async def _refused(_prompt: str) -> run.ModelReply:
+            await asyncio.sleep(0)
+            raise litellm.exceptions.APIError(status_code=403, message=body, llm_provider="openrouter", model="m")
+
+        items = plan.build_plan(_load(dataset), ["full"], 1, model="fake/model")
+        rows = _run(items, _refused, concurrency=1)
+
+        statuses = [row.status for row in rows]
+        assert statuses.count(report.STATUS_API_ERROR) == 1
+        assert statuses.count(report.STATUS_SKIPPED_SPEND_CAP) == len(items) - 1
+        skipped = next(row for row in rows if row.status == report.STATUS_SKIPPED_SPEND_CAP)
+        assert skipped.error is not None
+        assert "refused" in skipped.error
+        assert "18+ age confirmation" in skipped.error
+
     def test_a_provider_error_is_a_row_not_a_crash(self, dataset: dict[str, Path]) -> None:
         async def _timeout(_prompt: str) -> run.ModelReply:
             await asyncio.sleep(0)

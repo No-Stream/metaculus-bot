@@ -10,8 +10,10 @@ No research runs: the bundles come off ``backtests/research_archive/latest/``, t
 the residual round's tagged dataset, and the only network calls are completions on the OPERATOR'S
 PERSONAL OpenRouter key (the donated key is removed from the process environment before any client is
 built). The default model, Meta's Muse Spark 1.3 Contributor tier, may train on prompts; the operator
-accepted that for this open-source repo, and the OpenRouter account's privacy setting must allow
-training providers or every call fails on data policy. Runs are gated like ``gemini_verify.py``: a bare
+accepted that for this open-source repo. Two account settings gate it: the privacy setting must allow
+training providers (a refusal names the data policy) and the 18+ attestation at
+openrouter.ai/settings/preferences must be confirmed (the refusal is a 403 naming ``age_18plus``, the
+answer the first reachability call got on 2026-09-09). Runs are gated like ``gemini_verify.py``: a bare
 invocation prints the plan and the estimate and refuses, ``--dry-run`` prints them and exits clean,
 ``--i-accept-spend`` runs under ``--max-spend-usd``, and ``--rescore <run dir>`` rebuilds the results
 from ``calls.jsonl`` offline.
