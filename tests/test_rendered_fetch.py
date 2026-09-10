@@ -1,11 +1,10 @@
 """The shared headless-Chromium transport: its gates, its bounds, and the JSON it harvests.
 
-The transport's SSRF half (DNS pinning, the per-request route guard) is pinned by
-``tests/test_agentic_tools.py``, which drove it before it moved out of ``agentic/tools.py`` and
-still owns those cases. What lives here is what the move ADDED and what the transport owns for
-both callers: the XHR harvest and its bounds, the two render memos and their scoping, the
-navigation budget recomputed once the gates are held, the DOM ceiling, the main-frame status,
-the browser-context hardening, and the run-scoped state reset.
+This module owns the transport's complete browser contract: DNS pinning, the per-request route
+guard, XHR harvest and its bounds, the two render memos and their scoping, the navigation budget
+recomputed once the gates are held, the DOM ceiling, the main-frame status, browser-context
+hardening, and run-scoped state reset. The caller-specific ladder tests exercise how these
+transport results are recorded; they do not duplicate the browser mechanics here.
 
 Nothing here launches a browser. Playwright is faked through ``sys.modules`` by the one shared
 object graph in ``tests/playwright_fakes.py``, which the agentic suite drives too. Its fake page
@@ -21,7 +20,9 @@ import asyncio
 import inspect
 import logging
 import time
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import urlparse
 
 import pytest
@@ -33,11 +34,13 @@ from metaculus_bot.research.agentic import tools as agentic_tools
 from metaculus_bot.research.derived_api import DerivedEndpoint, derived_api_lead, largest_json
 from metaculus_bot.research.fetch_ladder import guard, rungs
 from metaculus_bot.research.fetch_ladder.context import LadderContext
+from metaculus_bot.research.fetch_ladder.policy import GAP_FILL_FETCH_POLICY
 from metaculus_bot.research.rendered_fetch import HarvestedJson, RenderedPage
 from metaculus_bot.research.resolution_fetch_result import FetchResult
 from scripts.telemetry.markers import MARKER_SPECS
 from tests.playwright_fakes import (
     FakeBrowser,
+    FakeChromium,
     FakePage,
     FakeResponse,
     FakeWebSocketRoute,
@@ -497,6 +500,208 @@ class TestTheRenderMemos:
         assert tier1_result is None
         assert rendered_fetch.rendered_to_nothing(_PAGE_URL, memo_scope=_TIER1_SCOPE) is True
         assert [attempt.skipped_reason for attempt in ctx.rungs] == [""]
+
+
+class TestTheBrowserTransportSecurityAndCapacity:
+    """The browser transport owns its request guard, teardown drain, and launch cap.
+
+    These cases used to enter through the gap-fill adapter's private rendered helper. Keeping
+    them at the transport boundary makes the assertions independent of the adapter that happens
+    to call the browser and leaves the shared rung tests to pin only caller-facing skip records.
+    """
+
+    async def test_the_route_guard_drains_before_teardown_and_tolerates_a_closed_target(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class _RacingClosedError(PlaywrightError):
+            pass
+
+        class FakeRoute:
+            def __init__(self, *, raise_on_action: bool = False) -> None:
+                self.aborted: str | None = None
+                self.continued = False
+                self._raise = raise_on_action
+
+            async def continue_(self) -> None:
+                if self._raise:
+                    raise _RacingClosedError("Route.continue: Target page, context or browser has been closed")
+                self.continued = True
+
+            async def abort(self, code: str | None = None) -> None:
+                if self._raise:
+                    raise _RacingClosedError("Route.abort: Target page, context or browser has been closed")
+                self.aborted = code
+
+        async def _is_public(url: str) -> bool:
+            return "evil" not in url
+
+        monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", _is_public)
+        page = FakePage(html="<html><body><p>rendered body</p></body></html>")
+        rendered = await _render(monkeypatch, page)
+
+        assert rendered is not None
+        assert page.unroute_behavior == "ignoreErrors"
+        assert page.teardown == ["unroute_all", "context.close", "browser.close"]
+
+        route_guard = page.route_handler
+        disallowed = FakeRoute()
+        await route_guard(disallowed, SimpleNamespace(url="http://evil.internal/imds"))
+        assert disallowed.aborted == "blockedbyclient"
+        assert disallowed.continued is False
+
+        allowed = FakeRoute()
+        await route_guard(allowed, SimpleNamespace(url="https://dashboard.example.com/subresource"))
+        assert allowed.continued is True
+        assert allowed.aborted is None
+
+        await route_guard(FakeRoute(raise_on_action=True), SimpleNamespace(url="https://dashboard.example.com/late"))
+        await route_guard(FakeRoute(raise_on_action=True), SimpleNamespace(url="http://evil.internal/late"))
+
+    async def test_the_render_uses_the_shared_playwright_setup_contract(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        semaphore_entries: list[str] = []
+
+        class RecordingSemaphore:
+            async def __aenter__(self) -> None:
+                semaphore_entries.append("entered")
+
+            async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+                del exc_type, exc, tb
+
+        page = FakePage(html='<html><body><a href="/next">Next</a><p>Rendered body</p></body></html>')
+        chromium = install_fake_playwright(monkeypatch, page, pinned=("dashboard.example.com", "93.184.216.34"))
+        monkeypatch.setattr(rendered_fetch, "_RENDERED_FETCH_GLOBAL_SEMAPHORE", asyncio.Semaphore(2))
+
+        rendered = await rendered_fetch.render_page(
+            _PAGE_URL,
+            memo_scope=_TIER1_SCOPE,
+            host_gate=RecordingSemaphore(),
+        )
+
+        assert rendered is not None
+        assert semaphore_entries == ["entered"]
+        assert page.route_patterns == ["**/*"]
+        (goto_call,) = page.goto_calls
+        assert goto_call["url"] == _PAGE_URL
+        assert goto_call["wait_until"] == "domcontentloaded"
+        assert goto_call["timeout"] == rendered_fetch.RENDER_TIMEOUT_MS - rendered_fetch.RENDER_SETTLE_MS
+        assert page.context_kwargs["user_agent"]
+        assert "Accept-Language" in page.context_kwargs["extra_http_headers"]
+        assert chromium.headless == [True]
+
+    async def test_concurrent_launches_never_exceed_the_global_cap(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        cap = 2
+        monkeypatch.setattr(rendered_fetch, "_RENDERED_FETCH_GLOBAL_SEMAPHORE", asyncio.Semaphore(cap))
+
+        live = 0
+        peak = 0
+        hold = asyncio.Event()
+        at_cap = asyncio.Event()
+
+        class _BarrierChromium(FakeChromium):
+            async def launch(self, *, headless: bool, args: list[str] | None = None) -> FakeBrowser:
+                nonlocal live, peak
+                live += 1
+                peak = max(peak, live)
+                if live >= cap:
+                    at_cap.set()
+                try:
+                    await hold.wait()
+                finally:
+                    live -= 1
+                return await super().launch(headless=headless, args=args)
+
+        page = FakePage(html="<html><body><p>rendered body</p></body></html>")
+        install_fake_playwright(monkeypatch, page, chromium=_BarrierChromium(page))
+
+        async def _render_one(url: str) -> RenderedPage | None:
+            return await rendered_fetch.render_page(
+                url,
+                memo_scope=_TIER1_SCOPE,
+                host_gate=asyncio.Semaphore(1),
+            )
+
+        tasks = [asyncio.create_task(_render_one(f"https://host.example.com/page{index}")) for index in range(cap + 3)]
+        await asyncio.wait_for(at_cap.wait(), timeout=1.0)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert live == cap
+        assert peak == cap
+
+        hold.set()
+        results = await asyncio.gather(*tasks)
+
+        assert all(result is not None for result in results)
+        assert peak == cap
+
+    async def test_the_route_guard_blocks_a_private_client_side_redirect(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        continued: list[str] = []
+        aborted: list[tuple[str, str]] = []
+
+        class FakeRoute:
+            def __init__(self, url: str) -> None:
+                self.request = SimpleNamespace(url=url)
+
+            async def continue_(self) -> None:
+                continued.append(self.request.url)
+
+            async def abort(self, error_code: str) -> None:
+                aborted.append((self.request.url, error_code))
+
+        class _RedirectingPage(FakePage):
+            async def goto(self, url: str, *, wait_until: str, timeout: int) -> Any:  # noqa: ASYNC109
+                route_guard = self.route_handler
+                main_route = FakeRoute(url)
+                await route_guard(main_route, main_route.request)
+                private_route = FakeRoute("http://169.254.169.254/latest/meta-data/")
+                await route_guard(private_route, private_route.request)
+                return await super().goto(url, wait_until=wait_until, timeout=timeout)
+
+        async def _is_public(url: str) -> bool:
+            await asyncio.sleep(0)
+            return "169.254.169.254" not in url
+
+        page = _RedirectingPage(html="<html><body><p>public content only</p></body></html>")
+        install_fake_playwright(monkeypatch, page, pinned=("dashboard.example.com", "93.184.216.34"))
+        monkeypatch.setattr(rendered_fetch, "_RENDERED_FETCH_GLOBAL_SEMAPHORE", asyncio.Semaphore(2))
+        monkeypatch.setattr("metaculus_bot.research.fetch_ladder.guard.is_public_http_url", _is_public)
+
+        rendered = await rendered_fetch.render_page(
+            _PAGE_URL,
+            memo_scope=_TIER1_SCOPE,
+            host_gate=asyncio.Semaphore(1),
+        )
+
+        assert rendered is not None
+        assert continued == [_PAGE_URL]
+        assert aborted == [("http://169.254.169.254/latest/meta-data/", "blockedbyclient")]
+        assert "169.254.169.254" not in rendered.html
+        assert rendered.html == "<html><body><p>public content only</p></body></html>"
+
+
+class TestRenderedDocumentLinks:
+    async def test_the_shared_gap_fill_rung_resolves_links_from_the_landing_document(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        page = FakePage(
+            html='<html><body><a href="methodology.html">Method</a><p>Rendered body</p></body></html>',
+            land_on="https://dashboard.example.com/senate/2026/",
+        )
+        install_fake_playwright(monkeypatch, page)
+        monkeypatch.setattr(rendered_fetch, "_RENDERED_FETCH_GLOBAL_SEMAPHORE", asyncio.Semaphore(2))
+        monkeypatch.setattr(
+            "metaculus_bot.research.fetch_ladder.classify._extract_main_text", MagicMock(return_value="Rendered body")
+        )
+        monkeypatch.setattr("asyncio.to_thread", AsyncMock(side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)))
+
+        direct = FetchResult(url=_PAGE_URL, status="js_wall", text="", http_status=200, content_type="text/html")
+        context = LadderContext(policy=GAP_FILL_FETCH_POLICY)
+        result = await rungs._rendered_rung(_PAGE_URL, direct, {}, context)
+
+        assert result is not None
+        assert result.links == ["https://dashboard.example.com/senate/2026/methodology.html"]
+        assert result.url == "https://dashboard.example.com/senate/2026/"
+        (attempt,) = [attempt for attempt in context.rungs if attempt.rung == "rendered"]
+        assert attempt.url == _PAGE_URL
 
 
 class TestTheNavigationBudgetAfterTheGates:
