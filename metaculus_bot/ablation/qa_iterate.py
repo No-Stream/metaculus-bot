@@ -34,7 +34,7 @@ from metaculus_bot.ablation.claude_cli import (
     DEFAULT_CLAUDE_EXECUTABLE,
     DEFAULT_TIMEOUT_SECONDS,
     _build_argv,
-    _extract_inner_result,  # noqa: F401  # re-export: tests/test_ablation_qa_iterate.py imports qa_iterate._extract_inner_result
+    _extract_inner_result,  # noqa: F401  # re-export: tests/ablation/test_ablation_qa_iterate.py imports qa_iterate._extract_inner_result
     _run_claude_subprocess,
     excerpt,
 )
