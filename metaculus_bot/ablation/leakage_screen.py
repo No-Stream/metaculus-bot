@@ -1,26 +1,28 @@
 """LLM-based leakage screen for the ablation benchmark.
 
-Operates on the *cached full research blob* (first-pass + gap-fill addendum)
-written by ``metaculus_bot.ablation.research``. Each verdict is cached on disk
-via ``AblationCache.write_leakage_screen``.
+Operates on the *cached full research blob* (first-pass plus gap-fill addendum) written by
+``metaculus_bot.ablation.research``; each verdict is cached on disk via
+``AblationCache.write_leakage_screen``.
 
-The behavior here intentionally diverges from the production screen in
-``metaculus_bot.backtest.leakage`` in two places:
+Two deliberate divergences from the production screen in ``metaculus_bot.backtest.leakage``. On
+detector failure this module returns ``is_leaked=True`` (drop the question) where production returns
+``False`` (keep it), because the ablation prefers losing data to admitting suspect data. And the
+detector prompt asks for structured JSON rather than a YES/NO prefix: production's prefix matcher
+(``response.strip().upper().startswith("YES")``) silently mis-parses ordinary LLM decoration such as
+``**Answer: YES**``, observed live on Q43131 where a leaky question went undropped. The prompt also
+enumerates implication-leak patterns (anchored comparisons, bracketing ranges, threshold framing,
+date-specific outcomes inside the resolution window), which the redactor missed live on Q43151 (ISM
+PMI) where ``"unchanged from March 52.7%"`` revealed the April value.
 
-1. On detector failure, this module returns ``is_leaked=True`` (drop the
-   question) rather than ``False`` (keep it). The ablation prefers losing
-   data to admitting suspect data.
-2. The detector prompt asks for **structured JSON output** rather than a
-   YES/NO prefix. Production's prefix matcher (``response.strip().upper()
-   .startswith("YES")``) silently mis-parses common LLM decorations such as
-   ``**Answer: YES**`` (markdown bold) — observed live on Q43131, where a
-   leaky question went undropped. Structured JSON makes the verdict robust
-   to surrounding prose / markdown.
-
-The prompt also explicitly enumerates implication-leak patterns (anchored
-comparisons, bracketing ranges, threshold framing, date-specific outcomes
-inside the resolution window) — patterns the redactor missed live on Q43151
-(ISM PMI) where ``"unchanged from March 52.7%"`` revealed the April value.
+Failure policy. ``_DETECTOR_TRANSIENT_EXCEPTIONS`` is the whole set that is retried or absorbed as
+``detector_failed=True``: ``openai.APIError`` (litellm's connection, timeout, rate-limit and
+service-unavailable wrappers all subclass it without subclassing each other, checked against the
+litellm exception module), ``asyncio.TimeoutError``, and the ``ValueError`` family that
+``_extract_is_leaked`` raises on unparseable JSON (``json.JSONDecodeError`` included). Anything else,
+a schema-parse typo or an ``AttributeError`` or ``KeyError`` from a refactor, propagates so a real
+bug reaches the operator instead of quietly costing questions. Z.AI's free tier has 5-10 minute
+outages, so the single retry in ``_detect_leakage_structured`` keeps a brief blip from dropping a
+chunk of questions, and the detector is free, so the retry costs nothing.
 """
 
 import asyncio
@@ -38,20 +40,7 @@ from metaculus_bot.ablation.cache import AblationCache
 from metaculus_bot.backtest.scoring import GroundTruth
 from metaculus_bot.research.provider_diagnostics import PROVIDER_DIAGNOSTICS_HEADER
 
-# Transient exceptions worth a single retry. The detector LLM call can fail in
-# two ways that legitimately recover on retry: (1) the LLM provider hiccups
-# (``openai.APIError`` is the common base for litellm's connection/timeout/
-# rate-limit/service-unavailable wrappers — ``litellm.APIError``, ``litellm.
-# APIConnectionError``, ``litellm.RateLimitError``, ``litellm.Timeout`` are
-# all subclasses of ``openai.APIError`` but NOT of one another — checked
-# inheritance directly, see the litellm exception module) or the asyncio
-# call times out (``asyncio.TimeoutError``); (2) the LLM emits malformed/
-# unexpected JSON, which ``_extract_is_leaked`` raises as ``ValueError``
-# (and ``json.JSONDecodeError``, a ValueError subclass, on a strict-JSON
-# parse failure before the regex fallback). Anything outside this set is a
-# real bug — schema-parse typo, AttributeError from a refactor, KeyError
-# from missing dict access — and must propagate so the operator sees it,
-# instead of being silently swallowed as ``detector_failed=True``.
+# The only failures worth a retry; everything else is a real bug. See the module docstring.
 _DETECTOR_TRANSIENT_EXCEPTIONS: tuple[type[BaseException], ...] = (
     asyncio.TimeoutError,
     openai.APIError,  # litellm exceptions (RateLimitError, Timeout, APIConnectionError, ...)
@@ -101,28 +90,21 @@ Do not include any prose outside the JSON.
 def _build_detector_llm(model: str) -> GeneralLlm:
     """Construct a detector LLM with a generous token budget for reasoning models.
 
-    Production ``leakage.py:22`` uses ``max_tokens=500`` against ``gpt-5.6-luna``,
-    where ``max_tokens`` only bounds the visible answer. The ablation default is
-    ``glm-4.5-air:free`` — a reasoning model where ``max_tokens`` is the
-    *combined* budget for reasoning + content (Z.AI docs:
-    https://docs.z.ai/guides/overview/concept-param). At 500, the model can
-    exhaust the budget on reasoning alone for long blobs and emit
-    ``content=None`` with ``finish_reason="length"``. We keep reasoning ON
-    (it's the whole point of using a reasoning model for this judgment task)
-    and raise the ceiling to 32k so reasoning + answer both fit comfortably,
-    even on the largest research blobs. Empirically Z.AI's ~14 tok/s throughput
-    on the free tier makes the latency cost of a higher ceiling small.
-
-    ``response_format={"type": "json_object"}`` is passed via ``extra_body``
-    so OpenRouter forwards it to providers that honor JSON-mode (most
-    OpenAI-compatible endpoints, including z-ai). Providers that ignore the
-    flag still typically emit JSON; ``_extract_is_leaked`` falls back to
-    regex extraction for prose-wrapped JSON.
+    ``metaculus_bot.backtest.leakage.screen_research_for_leakage`` runs the
+    production screen at ``max_tokens=500`` against ``gpt-5.6-luna``, where the
+    cap bounds only the visible answer. The ablation default
+    ``glm-4.5-air:free`` is a reasoning model whose cap is the COMBINED
+    reasoning-plus-content budget (https://docs.z.ai/guides/overview/concept-param),
+    so at 500 it can exhaust the budget on reasoning and return ``content=None``
+    with ``finish_reason="length"``. The fix raises the ceiling to 32k rather
+    than disabling reasoning, and Z.AI's ~14 tok/s free tier makes the added
+    latency small. ``response_format={"type": "json_object"}`` rides in
+    ``extra_body`` so OpenRouter forwards JSON mode to the providers that honor
+    it, and ``_extract_is_leaked`` falls back to regex for the rest.
     """
     return GeneralLlm(
         model=model,
-        # temperature=None defers reasoning models to provider defaults; redundant
-        # on ft 0.2.92 (GeneralLlm ctor default is already None). No top_p.
+        # Defers reasoning models to provider defaults; redundant on ft 0.2.92, whose ctor default is None.
         temperature=None,
         max_tokens=32_000,
         extra_body={"response_format": {"type": "json_object"}},
@@ -161,10 +143,7 @@ def _extract_is_leaked(raw_response: str) -> bool:
         raise ValueError(f"response missing 'is_leaked' field: {payload!r}")
 
     is_leaked = payload["is_leaked"]
-    # Free-tier providers occasionally emit ``"true"`` / ``"false"`` strings
-    # inside JSON when the model is sloppy with quoting. Accept those forms
-    # (case-insensitive, plus yes/no) rather than dropping the question to
-    # detector_failed=True for what's essentially a type-encoding wobble.
+    # Free-tier providers sometimes quote the boolean; a type-encoding wobble should not cost a question.
     if isinstance(is_leaked, str):
         normalized = is_leaked.strip().lower()
         if normalized in ("true", "yes"):
@@ -188,15 +167,10 @@ async def _detect_leakage_structured(
 ) -> tuple[bool, str]:
     """Run the structured-JSON leakage detector. Returns (is_leaked, raw_response).
 
-    Retries the LLM call ONCE on transient failures (network blip, JSON
-    parse error). Z.AI's free-tier glm-4.5-air detector occasionally has
-    5-10 minute outages; without retry, a brief blip drops a chunk of
-    questions to ``detector_failed=True`` (conservative is_leaked=True),
-    where re-screen would have succeeded. The detector is free, so the
-    retry is cheap insurance.
-
-    After two failed attempts, raises the last exception; the caller
-    treats this as ``detector_failed=True`` and conservatively drops.
+    Retries ONCE on ``_DETECTOR_TRANSIENT_EXCEPTIONS``, then raises the last
+    exception; the caller turns that into ``detector_failed=True`` and
+    conservatively drops the question. Why one retry, and what counts as
+    transient: the module docstring.
     """
     prompt = LEAKAGE_DETECTOR_PROMPT.format(
         question_text=question.question_text,
@@ -285,30 +259,15 @@ async def screen_research_blob(
 ) -> dict:
     """Screen a cached research blob for leakage. Caches the verdict per qid.
 
-    Returns a dict shaped like::
-
-        {
-            "is_leaked": bool,
-            "detector_response": str,        # raw response or "<failed>" sentinel
-            "detector_model": str,
-            "detector_failed": bool,         # True iff the LLM call raised
-            "screened_at": "<ISO datetime>",
-        }
-
-    Behavior:
-    - Cache hit (and not force): return cached payload unchanged.
-    - Cache miss (or force=True): build the detector_llm if not supplied, call
-      ``_detect_leakage_structured``, record verdict + raw response. On
-      exception (transport failure OR JSON parse failure), set is_leaked=True
-      (CONSERVATIVE — drop the question, the production screen keeps it) and
-      detector_failed=True.
-    - Content-free research blob (empty, or diagnostics-only from a fully-failed
-      run): short-circuit without calling the LLM.
-    - Always writes the verdict to cache before returning (even on detector
-      failure).
+    Returns a ``_build_verdict`` payload: the cached one unchanged on a cache
+    hit without ``force``, a not-leaked verdict with no LLM call on a
+    content-free blob, and otherwise the detector's. A detector failure inside
+    ``_DETECTOR_TRANSIENT_EXCEPTIONS`` becomes ``is_leaked=True`` plus
+    ``detector_failed=True``, the deliberate divergence from production
+    described in the module docstring. The verdict is always written to cache
+    before returning, detector failure included.
     """
-    # Async-checkpoint at function entry so cache-hit + empty-blob early returns
-    # still satisfy flake8-async ASYNC910. The cooperative yield is cheap.
+    # Cheap cooperative yield so the cache-hit and empty-blob early returns satisfy ASYNC910.
     await asyncio.sleep(0)
 
     assert question.id_of_question is not None
@@ -336,15 +295,7 @@ async def screen_research_blob(
     try:
         is_leaked, response_text = await _detect_leakage_structured(question, ground_truth, research_blob, detector_llm)
     except _DETECTOR_TRANSIENT_EXCEPTIONS:
-        # Conservative-drop: production returns False (keep) on detector
-        # failure; we override to True (drop) for the ablation. Transient
-        # transport errors (litellm.APIError + subclasses, asyncio timeouts)
-        # and JSON-parse failures (ValueError, json.JSONDecodeError) land
-        # here — either way we don't trust the verdict but we know the
-        # detector itself isn't buggy. Anything outside this set (KeyError,
-        # AttributeError, TypeError from a refactor regression) propagates
-        # so the operator sees real bugs instead of losing questions silently
-        # to detector_failed=True.
+        # Conservative drop: production keeps the question on detector failure, the ablation drops it.
         logger.exception(f"Leakage detector failed for qid {qid}")
         verdict = _build_verdict(
             is_leaked=True,
