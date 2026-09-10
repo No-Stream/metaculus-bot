@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, replace
+from time import monotonic
 
 from metaculus_bot.research.fetch_ladder import direct_fetch, guard
 from metaculus_bot.research.fetch_ladder.context import LadderContext
@@ -137,6 +138,27 @@ class TestRungZero:
         assert result.status == "success"
         assert session.requested == [_URL]
 
+    async def test_a_near_exhausted_wall_declines_rung_zero_before_fallback(self):
+        session = _session()
+        called = False
+
+        async def _known_api(url: str) -> FetchResult:
+            nonlocal called
+            called = True
+            raise AssertionError(f"rung zero should have declined: {url}")
+
+        policy = replace(RESOLUTION_SOURCE_POLICY, known_api=_known_api)
+        ctx = replace(
+            LadderContext(session=session, host_sems={}),
+            started=monotonic() - policy.total_wall_s - 1.0,
+        )
+
+        result = await fetch_url(_URL, policy=policy, ctx=ctx)
+
+        assert not called
+        assert result.status == "success"
+        assert session.requested == [_URL]
+
 
 class TestTheDigestSeat:
     async def test_the_sibling_digest_signature_drops_into_the_seat(self):
@@ -164,5 +186,5 @@ class TestTheDigestSeat:
         armed = replace(RESOLUTION_SOURCE_POLICY, digest=seat)
 
         assert armed.digest is _digest_page
-        assert RESOLUTION_SOURCE_POLICY.digest is None
+        assert RESOLUTION_SOURCE_POLICY.digest is not None
         assert (await bm25_digest("no shared vocabulary here", "hospitalizations", budget_seconds=1.0)).passages == []

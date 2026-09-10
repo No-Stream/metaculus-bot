@@ -27,6 +27,7 @@ from metaculus_bot.constants import (
     PAGE_DIGEST_WALL_MARGIN_S,
     RESOLUTION_SOURCE_WALL_TIMEOUT,
 )
+from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from metaculus_bot.research.page_digest import (
     DIGEST_METHOD_BM25,
     DIGEST_METHOD_LLM_EXTRACTIVE,
@@ -486,6 +487,9 @@ class TestClientConstruction:
         """Construction only, no call: the litellm metadata the ledger callback reads back carries the role."""
         monkeypatch.delenv("OAI_ANTH_OPENROUTER_KEY", raising=False)
         monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+        monkeypatch.setattr(
+            page_digest_module, "build_llm_with_openrouter_fallback", build_llm_with_openrouter_fallback
+        )
 
         llm = page_digest_module._build_extractor()
 

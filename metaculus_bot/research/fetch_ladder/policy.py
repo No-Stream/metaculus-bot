@@ -36,6 +36,7 @@ from metaculus_bot.research.fetch_ladder.verdict import (
     RESOLUTION_SOURCE_VERDICT,
     LadderVerdict,
 )
+from metaculus_bot.research.page_digest import digest_page
 from metaculus_bot.research.rendered_fetch import MemoScope
 from metaculus_bot.research.resolution_fetch_result import FetchResult, FetchRoute, FetchStatus
 
@@ -99,6 +100,7 @@ RESOLUTION_SOURCE_POLICY = LadderPolicy(
     disclose_unreadable_embeds=True,
     thin_content_escalation_chars=None,
     collect_links=False,
+    digest=digest_page,
 )
 
 # The `fetch` tool's own ladder; every value's reason: docs/architecture.md, the knob table.
@@ -119,6 +121,7 @@ GAP_FILL_FETCH_POLICY = LadderPolicy(
     disclose_unreadable_embeds=False,
     thin_content_escalation_chars=GAP_FILL_V2_MIN_CONTENT_CHARS,
     collect_links=True,
+    digest=digest_page,
 )
 
 # `read_document`'s free acquisition ladder: 25 s, and no archive rung (see the doc).

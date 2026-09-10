@@ -16,6 +16,7 @@ from playwright._impl._browser_type import BrowserType as PlaywrightBrowserType
 
 from metaculus_bot.publish_gate import reset_publish_skipped_closed
 from metaculus_bot.publish_hardening import reset_publish_attempt_failures
+from metaculus_bot.research import page_digest
 from metaculus_bot.research.degradation_views import reset_run_degradation_counters
 from metaculus_bot.research.fetch_ladder import run_cache
 from scripts import gha_artifacts
@@ -30,6 +31,15 @@ def _clear_fetch_ladder_run_cache() -> Iterator[None]:
     run_cache.clear()
     yield
     run_cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def _stub_page_digest_provider(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise real digest fallback by default; digest tests override this provider boundary."""
+    if request.node.get_closest_marker("live") is not None:
+        return
+    client = MagicMock(invoke=AsyncMock(side_effect=TimeoutError("offline extractor double")))
+    monkeypatch.setattr(page_digest, "build_llm_with_openrouter_fallback", MagicMock(return_value=client))
 
 
 # ---------------------------------------------------------------------------

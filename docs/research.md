@@ -1878,16 +1878,16 @@ local `.env` (see `.env.template`) and as a GitHub Actions secret surfaced into 
 workflow's environment. Without it the client raises on first use, which is the intended
 behaviour and also why no workflow should reference the module until the secret exists.
 
-### Page digest (`research/page_digest.py`; the `page_digest_extractor` role, standalone until the shared fetch ladder wires it in)
+### Page digest (`research/page_digest.py`; the `page_digest_extractor` role)
 
-The LLM-extractive digest of a long fetched page, built 2026-09-09 for the fetch-ladder
-unification. Nothing calls it yet: the ladder's `policy.digest` seat will, for a cited HTML page
-over `RESOLUTION_SOURCE_PER_URL_MAX_CHARS` in the resolution-source fetcher and for a
-`read_document` in the gap-fill v2 loop, replacing the BM25 `digest_local` path as the primary
-mechanism on both callers. Until then it is importable, tested against scripted doubles, and inert.
+The shared ladder binds `policy.digest` to `digest_page` for cited HTML over
+`RESOLUTION_SOURCE_PER_URL_MAX_CHARS` and for held flat text read through gap-fill v2's
+`read_document`. Fresh and cached HTML use the same presentation path with the current query
+and remaining wall. Ordinary gap-fill `fetch` remains paginated, and PDFs retain their
+page-aware BM25 digest. The driver-facing local-read method stays `digest_local`.
 
-**Why a model and not the BM25 digest.** A cited page over the per-URL cap is read from the top
-today, so its tail is unreachable, and the loop's deterministic BM25 digest reaches the tail with a
+**Why a model and not the BM25 digest.** A cited page over the per-URL cap was read from the top,
+so its tail was unreachable, and the loop's deterministic BM25 digest reached the tail with a
 lexical ranker the operator does not trust as the primary mechanism. The operator's decision
 (2026-09-09, `scratch_docs_and_planning/fetch_ladder_unification_plan_2026-09-09.md`, "The page
 digest, as agreed") was a cheap model reading the page, a literal grounding check as the
