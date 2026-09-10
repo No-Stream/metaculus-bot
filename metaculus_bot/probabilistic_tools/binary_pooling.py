@@ -22,19 +22,14 @@ from typing import Any
 from metaculus_bot.prob_math_utils import clamp_prob, logit, sigmoid
 from metaculus_bot.probabilistic_tools.base_rate import beta_binomial_update
 
-# Strength -> likelihood-ratio mapping, kept identical to the ad-hoc table at
-# metaculus_bot/ablation/run_pdf.py:78 (_STRENGTH_TO_LR). Re-defined here rather
-# than imported so this module does not depend on the ablation harness; the
-# numbers must stay in lockstep with run_pdf.
+# Copy of ``ablation.run_pdf._STRENGTH_TO_LR``, kept in lockstep; see docs/roster_history.md.
 _STRENGTH_TO_LR: dict[str, float] = {
     "weak": 1.5,
     "moderate": 3.0,
     "strong": 10.0,
 }
 
-# Base-prob clamp used before taking log-odds. Matches the inline [0.001, 0.999]
-# guard in run_pdf.py:110-113 — deliberately wider than PROB_CLAMP_EPS so the
-# reconstruction reproduces the ablation baseline exactly.
+# Wider than PROB_CLAMP_EPS on purpose, matching ``run_pdf._apply_evidence_lr``; see docs/roster_history.md.
 _BASE_PROB_FLOOR: float = 0.001
 _BASE_PROB_CEIL: float = 0.999
 
@@ -42,7 +37,8 @@ _BASE_PROB_CEIL: float = 0.999
 def _apply_evidence_lr(base_prob: float, evidence_items: list[Any]) -> float:
     """Sequential log-odds accumulation from evidence items.
 
-    Faithful re-implementation of run_pdf.py:106-124. Evidence items are
+    Faithful re-implementation of
+    ``metaculus_bot.ablation.run_pdf._apply_evidence_lr``. Evidence items are
     duck-typed: each must expose ``.direction`` ("up"/"down"/"neutral"),
     ``.strength`` (key into ``_STRENGTH_TO_LR``), and ``.likelihood_ratio``
     (an explicit positive float that overrides the strength mapping, or None).
