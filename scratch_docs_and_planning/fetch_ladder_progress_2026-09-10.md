@@ -4,10 +4,44 @@ Branch `fall/ladder` in the worktree `/Users/flatljan/personal/metaculus-bot-wt/
 `mantic-competition` at `6f2f051`. The plan this executes is
 `scratch_docs_and_planning/fetch_ladder_unification_plan_2026-09-09.md`; read it first, then this
 file for what has actually landed and what was decided along the way. A successor with no context
-can resume from the "Next" section at the bottom.
+can resume from the current status below; the later sections retain the migration history.
 
 Free gates only. Nothing in this work may spend money: no `main.py` run, no backtest, no probe, no
 GitHub Actions dispatch. `make test` is network-blocked by an autouse fixture and is always free.
+
+## Current status: migration complete, production wiring follows merge
+
+The recovered branch completed steps 4, 5 and 6 on 2026-09-10. The verified code commit is
+`4b2a368d58acfeb25ee8c8ee7101e297a70b2f57`; HEAD was unchanged across the final gate.
+`make test` passed 9,854 tests, with 39 skips and 5 live deselections, in 284 seconds. Ruff,
+format checking, basedpyright, deptry and all six import contracts passed. An independent review
+of the complete diff against `6f2f051` found no remaining unaccepted material production bug.
+The requested `/forge` command was unavailable here, so independent source review and executable
+regression checks supplied that review gate.
+
+Step 4 enabled remembered derived-feed reuse for gap-fill. Step 5 added the complete-read cache,
+shared throttle verdict and injectable async digest seat. The cache preserves each caller's
+verdict, cap, query and acquisition route; it never reuses an old attempt list or paid answer.
+The digest receives the wall remaining after extraction, preserves source text when selection is
+empty, and keeps PDF page labels. A short flat document uses a separate local query-match check,
+so model grounding counters cannot decide whether a local answer is available.
+
+Step 6 removed the obsolete agentic transports and classifiers. The earlier suggestion that all
+14 old browser tests were redundant was checked and corrected: unique setup, concurrency,
+subrequest, teardown, link and caller-specific decline assertions were migrated before deletion.
+The separate host-semaphore scopes remain the approved decision.
+
+Review regressions now cover cached robots directives, cache eviction during presentation,
+acquisition routes after failed rescues, throttle propagation across source-host rungs, gap-fill's
+impersonated thin/empty browser rescue, and unreadable PDF parse reuse. Resolution-source's
+unreadable impersonated response retains its original offsite fallback. A throttle from Wayback
+declines that archive rung because it describes the archive host, not the cited host. The recorded
+rendered-document limitation remains accepted; it was not silently expanded or repaired.
+
+Next: finish the full archived trigger/order replay, merge into `mantic-competition`, then bind
+the existing known-API and `page_digest` implementations there. The digest seat intentionally
+remains injectable/default BM25 on this intermediate branch. Final production wiring needs its
+own offline integration and CI-equivalent gate before any paid smoke is proposed.
 
 ## Design decisions taken before the first commit
 
