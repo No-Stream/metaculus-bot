@@ -930,6 +930,7 @@ class TestBodyCapAgainstLibcurl:
         """Non-stream mode sets ``CURLOPT_TIMEOUT_MS`` from ``timeout=``, so a body that trickles
         then stalls exits at the per-hop timeout rather than the 9-to-27 s overshoot stream mode's
         low-speed cutoff produced. The wall here is libcurl's, not an ``asyncio.timeout``."""
+        release_server = asyncio.Event()
 
         async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
             await _read_request_head(reader)
@@ -939,15 +940,18 @@ class TestBodyCapAgainstLibcurl:
                 with contextlib.suppress(*_DRAIN_ERRORS):
                     await writer.drain()
                 await asyncio.sleep(0.05)
-            await asyncio.sleep(30)
+            await release_server.wait()
             writer.close()
 
         per_hop = 1.0
         async with _loopback(monkeypatch, handler) as url:
             started = time.monotonic()
-            with pytest.raises(ImpersonateTransportError) as excinfo:
-                await _fetch(url, deadline_in_s=30.0, per_hop_timeout_s=per_hop)
-            elapsed = time.monotonic() - started
+            try:
+                with pytest.raises(ImpersonateTransportError) as excinfo:
+                    await _fetch(url, deadline_in_s=30.0, per_hop_timeout_s=per_hop)
+                elapsed = time.monotonic() - started
+            finally:
+                release_server.set()
 
         assert excinfo.value.failure_class == "timeout"
         # libcurl fires at the timeout; allow a small margin for the abort and teardown.

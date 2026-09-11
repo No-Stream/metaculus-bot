@@ -25,6 +25,7 @@ from unittest import mock
 
 import pytest
 
+from scripts import gha_artifacts
 from scripts.gha_artifacts import (
     STORE_META_FILENAME,
     ArtifactSelection,
@@ -40,6 +41,20 @@ from scripts.gha_artifacts import (
 )
 
 REPO = "No-Stream/metaculus-bot"
+
+
+@pytest.mark.parametrize("repetition", range(2))
+def test_default_store_is_lazy_and_isolated_per_test(repetition: int, tmp_path_factory: pytest.TempPathFactory) -> None:
+    store = Path(gha_artifacts.DEFAULT_STORE_DIR)
+    assert store.is_relative_to(tmp_path_factory.getbasetemp())
+    assert not store.exists()
+
+    with mock.patch("scripts.gha_artifacts._download_artifact_to", side_effect=_fake_gh_download(str(repetition))):
+        run_dir = persist_artifact(_artifact("research-100", 100, datetime.now(UTC)), REPO)
+
+    assert run_dir is not None
+    assert run_dir.is_relative_to(store)
+    assert is_persisted(store, "research-100")
 
 
 def _artifact(name: str, run_id: int, created: datetime) -> dict:

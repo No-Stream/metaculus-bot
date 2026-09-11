@@ -3,6 +3,7 @@ from collections.abc import Iterator
 from datetime import datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import uuid4
 
 import pytest
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
@@ -270,7 +271,9 @@ def _redirect_artifact_store(tmp_path_factory: pytest.TempPathFactory, monkeypat
     leave the omission unprotected. Tests that pass ``store_dir`` explicitly are
     unaffected.
     """
-    monkeypatch.setattr(gha_artifacts, "DEFAULT_STORE_DIR", str(tmp_path_factory.mktemp("gha_artifact_store")))
+    # Numbered mktemp scans every sibling on every test; let the store create a unique path only when used.
+    store_dir = tmp_path_factory.getbasetemp() / "gha_artifact_store" / uuid4().hex
+    monkeypatch.setattr(gha_artifacts, "DEFAULT_STORE_DIR", str(store_dir))
 
 
 # Shared failure fixtures
