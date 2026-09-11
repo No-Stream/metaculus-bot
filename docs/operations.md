@@ -2753,7 +2753,7 @@ the telemetry markers:
 - `Degradation counters: forecasters_dropped=..., questions_failed_to_publish=...,
   stacker_primary_failed=..., stacker_fallback_used=...,
   stacker_fallback_failed=..., research_provider_failures=...,
-  summarizer_failures=..., gap_fill_v2_errors=...,
+  summarizer_failures=..., gap_fill_v1_errors=..., gap_fill_v2_errors=...,
   prediction_market_degraded=..., prediction_market_source_losses=...,
   provider_degradation=..., publish_attempt_failures=...,
   publish_skipped_closed=..., time_budget_fast_path=...`: the

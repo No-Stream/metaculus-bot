@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from forecasting_tools import GeneralLlm
 
+from metaculus_bot.constants import GAP_FILL_MIN_RESEARCH_CHARS
 from metaculus_bot.prompts import SUMMARIZER_SOFT_FAIL_BANNER
 from metaculus_bot.research.asknews_summarization import summarize_asknews
 from metaculus_bot.research.gap_fill_stages import run_gap_fill_passes
@@ -1276,3 +1277,96 @@ class TestStagesReportTheirAccountingInsteadOfCounting:
         assert outcome.v2_errors == 1
         assert outcome.budget_cut is False
         assert outcome.research == "research prose"
+
+    @pytest.mark.asyncio
+    async def test_run_gap_fill_passes_reports_a_v1_crash_without_a_counter(self, question, monkeypatch) -> None:
+        """A v1 failure callback becomes stage accounting, just as v2's does."""
+        monkeypatch.setenv("GAP_FILL_ENABLED", "true")
+        monkeypatch.delenv("GAP_FILL_V2_ENABLED", raising=False)
+
+        async def failing_v1(
+            _question,
+            _research,
+            *,
+            is_benchmarking: bool,
+            on_error,
+        ) -> str:
+            assert is_benchmarking is False
+            on_error(ValueError("invalid analyzer schema"))
+            return ""
+
+        with patch(
+            "metaculus_bot.research.targeted.run_gap_fill_pass",
+            new=failing_v1,
+        ):
+            outcome = await run_gap_fill_passes(
+                question,
+                "x" * GAP_FILL_MIN_RESEARCH_CHARS,
+                fast_path=False,
+                is_benchmarking=False,
+                time_budget=None,
+            )
+
+        assert outcome.v1_errors == 1
+        assert outcome.v2_errors == 0
+        assert outcome.budget_cut is False
+        assert outcome.research == "x" * GAP_FILL_MIN_RESEARCH_CHARS
+
+    @pytest.mark.asyncio
+    async def test_run_gap_fill_passes_counts_a_v1_escape_from_the_failure_seam(self, question, monkeypatch) -> None:
+        """An unexpected v1 escape is counted at the stage guard, like v2's escape path."""
+        monkeypatch.setenv("GAP_FILL_ENABLED", "true")
+        monkeypatch.delenv("GAP_FILL_V2_ENABLED", raising=False)
+
+        with patch(
+            "metaculus_bot.research.targeted.run_gap_fill_pass",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("v1 escaped its own soft-fail"),
+        ):
+            outcome = await run_gap_fill_passes(
+                question,
+                "x" * GAP_FILL_MIN_RESEARCH_CHARS,
+                fast_path=False,
+                is_benchmarking=False,
+                time_budget=None,
+            )
+
+        assert outcome.v1_errors == 1
+        assert outcome.v2_errors == 0
+        assert outcome.budget_cut is False
+        assert outcome.research == "x" * GAP_FILL_MIN_RESEARCH_CHARS
+
+    @pytest.mark.asyncio
+    async def test_run_gap_fill_passes_does_not_report_a_legitimate_empty_v1_result(
+        self, question, monkeypatch
+    ) -> None:
+        """An analyzer that answers with no gaps is an ordinary empty result."""
+        monkeypatch.setenv("GAP_FILL_ENABLED", "true")
+        monkeypatch.delenv("GAP_FILL_V2_ENABLED", raising=False)
+
+        async def empty_v1(
+            _question,
+            _research,
+            *,
+            is_benchmarking: bool,
+            on_error,
+        ) -> str:
+            assert is_benchmarking is False
+            assert on_error is not None
+            return ""
+
+        with patch(
+            "metaculus_bot.research.targeted.run_gap_fill_pass",
+            new=empty_v1,
+        ):
+            outcome = await run_gap_fill_passes(
+                question,
+                "x" * GAP_FILL_MIN_RESEARCH_CHARS,
+                fast_path=False,
+                is_benchmarking=False,
+                time_budget=None,
+            )
+
+        assert outcome.v1_errors == 0
+        assert outcome.budget_cut is False
+        assert outcome.research == "x" * GAP_FILL_MIN_RESEARCH_CHARS

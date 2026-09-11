@@ -926,8 +926,13 @@ One deliberate delta from the old spec: a key absent from an era's line is now a
 record rather than explicitly None; read `record.get(key)` and treat both as "this era didn't
 emit it", never as a measured zero.
 
+`gap_fill_v1_errors` counts analyzer, schema and resolver failures reported by the v1 gap-fill
+pass. A valid empty analysis and gaps dropped by legitimate triage grades leave it at zero; the
+counter is separate from `gap_fill_v2_errors` so a v1 failure remains attributable. Both are
+alertable and the forecast still publishes before the CLI exits non-zero.
+
 `tests/test_degradation_counters.py` pins the shape of this line, and three of its pins are worth
-knowing before you edit either side. It drives fourteen of the alertable terms with a distinct power
+knowing before you edit either side. It drives fifteen of the alertable terms with a distinct power
 of two each, so the resulting sum names exactly which subset was counted and a missing or
 double-counted term is visible rather than merely wrong; `publish_skipped_closed` is the one term
 that sum leaves at zero, and the same file pins its presence on the line separately. Four terms are

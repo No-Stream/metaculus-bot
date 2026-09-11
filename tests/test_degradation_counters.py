@@ -52,6 +52,7 @@ def _snapshot(**overrides: int) -> DegradationSnapshot:
         "stacker_fallback_failed": 0,
         "research_provider_failures": 0,
         "summarizer_failures": 0,
+        "gap_fill_v1_errors": 0,
         "gap_fill_v2_errors": 0,
         "prediction_market_degraded": 0,
         "prediction_market_source_losses": 0,
@@ -110,7 +111,7 @@ def test_forecaster_reads_a_fresh_snapshot_after_counter_updates(mock_general_ll
 
 
 def test_alertable_count_sums_all_degradation_counters(mock_general_llm, monkeypatch):
-    """Property must sum every degradation counter: fourteen of ``alertable_total``'s fifteen
+    """Property must sum every degradation counter: fifteen of ``alertable_total``'s sixteen
     terms are driven here (``publish_skipped_closed`` is pinned on the summary line below). Using distinct powers of 2
     makes an off-by-one or missing-counter bug visible: the resulting sum
     uniquely identifies which subset was counted.
@@ -123,6 +124,7 @@ def test_alertable_count_sums_all_degradation_counters(mock_general_llm, monkeyp
     bot._pipeline.counters.stacker_fallback_used_count = 8
     bot._pipeline.counters.stacker_fallback_failed_count = 16
     bot._research_provider_failure_count = 32
+    bot._research.gap_fill_v1_error_count = 16384
     bot._gap_fill_v2_error_count = 64
     # A read-only accessor, not a bot attribute; see docs/telemetry_markers.md "DEGRADATION_COUNTERS".
     monkeypatch.setattr(prediction_market, "kalshi_catalogue_fetch_failures", lambda: 128)
@@ -139,7 +141,25 @@ def test_alertable_count_sums_all_degradation_counters(mock_general_llm, monkeyp
     # Budget-driven research loss off the fast path; see docs/research.md "Orchestrator implementation notes".
     bot._research.research_budget_cut_count = 8192
 
-    assert bot.alertable_count == 16383
+    assert bot.alertable_count == 32767
+
+
+def test_v1_gap_fill_failure_is_part_of_the_actual_alertable_total(mock_general_llm):
+    """A v1 stage failure reaches the bot property that drives the CLI exit."""
+    bot = _bot(mock_general_llm)
+
+    bot._research.gap_fill_v1_error_count = 1
+
+    assert bot.alertable_count == 1
+    assert "gap_fill_v1_errors=1" in format_degradation_summary(bot._degradation_snapshot())
+
+
+def test_an_empty_v1_gap_fill_result_does_not_alert(mock_general_llm):
+    """A legitimate no-gaps result leaves the run all-clear."""
+    bot = _bot(mock_general_llm)
+
+    assert bot._research.gap_fill_v1_error_count == 0
+    assert bot.alertable_count == 0
 
 
 def test_alertable_count_zero_by_default(mock_general_llm):
@@ -185,6 +205,7 @@ async def test_run_summary_lines_name_what_they_count(mock_general_llm, caplog):
     assert "research_provider_failures=3" in degradation
     assert "research_provider_timeouts" not in degradation
     assert "summarizer_failures=1" in degradation
+    assert "gap_fill_v1_errors=0" in degradation
     assert "prediction_market_source_losses=0" in degradation
     assert "prediction_market_platform_failures" not in degradation
 

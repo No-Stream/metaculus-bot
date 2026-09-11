@@ -115,9 +115,10 @@ def _patch_resolver(invoke: AsyncMock) -> Iterator[MagicMock]:
 class TestParseGapList:
     """Cover the various shapes of analyzer output the parser must tolerate."""
 
-    def test_empty_string_returns_empty(self) -> None:
-        assert _parse_gap_list("") == []
-        assert _parse_gap_list("   \n  ") == []
+    @pytest.mark.parametrize("raw", ["", "   \n  "])
+    def test_empty_string_raises(self, raw: str) -> None:
+        with pytest.raises(ValueError, match="empty response"):
+            _parse_gap_list(raw)
 
     def test_plain_valid_json(self) -> None:
         raw = '{"gaps": [{"gap": "g1", "why_matters": "wm1", "search_query": "sq1"}]}'
@@ -142,10 +143,9 @@ class TestParseGapList:
         assert len(out) == 1
         assert out[0]["gap"] == "g"
 
-    def test_malformed_json_returns_empty(self) -> None:
-        out = _parse_gap_list("not json at all, just words")
-
-        assert out == []
+    def test_malformed_json_raises(self) -> None:
+        with pytest.raises(ValueError, match="invalid JSON"):
+            _parse_gap_list("not json at all, just words")
 
     def test_a_slot_without_gap_text_is_kept_empty_for_triage_to_drop(self) -> None:
         """The parser never compacts the list: ``same_need_as`` is a position in the ANALYZER's list, so a
@@ -428,8 +428,7 @@ class TestTriageGaps:
         assert triage.dropped == [{**gap, "position": 1, "reason": DROP_SCHEMA}]
 
     def test_an_omitted_same_need_as_key_reads_as_no_pointer(self) -> None:
-        """Models routinely omit a key whose value would be null, and the analyzer's JSON is not
-        schema-enforced, so dropping every gap over a missing pointer would switch v1 off outright. A
+        """An omitted null pointer remains compatible with archived analyzer output. A
         pointer the analyzer did type is still validated (see ``test_schema_drift_drops_the_gap``)."""
         gap = _gap_without("same_need_as")
 
@@ -814,20 +813,20 @@ async def test_raw_record_carries_the_survivors_and_the_dropped_gaps() -> None:
 
 @pytest.mark.asyncio
 async def test_malformed_analyzer_output_soft_fails() -> None:
-    """If the analyzer returns no parseable gaps, we get "" and no searches run.
-
-    This simulates ``_parse_gap_list`` returning [] inside ``_run_analyzer``.
-    """
+    """Malformed output preserves forecasting but reports a stage failure."""
     question = MockQuestion()
-
+    errors: list[BaseException] = []
+    analyzer = MagicMock(invoke=AsyncMock(return_value="not valid JSON"))
     fake_search = AsyncMock(return_value="should not be called")
     with (
-        patch("metaculus_bot.research.targeted._run_analyzer", AsyncMock(return_value=[])),
+        patch("metaculus_bot.fallback_openrouter.build_llm_with_openrouter_fallback", return_value=analyzer),
         _patch_resolver(fake_search),
     ):
-        out = await run_gap_fill_pass(_q(question), "first-pass research")
+        out = await run_gap_fill_pass(_q(question), "first-pass research", on_error=errors.append)
 
     assert out == ""
+    assert len(errors) == 1
+    assert isinstance(errors[0], ValueError)
     fake_search.assert_not_called()
 
 

@@ -6,8 +6,8 @@ independent failure guards, budget arithmetic and error accounting belong togeth
 away from provider selection and bundle assembly.
 
 ``run_gap_fill_passes`` RETURNS its accounting in a ``GapFillOutcome`` rather than
-bumping counters, because the counters (``gap_fill_v2_error_count``,
-``research_budget_cut_count``) live on the orchestrator, which is what the forecaster
+bumping counters, because the counters (``gap_fill_v1_error_count``,
+``gap_fill_v2_error_count``, ``research_budget_cut_count``) live on the orchestrator, which is what the forecaster
 and the end-of-run degradation line read. The two gap-fill modules stay behind
 function-level imports inside the failure guards, so an import error in either one
 degrades the question instead of killing the run.
@@ -42,8 +42,8 @@ logger = logging.getLogger(__name__)
 class GapFillOutcome:
     """One question's gap-fill result plus the accounting its caller owns.
 
-    ``v2_errors`` and ``budget_cut`` are returned rather than counted here because
-    both counters they feed live on the orchestrator. ``budget_cut`` is a single
+    ``v1_errors``, ``v2_errors`` and ``budget_cut`` are returned rather than counted here because
+    the counters they feed live on the orchestrator. ``budget_cut`` is a single
     boolean, not a count: the orchestrator's own bookkeeping dedupes per question, so
     a question losing v1 AND v2 to the deadline is one degradation, and collapsing the
     three cut sites into one flag is what makes that impossible to double-count.
@@ -51,6 +51,7 @@ class GapFillOutcome:
 
     research: str
     v2_payload: dict | None
+    v1_errors: int
     v2_errors: int
     budget_cut: bool
 
@@ -74,14 +75,20 @@ async def _run_gap_fill_v1(
     active: bool,
     is_benchmarking: bool,
     time_budget: QuestionTimeBudget | None,
-) -> tuple[str, bool]:
-    """Return ``(addendum, budget_cut)``; the addendum is ``""`` when inactive, cut, or failed.
+) -> tuple[str, bool, int]:
+    """Return ``(addendum, budget_cut, errors)``; addendum is ``""`` when inactive, cut, or failed.
 
     Its own failure guard (v2 has a separate one) so a v1 defect can never zero
     v2's findings, and vice versa.
     """
     if not active:
-        return "", False
+        return "", False, 0
+    errors = 0
+
+    def _count_error(_exc: BaseException) -> None:
+        nonlocal errors
+        errors += 1
+
     try:
         from metaculus_bot.research.targeted import (  # noqa: PLC0415  # HARNESS-SCAN-EXEMPT-function-level-import  # import stays inside failure guard
             run_gap_fill_pass,
@@ -89,20 +96,25 @@ async def _run_gap_fill_v1(
 
         # Bounded by the research phase's remainder, so a pass that overruns its own deadlines cannot spend the forecast's time.
         addendum = await asyncio.wait_for(
-            run_gap_fill_pass(question, research, is_benchmarking=is_benchmarking),
+            run_gap_fill_pass(
+                question,
+                research,
+                is_benchmarking=is_benchmarking,
+                on_error=_count_error,
+            ),
             timeout=_remaining_research_phase_s(time_budget),
         )
-        return addendum, False
+        return addendum, False, errors
     except TimeoutError:
         # A deliberate budget cut, not a failure: its own branch keeps it out of the "stage failed" traceback.
         logger.warning(
             "GAP_FILL_V1_CUT_FOR_BUDGET: question=%s; research phase ran out of budget",
             getattr(question, "id_of_question", None),
         )
-        return "", True
+        return "", True, errors
     except Exception:  # HARNESS-SCAN-EXEMPT-broad-except — gap-fill is optional; a failure (import error, unhandled raise) must never kill the forecast
         logger.exception("Gap-fill v1 stage failed; proceeding without it")
-        return "", False
+        return "", False, errors + 1
 
 
 async def _run_gap_fill_v2(
@@ -248,7 +260,7 @@ async def run_gap_fill_passes(
         )
         budget_cut = True
     if not (gap_fill_v1_active or gap_fill_v2_active):
-        return GapFillOutcome(research=research, v2_payload=None, v2_errors=0, budget_cut=budget_cut)
+        return GapFillOutcome(research=research, v2_payload=None, v1_errors=0, v2_errors=0, budget_cut=budget_cut)
 
     gap_fill_v2_payload: dict | None = None
     ghost_context: GhostContext | None = None
@@ -261,7 +273,7 @@ async def run_gap_fill_passes(
         nonlocal ghost_context
         ghost_context = context
 
-    (addendum, v1_cut), (v2_findings, v2_cut, v2_errors) = await asyncio.gather(
+    (addendum, v1_cut, v1_errors), (v2_findings, v2_cut, v2_errors) = await asyncio.gather(
         _run_gap_fill_v1(
             question, research, active=gap_fill_v1_active, is_benchmarking=is_benchmarking, time_budget=time_budget
         ),
@@ -287,4 +299,10 @@ async def run_gap_fill_passes(
     if v2_findings:
         # v2_findings carries its own "## Agentic Research Findings" header (render_findings), distinct from v1's.
         research = f"{research}\n\n---\n\n{v2_findings}"
-    return GapFillOutcome(research=research, v2_payload=gap_fill_v2_payload, v2_errors=v2_errors, budget_cut=budget_cut)
+    return GapFillOutcome(
+        research=research,
+        v2_payload=gap_fill_v2_payload,
+        v1_errors=v1_errors,
+        v2_errors=v2_errors,
+        budget_cut=budget_cut,
+    )

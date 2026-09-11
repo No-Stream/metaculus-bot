@@ -106,6 +106,8 @@ class ResearchOrchestrator:
         self.provider_failure_count: int = 0
         # Alertable: ships raw articles as the briefing. See docs/research.md "Orchestrator implementation notes".
         self.summarizer_failure_count: int = 0
+        # Genuine v1 failures only, and alertable. See docs/research.md "Orchestrator implementation notes".
+        self.gap_fill_v1_error_count: int = 0
         # Genuine v2 crashes only, and alertable. See docs/research.md "Orchestrator implementation notes".
         self.gap_fill_v2_error_count: int = 0
         # Off-fast-path budget thinning, deduped. See docs/research.md "Orchestrator implementation notes".
@@ -430,7 +432,7 @@ class ResearchOrchestrator:
         """Run both gap-fill passes and absorb their accounting into this bot's counters.
 
         ``gap_fill_stages`` returns what happened rather than counting it, so this is
-        the one place a v2 crash bumps ``gap_fill_v2_error_count`` and the one place a
+        the one place a v1 or v2 crash bumps its corresponding error counter and the one place a
         budget cut reaches ``_record_research_budget_cut`` (whose per-question dedup and
         fast-path suppression then apply once, however many stages were cut).
         """
@@ -441,6 +443,7 @@ class ResearchOrchestrator:
             is_benchmarking=self._is_benchmarking,
             time_budget=time_budget,
         )
+        self.gap_fill_v1_error_count += outcome.v1_errors
         self.gap_fill_v2_error_count += outcome.v2_errors
         if outcome.budget_cut:
             self._record_research_budget_cut(question, fast_path=fast_path)

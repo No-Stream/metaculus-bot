@@ -34,6 +34,7 @@ class DegradationSnapshot:
     stacker_fallback_failed: int
     research_provider_failures: int
     summarizer_failures: int
+    gap_fill_v1_errors: int
     gap_fill_v2_errors: int
     prediction_market_degraded: int
     prediction_market_source_losses: int
@@ -67,6 +68,7 @@ def alertable_total(snapshot: DegradationSnapshot) -> int:
         + snapshot.stacker_fallback_failed
         + snapshot.research_provider_failures
         + snapshot.summarizer_failures
+        + snapshot.gap_fill_v1_errors
         + snapshot.gap_fill_v2_errors
         + snapshot.prediction_market_degraded
         + snapshot.prediction_market_source_losses
@@ -99,6 +101,7 @@ def format_degradation_summary(snapshot: DegradationSnapshot) -> str:
         f"stacker_fallback_failed={snapshot.stacker_fallback_failed}, "
         f"research_provider_failures={snapshot.research_provider_failures}, "
         f"summarizer_failures={snapshot.summarizer_failures}, "
+        f"gap_fill_v1_errors={snapshot.gap_fill_v1_errors}, "
         f"gap_fill_v2_errors={snapshot.gap_fill_v2_errors}, "
         f"prediction_market_degraded={snapshot.prediction_market_degraded}, "
         f"prediction_market_source_losses={snapshot.prediction_market_source_losses}, "

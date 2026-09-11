@@ -13,11 +13,12 @@ survivor via a parallel OpenAI native web search (OpenRouter, donated-key billed
 import asyncio
 import json
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from forecasting_tools import GeneralLlm, MetaculusQuestion
+from pydantic import BaseModel, ConfigDict
 
 from metaculus_bot.constants import (
     CRUX_SOFT_DEADLINE,
@@ -67,6 +68,27 @@ DROP_SAME_NEED = "same_need"
 DROP_SCHEMA = "schema"
 DROP_OVER_CAP = "over_cap"
 DROP_REASONS: tuple[str, ...] = (DROP_NOT_ANSWERABLE, DROP_ALREADY_ANSWERED, DROP_SAME_NEED, DROP_SCHEMA, DROP_OVER_CAP)
+
+
+class GapCandidate(BaseModel):
+    """Required analyzer fields, enforced by the provider before local triage."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    gap: str
+    why_matters: str
+    search_query: str
+    answerable_now: bool
+    already_in_first_pass: bool
+    same_need_as: int | None
+
+
+class GapAnalysis(BaseModel):
+    """An explicitly empty list is a successful analysis with no useful gaps."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    gaps: list[GapCandidate]
 
 
 async def extract_disagreement_crux(
@@ -132,7 +154,7 @@ def _parse_gap_list(raw: str) -> list[dict[str, Any]]:
     """Extract the gap list from the analyzer's JSON output, one slot per listed item, ungraded and unclipped.
 
     Robust to light markdown wrapping (```json``` fences) and trailing commentary.
-    Returns [] on any parse failure — callers should soft-fail. Every list item
+    Raises ValueError on an invalid envelope so callers can report degradation. Every list item
     keeps its slot (a non-dict item or one without gap text becomes an empty slot)
     so ``same_need_as`` positions stay the analyzer's own; the three grade fields
     (``GAP_GRADE_FIELDS``) pass through exactly as the analyzer typed them, and
@@ -140,7 +162,7 @@ def _parse_gap_list(raw: str) -> list[dict[str, Any]]:
     one. Grading, the schema drops and the ``GAP_FILL_MAX_GAPS`` cap all happen there.
     """
     if not raw or not raw.strip():
-        return []
+        raise ValueError("Gap-fill analyzer returned an empty response")
 
     # Fenced first, then a balanced-brace scan for trailing prose. See docs/research.md "v1 implementation notes".
     fenced = extract_json_block(raw)
@@ -153,16 +175,14 @@ def _parse_gap_list(raw: str) -> list[dict[str, Any]]:
             f"GapFill: could not parse analyzer JSON ({type(exc).__name__}): {exc}; "
             f"raw[:200]={raw[:200]!r}"  # HARNESS-SCAN-EXEMPT-subsampling: a log-line preview, not a data reduction
         )
-        return []
+        raise ValueError("Gap-fill analyzer returned invalid JSON") from exc
 
     if not isinstance(data, dict):
-        logger.warning(f"GapFill: analyzer output was not a dict, got {type(data).__name__}")
-        return []
+        raise ValueError(f"Gap-fill analyzer output was not an object: {type(data).__name__}")
 
-    gaps_raw = data.get("gaps", [])
+    gaps_raw = data.get("gaps")
     if not isinstance(gaps_raw, list):
-        logger.warning(f"GapFill: 'gaps' field was not a list, got {type(gaps_raw).__name__}")
-        return []
+        raise ValueError("Gap-fill analyzer output must contain a gaps list")
 
     gaps: list[dict[str, Any]] = []
     for item in gaps_raw:
@@ -272,10 +292,9 @@ async def _run_analyzer(
     index; the task is gap decomposition (not deep judgment) under a tight
     soft-fail wall cap, so terra-low is the latency-safe tier.
 
-    Without google-genai's response_mime_type=application/json, the prompt asks
-    for ```json fenced output and _parse_gap_list handles fence stripping +
-    balanced-brace fallback for trailing commentary. Returns every parsed gap;
-    ``triage_gaps`` grades and caps them.
+    Strict structured output requires every grade; require_parameters prevents a
+    provider from silently ignoring the schema. Local triage still validates the
+    grades and positional pointers before any resolver spend.
     """
     from metaculus_bot.fallback_openrouter import (  # noqa: PLC0415  # late import: tests patch this at its source module
         build_llm_with_openrouter_fallback,
@@ -289,6 +308,11 @@ async def _run_analyzer(
         temperature=None,
         timeout=GAP_FILL_ANALYZER_TIMEOUT,
         allowed_tries=1,
+        response_format={
+            "type": "json_schema",
+            "json_schema": {"name": "gap_analysis", "strict": True, "schema": GapAnalysis.model_json_schema()},
+        },
+        extra_body={"provider": {"require_parameters": True}},
     )
     prompt = gap_fill_analyzer_prompt(
         question_text=question.question_text,
@@ -350,6 +374,7 @@ async def run_gap_fill_pass(
     first_pass_research: str,
     *,
     is_benchmarking: bool = False,
+    on_error: Callable[[BaseException], None] | None = None,
 ) -> str:
     """Identify, triage and resolve factual gaps in first-pass research.
 
@@ -357,10 +382,9 @@ async def run_gap_fill_pass(
     search per survivor. The models, the stage detail and the triage rules are in docs/research.md
     "v1: targeted gap-fill".
 
-    Never raises: returns "" on any upstream failure (missing API key, timeout, SDK error, network
-    error), logging the type and message, because gap-fill is optional enrichment and a forecast on
-    first-pass research alone beats no forecast. The ``research.strip()`` guard at the call site
-    keeps this from swallowing a first-pass failure.
+    Keeps successful research on upstream failure and reports one error per pass through
+    ``on_error`` so the run exits nonzero after publishing. Valid empty analyses and
+    deliberate triage drops are not failures. Cancellation of the pass still propagates.
     """
     qid = getattr(question, "id_of_question", None)
     try:
@@ -368,11 +392,18 @@ async def run_gap_fill_pass(
     except _GAP_FILL_SOFT_FAIL_EXCEPTIONS as exc:
         # A dead analyzer looks exactly like a question with no gaps. See docs/research.md "v1 implementation notes".
         logger.warning(f"GAP_FILL_ANALYZER_FAILED: question={qid} error={type(exc).__name__} detail={exc}")
+        if on_error is not None:
+            on_error(exc)
         # A scheduler checkpoint on the no-op path, for ASYNC910. See docs/research.md "v1 implementation notes".
         await asyncio.sleep(0)
         return ""
 
     triage = triage_gaps(gaps, max_gaps=GAP_FILL_MAX_GAPS)
+    failure: BaseException | None = (
+        ValueError(f"Gap-fill analyzer returned {triage.dropped_for(DROP_SCHEMA)} schema-invalid gap(s)")
+        if triage.dropped_for(DROP_SCHEMA)
+        else None
+    )
     # Every slot failing the schema is v1 gone dark while the analyzer still bills: WARN, like a dead analyzer.
     wholesale_schema_drift = triage.listed > 0 and triage.dropped_for(DROP_SCHEMA) == triage.listed
     (logger.warning if wholesale_schema_drift else logger.info)(_format_triage_marker(qid, triage))
@@ -397,6 +428,8 @@ async def run_gap_fill_pass(
     for idx, (gap, res) in enumerate(zip(triage.kept, results, strict=True), start=1):
         if isinstance(res, BaseException):
             logger.warning(f"GapFill: gap #{idx} search failed ({type(res).__name__}): {res}")
+            if failure is None:
+                failure = res
             continue
         result_text = res
         if not result_text or not result_text.strip():
@@ -405,6 +438,8 @@ async def run_gap_fill_pass(
         why_line = f"_Why it matters: {why}_\n\n" if why else ""
         sections.append(f"### Gap {idx}: {gap['gap']}\n\n{why_line}{result_text}")
 
+    if failure is not None and on_error is not None:
+        on_error(failure)
     if not sections:
         return ""
 

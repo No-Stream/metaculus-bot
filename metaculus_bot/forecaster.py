@@ -456,6 +456,14 @@ class TemplateForecaster(CompactLoggingForecastBot):
         self._research.gap_fill_v2_error_count = value
 
     @property
+    def _gap_fill_v1_error_count(self) -> int:
+        return self._research.gap_fill_v1_error_count
+
+    @_gap_fill_v1_error_count.setter
+    def _gap_fill_v1_error_count(self, value: int) -> None:
+        self._research.gap_fill_v1_error_count = value
+
+    @property
     def alertable_count(self) -> int:
         """Sum of counters whose non-zero value should page us (see degradation_counters)."""
         return alertable_total(self._degradation_snapshot())
@@ -476,6 +484,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             stacker_fallback_failed=aggregation_counters.stacker_fallback_failed_count,
             research_provider_failures=self._research_provider_failure_count,
             summarizer_failures=self._summarizer_failure_count,
+            gap_fill_v1_errors=self._gap_fill_v1_error_count,
             gap_fill_v2_errors=self._gap_fill_v2_error_count,
             prediction_market_degraded=self._prediction_market_degraded_count,
             prediction_market_source_losses=self._prediction_market_source_loss_count,

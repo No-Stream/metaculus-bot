@@ -596,6 +596,7 @@ class TestGapFillCutByTheResearchPhaseBudget:
         assert "x" * 2000 in research
         assert "Targeted Gap-Fill" not in research
         assert "Agentic Research Findings" not in research
+        assert orchestrator.gap_fill_v1_error_count == 0
         assert orchestrator.gap_fill_v2_error_count == 0
         # The cut IS alertable, once: both passes cut on one question dedupe to a
         # single research_budget_cut_count bump — the off-fast-path counter that

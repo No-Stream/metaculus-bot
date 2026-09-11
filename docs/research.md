@@ -73,6 +73,13 @@ briefing. Alertable by operator decision 2026-07-26 on quality grounds: provider
 from POST-summarizer text, so a permanently dead summarizer would otherwise degrade every briefing
 while AskNews keeps reporting `status="ok"`.
 
+**`gap_fill_v1_error_count`.** A v1 analyzer, schema or resolver failure is alertable even though
+the stage returns the surviving first-pass research and publication continues. The v1 stage reports
+one failure per pass through its callback, including partial schema drift, while a valid empty
+analysis and legitimate triage drops stay at zero; an unexpected escape from the stage guard is
+counted like the v2 escape path. It is surfaced as `gap_fill_v1_errors` in the forecaster snapshot,
+the run summary and `alertable_count`, separately from budget cuts and v2 failures.
+
 **`gap_fill_v2_error_count`.** Genuine gap-fill-v2 CRASHES only, not idle "driver found nothing"
 runs and not deadline hits. It mirrors `provider_failure_count`: surfaced to the forecaster as
 `_gap_fill_v2_error_count` and folded into `alertable_count`, so a dead v2 feature reddens CI. A
@@ -2118,15 +2125,17 @@ reason per gap so the marker's counts partition the list:
    carrying a string where a boolean belongs, or pointing at itself, forward, at zero or with a
    non-integer, or sitting in an empty slot, is dropped as `schema`, never read as passing: a grade
    that defaulted to passing would spend exactly the money the grade exists to save. An ABSENT
-   `same_need_as` key is the one exception and reads as null, no pointer, because the analyzer's JSON
-   is not schema-enforced at the request level and models routinely omit a key whose value would be
-   null, so dropping every gap over a missing pointer would switch v1 off entirely, which is worse
-   than the drift it would catch. A `same_need_as` the analyzer did type is still validated. An
+   `same_need_as` key still reads as null for compatibility with archived outputs. New analyzer
+   calls enforce all six fields with strict JSON Schema and `provider.require_parameters=true`;
+   providers must support the schema rather than silently dropping it. A `same_need_as` the analyzer
+   did type is still validated. An
    analyzer that ignores the schema wholesale shows up as `dropped_schema=listed` on every question,
    and the marker line is emitted at WARNING in exactly that case (the same level as
    `GAP_FILL_ANALYZER_FAILED`, because v1 has gone dark while the analyzer still bills), while a
    question whose gaps all fail on legitimate grades stays at INFO, because that is the filter
-   working. Either way the forecast proceeds on the first pass and gap-fill v2.
+   working. Any schema drop reports a v1 failure, including partial schema drift. The forecast
+   proceeds using successful research, then the run exits 1 through its degradation accounting.
+   A valid empty list or gaps dropped solely on legitimate grades do not count as failures.
 4. **The cap last.** `GAP_FILL_MAX_GAPS` applies to the survivors, so a dropped gap never displaces
    a kept one; a survivor past the cap is dropped as `over_cap`. The analyzer is still asked for at
    most that many, so this binds only when it over-lists.
@@ -2156,9 +2165,8 @@ each naming the function it came from. No executable code changed in that pass.
 
 **`_GAP_FILL_SOFT_FAIL_EXCEPTIONS` (module level).** The tuple is `(Exception,)`, and the breadth is
 deliberate. It names the exceptions that trigger a soft-fail, meaning a `""` return, out of
-`run_gap_fill_pass`, whose documented policy is "never raises, returns `''` on any upstream failure":
-gap-fill is an optional enrichment layer, and a forecast with only first-pass research is strictly
-better than no forecast at all. Listing specific exception classes was tractable while both stages
+`run_gap_fill_pass`. Failures return the surviving research and notify `on_error` once per pass,
+so publishing can finish before the run exits 1. Listing specific exception classes was tractable while both stages
 ran on google-genai. After the 2026-05-20 migration of the analyzer to OpenRouter and litellm it is
 not, because the analyzer can now raise `litellm.APIError`, `openai.AuthenticationError`,
 `anthropic.RateLimitError` and more. Catching `Exception` is what matches the stated policy, and it
@@ -2186,7 +2194,8 @@ flagged line by a `# fmt: skip` (see the note at the end of this section).
 **`_parse_gap_list`: choosing an extractor, and the raw preview in the warning.** Fenced blocks are
 preferred, through the canonical extractor in `structured_output_schema`, and the fallback is a
 string-literal-aware balanced-brace scan for unfenced payloads with trailing commentary. Both helpers
-live in one module so the brace scanner is fixed in one place. The parse-failure warning previews the
+live in one module so the brace scanner is fixed in one place. Invalid JSON, an empty response, or a
+missing/non-list `gaps` field raises `ValueError`; only an explicit empty list means no gaps. The parse-failure warning previews the
 analyzer response with `raw[:200]`, another display truncation carrying the same pragma and the same
 `# fmt: skip`.
 

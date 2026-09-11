@@ -780,7 +780,7 @@ are here.
 **What `_assert_pipeline_ran` pins.**
 
 - `alertable_count == 0`: the sum of every degradation counter (forecasters dropped, publish
-  failures, stacker fallbacks, research-provider failures, gap-fill v2 errors). The orchestrator
+  failures, stacker fallbacks, research-provider failures, gap-fill v1 and v2 errors). The orchestrator
   SWALLOWS provider exceptions into `status="errored"` plus a counter bump rather than re-raising,
   so a broken provider dep would otherwise pass silently. This is the tripwire for it.
 - `EXTRACTION_RUNG rung=block`: the forecaster's canned block parsed at rung 1, so the
@@ -793,11 +793,9 @@ are here.
   router sends `set_research_plan` then `conclude`, so `tool_calls` is at least 2 here, and the
   `(?<!dup_)` in the regex keeps the match off the sibling `dup_tool_calls=` field.
 - `GAP_FILL_V1_TRIAGE listed=1 kept=1` plus the resolved `### Gap 1` section in the research
-  bundle: gap-fill v1 is otherwise invisible in this test, because `_run_gap_fill_v1` returns `""`
-  with no counter, so a triage that dropped the canned gap (a grade field missing from
-  `_CANNED_GAP_ANALYZER`, or a `triage_gaps` regression) would leave every other assertion in the
-  file green while no resolver ever ran. This is the only test that drives real analyzer JSON
-  through `_parse_gap_list`, `triage_gaps` and the resolver.
+  bundle: this drives real analyzer JSON through `_parse_gap_list`, `triage_gaps` and the resolver.
+  A v1 failure would leave the first-pass bundle publishable but increment the separate
+  `gap_fill_v1_errors` counter, so the `alertable_count == 0` assertion catches it.
 - Provider diagnostics: each required provider reports `ok`, meaning its real formatting code
   produced non-empty text, and no provider reports `errored`, the direct catch for a swallowed
   provider-dep break that the orchestrator turns into `status="errored"` instead of re-raising.

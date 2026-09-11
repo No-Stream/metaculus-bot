@@ -222,6 +222,7 @@ class _RealAlertableCountBot(MagicMock):
     _degradation_snapshot = TemplateForecaster._degradation_snapshot
     _research_provider_failure_count = TemplateForecaster._research_provider_failure_count
     _summarizer_failure_count = TemplateForecaster._summarizer_failure_count
+    _gap_fill_v1_error_count = TemplateForecaster._gap_fill_v1_error_count
     _gap_fill_v2_error_count = TemplateForecaster._gap_fill_v2_error_count
     _prediction_market_degraded_count = TemplateForecaster._prediction_market_degraded_count
     _prediction_market_source_loss_count = TemplateForecaster._prediction_market_source_loss_count

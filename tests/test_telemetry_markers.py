@@ -2610,7 +2610,7 @@ class TestForecastersUsed:
 DEGRADATION_COUNTERS_LINE = (
     PFX + "Degradation counters: forecasters_dropped=2, questions_failed_to_publish=0, "
     "stacker_primary_failed=0, stacker_fallback_used=0, stacker_fallback_failed=0, "
-    "research_provider_failures=1, summarizer_failures=3, gap_fill_v2_errors=0, "
+    "research_provider_failures=1, summarizer_failures=3, gap_fill_v1_errors=2, gap_fill_v2_errors=0, "
     "prediction_market_degraded=0, prediction_market_source_losses=4, provider_degradation=1, "
     "publish_attempt_failures=1, publish_skipped_closed=2, time_budget_fast_path=3, "
     "research_budget_cuts=5"
@@ -2662,7 +2662,7 @@ DEGRADATION_COUNTERS_LEGACY_LINE = (
 
 
 class TestDegradationCounters:
-    def test_all_fifteen_current_keys_parse(self):
+    def test_all_sixteen_current_keys_parse(self):
         rec = _parse_one(DEGRADATION_COUNTERS_LINE)
         assert rec["marker"] == "degradation_counters"
         assert rec["research_budget_cuts"] == 5
@@ -2670,6 +2670,7 @@ class TestDegradationCounters:
         assert rec["publish_skipped_closed"] == 2
         assert rec["forecasters_dropped"] == 2
         assert rec["questions_failed_to_publish"] == 0
+        assert rec["gap_fill_v1_errors"] == 2
 
     def test_pre_budget_cut_line_still_harvests_everything_else(self):
         rec = _parse_one(DEGRADATION_COUNTERS_PRE_BUDGET_CUT_LINE)
