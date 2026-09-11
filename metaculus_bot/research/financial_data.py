@@ -25,6 +25,7 @@ from metaculus_bot.constants import (
     FINANCIAL_YFINANCE_RECENT_DAYS,
     FRED_API_KEY_ENV,
     MAX_FINANCIAL_IDENTIFIERS,
+    TS_ANCHOR_HTTP_TIMEOUT,
 )
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from metaculus_bot.llm_retry import invoke_with_transient_retry
@@ -361,8 +362,8 @@ def _yfinance_history(ticker_obj: Any, window_end: datetime, *, is_benchmarking:
     start = (window_end - timedelta(days=FINANCIAL_YFINANCE_LOOKBACK_DAYS)).date()
     if is_benchmarking:
         end = (window_end + timedelta(days=1)).date()  # yfinance end is EXCLUSIVE → +1d makes as_of inclusive
-        return ticker_obj.history(start=start.isoformat(), end=end.isoformat())
-    return ticker_obj.history(start=start.isoformat())
+        return ticker_obj.history(start=start.isoformat(), end=end.isoformat(), timeout=TS_ANCHOR_HTTP_TIMEOUT)
+    return ticker_obj.history(start=start.isoformat(), timeout=TS_ANCHOR_HTTP_TIMEOUT)
 
 
 def _yfinance_latest_lines(

@@ -2011,12 +2011,16 @@ failure is `error` naming the exception class.
 
 **The bounds** (`known_api/backends.py` constants): one series or ticker per call; a windowed read
 capped at 400 observations, newest kept, with a line saying so, and a 30-observation default;
-15 s per FRED or Yahoo call, because fredapi's `urlopen` carries no timeout of its own so
-`asyncio.wait_for` bounds the await; five market rows; at most four Kalshi detail GETs per
-question, through one `KalshiGetBudget` shared by the explicit market tool and the rung-0 callback;
-`PLATFORM_HTTP_TIMEOUT` per venue call. The explicit tools and rung-0 callback also share the
-gap-fill question's HTTP session. The ladder applies the remaining question wall to each callback
-invocation, and a timeout declines that URL so another cited URL can continue.
+15 s on each FRED or Yahoo HTTP request, with a 15 s async response bound around the blocking
+operation; the async bound declines a slow result but cannot terminate its worker thread, while
+the client-side timeout ensures a stalled socket eventually releases it. A keyed FRED read can
+make several requests for metadata or the optional first-release comparison, so these are
+per-request bounds rather than a guarantee that the complete enrichment finishes in 15 s. Five
+market rows; at most four Kalshi detail GETs per question, through one `KalshiGetBudget` shared by
+the explicit market tool and the rung-0 callback; `PLATFORM_HTTP_TIMEOUT` per venue call. The
+explicit tools and rung-0 callback also share the gap-fill question's HTTP session. The ladder
+applies the remaining question wall to each callback invocation, and a timeout declines that URL
+so another cited URL can continue.
 
 **The two adapters** (`known_api/adapters.py`) are the whole coupling to the two callers:
 `to_tool_outcome` returns the gap-fill loop's `ToolOutcome` with method `known_api`, and

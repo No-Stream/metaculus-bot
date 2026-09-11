@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Any
 
+import pandas as pd
 import pytest
 
 from metaculus_bot.research import resolution_source
@@ -17,6 +18,31 @@ from metaculus_bot.research.resolution_fetch_result import FetchResult
 from tests.resolution_source_fakes import FakeSession
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://finance.yahoo.com/quote/SPCX/history/?period1=1784592000&period2=1785024000",
+        "https://query1.finance.yahoo.com/v8/finance/chart/SPCX?period1=1784592000&period2=1785024000&interval=1d",
+    ],
+)
+async def test_yahoo_exclusive_end_is_excluded_from_rendered_history(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
+    ceilings: list[date] = []
+
+    def fetch_series(spec: Any, ceiling: date, *, lookback_years: int) -> pd.Series:
+        ceilings.append(ceiling)
+        return pd.Series([100.0, 200.0], index=pd.to_datetime(["2026-07-25", "2026-07-26"]))
+
+    monkeypatch.setattr(backends.ts_fetch, "fetch_series", fetch_series)
+    fetcher = wiring.build_known_api_fetcher(session=object())
+    result = await fetcher(url)
+
+    assert ceilings == [date(2026, 7, 25)]
+    assert result is not None
+    assert result.status == "success"
+    assert "2026-07-25" in result.text
+    assert "2026-07-26" not in result.text
 
 
 def _ok(series_id: str) -> KnownApiResult:

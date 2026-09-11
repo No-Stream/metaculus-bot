@@ -9,7 +9,7 @@ about what counts as a FRED, Yahoo or Kalshi URL. Detail: docs/research.md "Know
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Literal
 from urllib.parse import parse_qs, urlparse
 
@@ -96,12 +96,14 @@ def _translate_yahoo(url: str) -> KnownApiCall | None:
     if not symbols:
         return None
     query = parse_qs(urlparse(url).query)
+    exclusive_end = _epoch_or_none(_first(query, "period2"))
     return KnownApiCall(
         kind="yahoo",
         canonical_url=f"https://finance.yahoo.com/quote/{symbols[0]}/history/",
         yahoo_symbol=symbols[0],
         window_start=_epoch_or_none(_first(query, "period1")),
-        window_end=_epoch_or_none(_first(query, "period2")),
+        # Yahoo's period2 excludes its date; backend windows use inclusive dates.
+        window_end=exclusive_end - timedelta(days=1) if exclusive_end is not None else None,
     )
 
 

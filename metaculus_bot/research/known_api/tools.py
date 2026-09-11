@@ -20,7 +20,7 @@ from typing import Any
 from metaculus_bot.research.agentic.types import ToolOutcome, ToolSpec
 from metaculus_bot.research.known_api import adapters, backends
 
-# Above each backend's own 15 s FRED/Yahoo bound and the market snapshot's per-venue timeouts.
+# Above each backend's 15 s FRED/Yahoo response bound and the market snapshot's per-venue timeouts.
 _FRED_YAHOO_TOOL_TIMEOUT_S = 20.0
 _MARKET_TOOL_TIMEOUT_S = 30.0
 

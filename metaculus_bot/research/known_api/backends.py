@@ -8,10 +8,12 @@ transport or quota failure is ``error`` naming the exception class. Detail: docs
 "Known-API registry".
 
 The bounds are the ones the 2026-09-09 cost pass measured a need for: a windowed read capped at
-400 observations newest-kept, 15 s per FRED or Yahoo call (fredapi's ``urlopen`` carries no
-timeout of its own, so the whole worker is bounded by :func:`asyncio.wait_for`), five market rows,
-and at most four Kalshi detail GETs per question (a :class:`KalshiGetBudget` the caller constructs
-per question, since the loop has no per-question object yet -- see :func:`market_snapshot`).
+400 observations newest-kept, a 15 s client timeout on each FRED or Yahoo HTTP request, five
+market rows, and at most four Kalshi detail GETs per question (a :class:`KalshiGetBudget` the
+caller constructs per question, since the loop has no per-question object yet -- see
+:func:`market_snapshot`). The FRED and Yahoo operations also have a 15 s async response bound;
+that declines a slow result but cannot terminate a Python worker thread, while the client timeout
+ensures a stalled socket eventually releases it.
 """
 
 from __future__ import annotations
@@ -47,7 +49,7 @@ from metaculus_bot.research.number_format import format_decimal_change, format_d
 
 logger = logging.getLogger(__name__)
 
-# fredapi's urlopen has no timeout of its own, so asyncio.wait_for bounds the await, not the worker.
+# The async bound declines a slow result; the FRED and Yahoo clients carry the transport bound.
 FRED_YAHOO_CALL_TIMEOUT_S = 15.0
 # The default read is the recent window; the driver widens it with start/end when it needs history.
 DEFAULT_OBSERVATIONS = 30
@@ -154,7 +156,7 @@ def _render_series_block(*, header: str, source_url: str, series: pd.Series, tot
 
 
 async def _bounded(sync_call: Callable[[], KnownApiResult], *, label: str) -> KnownApiResult:
-    """Run a blocking backend in a thread, bounded by :data:`FRED_YAHOO_CALL_TIMEOUT_S`."""
+    """Run a blocking backend in a thread with a bounded response wait."""
     try:
         return await asyncio.wait_for(asyncio.to_thread(sync_call), timeout=FRED_YAHOO_CALL_TIMEOUT_S)
     except TimeoutError:

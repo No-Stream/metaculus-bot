@@ -26,6 +26,7 @@ dependencies = [
     "tqdm>=4.66", # imported at top level in backtest.py / community_benchmark.py
     "typeguard>=4.5", # imported at top level in backtest.py / community_benchmark.py / scoring_patches.py
     "trafilatura>=2.1.0",
+    "defusedxml>=0.7.1",
     "json-repair>=0.61.1",
     "ijson>=3.5.1",
     "pypdf>=6.16.2",

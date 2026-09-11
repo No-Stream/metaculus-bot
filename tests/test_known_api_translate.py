@@ -92,7 +92,7 @@ class TestYahooShapes:
         assert call is not None
         assert call.yahoo_symbol == "^TYX"
         assert call.window_start == date(2026, 8, 1)
-        assert call.window_end == date(2026, 8, 9)
+        assert call.window_end == date(2026, 8, 8)
 
     def test_bare_equals_symbol(self):
         call = translate("https://finance.yahoo.com/quote/BZ=F/")
@@ -107,6 +107,13 @@ class TestYahooShapes:
         assert call.kind == "yahoo"
         assert call.yahoo_symbol == "SPCX"
         assert call.window_start == date(2026, 7, 21)
+        assert call.window_end == date(2026, 7, 25)
+
+    @pytest.mark.parametrize("period2", ["", "invalid", "999999999999999999999"])
+    def test_invalid_end_leaves_window_unbounded(self, period2: str) -> None:
+        call = translate(f"https://finance.yahoo.com/quote/SPCX/history/?period2={period2}")
+        assert call is not None
+        assert call.window_end is None
 
     @pytest.mark.parametrize(
         "url",

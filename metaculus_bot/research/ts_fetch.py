@@ -260,7 +260,7 @@ def _fetch_yfinance_csv(spec: SeriesSpec, start: date, ceiling: date) -> bytes:
     try:
         # end is EXCLUSIVE in yfinance 1.x → ceiling + 1 day makes the ceiling inclusive.
         frame = yfinance.Ticker(spec.series_id).history(
-            start=start.isoformat(), end=(ceiling + timedelta(days=1)).isoformat()
+            start=start.isoformat(), end=(ceiling + timedelta(days=1)).isoformat(), timeout=HTTP_TIMEOUT_S
         )
     except YFException as exc:
         raise FetchError(f"{spec.series_id}: yfinance fetch failed: {exc}") from exc
@@ -278,19 +278,24 @@ def _fetch_yfinance_csv(spec: SeriesSpec, start: date, ceiling: date) -> bytes:
     return buf.getvalue().encode("utf-8")
 
 
+def _http_get_response(url: str, params: dict[str, str]) -> tuple[int, bytes]:
+    """Single HTTP transport seam, returning status and body after closing the response."""
+    _politeness_gate()
+    with requests.get(url, params=params, headers=BROWSER_HEADERS, timeout=HTTP_TIMEOUT_S) as response:
+        return response.status_code, response.content
+
+
 def _http_get(url: str, params: dict[str, str]) -> bytes:
     """Single HTTP seam: politeness pacing + browser UA + status check. Tests mock this."""
-    _politeness_gate()
     try:
-        response = requests.get(url, params=params, headers=BROWSER_HEADERS, timeout=HTTP_TIMEOUT_S)
+        status_code, content = _http_get_response(url, params)
     except requests.RequestException as exc:
         raise FetchError(f"HTTP request failed for {url} params={params}: {exc}") from exc
-    if response.status_code != 200:
+    if status_code != 200:
         raise FetchError(
-            f"HTTP {response.status_code} for {url} params={params} "
-            f"(bad series id, or vintage predating the first vintage)"
+            f"HTTP {status_code} for {url} params={params} (bad series id, or vintage predating the first vintage)"
         )
-    return response.content
+    return content
 
 
 # ---------------------------------------------------------------------------
