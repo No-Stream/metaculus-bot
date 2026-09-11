@@ -7,7 +7,9 @@ carries those same literals, so a patch aimed at a module that does not build th
 leave these tests green while they silently stopped proving anything.
 """
 
+import http.server
 import re
+import threading
 from typing import ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.error import URLError
@@ -17,6 +19,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from metaculus_bot.constants import TS_ANCHOR_HTTP_TIMEOUT
+from metaculus_bot.research import fred_rendering, ts_fetch
 from metaculus_bot.research.financial_data import financial_data_provider
 from metaculus_bot.research.fred_rendering import (
     UnknownFredSeries,
@@ -53,6 +57,54 @@ class TestFetchFredData:
         # Should contain the latest value
         assert "4.2" in result or "4.20" in result
 
+    def test_fredapi_request_carries_the_client_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls: list[float | None] = []
+
+        class _Response:
+            content = b"<fred><series id='UNRATE' title='Unemployment Rate'/></fred>"
+            status_code = 200
+
+            def __enter__(self) -> "_Response":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                pass
+
+        def _get(_url: str, *, params: dict[str, str], headers: dict[str, str], timeout: float) -> _Response:
+            del params, headers
+            calls.append(timeout)
+            return _Response()
+
+        monkeypatch.setattr(fred_rendering.requests, "get", _get)
+
+        fred = fred_rendering.Fred(api_key="fake_api_key")
+        fred.get_series_info("UNRATE")
+
+        assert calls == [TS_ANCHOR_HTTP_TIMEOUT]
+
+    def test_fredapi_request_times_out_against_a_stalled_loopback_server(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        release = threading.Event()
+
+        class _StallingHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                release.wait(timeout=2.0)
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _StallingHandler)
+        server_thread = threading.Thread(target=server.serve_forever)
+        server_thread.start()
+        monkeypatch.setattr(ts_fetch, "HTTP_TIMEOUT_S", 0.05)
+
+        try:
+            fred = fred_rendering.Fred(api_key="fake_api_key")
+            fred.root_url = f"http://127.0.0.1:{server.server_port}"
+            with pytest.raises(OSError, match="FRED request failed"):
+                fred.get_series_info("UNRATE")
+        finally:
+            release.set()
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2.0)
+
     def test_fred_exception_returns_empty_string(self) -> None:
         with patch("metaculus_bot.research.fred_rendering.Fred") as mock_fred_class:
             mock_fred_class.return_value.get_series.side_effect = Exception("API error")
@@ -60,6 +112,24 @@ class TestFetchFredData:
             result = _fetch_fred_data("INVALID", "fake_api_key")
 
         assert result == ""
+
+    @pytest.mark.parametrize(
+        ("status", "body", "error"),
+        [
+            (400, b'<error message="The series does not exist."/>', ValueError),
+            (400, b"not XML", fred_rendering.ParseError),
+            (200, b"not XML", fred_rendering.ParseError),
+        ],
+    )
+    def test_fredapi_preserves_response_errors(
+        self, monkeypatch: pytest.MonkeyPatch, status: int, body: bytes, error: type[Exception]
+    ) -> None:
+        monkeypatch.setattr(fred_rendering, "_http_get_response", lambda _url, _params: (status, body))
+        fred = fred_rendering.Fred(api_key="fake_api_key")
+        with pytest.raises(error) as caught:
+            fred.get_series_info("INVALID")
+        if error is ValueError:
+            assert "The series does not exist." in str(caught.value)
 
 
 class TestUnknownFredSeries:

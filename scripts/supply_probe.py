@@ -1,60 +1,26 @@
-"""Question-supply probe over Metaculus post statuses, INCLUDING ``closed``.
+"""Question-supply probe over a tournament's post statuses, INCLUDING ``closed``.
 
-Why this exists: two consecutive residual rounds' supply projections missed, both for the
-same reason. A question that has closed to forecasting but has not resolved yet sits at
-post status ``closed``, and each round's probe queried only ``statuses=resolved`` and
-``statuses=open``, so those questions were invisible. On 2026-08-31 the summer tournament
-held 178 posts at ``closed``; 26 of them were the frozen-triple checkpoint cohort the
-projection was about, and 16 of those were already past their own
-``scheduled_resolve_time`` (worst 17.1 days). Both probes were scratch scripts, so the fix
-kept getting re-lost — hence a tracked utility with tests.
+Per slug it reports posts and questions at each status, the backlog of unresolved questions
+past their own ``scheduled_resolve_time``, the FORFEIT sweep (closed or resolved questions the
+bot never forecast, with their windows) and the miss rate per UTC release hour. Two platforms:
+Metaculus (default; ``METACULUS_TOKEN`` required, ``my_forecasts`` read off the list page and
+fetched per post only where it is missing) and Mantic's Crucible (``--platform mantic``; public
+reads, ``MANTIC_TOKEN`` optional, resolved questions classified from the public spot-time
+snapshot). Every list GET carries ``with_cp=true``, which is what puts both of those on the list
+page. The platform seams are the ``PlatformProbe`` table in ``scripts/supply_probe_platforms.py``.
 
-What it reports per slug: posts and questions at each requested status, the backlog of
-UNRESOLVED questions already past their own ``scheduled_resolve_time`` with the worst
-overdue margin, and the FORFEIT sweep described next. The backlog is the number that tells
-a supply projection whether questions are late on Metaculus's side (nothing we can do)
-rather than missing from our pull.
-
-**The forfeit sweep** lists every question on a ``closed`` or ``resolved`` post that the
-bot never forecast at all, with its open/close window. This is a supply question, not a
-scoring one: a forfeited question never reaches the performance dataset (the collector drops
-a question with no ``my_forecasts.latest``), so a sweep that starts from questions the bot
-intook cannot see one. The 2026-09-01 residual round found the triple era had lost SIX
-questions to delivery where the prior sweep saw one — q44801 to a cron gap, q45085 to a
-late submit against a 12:00 close, q45093 / q45374 / q45375 to cancelled runs, q45216 to a
-retroactive close — which is why this belongs in the weekly read rather than in a round's
-scratch scripts. Only ``closed`` and ``resolved`` posts count: an open question the bot has
-not forecast YET is not a forfeit.
-
-Resolving "did we forecast this" needs ``my_forecasts``, which the posts LIST payload does
-not reliably carry (the scoring pull fetches every post individually for exactly that
-reason), so the sweep reads the list payload where the key is there and issues one
-per-post detail GET where it is not. Questions whose state stays unreadable are counted
-and disclosed as ``unknown`` rather than filed as forfeits — under-reporting a forfeit is
-recoverable, calling a forecast question forfeited is not.
-
-Read-only and free: it hits only the Metaculus posts list and post detail — no LLM call, no
-research provider, no publish — so it sits outside the repo's cost gate.
-
-Two API facts it is built around, both learned by the scratch probes it replaces:
-
-* The tournament-filtered posts list gives no usable total, so paging stops on the first
-  short page rather than trusting ``count``/``next``.
-* The endpoint rate-limits aggressively right after a full performance pull, so every
-  request carries a bounded 429 retry and pages are spaced.
-
-A slug that errors (the bare ``metaculus-cup`` slug returns 400 today — see the fall-cup note in
-``metaculus_bot/constants.py``) is reported as an error row and the survey continues, so
-one dead slug cannot hide the live ones. That also makes this the cheapest way to watch
-for the fall cup opening questions: the ``metaculus-cup-fall-2026`` row goes from zero
-posts to non-zero on the day it does.
+Read-only and free: only the platform's posts list and post detail, no LLM, research or publish
+call. Paging stops on the first short page and every request carries a bounded 429 retry. Why
+it exists, the API facts it is built around and how to read the report: ``docs/supply_probe.md``.
 
 Usage:
     uv run python scripts/supply_probe.py
     uv run python scripts/supply_probe.py --slugs fall-futureeval-2026 --statuses open closed
     uv run python scripts/supply_probe.py --no-forfeits          # counts only, no detail GETs
+    uv run python scripts/supply_probe.py --platform mantic     # public reads; MANTIC_TOKEN optional
     make supply_probe
     make supply_probe ARGS="--slugs metaculus-cup-fall-2026 --output /tmp/supply.json"
+    make supply_probe_mantic ARGS="--slugs series-2 --output scratch/mantic_supply.json"
 """
 
 from __future__ import annotations
@@ -63,6 +29,7 @@ import argparse
 import json
 import logging
 import os
+import statistics
 import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -71,67 +38,49 @@ from pathlib import Path
 from typing import Any
 
 import requests
-from forecasting_tools import MetaculusApi
-from forecasting_tools.helpers.metaculus_client import MetaculusClient
 
-from metaculus_bot.api_preflight import verify_metaculus_api_identity
+from metaculus_bot.api_preflight import verify_api_identity
 from metaculus_bot.config import load_environment
-from metaculus_bot.constants import FALL_CUP_SLUG, METACULUS_CUP_ID, TOURNAMENT_ID
+from metaculus_bot.constants import MANTIC_TOKEN_ENV, MANTIC_TOURNAMENT_ID, PLATFORM_METACULUS
 
-# The scoring pull's own post-unwrapping, shared rather than re-derived: both read the same
-# posts list, and a probe that counted questions differently from the pull it exists to
-# project would be answering a subtly different question.
+# Shared with the scoring pull so the two count questions one way (docs/supply_probe.md "API facts").
 from metaculus_bot.performance_analysis.collector import FETCH_DELAY_SECS, questions_on_post
 from metaculus_bot.time_utils import _as_utc, parse_iso_utc
+from scripts.supply_probe_platforms import (
+    DEFAULT_SLUGS,
+    FORECAST_ABSENT,
+    FORECAST_PRESENT,
+    FORECAST_UNKNOWN,
+    METACULUS_PROBE,
+    PLATFORM_PROBES,
+    POSTS_URL,
+    PlatformProbe,
+    bot_forecast_state,
+)
 
 logger = logging.getLogger(__name__)
 
-# Read off the client rather than hardcoded, so the host this probe sends the token to is
-# the same host `verify_metaculus_api_identity` vetted (it derives its preflight URL the same
-# way). Both honor a METACULUS_API_BASE_URL override, including one set in a .env file: this
-# assignment runs after the imports above, and importing `metaculus_bot.constants` is what
-# loads .env / .env.local, while the preflight resolves its own URL per call for the same
-# reason (see `api_preflight.preflight_url`).
-POSTS_URL = f"{MetaculusClient().base_url}/posts/"
-
-# The three statuses the receipts exercised. `closed` is the whole point of the utility;
-# pass --statuses to ask about any other status the API accepts.
+# `closed` is the whole point of the utility; --statuses asks about any other status the API accepts.
 DEFAULT_STATUSES: tuple[str, ...] = ("open", "closed", "resolved")
 
-# The forfeit sweep's scope. An OPEN question the bot has not forecast yet is not a forfeit,
-# so only posts whose forecasting window has shut are candidates.
+# The forfeit sweep's scope: an OPEN question the bot has not forecast yet is not a forfeit.
 FORFEIT_STATUSES: tuple[str, ...] = ("closed", "resolved")
-
-# The repo's own season slugs, deduplicated so re-pointing METACULUS_CUP_ID at the dated
-# fall slug collapses two rows into one instead of probing it twice. Minibench comes from
-# forecasting-tools, the same spelling cli.py forecasts on.
-DEFAULT_SLUGS: tuple[str, ...] = tuple(
-    dict.fromkeys([TOURNAMENT_ID, METACULUS_CUP_ID, FALL_CUP_SLUG, MetaculusApi.CURRENT_MINIBENCH_ID])
-)
 
 PAGE_SIZE = 100
 MAX_PAGES = 40  # 4,000 posts per status — an order of magnitude above any slug we probe
 REQUEST_SPACING_SECS = 1.0
-# Per-post detail GETs are spaced tighter than page GETs: the forfeit sweep can issue a few
-# hundred of them for a full season. Imported from the scoring pull rather than copied, so the
-# two read-only Metaculus walkers cannot drift into different politeness.
+# Shared with the scoring pull so the two read-only Metaculus walkers keep one politeness.
 DETAIL_REQUEST_SPACING_SECS = FETCH_DELAY_SECS
-# How often the sweep says where it is. Every GET is a DEBUG line; at 0.5 s spacing a
-# 25-post cadence puts an INFO line on the console about every 13 seconds, which is often
-# enough to tell a slow sweep from a wedged one without burying the slug's own summary.
+# At 0.5 s spacing this is an INFO line about every 13 s: enough to tell a slow sweep from a wedged one.
 DETAIL_PROGRESS_EVERY = 25
 REQUEST_TIMEOUT_SECS = 45
 MAX_RETRIES = 6
 RETRY_BACKOFF_SECS = 6.0
 SECONDS_PER_DAY = 86_400.0
 SECONDS_PER_HOUR = 3_600.0
+MINUTES_PER_HOUR = 60.0
 DEFAULT_MAX_BACKLOG_ROWS = 20
 DEFAULT_MAX_FORFEIT_ROWS = 20
-
-# What ``bot_forecast_state`` can answer. UNKNOWN is a measurement failure, not a forfeit.
-FORECAST_PRESENT = "forecast"
-FORECAST_ABSENT = "no_forecast"
-FORECAST_UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True)
@@ -147,9 +96,7 @@ class QuestionRow:
     is_resolved: bool
     open_time: str | None = None
     close_time: str | None = None
-    # One of FORECAST_PRESENT / FORECAST_ABSENT / FORECAST_UNKNOWN. UNKNOWN on any payload
-    # that carried no readable ``my_forecasts`` — a list page the sweep did not enrich, or a
-    # detail page that answered with a null block.
+    # FORECAST_PRESENT / FORECAST_ABSENT / FORECAST_UNKNOWN; UNKNOWN whenever no payload answered.
     forecast_state: str = FORECAST_UNKNOWN
 
 
@@ -208,6 +155,33 @@ class ForecastStateCounts:
 
 
 @dataclass(frozen=True)
+class ReleaseHourRow:
+    """The forfeit-eligible questions that opened in one UTC hour of day, and how they split.
+
+    ``hour_utc`` is None for questions whose ``open_time`` did not parse. ``miss_rate`` is
+    ``no_forecast / (forecast + no_forecast)``, the share of DECIDED questions we lost, and None
+    when nothing in the bucket was decided.
+    """
+
+    hour_utc: int | None
+    questions: int
+    forecast: int
+    no_forecast: int
+    unknown: int
+    miss_rate: float | None
+
+
+@dataclass(frozen=True)
+class WindowMinutes:
+    """Distribution of the realized open-to-close window over the eligible questions that carry both ends."""
+
+    shortest: float
+    median: float
+    longest: float
+    questions: int
+
+
+@dataclass(frozen=True)
 class SlugSupply:
     """One slug's supply census, or the error that stopped it."""
 
@@ -220,6 +194,8 @@ class SlugSupply:
     resolved_within_unresolved_posts: int = 0
     forfeits: tuple[ForfeitRow, ...] = ()
     forecast_states: ForecastStateCounts = ForecastStateCounts()
+    by_release_hour: tuple[ReleaseHourRow, ...] = ()
+    window_minutes: WindowMinutes | None = None
     error: str | None = None
 
     @property
@@ -241,36 +217,16 @@ def _question_is_resolved(question: Mapping[str, Any], post_status: str) -> bool
     return question.get("actual_resolve_time") is not None or question.get("resolution") is not None
 
 
-def bot_forecast_state(question: Mapping[str, Any]) -> str:
-    """Whether the token's own user forecast THIS question, per its ``my_forecasts`` block.
-
-    Three answers, because "the payload says we did not forecast it" and "the payload does
-    not say" are different facts and only the first is a forfeit. A list-page question dict
-    carries no ``my_forecasts`` at all, so it answers UNKNOWN until the sweep enriches it
-    from a per-post detail GET.
-
-    ``history`` is the authoritative emptiness test (the operator's own read of the API), but
-    a non-empty ``latest`` also counts as present: this must never call a real forecast a
-    forfeit, and the scoring collector keys on ``latest``.
-    """
-    if "my_forecasts" not in question:
-        return FORECAST_UNKNOWN
-    my_forecasts = question.get("my_forecasts")
-    if not isinstance(my_forecasts, Mapping):
-        # Present but null/scalar: the block carried no answer, so neither do we.
-        return FORECAST_UNKNOWN
-    if my_forecasts.get("history") or my_forecasts.get("latest"):
-        return FORECAST_PRESENT
-    return FORECAST_ABSENT
-
-
 def _close_time(question: Mapping[str, Any]) -> str | None:
     """When forecasting actually shut, preferring the realized close over the scheduled one."""
     return question.get("actual_close_time") or question.get("scheduled_close_time")
 
 
-def question_rows(posts_by_status: Mapping[str, Sequence[Mapping[str, Any]]]) -> list[QuestionRow]:
-    """Flatten the per-status post pages into one row per (question, status) pairing."""
+def question_rows(
+    posts_by_status: Mapping[str, Sequence[Mapping[str, Any]]], *, platform: PlatformProbe = METACULUS_PROBE
+) -> list[QuestionRow]:
+    """Flatten the per-status post pages into one row per (question, status) pairing, each
+    carrying the platform's read of whether the bot forecast it."""
     rows: list[QuestionRow] = []
     for status, posts in posts_by_status.items():
         for post in posts:
@@ -287,7 +243,7 @@ def question_rows(posts_by_status: Mapping[str, Sequence[Mapping[str, Any]]]) ->
                         is_resolved=_question_is_resolved(question, status),
                         open_time=question.get("open_time"),
                         close_time=_close_time(question),
-                        forecast_state=bot_forecast_state(question),
+                        forecast_state=platform.forecast_state(question),
                     )
                 )
     return rows
@@ -343,17 +299,23 @@ def _window_hours(row: QuestionRow) -> float | None:
     return (closed - opened).total_seconds() / SECONDS_PER_HOUR
 
 
-def _forfeit_rows(rows: Sequence[QuestionRow]) -> tuple[tuple[ForfeitRow, ...], ForecastStateCounts]:
+def _forfeit_eligible(rows: Iterable[QuestionRow]) -> list[QuestionRow]:
+    """The closed/resolved questions, one row each.
+
+    Deduped because a post that resolves mid-probe pages under both ``closed`` and ``resolved``
+    and would otherwise be counted (and listed) twice. Every copy of a post carries the same
+    enrichment, so which one survives changes only the reported status.
+    """
+    return _first_per_question_id(row for row in rows if row.post_status in FORFEIT_STATUSES)
+
+
+def _forfeit_rows(eligible: Sequence[QuestionRow]) -> tuple[tuple[ForfeitRow, ...], ForecastStateCounts]:
     """Forfeited questions (newest window first) plus the forecast-state split behind them.
 
     Newest first because a weekly read is about what we just lost; the window length rides
     each row instead of ordering it, since a short window and a stale one are different
     diagnoses and only one of them is urgent.
     """
-    # Deduped, because a post that resolves mid-probe pages under both `closed` and
-    # `resolved` and would otherwise be counted (and listed) twice. Every copy of a post
-    # carries the same enrichment, so which one survives changes only the reported status.
-    eligible = _first_per_question_id(row for row in rows if row.post_status in FORFEIT_STATUSES)
     counts = ForecastStateCounts(
         with_forecast=sum(1 for row in eligible if row.forecast_state == FORECAST_PRESENT),
         without_forecast=sum(1 for row in eligible if row.forecast_state == FORECAST_ABSENT),
@@ -378,30 +340,77 @@ def _forfeit_rows(rows: Sequence[QuestionRow]) -> tuple[tuple[ForfeitRow, ...], 
     return tuple(forfeits), counts
 
 
+def _miss_rate(forecast: int, no_forecast: int) -> float | None:
+    """Share of DECIDED questions that were forfeited; None when nothing was decided."""
+    decided = forecast + no_forecast
+    return no_forecast / decided if decided else None
+
+
+def _release_hour_row(hour_utc: int | None, rows: Sequence[QuestionRow]) -> ReleaseHourRow:
+    forecast = sum(1 for row in rows if row.forecast_state == FORECAST_PRESENT)
+    no_forecast = sum(1 for row in rows if row.forecast_state == FORECAST_ABSENT)
+    return ReleaseHourRow(
+        hour_utc=hour_utc,
+        questions=len(rows),
+        forecast=forecast,
+        no_forecast=no_forecast,
+        unknown=sum(1 for row in rows if row.forecast_state == FORECAST_UNKNOWN),
+        miss_rate=_miss_rate(forecast, no_forecast),
+    )
+
+
+def _release_hour_rows(eligible: Sequence[QuestionRow]) -> tuple[ReleaseHourRow, ...]:
+    """The eligible questions bucketed by the UTC hour of day they opened, ascending.
+
+    The hour of ``open_time`` is the release hour: on Mantic's 60-minute windows it is the hour
+    the bot had to land a run in, so the miss rate per bucket is the direct read of which cron
+    slots GitHub delivers. An unreadable ``open_time`` gets its own None bucket, listed last.
+    """
+    by_hour: dict[int | None, list[QuestionRow]] = {}
+    for row in eligible:
+        opened = parse_iso_utc(row.open_time)
+        by_hour.setdefault(None if opened is None else opened.hour, []).append(row)
+    ordered = sorted(by_hour, key=lambda hour: (hour is None, hour or 0))
+    return tuple(_release_hour_row(hour, by_hour[hour]) for hour in ordered)
+
+
+def _window_minutes(eligible: Sequence[QuestionRow]) -> WindowMinutes | None:
+    """Distribution of the realized open-to-close window, over the questions where both ends read."""
+    windows = [hours * MINUTES_PER_HOUR for hours in map(_window_hours, eligible) if hours is not None]
+    if not windows:
+        return None
+    return WindowMinutes(
+        shortest=min(windows), median=statistics.median(windows), longest=max(windows), questions=len(windows)
+    )
+
+
 def summarize_slug_supply(
     slug: str,
     posts_by_status: Mapping[str, Sequence[Mapping[str, Any]]],
     *,
     now: datetime,
+    platform: PlatformProbe = METACULUS_PROBE,
 ) -> SlugSupply:
-    """Partition one slug's paged posts by status, then compute its backlog and forfeits.
+    """Partition one slug's paged posts by status, then compute its backlog, forfeits and
+    per-release-hour miss table.
 
     Pure: the caller supplies the pages and the clock. Per-status counts report what the
     API returned for that status; the totals count each post and question once, because a
     post that resolves mid-probe can be paged under both ``closed`` and ``resolved``.
 
-    The forfeit sweep reads whatever ``my_forecasts`` the supplied payloads carry. On raw
-    list pages that is nothing, so every eligible question comes back ``unknown`` and the
-    forfeit list is empty — call :func:`resolve_bot_forecasts` on the pages first (as
-    :func:`probe_slugs` does) to get an answer.
+    The forfeit sweep reads whatever the supplied payloads carry through the platform's
+    ``forecast_state``. A list page fetched with the platform's ``list_params`` answers as it is;
+    a Metaculus page read without ``with_cp=true`` carries no ``my_forecasts``, so every eligible
+    question comes back ``unknown`` and the forfeit list is empty — call
+    :func:`resolve_bot_forecasts` on the pages first (as :func:`probe_slugs` does) to fill the gaps.
     """
-    rows = question_rows(posts_by_status)
+    rows = question_rows(posts_by_status, platform=platform)
     resolved_ids = {row.question_id for row in rows if row.is_resolved}
     unresolved = [row for row in _first_per_question_id(rows) if row.question_id not in resolved_ids]
-    # Scheduled times parse to tz-aware UTC, so a naive `now` from an analysis script would
-    # make the overdue subtraction raise instead of answering.
+    # A naive `now` from an analysis script must not make the tz-aware overdue subtraction raise.
     backlog, without_schedule = _backlog_rows(unresolved, _as_utc(now))
-    forfeits, forecast_states = _forfeit_rows(rows)
+    eligible = _forfeit_eligible(rows)
+    forfeits, forecast_states = _forfeit_rows(eligible)
 
     return SlugSupply(
         slug=slug,
@@ -422,14 +431,17 @@ def summarize_slug_supply(
         ),
         forfeits=forfeits,
         forecast_states=forecast_states,
+        by_release_hour=_release_hour_rows(eligible),
+        window_minutes=_window_minutes(eligible),
     )
 
 
-def _get_json(params: dict[str, str | int], token: str, *, url: str = POSTS_URL) -> dict:
+def _get_json(params: dict[str, str | int], token: str | None, *, url: str = POSTS_URL) -> dict:
     """GET a posts endpoint with a bounded, 429-aware retry.
 
-    ``url`` defaults to the posts LIST; the forfeit sweep passes a single post's detail URL
-    through the same retry, since both endpoints share the rate limiter that motivated it.
+    ``url`` defaults to the Metaculus posts LIST; the forfeit sweep passes a post's detail URL and
+    the Mantic mode its own list URL through the same retry, since the endpoints share the rate
+    limiter that motivated it. A None ``token`` sends no ``Authorization`` header (public Mantic read).
 
     Local rather than reusing ``performance_analysis.collector``'s helper: that one is
     scoped to the scoring pull (three retries, and a ``RuntimeError`` when they run out),
@@ -440,7 +452,7 @@ def _get_json(params: dict[str, str | int], token: str, *, url: str = POSTS_URL)
     through to ``raise_for_status`` on the last attempt, which made that raise unreachable
     and reported six rate-limited attempts as one unlucky request.
     """
-    headers = {"Authorization": f"Token {token}"}
+    headers = {"Authorization": f"Token {token}"} if token else {}
     for attempt in range(MAX_RETRIES):
         response = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT_SECS)
         if response.status_code != 429:
@@ -454,21 +466,30 @@ def _get_json(params: dict[str, str | int], token: str, *, url: str = POSTS_URL)
     raise requests.HTTPError(f"429 rate limit: retries exhausted after {MAX_RETRIES} attempts")
 
 
-def fetch_posts_by_status(slug: str, statuses: Sequence[str], token: str) -> dict[str, list[dict]]:
+def fetch_posts_by_status(
+    slug: str, statuses: Sequence[str], token: str | None, *, platform: PlatformProbe = METACULUS_PROBE
+) -> dict[str, list[dict]]:
     """Page every requested status for one slug. Raises ``requests.RequestException``.
 
-    Stops on the first short page: the scratch probes this replaces found the
-    tournament-filtered list serving no usable total, so page length is the only
-    end-of-results signal we trust. ``MAX_PAGES`` bounds the walk.
+    Stops on the first short page: the scratch probes this replaces found the Metaculus
+    tournament-filtered list serving no usable total, and Mantic advertises ``next`` past its
+    last page with ``count`` null, so page length is the only end-of-results signal either
+    platform gives. ``MAX_PAGES`` bounds the walk. The platform's ``list_params`` ride every page
+    GET, token or not: ``with_cp=true`` is what puts the public snapshot on a Mantic page, and the
+    tokenless mode classified nothing while it was sent only under a token.
     """
     posts_by_status: dict[str, list[dict]] = {}
     for status in statuses:
         posts: list[dict] = []
         for page in range(MAX_PAGES):
-            data = _get_json(
-                {"tournaments": slug, "statuses": status, "limit": PAGE_SIZE, "offset": page * PAGE_SIZE},
-                token,
-            )
+            params: dict[str, str | int] = {
+                "tournaments": slug,
+                "statuses": status,
+                "limit": PAGE_SIZE,
+                "offset": page * PAGE_SIZE,
+                **platform.list_params,
+            }
+            data = _get_json(params, token, url=platform.posts_url)
             results = data.get("results") or []
             posts.extend(results)
             if len(results) < PAGE_SIZE:
@@ -501,22 +522,21 @@ def _posts_needing_detail(posts_by_status: Mapping[str, Sequence[dict]]) -> dict
     return needed
 
 
-def resolve_bot_forecasts(posts_by_status: dict[str, list[dict]], token: str, *, slug: str | None = None) -> int:
-    """Fill in ``my_forecasts`` on forfeit-eligible posts, in place. Returns fetches issued.
+def resolve_bot_forecasts(posts_by_status: dict[str, list[dict]], token: str | None, *, slug: str | None = None) -> int:
+    """Fill in ``my_forecasts`` on forfeit-eligible Metaculus posts, in place. Returns fetches issued.
 
-    One detail GET per post that needs one, and the fetched payload replaces that post under
-    EVERY status it was paged under, so the two copies of a post that resolved mid-probe
-    cannot disagree about whether we forecast it.
+    One detail GET per post that needs one; the fetched payload replaces that post under EVERY
+    status it was paged under, so two copies of a post that resolved mid-probe cannot disagree.
+    With ``with_cp=true`` on the list GET the page already answers for nearly every post, so this
+    is the fallback for the ones left unknown. Metaculus-only (``POSTS_URL``): Mantic's list page
+    always answers, so it is never called there.
 
-    ``slug`` only labels the log lines. The sweep spends minutes issuing spaced GETs and used
-    to say nothing while it did, so a run that had wedged looked exactly like one that was
-    working; it now reports progress every ``DETAIL_PROGRESS_EVERY`` posts, with one DEBUG
-    line per GET for a per-URL trace.
+    ``slug`` only labels the log lines. The sweep can spend minutes issuing spaced GETs, so it
+    reports progress every ``DETAIL_PROGRESS_EVERY`` posts (a wedged run used to look exactly like
+    a working one), with one DEBUG line per GET for a per-URL trace.
 
-    A post whose detail GET fails is left as it was, which reads through as ``unknown``
-    rather than as a forfeit. The exception is swallowed per post on purpose: the sweep is a
-    supplement to the counts, and one unreachable post must not cost the slug its census.
-    Raises nothing; an exhausted retry on EVERY post shows up as a large ``unknown`` count.
+    A post whose detail GET fails stays as it was and reads ``unknown`` rather than forfeited: one
+    unreachable post must not cost the slug its census. Raises nothing; every GET failing is a large ``unknown``.
     """
     needed = _posts_needing_detail(posts_by_status)
     if not needed:
@@ -547,35 +567,37 @@ def resolve_bot_forecasts(posts_by_status: dict[str, list[dict]], token: str, *,
 def probe_slugs(
     slugs: Sequence[str],
     statuses: Sequence[str],
-    token: str,
+    token: str | None,
     *,
     now: datetime,
     resolve_forfeits: bool = False,
+    platform: PlatformProbe = METACULUS_PROBE,
 ) -> list[SlugSupply]:
     """Survey every slug, soft-failing per slug so one dead slug reports as an error row.
 
-    Scoped to ``requests.RequestException`` (transport, HTTP status and JSON-decode
-    failures of the call). A survey over several slugs expects some to be dead — the bare
-    ``metaculus-cup`` slug returns 400 today — and aborting the whole run on the first would hide
-    the live ones. Anything that is not a request failure is a contract break and crashes.
+    Scoped to ``requests.RequestException`` (transport, HTTP status and JSON-decode failures of
+    the call). A survey over several slugs expects some to be dead — the bare ``metaculus-cup``
+    slug and an unknown Mantic slug both answer 400 — and aborting on the first would hide the
+    live ones. Anything that is not a request failure is a contract break and crashes.
 
-    ``resolve_forfeits`` costs one detail GET per closed/resolved post that the list page did
-    not already answer for, which is a few hundred requests over a full season. It defaults
-    OFF so a caller that only wants the status counts pays nothing; the CLI turns it ON
-    (``--no-forfeits`` to opt out), because a forfeit is the thing the weekly read exists to
-    catch.
+    ``resolve_forfeits`` costs one detail GET per closed/resolved post the list page did not
+    already answer for, which with ``with_cp=true`` on every list GET is close to none. It
+    defaults OFF so a caller that only wants counts pays nothing; the CLI turns it ON
+    (``--no-forfeits`` to opt out), because a forfeit is what the weekly read exists to catch.
+    Moot where the list page always answers (Mantic): no detail GET is issued there whatever the
+    flag says.
     """
     supplies: list[SlugSupply] = []
     for slug in slugs:
         try:
-            posts_by_status = fetch_posts_by_status(slug, statuses, token)
-            if resolve_forfeits:
+            posts_by_status = fetch_posts_by_status(slug, statuses, token, platform=platform)
+            if resolve_forfeits and platform.sweep_needs_detail_gets:
                 resolve_bot_forecasts(posts_by_status, token, slug=slug)
         except requests.RequestException as exc:
             logger.warning(f"{slug}: supply probe failed ({exc})")
             supplies.append(SlugSupply(slug=slug, error=str(exc)))
             continue
-        supplies.append(summarize_slug_supply(slug, posts_by_status, now=now))
+        supplies.append(summarize_slug_supply(slug, posts_by_status, now=now, platform=platform))
     return supplies
 
 
@@ -606,7 +628,7 @@ def _render_backlog(supply: SlugSupply, max_rows: int) -> list[str]:
     return lines
 
 
-def _render_forfeits(supply: SlugSupply, max_rows: int) -> list[str]:
+def _render_forfeits(supply: SlugSupply, max_rows: int, platform: PlatformProbe) -> list[str]:
     """The forfeit block: what the bot never forecast, and the state split behind the count."""
     states = supply.forecast_states
     if states.total == 0:
@@ -616,12 +638,12 @@ def _render_forfeits(supply: SlugSupply, max_rows: int) -> list[str]:
         f"(of {states.total}; forecast {states.with_forecast}, unknown {states.unknown})"
     ]
     if states.unknown == states.total:
-        lines.append("    my_forecasts was unreadable on every one — run without --no-forfeits to resolve it")
+        lines.append(f"    {platform.all_unknown_hint}")
         return lines
     if states.with_forecast == 0 and states.without_forecast:
         lines.append(
-            "    !!! no question on this slug carries a bot forecast. Check that METACULUS_TOKEN is "
-            "the bot's own token before reading these as forfeits."
+            f"    !!! no question on this slug carries a bot forecast. {platform.identity_hint} "
+            "before reading these as forfeits."
         )
     if not supply.forfeits:
         return lines
@@ -639,16 +661,64 @@ def _render_forfeits(supply: SlugSupply, max_rows: int) -> list[str]:
     return lines
 
 
+_RELEASE_HOUR_HEADER = (
+    f"    {'hour_utc':>8} {'questions':>9} {'forecast':>8} {'no_forecast':>11} {'unknown':>7} {'miss_rate':>9}"
+)
+
+
+def _release_hour_line(row: ReleaseHourRow, label: str) -> str:
+    miss_rate = f"{row.miss_rate:.1%}" if row.miss_rate is not None else "-"
+    return f"    {label:>8} {row.questions:>9} {row.forecast:>8} {row.no_forecast:>11} {row.unknown:>7} {miss_rate:>9}"
+
+
+def _render_release_hours(supply: SlugSupply) -> list[str]:
+    """The cadence instrument: per UTC release hour, how many eligible questions we lost.
+
+    The total row is built from ``forecast_states`` rather than by re-summing the rows: both
+    cover the same eligible set, so the two blocks of the report cannot disagree.
+    """
+    if not supply.by_release_hour:
+        return []
+    states = supply.forecast_states
+    total = ReleaseHourRow(
+        hour_utc=None,
+        questions=states.total,
+        forecast=states.with_forecast,
+        no_forecast=states.without_forecast,
+        unknown=states.unknown,
+        miss_rate=_miss_rate(states.with_forecast, states.without_forecast),
+    )
+    lines = [
+        "  Miss rate by UTC release hour (closed/resolved questions; miss_rate = no_forecast / decided):",
+        _RELEASE_HOUR_HEADER,
+        *(
+            _release_hour_line(row, "n/a" if row.hour_utc is None else str(row.hour_utc))
+            for row in supply.by_release_hour
+        ),
+        _release_hour_line(total, "total"),
+    ]
+    window = supply.window_minutes
+    if window is not None:
+        lines.append(
+            f"    window open-to-close, minutes: min {window.shortest:.0f} / median {window.median:.0f} / "
+            f"max {window.longest:.0f} (over {window.questions} questions)"
+        )
+    return lines
+
+
 def render_report(
     supplies: Sequence[SlugSupply],
     *,
     now: datetime,
     max_backlog_rows: int = DEFAULT_MAX_BACKLOG_ROWS,
     max_forfeit_rows: int = DEFAULT_MAX_FORFEIT_ROWS,
+    platform: PlatformProbe = METACULUS_PROBE,
 ) -> str:
     """Render the survey as text. Pure — no clock read, no IO."""
     lines = [
-        "Metaculus question-supply probe. Post status `closed` means closed to forecasting but NOT yet resolved.",
+        f"{platform.name.capitalize()} question-supply probe. "
+        "Post status `closed` means closed to forecasting but NOT yet resolved.",
+        platform.classification_note,
         f"as of {now.isoformat()}",
     ]
     for supply in supplies:
@@ -662,19 +732,32 @@ def render_report(
             lines.append(f"  {count.status:<12}{count.posts:>8}{count.questions:>11}")
         lines.append(f"  {'total':<12}{supply.total_posts:>8}{supply.total_questions:>11}")
         lines.extend(_render_backlog(supply, max_backlog_rows))
-        lines.extend(_render_forfeits(supply, max_forfeit_rows))
+        lines.extend(_render_forfeits(supply, max_forfeit_rows, platform))
+        lines.extend(_render_release_hours(supply))
     return "\n".join(lines)
 
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        description="Report Metaculus question supply per tournament slug, counting `closed` posts."
+        description="Report question supply per tournament slug, counting `closed` posts, on Metaculus or Mantic."
+    )
+    parser.add_argument(
+        "--platform",
+        choices=sorted(PLATFORM_PROBES),
+        default=PLATFORM_METACULUS,
+        help=(
+            "Question platform to probe (default: %(default)s). Mantic's read endpoints are public, so "
+            f"{MANTIC_TOKEN_ENV} is optional there and only lets closed-but-unresolved questions classify."
+        ),
     )
     parser.add_argument(
         "--slugs",
         nargs="+",
-        default=list(DEFAULT_SLUGS),
-        help=f"Tournament slugs to probe (default: {' '.join(DEFAULT_SLUGS)})",
+        default=None,
+        help=(
+            f"Tournament slugs to probe (default: the platform's season slugs, {' '.join(DEFAULT_SLUGS)} on "
+            f"Metaculus and {MANTIC_TOURNAMENT_ID} on Mantic)"
+        ),
     )
     parser.add_argument(
         "--statuses",
@@ -699,38 +782,51 @@ def main(argv: list[str] | None = None) -> None:
         dest="forfeits",
         action="store_false",
         help=(
-            "Skip the forfeit sweep. It costs one extra read-only GET per closed/resolved post "
-            "whose list page did not already carry my_forecasts; skipping leaves every question's "
-            "state reported as unknown."
+            "Skip the Metaculus forfeit sweep's detail GETs (one read-only GET per closed/resolved post whose "
+            "list page did not already carry my_forecasts), leaving those questions reported as unknown. "
+            "Mantic classifies off the list page and never issues them."
         ),
     )
     parser.add_argument("--output", default=None, help="Optional path to dump the census as JSON.")
     args = parser.parse_args(argv)
+    platform = PLATFORM_PROBES[args.platform]
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
 
     load_environment()
-    token = os.environ.get("METACULUS_TOKEN")
-    if not token:
-        parser.error("METACULUS_TOKEN is not set (put it in .env or the environment)")
+    token = os.environ.get(platform.token_env) or None
+    if platform.token_required and not token:
+        parser.error(f"{platform.token_env} is not set (put it in .env or the environment)")
+    if token is None:
+        logger.info(
+            f"{platform.token_env} is not set: running public-only, so closed-but-unresolved questions read unknown"
+        )
 
-    # Confirm the host is the real Metaculus before the token goes out (DNS-parking
-    # incident — see metaculus_bot/api_preflight.py).
-    verify_metaculus_api_identity()
+    # The host is vetted before any token goes out (DNS-parking incident; see metaculus_bot/api_preflight.py).
+    verify_api_identity(platform.base_url)
 
     now = datetime.now(UTC)
-    supplies = probe_slugs(args.slugs, tuple(args.statuses), token, now=now, resolve_forfeits=args.forfeits)
+    slugs = args.slugs or list(platform.default_slugs)
+    supplies = probe_slugs(
+        slugs, tuple(args.statuses), token, now=now, resolve_forfeits=args.forfeits, platform=platform
+    )
     print(
         render_report(
             supplies,
             now=now,
             max_backlog_rows=args.max_backlog_rows,
             max_forfeit_rows=args.max_forfeit_rows,
+            platform=platform,
         )
     )
 
     if args.output:
-        payload = {"generated_at": now.isoformat(), "slugs": [asdict(supply) for supply in supplies]}
+        payload = {
+            "generated_at": now.isoformat(),
+            "platform": platform.name,
+            "bot_user_id": platform.bot_user_id,
+            "slugs": [asdict(supply) for supply in supplies],
+        }
         Path(args.output).write_text(json.dumps(payload, indent=2))
         logger.info(f"Wrote supply census to {args.output}")
 

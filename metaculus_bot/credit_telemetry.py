@@ -1,79 +1,31 @@
 """Per-run OpenRouter credit-balance telemetry, plus the per-role dollar ledger.
 
-Fetches key balances (donated + personal) at run start and end and emits
-greppable marker lines — ``CREDIT_BALANCE:`` / ``CREDIT_SPEND:`` — following
-the existing marker-log convention (``EXTRACTION_RUNG:``, ``OPEN_BOUND_PILING:``).
-All four workflow yamls tee stdout+stderr to a ``run_logs/`` artifact, so these
-lines are durably grep-able per run; no extra artifact plumbing is needed.
+Fetches both keys' balances at run start and end and emits greppable
+``CREDIT_BALANCE`` / ``CREDIT_SPEND`` / ``CREDIT_FLOOR_BREACH`` markers into the
+``run_logs/`` artifact every workflow tees. The per-key deltas say WHAT a run
+cost; the ``CREDIT_ROLE_SPEND`` ledger at the bottom of this module says WHERE it
+went, off OpenRouter's own per-call usage accounting.
 
-The per-key deltas say WHAT a run cost; the ``CREDIT_ROLE_SPEND:`` lines at the
-bottom of this module say WHERE it went (forecaster slot, research stage, parser,
-...), read off OpenRouter's own per-call usage accounting. See "Per-role dollar
-attribution" below.
+Per-run spend reads the ``limit_remaining`` delta on a limit-bearing key, the only
+field covering BYOK-routed spend, and falls back to the ``usage`` delta on an
+uncapped one (the personal key). That fallback is a LOWER BOUND, since OpenRouter
+has usually not settled the run's spend by the time the end snapshot fires, so a
+``0.00`` is not evidence of no spend; there is deliberately no wait-and-re-read,
+and ``scripts/reconcile_credit_spend.py`` recovers the settled figure afterwards.
+A BYOK route on the personal key (the OpenAI slugs) is a separate blind spot: it
+never reaches ``usage`` at all and is visible only on the role ledger.
 
-The end-of-run check also reports whether the DONATED key's remaining balance
-(``limit_remaining``) fell below ``OPENROUTER_CREDIT_FLOOR_USD``. That is an
-EARLY-WARNING level and not an empty tank: only Metaculus can refill this key, so
-the reminder has to arrive while there is still runway left to ask for a top-up.
-cli.main uses the breach to exit non-zero AFTER all forecasting/publishing
-completes — never an abort — and only while credit alerting is active
-(``constants.credit_alerts_active``, the dated suppression lever). The suppression
-is purely an exit-status decision made in cli.main: this module always reports the
-breach and always logs ``CREDIT_FLOOR_BREACH``.
+The end-of-run check also reports whether the DONATED key's ``limit_remaining``
+fell below ``OPENROUTER_CREDIT_FLOOR_USD``, an early-warning level and not an
+empty tank; cli.main turns a breach into a non-zero exit after forecasting and
+publishing finish, never an abort, and only while credit alerting is active. This
+module also owns the drained-vs-revoked discriminator
+(``classify_donated_key_state``) that ``fallback_openrouter`` consults on
+OpenRouter's spend-cap 403. Telemetry must never fail or block a run: every fetch
+error logs a WARNING and reads as "unknown", and unknown never trips the floor
+exit.
 
-Field semantics (verified against live /auth/key pulls, 2026-07-17): ``usage``
-counts only spend billed as native OpenRouter credits. Spend routed through
-BYOK provider integrations (the donated Metaculus key routes nearly everything
-this way) lands in ``byok_usage`` instead, so ``usage`` can sit frozen while
-real money burns. ``limit_remaining = limit - usage - byok_usage`` (when
-``include_byok_in_limit``), making it the only field that reliably tracks
-total spend on a limit-bearing key. Per-run spend therefore comes from the
-``limit_remaining`` delta when the key reports one, with the ``usage`` delta
-as the fallback for uncapped keys (personal: ``limit_remaining`` is null and
-spend does land in ``usage``).
-
-THE PERSONAL KEY'S PER-RUN DELTA IS A LOWER BOUND, AND THE CAUSE IS SETTLEMENT
-LAG — NOT BYOK. Worth stating flatly because the BYOK paragraph above is the
-wrong explanation for it and misled two separate investigations: on the personal
-key ``usage`` genuinely does climb ($154.58 -> $160.24 over 2026-07-20..27), so
-nothing is hiding in ``byok_usage``. What happens is that OpenRouter has not
-booked the run's spend by the time the end snapshot fires, seconds after the last
-call. Measured over ``backtests/telemetry_archive/credit_balance.jsonl``, 178
-paired personal-key runs: the within-run deltas summed to $3.31 against $5.66 of
-true lifetime-usage growth (58% captured), and 160 of 178 runs reported exactly
-$0.00. The missing $2.35 is fully accounted for by the gap between each run's
-``phase=end`` usage and the NEXT run's ``phase=start`` usage — $3.31 + $2.35 =
-$5.66, exactly, to the cent. The money is late, not lost.
-
-The tightest version of the evidence, restricted to runs that DEMONSTRABLY spent:
-of the 25 paired runs carrying at least one ``extraction_rung`` record (a forecast
-provably happened, and ``gemini-3.1-pro-preview`` — the slot pinned to the
-personal key — produced one in all 25), 7 reported exactly $0.00. That is a 28%
-false-zero rate on runs that cannot have been free.
-``scripts/reconcile_credit_spend.py`` recovers a real figure for all 7
-($0.10-$0.32 each), which is the direct demonstration that the zeros are lag
-rather than absence.
-
-There is deliberately no wait-and-re-read here. The earliest CONFIRMED settlement
-in the archive is 153s after the end snapshot and the median is ~25 minutes, so a
-delay short enough to sit in cli.main's ``finally`` (where telemetry must never
-stall a run) is below anything the data can show would work — it would be an
-unverifiable guess that also slowed every run. Instead the marker states its own
-source (``source=usage_delta_unsettled``) and a sibling
-``CREDIT_SPEND_UNSETTLED`` WARNING says the figure is a floor, so a ``0.00`` can
-never be misread as "this run was free". The settled per-run number is recovered
-after the fact by ``scripts/reconcile_credit_spend.py``, which differences each
-run's start usage against its successor's — the only place the lag is actually
-observable.
-
-This module also owns the DRAINED-vs-REVOKED discriminator
-(``classify_donated_key_state``) that ``fallback_openrouter`` consults when a
-donated-key call fails with OpenRouter's spend-cap 403. Same endpoint, same
-parser, so the "how much is left on the donated key" question has one
-implementation.
-
-Telemetry must never fail or block a run: every fetch error is logged as a
-WARNING and treated as "unknown", and unknown never triggers the floor exit.
+Field semantics and the measurements: docs/operations.md "Credit telemetry and the refill floor".
 """
 
 from __future__ import annotations
@@ -83,7 +35,7 @@ import logging
 import math
 import os
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
@@ -93,7 +45,12 @@ from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 
 from metaculus_bot.check_openrouter_credits import KEY_SPECS, fetch_auth_key
-from metaculus_bot.constants import CREDIT_ALERT_RESUME_DATE, OPENROUTER_CREDIT_FLOOR_USD
+from metaculus_bot.constants import (
+    CREDIT_ALERT_RESUME_DATE,
+    OPENROUTER_CREDIT_FLOOR_USD,
+    PROMPT_TOKENS_ALERT_THRESHOLD,
+    donated_openrouter_key_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -131,8 +88,7 @@ def _fmt(value: float | None) -> str:
     return "n/a" if value is None else f"{value:.2f}"
 
 
-# How a CREDIT_SPEND delta was derived, which is what tells a reader how much to
-# trust it. Emitted as ``source=`` on the marker line.
+# Emitted as ``source=`` on the CREDIT_SPEND line: how the delta was derived, hence how far to trust it.
 SPEND_SOURCE_REMAINING: str = "remaining_delta"
 SPEND_SOURCE_USAGE: str = "usage_delta_unsettled"
 SPEND_SOURCE_NONE: str = "unavailable"
@@ -149,8 +105,8 @@ def _run_delta_usd(start: KeyBalanceSnapshot | None, end: KeyBalanceSnapshot) ->
       donated key routes nearly everything through.
     * ``usage_delta_unsettled`` (end - start) — the fallback for uncapped keys,
       which report no ``limit_remaining``. Systematically UNDER-reports, because
-      ``usage`` lags the run (see ``_run_delta_usd``'s settlement note in the module
-      docstring). A ``0.00`` from this branch does NOT mean no spend.
+      ``usage`` lags the run (docs/operations.md "Credit telemetry and the refill
+      floor"). A ``0.00`` from this branch does NOT mean no spend.
     * ``unavailable`` — no start snapshot, or neither field pair is reported.
     """
     if start is None:
@@ -165,6 +121,10 @@ def _run_delta_usd(start: KeyBalanceSnapshot | None, end: KeyBalanceSnapshot) ->
 def _fetch_snapshot(alias: str, phase: str) -> KeyBalanceSnapshot | None:
     """Fetch one key's balance; on ANY failure, warn and return None.
 
+    The donated key is skipped outright (one INFO line, no HTTP) while
+    ``DONATED_OPENROUTER_KEY_ENABLED`` is off: a Mantic run never routes through that key, so
+    its balance is not the run's business and the refill floor downstream must not fire on it.
+
     A missing env var or endpoint hiccup must never fail the run (this is telemetry), so we
     log and continue. The catch is deliberately total rather than a curated tuple: cli.main
     calls ``log_end_and_check_floor`` from a ``finally``, so an escape there replaces
@@ -174,6 +134,9 @@ def _fetch_snapshot(alias: str, phase: str) -> KeyBalanceSnapshot | None:
     ``SSL_CERT_FILE``, ``httpx.InvalidURL`` (not an ``httpx.HTTPError`` subclass), and the
     ``RuntimeError`` this repo's own autouse network guard raises.
     """
+    if alias == DONATED_KEY_ALIAS and not donated_openrouter_key_enabled():
+        logger.info("CREDIT_BALANCE: key=%s phase=%s skipped (donated routing disabled)", alias, phase)
+        return None
     env_var, _ = KEY_SPECS[alias]
     api_key = os.getenv(env_var)
     if not api_key:
@@ -181,20 +144,13 @@ def _fetch_snapshot(alias: str, phase: str) -> KeyBalanceSnapshot | None:
         return None
     try:
         data = fetch_auth_key(api_key)
-        # Build the snapshot INSIDE the try: fetch_auth_key returns
-        # ``payload.get("data", payload)``, so a 200 whose body carries a
-        # non-mapping ``data`` (``{"data": null}`` / ``{"data": [...]}``) yields a
-        # non-dict here, and ``data.get(...)`` then raises AttributeError. Keeping
-        # the .get() calls under the try means that malformed-but-200 case degrades
-        # to a WARNING + None like any other fetch failure, never crashing the run.
+        # Built inside the try so a 200 carrying a non-mapping ``data`` degrades like any other fetch failure.
         return KeyBalanceSnapshot(
             alias=alias,
             remaining_usd=_as_float(data.get("limit_remaining")),
             usage_usd=_as_float(data.get("usage")),
         )
-    except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except
-        # Broad by design, not defensiveness: the module contract is that telemetry cannot
-        # fail a run, and this sits under a cli.main ``finally``. See the docstring.
+    except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except: telemetry must never fail a run
         logger.warning(
             "CREDIT_BALANCE: key=%s phase=%s fetch failed (%s); continuing without balance telemetry",
             alias,
@@ -228,21 +184,12 @@ class CreditTelemetry:
         """Log end balances + per-run spend; return True iff the donated key's
         remaining balance is KNOWN and below the floor (unknown never trips it).
 
-        Spend delta prefers the ``limit_remaining`` drop (start - end): on
-        limit-bearing keys it is the only field covering BYOK-routed spend,
-        which the donated key routes nearly everything through (``usage`` sat
-        frozen at $4.16 across a $3.34 run, 2026-07-17). Uncapped keys report
-        no ``limit_remaining``, so they fall back to the ``usage`` delta.
-
-        Every ``CREDIT_SPEND`` line carries ``source=`` naming which branch produced
-        it, and the ``usage``-delta branch additionally logs
-        ``CREDIT_SPEND_UNSETTLED`` — that branch systematically under-reports
-        because of settlement lag (module docstring has the measurements), so the
-        number is a floor and a ``0.00`` is not evidence of no spend.
-
-        Caveats: an out-of-band top-up mid-run skews the remaining-based delta
-        (rare; per-run spend is indicative anyway), and OpenRouter caches these
-        values briefly — don't build on exact figures.
+        The spend delta prefers the ``limit_remaining`` drop (start - end) and falls back
+        to the ``usage`` delta on an uncapped key. Every ``CREDIT_SPEND`` line names its
+        branch in ``source=``, and the ``usage`` branch also logs
+        ``CREDIT_SPEND_UNSETTLED`` because it under-reports. Field semantics, the
+        measurements and the top-up and caching caveats: docs/operations.md "Credit
+        telemetry and the refill floor".
         """
         donated_below_floor = False
         for alias in KEY_SPECS:
@@ -264,13 +211,7 @@ class CreditTelemetry:
                 spend_source,
             )
             if spend_source == SPEND_SOURCE_USAGE:
-                # Say it inline rather than only in the docs. This is the number
-                # watching the operator's monthly cap on a self-funded key, and a
-                # bare "0.00" reads as "this run was free" when it actually means
-                # "OpenRouter had not settled the spend yet". Measured across 178
-                # archived personal-key runs: the within-run deltas summed to 58% of
-                # the true growth, and 7 of 25 runs that demonstrably forecast
-                # reported exactly 0.00.
+                # Loud, not just a source= field: a bare 0.00 reads as "this run was free".
                 logger.warning(
                     "CREDIT_SPEND_UNSETTLED: key=%s run_delta_usd=%s is a LOWER BOUND — %s reports no "
                     "limit_remaining, so this is a lifetime-usage delta and OpenRouter has typically "
@@ -294,17 +235,7 @@ class CreditTelemetry:
         return donated_below_floor
 
 
-# --- Drained-vs-revoked discriminator for the donated key -------------------
-#
-# OpenRouter reports a breached per-key spend cap as HTTP 403 with the text
-# "Key limit exceeded (total limit)", and reports a revoked key as HTTP 401 on
-# an LLM call. But a key that Metaculus RE-CAPPED TO ZERO produces the exact
-# same 403 text as a key that simply spent its whole allocation, and the
-# operator wants opposite CI colors for those: a genuinely drained key is the
-# expected empty wallet (green, but only while the credit-alert suppression
-# window is open), a zeroed or revoked one is real breakage (red either way). No amount of text matching can separate them, so
-# we ask the free, read-only /auth/key endpoint what the cap actually looks
-# like. See ``fallback_openrouter.is_suppressible_credit_error``.
+# --- Drained vs revoked donated key: docs/operations.md "What a dry donated key actually returns".
 
 
 class DonatedKeyState(StrEnum):
@@ -324,32 +255,10 @@ class DonatedKeyState(StrEnum):
     UNKNOWN = "unknown"  # probe could not answer (no key configured, endpoint error, odd payload)
 
 
-# Shorter than ``AUTH_KEY_REQUEST_TIMEOUT_S`` by design: this probe can fire mid-run, so it
-# must not be able to stall a forecast. The shared ``fetch_auth_key`` default is fine for
-# the CLI and the start/end telemetry, which run outside the forecasting window.
-#
-# Read as PER NETWORK OPERATION, not as a bound on total elapsed time. httpx applies a bare
-# float to connect / read / write / pool independently, so a server trickling bytes slower
-# than the read timeout resets the clock on every chunk and the call can run many multiples
-# of this budget (measured against a local trickling server, a one-second timeout took ten
-# seconds to return twenty bytes). The hard total cap lives at the latency-sensitive call
-# site (``fallback_openrouter.record_donated_key_fallback`` wraps the probe in
-# ``asyncio.wait_for``), because that is the only hop where the promise has to hold.
+# Per-operation, not a total elapsed cap: docs/operations.md "What a dry donated key actually returns".
 DONATED_KEY_PROBE_TIMEOUT_S: float = 5.0
 
-# One probe per process, lock-guarded so concurrent callers share one verdict. A run that
-# loses every donated-key call would otherwise fire one HTTP request per failure, and
-# caching failures matters as much as caching verdicts (a dead endpoint would otherwise
-# cost one timeout per failed call). ``None`` means "never probed", which cli renders
-# differently from any verdict.
-#
-# ``threading``, not ``asyncio``: every production caller arrives on an
-# ``asyncio.to_thread`` worker (see ``fallback_openrouter.record_donated_key_fallback``),
-# so the contention is between real OS threads. The lock is what makes the ONE VERDICT
-# part true, which matters more than the one-request part — without it each caller keeps
-# its own probe result, so an intermittently failing ``/auth/key`` splits a single
-# drained-key incident into some suppressed and some alertable events, and cli then exits
-# red on the very condition the suppression window exists for.
+# One verdict per process, lock-guarded; why: docs/operations.md "What a dry donated key actually returns".
 _probed_donated_key_state: DonatedKeyState | None = None
 _PROBE_LOCK = threading.Lock()
 
@@ -377,41 +286,29 @@ def _probe_donated_key_state() -> DonatedKeyState:
     api_key = os.getenv(env_var)
     if not api_key:
         # No donated key configured, so there is no donated wallet to be empty.
-        # Returning early also keeps this probe free of network I/O in tests that
-        # don't stub it.
         return DonatedKeyState.UNKNOWN
     try:
         data = fetch_auth_key(api_key, timeout=DONATED_KEY_PROBE_TIMEOUT_S)
-        # Read the fields INSIDE the try for the same reason ``_fetch_snapshot``
-        # does: a 200 whose body carries a non-mapping ``data`` makes ``.get``
-        # raise AttributeError, and that must degrade to UNKNOWN like any other
-        # inconclusive answer.
+        # Read inside the try like ``_fetch_snapshot``: a 200 with a non-mapping ``data`` degrades to UNKNOWN.
         limit_usd = _as_float(data.get("limit"))
         remaining_usd = _as_float(data.get("limit_remaining"))
     except httpx.HTTPStatusError as exc:
-        # 401 = key rejected, 404 = key no longer exists. Anything else (429 on the
-        # balance endpoint, a 5xx) tells us nothing about the wallet.
+        # 401 = key rejected, 404 = key gone; any other status says nothing about the wallet.
         if exc.response.status_code in (401, 404):
             return DonatedKeyState.REVOKED
         return DonatedKeyState.UNKNOWN
-    except Exception:  # HARNESS-SCAN-EXEMPT-broad-except
-        # Broad by design: see the docstring. A curated tuple already missed
-        # FileNotFoundError (stale SSL_CERT_FILE), httpx.InvalidURL (not an HTTPError
-        # subclass) and RuntimeError (the suite's network guard).
+    except Exception:  # HARNESS-SCAN-EXEMPT-broad-except: a curated tuple already missed three real shapes
         logger.exception("DONATED_KEY_STATE: /auth/key probe failed; classifying as unknown (stays alertable)")
         return DonatedKeyState.UNKNOWN
 
     if limit_usd is None or remaining_usd is None:
-        # An uncapped key has no cap to exceed, so a spend-cap failure on one is
-        # unexplained rather than expected.
+        # An uncapped key has no cap to exceed, so a spend-cap failure on one is unexplained.
         return DonatedKeyState.UNKNOWN
     if limit_usd <= 0:
         return DonatedKeyState.ZEROED
     if remaining_usd > 0:
         return DonatedKeyState.FUNDED
-    # OpenRouter clamps ``limit_remaining`` at 0 even when the true arithmetic is
-    # negative (live: limit=850, usage=4.39, byok_usage=846.42 → reported 0.00), so
-    # ``<= 0`` rather than ``== 0``.
+    # OpenRouter clamps ``limit_remaining`` at 0 when the true arithmetic is negative, so drained is <= 0.
     return DonatedKeyState.DRAINED
 
 
@@ -428,16 +325,14 @@ def classify_donated_key_state() -> DonatedKeyState:
         return cached
 
     with _PROBE_LOCK:
-        # Re-check inside the lock: a caller that queued behind the winner must take the
-        # winner's verdict rather than probe again with its own.
+        # Re-check inside the lock: a caller queued behind the winner takes the winner's verdict.
         cached = _probed_donated_key_state
         if cached is not None:
             return cached
 
         state = _probe_donated_key_state()
         _probed_donated_key_state = state
-        # Logged inside the lock so the marker line appears exactly once per run — N copies
-        # of one verdict would read as N separate probes to whoever greps the run log.
+        # Logged inside the lock so the marker appears exactly once per run, not once per caller.
         if state is DonatedKeyState.DRAINED:
             logger.info(
                 "DONATED_KEY_STATE: state=%s — the donated OpenRouter key spent its whole allocation "
@@ -458,103 +353,41 @@ def classify_donated_key_state() -> DonatedKeyState:
         return state
 
 
-# --- Per-role dollar attribution ---------------------------------------------
-#
-# WHY. The per-key deltas above cannot say which ROLE spent the money, and every cost
-# argument in the 2026-08-31 gemini-slot review was blocked on exactly that: the measured
-# $0.38-0.41/question could not be split into forecaster vs research vs ranker, so "a 4th
-# member costs +33%" stayed an assertion (scratch/residual_2026-08-31/gemini_review/
-# RECOMMENDATION.md §3, §4 item 4).
-#
-# SOURCE OF TRUTH: OpenRouter's own per-call usage accounting, not litellm's price table.
-# OpenRouter returns a ``usage`` object on every completion (usage accounting is on by
-# default per openrouter.ai/docs/use-cases/usage-accounting; litellm 1.92's OpenRouter
-# transformation also sends ``usage: {include: true}`` explicitly) carrying
-#   * ``cost``: "The total amount charged to your account" — the credits drawn from the
-#     key. Off BYOK routing this is the whole charge; on BYOK routing it is only
-#     OpenRouter's platform fee (5% of list price, waived under a monthly allowance).
-#   * ``cost_details.upstream_inference_cost``: "The actual cost charged by the upstream
-#     AI provider", BYOK requests only, ``0``/``null`` otherwise.
-# The donated Metaculus key routes OpenAI/Anthropic/Google through Metaculus's BYOK
-# integrations, so on that key nearly everything lands in ``upstream_inference_cost`` —
-# which is also what ``/auth/key`` books as ``byok_usage`` and subtracts from
-# ``limit_remaining`` (module docstring: a $3.34 run left ``usage`` frozen). The personal
-# key is not BYOK, so its whole bill is ``cost``. Summing the two therefore gives one
-# number, on either key, that maps onto what ``CREDIT_SPEND`` measures.
-#
-# WHY A litellm CALLBACK. forecasting-tools' ``GeneralLlm.invoke`` returns only the text;
-# the ``TextTokenCostResponse`` it builds keeps litellm's ``response_cost`` hidden param
-# (= ``usage.cost`` via litellm's header lift, i.e. ~$0 for every BYOK call) and drops the
-# usage object itself. The one seam that still sees the raw ``ModelResponse`` — and so
-# ``cost_details`` — is litellm's success callback, which is also how forecasting-tools'
-# own ``LitellmCostTracker`` works. ``litellm.Usage`` keeps every extra field the body
-# carried as an attribute, so ``response.usage.get("cost_details")`` reads straight off it.
-#
-# WHY ``metadata=``. ``metadata`` is a litellm-only kwarg: it lands in
-# ``litellm_params["metadata"]`` for callbacks and is never forwarded to OpenRouter
-# (litellm forwards it to a provider only for OpenAI under ``enable_preview_features``).
-# ``GeneralLlm`` passes unknown kwargs through to ``acompletion`` unchanged, so a
-# ``metadata=llm_call_metadata(role, key_alias)`` stamped at construction reaches every
-# completion that LLM makes. The raw ``acompletion`` path in ``research/agentic/llm.py``
-# stamps the same dict per call.
-#
-# THREADING. The callback runs on the event loop inside litellm's logging worker, and the
-# accumulation below has no ``await``, so the ledger needs no lock — the same
-# bytecode-atomic argument ``fallback_openrouter.record_donated_key_fallback`` makes for
-# the fallback counters. Only ``async_log_success_event`` is implemented: litellm skips
-# the sync ``log_success_event`` for ``acompletion`` unless a sync-only callback is
-# registered, and implementing both would double-count.
+# --- Per-role dollar attribution. Semantics, the callback seam and threading: docs/operations.md "Per-role spend".
 
-# litellm ``metadata=`` keys the ledger reads back. Distinct from the ``KEY_SPECS``
-# aliases below on purpose: these name FIELDS, those name KEYS.
+# These name litellm ``metadata=`` FIELDS; the ``KEY_SPECS`` aliases below name KEYS.
 ROLE_METADATA_KEY: str = "role"
 KEY_ALIAS_METADATA_KEY: str = "key_alias"
+# Stamped per call by the one builder that knows its question (the v2 driver); absent on the roster LLMs.
+QUESTION_METADATA_KEY: str = "question"
 
-# Which OpenRouter key a completion billed. ``donated`` / ``personal`` are the
-# ``KEY_SPECS`` aliases, so ``CREDIT_ROLE_SPEND key=`` joins onto ``CREDIT_SPEND key=``
-# and ``CREDIT_BALANCE key=``. ``direct`` is a non-OpenRouter slug (a perplexity/ or
-# exa/ model billed to its own provider key, outside this ledger's remit but still
-# counted); ``unknown`` is a completion that carried no key tag at all.
+# The ``KEY_SPECS`` aliases verbatim, so ``CREDIT_ROLE_SPEND key=`` joins onto ``CREDIT_SPEND key=``.
 DONATED_KEY_ALIAS: str = "donated"
 PERSONAL_KEY_ALIAS: str = "personal"
 DIRECT_KEY_ALIAS: str = "direct"
 UNKNOWN_KEY_ALIAS: str = "unknown"
 
-# A completion nobody tagged: forecasting-tools' own helpers (SmartSearcher), an ablation
-# or benchmark harness, or a builder call site that forgot ``role=``. Visible on purpose.
+# A completion nobody tagged, kept visible on purpose rather than folded into another row.
 UNTAGGED_ROLE: str = "untagged"
 
-# How long cli.main may wait for litellm's logging worker to deliver the last success
-# callbacks before the ledger is logged. Telemetry must never stall the end of a run, and
-# the bound is reachable two ways, not one: a wedged worker (a worker loop that dies on
-# any non-``CancelledError`` leaves ``queue.join()`` outstanding forever), AND a single
-# callback slower than 10s — litellm allows each queued coroutine 20s
-# (``LOGGING_WORKER_MAX_TIME_PER_COROUTINE``), twice this window, so a callback litellm
-# still considers healthy trips us. Left at 10.0 deliberately: both callbacks we register
-# are in-memory arithmetic, so raising it is an unverified retune that would only lengthen
-# a pointless wait on a dead worker. Exceeding it costs the last few completions' rows,
-# never the run (see ``drain_litellm_callbacks``).
+# What trips this bound, and why 10.0 rather than more: docs/operations.md "Per-role spend".
 LITELLM_CALLBACK_DRAIN_TIMEOUT_S: float = 10.0
 
 
-def llm_call_metadata(role: str | None, key_alias: str) -> dict[str, str]:
+def llm_call_metadata(role: str | None, key_alias: str, *, question_ref: str | None = None) -> dict[str, str]:
     """The litellm ``metadata=`` payload that tags every completion for the role ledger.
 
-    Roles in use (descriptive, one per spend line; ``forecaster:<vendor>`` for the
-    roster slots, derived from the slug by ``llm_configs.forecaster_role`` so a roster
-    swap cannot mislabel a slot): ``forecaster:openai`` / ``forecaster:anthropic`` / ``forecaster:google``,
-    ``stacker``, ``stacker_fallback``, ``parser``, ``summarizer``, ``crux_analyzer``,
-    ``native_search``, ``targeted_search``, ``gap_fill_analyzer``, ``gap_fill_resolver``,
-    ``gap_fill_v2_driver``, ``market_query_author``, ``market_ranker``,
-    ``financial_classifier``, ``perplexity_research``. ``role=None`` tags ``untagged`` HERE,
-    at construction, so every metaculus_bot-built LLM carries an explicit token and an
-    ``untagged`` row in a run log means one builder call site forgot its ``role=``.
-
-    Not on OpenRouter, so never in this ledger: the Gemini grounded-search provider and
-    gap-fill v2's ``read_document`` (google-genai on the personal Google AI Studio key),
-    AskNews (subscription), Exa (``search_web``).
+    ``role=None`` tags ``untagged`` HERE, at construction, so an ``untagged`` row in a run
+    log means one builder call site forgot its ``role=``. ``question_ref`` rides a third key
+    when the caller knows it (the v2 driver builds its call per question; the roster
+    ``GeneralLlm`` objects are built once per process and cannot) and ``PROMPT_SIZE_ALERT``
+    reads it back. The role vocabulary and what never reaches this ledger:
+    docs/operations.md "Per-role spend".
     """
-    return {ROLE_METADATA_KEY: role or UNTAGGED_ROLE, KEY_ALIAS_METADATA_KEY: key_alias}
+    metadata = {ROLE_METADATA_KEY: role or UNTAGGED_ROLE, KEY_ALIAS_METADATA_KEY: key_alias}
+    if question_ref is not None:
+        metadata[QUESTION_METADATA_KEY] = question_ref
+    return metadata
 
 
 def plain_llm_key_alias(model: str) -> str:
@@ -567,18 +400,56 @@ def plain_llm_key_alias(model: str) -> str:
     return PERSONAL_KEY_ALIAS if model.startswith("openrouter/") else DIRECT_KEY_ALIAS
 
 
+@dataclass(frozen=True)
+class TokenCounts:
+    """Token counts off one completion's ``usage``, summed per row on the ledger.
+
+    ``cached`` is ``prompt_tokens_details.cached_tokens`` (prompt tokens read from the
+    provider's prompt cache) and ``reasoning`` is ``completion_tokens_details.reasoning_tokens``
+    (hidden reasoning output); each is 0 when the provider reports nothing.
+    """
+
+    prompt: int = 0
+    completion: int = 0
+    cached: int = 0
+    reasoning: int = 0
+
+    def __add__(self, other: TokenCounts) -> TokenCounts:
+        return TokenCounts(
+            prompt=self.prompt + other.prompt,
+            completion=self.completion + other.completion,
+            cached=self.cached + other.cached,
+            reasoning=self.reasoning + other.reasoning,
+        )
+
+
+NO_TOKENS: TokenCounts = TokenCounts()
+
+
 @dataclass
 class _RoleSpendAccumulator:
     calls: int = 0
     costed_calls: int = 0
+    byok_calls: int = 0
     usd: float = 0.0
     byok_usd: float = 0.0
+    charged_usd: float = 0.0
+    tokens: TokenCounts = field(default_factory=TokenCounts)
+    max_prompt_tokens: int = 0
 
 
 @dataclass(frozen=True)
 class RoleSpendRow:
-    """One ``CREDIT_ROLE_SPEND`` line. ``usd`` / ``byok_usd`` are ``None`` when no call
-    carried cost data (rendered ``n/a``), never a fabricated zero."""
+    """One ``CREDIT_ROLE_SPEND`` line.
+
+    ``usd`` is the original ``cost + upstream_inference_cost`` sum, kept as emitted since
+    2026-09-03; it double counts a non-BYOK call whose upstream cost OpenRouter echoes. Since
+    2026-09-09 ``charged_usd`` is the money actually charged (``cost`` plus, on a BYOK call only,
+    the upstream cost) and ``byok_calls`` says how many of ``calls`` routed BYOK. The three
+    dollar fields are ``None`` when no call carried cost data (rendered ``n/a``), never a
+    fabricated zero. ``max_prompt_tokens`` is the largest single prompt among the row's calls,
+    the packet-size read that a summed ``tokens.prompt`` hides.
+    """
 
     role: str
     key_alias: str
@@ -586,28 +457,44 @@ class RoleSpendRow:
     costed_calls: int
     usd: float | None
     byok_usd: float | None
+    tokens: TokenCounts
+    charged_usd: float | None
+    byok_calls: int
+    max_prompt_tokens: int
 
 
 _role_spend: dict[tuple[str, str], _RoleSpendAccumulator] = {}
 
 
 def record_llm_call_spend(
-    role: str, key_alias: str, *, cost_usd: float | None, byok_upstream_usd: float | None
+    role: str,
+    key_alias: str,
+    *,
+    cost_usd: float | None,
+    byok_upstream_usd: float | None,
+    is_byok: bool = False,
+    tokens: TokenCounts = NO_TOKENS,
 ) -> None:
     """Add one successful completion to the ledger.
 
-    ``cost_usd`` is OpenRouter's ``usage.cost`` (credits drawn from the key) and
-    ``byok_upstream_usd`` its ``cost_details.upstream_inference_cost`` (the provider's
-    charge on a BYOK route). A call with neither is counted but not costed. Synchronous
-    and await-free by design — see the THREADING note above.
+    ``cost_usd`` is OpenRouter's ``usage.cost`` (what it charged the key's credits) and
+    ``byok_upstream_usd`` its ``cost_details.upstream_inference_cost`` (the provider's charge,
+    billed to the BYOK account's owner when ``is_byok``). A call with neither is counted but
+    not costed; its tokens are summed either way. Synchronous and await-free by design (the
+    callback runs on the event loop; docs/operations.md "Per-role spend").
     """
     accumulator = _role_spend.setdefault((role, key_alias), _RoleSpendAccumulator())
     accumulator.calls += 1
+    accumulator.byok_calls += is_byok
+    accumulator.tokens = accumulator.tokens + tokens
+    accumulator.max_prompt_tokens = max(accumulator.max_prompt_tokens, tokens.prompt)
     if cost_usd is None and byok_upstream_usd is None:
         return
     accumulator.costed_calls += 1
     accumulator.usd += (cost_usd or 0.0) + (byok_upstream_usd or 0.0)
     accumulator.byok_usd += byok_upstream_usd or 0.0
+    # Off BYOK, OpenRouter echoes the upstream cost beside cost; only the BYOK route charges both payers.
+    accumulator.charged_usd += (cost_usd or 0.0) + ((byok_upstream_usd or 0.0) if is_byok else 0.0)
 
 
 def role_spend_rows() -> list[RoleSpendRow]:
@@ -620,6 +507,10 @@ def role_spend_rows() -> list[RoleSpendRow]:
             costed_calls=acc.costed_calls,
             usd=acc.usd if acc.costed_calls else None,
             byok_usd=acc.byok_usd if acc.costed_calls else None,
+            tokens=acc.tokens,
+            charged_usd=acc.charged_usd if acc.costed_calls else None,
+            byok_calls=acc.byok_calls,
+            max_prompt_tokens=acc.max_prompt_tokens,
         )
         for (role, key_alias), acc in _role_spend.items()
     ]
@@ -632,8 +523,7 @@ def reset_role_spend() -> None:
 
 
 def _fmt_usd(value: float | None) -> str:
-    # Four decimals, not the balance lines' two: per-role figures are fractions of a
-    # cent per call (the parser is ~$0.0005/question).
+    """Render a per-role dollar figure at four decimals, since per-role costs run under a cent per call."""
     return "n/a" if value is None else f"{value:.4f}"
 
 
@@ -650,24 +540,151 @@ def log_role_spend() -> None:
         return
     for row in rows:
         logger.info(
-            "CREDIT_ROLE_SPEND: role=%s key=%s usd=%s calls=%d costed_calls=%d byok_usd=%s",
+            "CREDIT_ROLE_SPEND: role=%s key=%s usd=%s calls=%d costed_calls=%d byok_usd=%s"
+            " prompt_tokens=%d completion_tokens=%d cached_tokens=%d reasoning_tokens=%d"
+            " charged_usd=%s byok_calls=%d max_prompt_tokens=%d",
             row.role,
             row.key_alias,
             _fmt_usd(row.usd),
             row.calls,
             row.costed_calls,
             _fmt_usd(row.byok_usd),
+            row.tokens.prompt,
+            row.tokens.completion,
+            row.tokens.cached,
+            row.tokens.reasoning,
+            _fmt_usd(row.charged_usd),
+            row.byok_calls,
+            row.max_prompt_tokens,
         )
 
 
-def _openrouter_usage_cost(response_obj: Any) -> tuple[float | None, float | None]:
-    """``(usage.cost, usage.cost_details.upstream_inference_cost)`` off a litellm response,
-    each ``None`` when unreported (or non-finite, same rule as ``_as_float``)."""
+@dataclass(frozen=True)
+class RunSpendSummary:
+    """The ledger folded down to one ``CREDIT_RUN_SUMMARY`` line: the run's money over its questions.
+
+    ``n_questions`` is the count of forecast reports the run produced. A dollar field is ``None``
+    when no costed call backs it (rendered ``n/a``); a key with no rows at all is a true 0.0,
+    since nothing billed through it. ``max_prompt_role`` names the row holding the run's largest
+    single prompt, ``None`` on an empty ledger.
+    """
+
+    n_questions: int
+    charged_usd: float | None
+    donated_usd: float | None
+    personal_usd: float | None
+    prompt_tokens: int
+    cached_tokens: int
+    max_prompt_tokens: int
+    max_prompt_role: str | None
+
+    @property
+    def usd_per_question(self) -> float | None:
+        if self.charged_usd is None or self.n_questions == 0:
+            return None
+        return self.charged_usd / self.n_questions
+
+    @property
+    def cached_share(self) -> float | None:
+        return None if self.prompt_tokens == 0 else self.cached_tokens / self.prompt_tokens
+
+
+def _charged_total(rows: list[RoleSpendRow]) -> float | None:
+    """Sum of ``charged_usd`` over ``rows``: 0.0 for no rows, ``None`` when rows exist but none is costed."""
+    if not rows:
+        return 0.0
+    costed = [row.charged_usd for row in rows if row.charged_usd is not None]
+    return sum(costed) if costed else None
+
+
+def run_spend_summary(n_questions: int) -> RunSpendSummary:
+    """Fold the current ledger into the per-run summary over ``n_questions`` forecast reports."""
+    rows = role_spend_rows()
+    largest = max(rows, key=lambda row: row.max_prompt_tokens, default=None)
+    return RunSpendSummary(
+        n_questions=n_questions,
+        charged_usd=_charged_total(rows) if rows else None,
+        donated_usd=_charged_total([row for row in rows if row.key_alias == DONATED_KEY_ALIAS]),
+        personal_usd=_charged_total([row for row in rows if row.key_alias == PERSONAL_KEY_ALIAS]),
+        prompt_tokens=sum(row.tokens.prompt for row in rows),
+        cached_tokens=sum(row.tokens.cached for row in rows),
+        max_prompt_tokens=largest.max_prompt_tokens if largest is not None else 0,
+        max_prompt_role=largest.role if largest is not None else None,
+    )
+
+
+def log_run_summary(n_questions: int) -> None:
+    """Emit the one ``CREDIT_RUN_SUMMARY`` line, on every path, after the ``CREDIT_ROLE_SPEND`` rows.
+
+    The per-role rows carry no question denominator, which is how a five-fold-wrong
+    per-question figure stood for two months (docs/operations.md "Per-role spend"); this line
+    puts the denominator beside the money so cost per question falls out of every run log.
+    """
+    summary = run_spend_summary(n_questions)
+    logger.info(
+        "CREDIT_RUN_SUMMARY: n_questions=%d charged_usd=%s usd_per_question=%s donated_usd=%s personal_usd=%s"
+        " prompt_tokens=%d cached_tokens=%d cached_share=%s max_prompt_tokens=%d max_prompt_role=%s",
+        summary.n_questions,
+        _fmt_usd(summary.charged_usd),
+        _fmt_usd(summary.usd_per_question),
+        _fmt_usd(summary.donated_usd),
+        _fmt_usd(summary.personal_usd),
+        summary.prompt_tokens,
+        summary.cached_tokens,
+        _fmt_usd(summary.cached_share),
+        summary.max_prompt_tokens,
+        summary.max_prompt_role or "none",
+    )
+
+
+@dataclass(frozen=True)
+class _CallUsage:
+    """What one completion's ``usage`` object says about money, routing and tokens."""
+
+    cost_usd: float | None
+    byok_upstream_usd: float | None
+    is_byok: bool
+    tokens: TokenCounts
+
+
+def _usage_token_counts(usage: Any) -> TokenCounts:
+    prompt_details = usage.prompt_tokens_details
+    completion_details = usage.completion_tokens_details
+    return TokenCounts(
+        prompt=usage.prompt_tokens or 0,
+        completion=usage.completion_tokens or 0,
+        cached=(prompt_details.cached_tokens if prompt_details is not None else None) or 0,
+        reasoning=(completion_details.reasoning_tokens if completion_details is not None else None) or 0,
+    )
+
+
+def _openrouter_call_usage(response_obj: Any) -> _CallUsage:
+    """Read ``usage.cost``, ``usage.cost_details.upstream_inference_cost``, ``usage.is_byok`` and the
+    token counts off a litellm response; each dollar figure is ``None`` when unreported (or
+    non-finite, same rule as ``_as_float``), and a response without ``usage`` reads as uncosted."""
     usage = getattr(response_obj, "usage", None)
     if usage is None:
-        return None, None
+        return _CallUsage(cost_usd=None, byok_upstream_usd=None, is_byok=False, tokens=NO_TOKENS)
     cost_details = usage.get("cost_details") or {}
-    return _as_float(usage.get("cost")), _as_float(cost_details.get("upstream_inference_cost"))
+    return _CallUsage(
+        cost_usd=_as_float(usage.get("cost")),
+        byok_upstream_usd=_as_float(cost_details.get("upstream_inference_cost")),
+        is_byok=usage.get("is_byok") is True,
+        tokens=_usage_token_counts(usage),
+    )
+
+
+def _alert_on_oversized_prompt(role: str, question_ref: str | None, prompt_tokens: int) -> None:
+    """WARN once per call whose prompt exceeds the threshold; the call is already billed, so this reads, never gates."""
+    if prompt_tokens <= PROMPT_TOKENS_ALERT_THRESHOLD:
+        return
+    logger.warning(
+        "PROMPT_SIZE_ALERT: role=%s question=%s prompt_tokens=%d threshold=%d",
+        role,
+        question_ref or "n/a",
+        prompt_tokens,
+        PROMPT_TOKENS_ALERT_THRESHOLD,
+    )
 
 
 class RoleSpendTracker(CustomLogger):
@@ -679,13 +696,17 @@ class RoleSpendTracker(CustomLogger):
     ) -> None:
         del start_time, end_time  # CustomLogger hook signature; the ledger is not timed
         metadata = (kwargs.get("litellm_params") or {}).get("metadata") or {}
-        cost_usd, byok_upstream_usd = _openrouter_usage_cost(response_obj)
+        role = metadata.get(ROLE_METADATA_KEY, UNTAGGED_ROLE)
+        usage = _openrouter_call_usage(response_obj)
         record_llm_call_spend(
-            metadata.get(ROLE_METADATA_KEY, UNTAGGED_ROLE),
+            role,
             metadata.get(KEY_ALIAS_METADATA_KEY, UNKNOWN_KEY_ALIAS),
-            cost_usd=cost_usd,
-            byok_upstream_usd=byok_upstream_usd,
+            cost_usd=usage.cost_usd,
+            byok_upstream_usd=usage.byok_upstream_usd,
+            is_byok=usage.is_byok,
+            tokens=usage.tokens,
         )
+        _alert_on_oversized_prompt(role, metadata.get(QUESTION_METADATA_KEY), usage.tokens.prompt)
 
 
 def install_role_spend_tracker() -> None:
@@ -698,32 +719,19 @@ def install_role_spend_tracker() -> None:
 async def drain_litellm_callbacks(timeout_s: float = LITELLM_CALLBACK_DRAIN_TIMEOUT_S) -> None:
     """Wait for litellm's logging worker to deliver every pending success callback.
 
-    Must run INSIDE the event loop the completions ran on: the worker's queue is bound to
-    that loop and is reset (dropping whatever is queued) when a different loop shows up.
-    litellm enqueues each callback from a ``create_task``, so yield to the loop first —
-    otherwise ``flush`` can find an empty queue with the enqueue still a tick away — then
-    join the queue, bounded so telemetry can never hold the end of a run hostage.
-
-    The bound is caught HERE, not at the call site, so every caller inherits the promise
-    this docstring makes. Its one caller awaits this from a ``finally``
-    (``cli._forecast_with_callback_drain``) and nothing between there and process exit
-    catches, so a raise would discard a fully published run's reports and skip
-    ``log_report_summary`` plus the whole degradation/exit block — the q45085 failure
-    shape, on a run where every question published — or, on a run that was already
-    failing, demote the real forecast error to ``__context__``. ``CancelledError`` is a
-    ``BaseException`` and still propagates, so the GHA SIGTERM path is unaffected.
+    Must run INSIDE the event loop the completions ran on (the worker's queue is bound to
+    it), after yielding twice so the ``create_task`` enqueue has landed, and bounded so
+    telemetry can never hold the end of a run hostage. The timeout is swallowed HERE, not
+    at the call site: the one caller awaits this from ``cli._forecast_with_callback_drain``'s
+    ``finally``, where a raise would discard a fully published run's reports (the q45085
+    shape). ``CancelledError`` still propagates. Detail: docs/operations.md "Per-role spend".
     """
     for _ in range(2):
         await asyncio.sleep(0)
     try:
         await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=timeout_s)
     except TimeoutError:
-        # Distinct marker on purpose: the CREDIT_ROLE_SPEND harvester spec expects
-        # role=/key=/usd=/calls= fields, so prose under that prefix would pollute every
-        # grep of a run log without ever parsing as a row. This prefix has carried its own
-        # spec since 2026-09-04 (scripts/telemetry/markers.py
-        # "litellm_callback_drain_timeout"), which reads the "within <n>s" clause; reword
-        # the rest of the sentence freely, but that clause is now a data contract.
+        # The "within %.1fs" clause is a data contract (scripts/telemetry/markers.py "litellm_callback_drain_timeout").
         logger.warning(
             "LITELLM_CALLBACK_DRAIN_TIMEOUT: litellm's logging worker did not deliver its queued "
             "success callbacks within %.1fs; continuing so the run can finish. The CREDIT_ROLE_SPEND "

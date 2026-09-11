@@ -177,15 +177,15 @@ def _yf_ohlc(dates: list[str], *, close: list[float], high: list[float]) -> pd.D
     )
 
 
-def _fake_yf_ticker(frame: pd.DataFrame) -> tuple[type, list[dict[str, str]]]:
+def _fake_yf_ticker(frame: pd.DataFrame) -> tuple[type, list[dict[str, object]]]:
     """Return a (Ticker-class, calls-list) pair; the class records every history() kwargs."""
-    calls: list[dict[str, str]] = []
+    calls: list[dict[str, object]] = []
 
     class _Ticker:
         def __init__(self, symbol: str) -> None:
             self.symbol = symbol
 
-        def history(self, **kwargs: str) -> pd.DataFrame:
+        def history(self, **kwargs: object) -> pd.DataFrame:
             calls.append(kwargs)
             return frame
 
@@ -211,6 +211,15 @@ class TestYfinanceFetch:
         series = fetch_series(SeriesSpec(source="yfinance", series_id="^VIX"), date(2026, 6, 30))
 
         assert float(series.iloc[-1]) == pytest.approx(19.0)  # Close (default column)
+
+    def test_history_request_carries_the_client_timeout(self, monkeypatch):
+        frame = _yf_ohlc(["2026-06-30"], close=[19.0], high=[22.0])
+        ticker, calls = _fake_yf_ticker(frame)
+        monkeypatch.setattr("yfinance.Ticker", ticker)
+
+        fetch_series(SeriesSpec(source="yfinance", series_id="^VIX"), date(2026, 6, 30))
+
+        assert calls[0]["timeout"] == tf.HTTP_TIMEOUT_S
 
     def test_empty_frame_raises_fetch_error(self, monkeypatch):
         ticker, _ = _fake_yf_ticker(pd.DataFrame())

@@ -100,3 +100,27 @@ class TestApiKeyUtils:
 
         result = get_openrouter_api_key("openrouter/openai/gpt-5.1")
         assert result is None
+
+    def test_master_switch_off_returns_general_key_for_every_donated_provider(self, monkeypatch):
+        """DONATED_OPENROUTER_KEY_ENABLED=false (a Mantic run): the donated key is never chosen,
+        even with both keys set to distinct values and the Gemini toggle explicitly ON.
+
+        Metaculus donated that key for its own tournaments; a run for another platform spends
+        only the operator's personal key.
+        """
+        monkeypatch.setenv("OAI_ANTH_OPENROUTER_KEY", "special_key")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "general_key")
+        monkeypatch.setenv("GEMINI_USE_DONATED_OPENROUTER_KEY", "true")
+        monkeypatch.setenv("DONATED_OPENROUTER_KEY_ENABLED", "false")
+
+        assert get_openrouter_api_key("openrouter/openai/gpt-5.6-sol") == "general_key"
+        assert get_openrouter_api_key("openrouter/anthropic/claude-opus-4.8") == "general_key"
+        assert get_openrouter_api_key("openrouter/google/gemini-3.5-flash") == "general_key"
+
+    def test_master_switch_unset_keeps_special_key(self, monkeypatch):
+        """Default ON: a Metaculus run that never sets the switch still prefers the donated key."""
+        monkeypatch.setenv("OAI_ANTH_OPENROUTER_KEY", "special_key")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "general_key")
+        monkeypatch.delenv("DONATED_OPENROUTER_KEY_ENABLED", raising=False)
+
+        assert get_openrouter_api_key("openrouter/openai/gpt-5.6-sol") == "special_key"

@@ -32,6 +32,7 @@ from forecasting_tools import (
 )
 from forecasting_tools.data_models.data_organizer import PredictionTypes
 from forecasting_tools.data_models.forecast_report import ResearchWithPredictions
+from forecasting_tools.data_models.questions import DateQuestion
 
 from metaculus_bot import stacking
 from metaculus_bot.aggregation_pipeline import AggregationPipeline
@@ -56,15 +57,17 @@ logger = logging.getLogger(__name__)
 
 _STACKING_STRATEGIES = (AggregationStrategy.STACKING, AggregationStrategy.CONDITIONAL_STACKING)
 
-# Per-question-type stacking gates. All three default to DISABLED. Set
+# Per-question-type stacking gates. All three flags default to DISABLED. Set
 # <TYPE>_STACKING_ENABLED=true in deploy env to opt a type back into stacking;
 # otherwise the stacker is bypassed (forces the median/skipped path). Binary and
 # MC are matched before NumericQuestion because DiscreteQuestion subclasses the
-# latter and must read the numeric gate.
+# latter and must read the numeric gate; a date question stacks through the numeric
+# stacker, so it reads that gate too (no entry = eligible while every flag is off).
 _STACKING_ENV_BY_QUESTION_TYPE: dict[type[MetaculusQuestion], str] = {
     BinaryQuestion: BINARY_STACKING_ENABLED_ENV,
     MultipleChoiceQuestion: MC_STACKING_ENABLED_ENV,
     NumericQuestion: NUMERIC_STACKING_ENABLED_ENV,
+    DateQuestion: NUMERIC_STACKING_ENABLED_ENV,
 }
 
 
@@ -81,8 +84,8 @@ def _with_diagnostics(text: str, diagnostics_block: str | None) -> str:
 def _type_gate_enabled(question: MetaculusQuestion) -> bool:
     """Whether this question type's ``<TYPE>_STACKING_ENABLED`` flag is set.
 
-    A question matching none of the three types has no gate to fail, so it stays
-    eligible for stacking.
+    A question matching none of the gated types has no gate to fail, so it stays
+    eligible for stacking; every type the bot forecasts has an entry.
     """
     for question_type, env_name in _STACKING_ENV_BY_QUESTION_TYPE.items():
         if isinstance(question, question_type):

@@ -19,18 +19,23 @@ import pytest
 
 from metaculus_bot.constants import RESOLUTION_SOURCE_WAYBACK_MAX_AGE_DAYS
 from metaculus_bot.research import resolution_presentation, resolution_source
+from metaculus_bot.research.fetch_ladder import classify, verdict
+from metaculus_bot.research.fetch_ladder.policy import RESOLUTION_SOURCE_POLICY
+from metaculus_bot.research.fetch_ladder.verdict import looks_like_js_wall
 from metaculus_bot.research.http_fetch import (
     MAX_UNDECODABLE_CHAR_RATIO,
     decode_text_body,
     meta_refresh_target,
     rewrite_aria_tables,
 )
+from metaculus_bot.research.resolution_body_text import strip_html_tags
 from metaculus_bot.research.resolution_fetch_result import (
     _SERVER_HEADER_MAX_CHARS,
     ROUTE_CAVEATS,
     RungAttempt,
     http_failure_class,
     server_header_token,
+    vacuous_body_status,
 )
 from metaculus_bot.research.resolution_presentation import format_resolution_sections
 from metaculus_bot.research.resolution_source import (
@@ -40,11 +45,8 @@ from metaculus_bot.research.resolution_source import (
     is_metaculus_self_ref,
     is_yahoo_ticker_url,
     looks_like_csv_rows,
-    looks_like_js_wall,
     select_fetchable_urls,
-    strip_html_tags,
     strip_markdown_escapes,
-    vacuous_body_status,
 )
 from metaculus_bot.research.wayback import WaybackSnapshot, wayback_lead
 from tests.resolution_source_fakes import cdc_aria_stat_block_page, cp1252_aria_stat_block_page
@@ -199,6 +201,88 @@ class TestUrlParensBelongToTheUrl:
         assert time.monotonic() - start < 1.0
 
 
+class TestUrlBracketsBelongToTheUrl:
+    """Brackets inside a cited API query, the Mantic readiness review's item 4 (2026-09-08).
+
+    Mantic question writers resolve a question to "the count this API query returns" and cite
+    the query, and Rails-style query grammars put the filter keys in brackets. The old URL class
+    allowed `[` and excluded `]` with no balanced-bracket atom, so the match stopped at the first
+    bracket. Six of the 556 public Mantic posts lost a URL that way, and the truncated Federal
+    Register query is the worst kind of failure: it answers HTTP 200 with the UNFILTERED count
+    (`{"description":"All Documents","count":10000}` against a correct 125), which the
+    resolution-source fetcher then serves as the grading evidence for a question whose upper
+    bound is 75. Same edit: writers fence an API URL in backticks (ten URLs on nine posts) and the
+    fenced form 404s where the clean form is 200, so a backtick ends a URL.
+    """
+
+    # Post 434's "Source Hierarchy" paragraph verbatim: the JSON API query sits inside prose parens AND has brackets.
+    POST_434_SOURCE_HIERARCHY = (
+        "**Source Hierarchy**: The human-readable web interface at federalregister.gov is the primary "
+        "authority. If its reported count differs from the Federal Register JSON API, the human-readable "
+        "page count prevails. If the web interface is unavailable at 12:00 UTC on 2026-08-15, the JSON API "
+        "(https://www.federalregister.gov/api/v1/documents.json?conditions[agencies][]=nuclear-regulatory-commission"
+        "&conditions[publication_date][gte]=2026-06-08&conditions[publication_date][lte]=2026-08-12) will be "
+        "used. If both are unavailable, the observation will be delayed up to 48 hours until 12:00 UTC on "
+        "2026-08-17. If both remain unavailable, the NRC ADAMS system (https://adams.nrc.gov/wba/) is the "
+        "tertiary source."
+    )
+    POST_434_JSON_API_URL = (
+        "https://www.federalregister.gov/api/v1/documents.json?conditions[agencies][]=nuclear-regulatory-commission"
+        "&conditions[publication_date][gte]=2026-06-08&conditions[publication_date][lte]=2026-08-12"
+    )
+    # Post 598's query line verbatim: backtick-fenced, bracketed date range; the old extractor cut it at the `[`.
+    POST_598_QUERY_LINE = (
+        "The API query to be used is: `https://api.fda.gov/drug/enforcement.json?search=classification:"
+        "%22Class+I%22+AND+report_date:[20260706+TO+20260811]&limit=1`"
+    )
+    POST_598_QUERY_URL = (
+        "https://api.fda.gov/drug/enforcement.json?search=classification:%22Class+I%22+AND+report_date:"
+        "[20260706+TO+20260811]&limit=1"
+    )
+
+    def test_post_434_json_api_query_survives_whole_inside_prose_parens(self):
+        assert extract_source_urls(self.POST_434_SOURCE_HIERARCHY) == [
+            self.POST_434_JSON_API_URL,
+            "https://adams.nrc.gov/wba/",
+        ]
+
+    def test_post_598_backticked_bracketed_query_survives_whole_without_the_backtick(self):
+        assert extract_source_urls(self.POST_598_QUERY_LINE) == [self.POST_598_QUERY_URL]
+
+    def test_a_backtick_fenced_url_loses_the_fence(self):
+        assert extract_source_urls("Query `https://api.example.com/v1/items?limit=1` at noon.") == [
+            "https://api.example.com/v1/items?limit=1"
+        ]
+
+    def test_markdown_link_keeps_the_bracketed_query(self):
+        assert extract_source_urls(f"[the query]({self.POST_434_JSON_API_URL})") == [self.POST_434_JSON_API_URL]
+
+    def test_a_url_inside_prose_brackets_drops_the_prose_bracket(self):
+        # The `]` closes the prose `[`, not anything inside the URL, so it is a delimiter.
+        assert extract_source_urls("Source [https://example.com/x] as cited.") == ["https://example.com/x"]
+        assert extract_source_urls("see https://example.com/x] and more") == ["https://example.com/x"]
+
+    def test_prose_brackets_around_a_url_that_has_its_own_brackets(self):
+        # Both rules at once: the inner pair stays, the outer prose bracket goes.
+        assert extract_source_urls("[https://example.com/q?a[b]=1]") == ["https://example.com/q?a[b]=1"]
+
+    def test_an_empty_bracket_pair_at_the_end_of_the_url_is_kept(self):
+        # Rails array params end in `[]`; the old `_TRAILING_PUNCT` stripped the closer.
+        assert extract_source_urls("Count https://example.com/q?ids[] daily.") == ["https://example.com/q?ids[]"]
+
+    def test_an_unbalanced_open_bracket_does_not_truncate_a_bare_url(self):
+        # Mirrors the lone-`(` rule: no closer exists anywhere, so `[` cannot be a delimiter.
+        assert extract_source_urls("https://example.com/a[b then prose") == ["https://example.com/a[b"]
+
+    def test_a_long_bracket_run_matches_in_linear_time(self):
+        # Same shape as the paren pin: a `[` starts a balanced group or is a literal, and the
+        # group's body excludes brackets, so the two branches never match the same text.
+        text = "https://example.com/" + "[a" * 400 + " and prose"
+        start = time.monotonic()
+        extract_source_urls(text)
+        assert time.monotonic() - start < 1.0
+
+
 class TestSkipPredicates:
     def test_is_metaculus_self_ref(self):
         assert is_metaculus_self_ref("https://metaculus.com/q/12345") is True
@@ -232,6 +316,29 @@ class TestSkipPredicates:
         # A capture of an ordinary page is still an ordinary (fetchable) source.
         assert is_metaculus_self_ref("https://web.archive.org/web/20240101000000/https://www.bls.gov/cpi/") is False
 
+    def test_is_metaculus_self_ref_covers_the_mantic_competition_site(self):
+        """A Mantic question page shows the other bots' forecasts and comments, so fetching one
+        would leak competitor forecasts into research. The refusal covers the competition host
+        and its subdomains only: the rest of mantic.com is the company's marketing site and blog,
+        which publishes forecasts and is a legitimate outside source."""
+        assert is_metaculus_self_ref("https://competitions.mantic.com/questions/650/") is True
+        assert is_metaculus_self_ref("https://api.competitions.mantic.com/posts/650/") is True
+        # Port and userinfo must not bypass, exactly as for Metaculus.
+        assert is_metaculus_self_ref("https://competitions.mantic.com:443/questions/650/") is True
+        assert is_metaculus_self_ref("https://user@competitions.mantic.com/questions/650/") is True
+        # A Wayback capture of a Mantic question page is the question quoting itself too.
+        assert (
+            is_metaculus_self_ref(
+                "https://web.archive.org/web/20260901000000/https://competitions.mantic.com/questions/650/"
+            )
+            is True
+        )
+        assert is_metaculus_self_ref("https://www.mantic.com/") is False
+        assert is_metaculus_self_ref("https://blog.mantic.com/forecasting-the-fed/") is False
+        assert is_metaculus_self_ref("https://mantic.com/") is False
+        # A host that merely ends in the string is not the competition site.
+        assert is_metaculus_self_ref("https://notcompetitions.mantic.com/x") is False
+
     def test_is_fred_url(self):
         assert is_fred_url("https://fred.stlouisfed.org/series/DGS10") is True
         assert is_fred_url("https://stlouisfed.org/other") is False
@@ -254,7 +361,8 @@ class TestSelectFetchableUrls:
 
     def test_drops_self_ref_fred_yahoo_ticker(self):
         criteria = (
-            "See https://metaculus.com/q/1 and https://fred.stlouisfed.org/series/DGS10 "
+            "See https://metaculus.com/q/1 and https://competitions.mantic.com/questions/650/ "
+            "and https://fred.stlouisfed.org/series/DGS10 "
             "and https://finance.yahoo.com/quote/AAPL — but also https://www.bls.gov/cpi/."
         )
         urls = select_fetchable_urls(criteria, "")
@@ -305,12 +413,12 @@ class TestSelectFetchableUrls:
 
 class TestLooksLikeJsWall:
     def test_short_text_flagged(self, monkeypatch):
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_JS_WALL_MIN_CHARS", 100)
-        assert resolution_source.looks_like_js_wall("only a few chars") is True
+        monkeypatch.setattr(verdict, "RESOLUTION_SOURCE_JS_WALL_MIN_CHARS", 100)
+        assert verdict.looks_like_js_wall("only a few chars") is True
 
     def test_long_text_not_flagged(self, monkeypatch):
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_JS_WALL_MIN_CHARS", 20)
-        assert resolution_source.looks_like_js_wall("x" * 30) is False
+        monkeypatch.setattr(verdict, "RESOLUTION_SOURCE_JS_WALL_MIN_CHARS", 20)
+        assert verdict.looks_like_js_wall("x" * 30) is False
 
     def test_whitespace_only_flagged(self):
         assert looks_like_js_wall("       \n\n   ") is True
@@ -746,7 +854,8 @@ class TestFormatResolutionSections:
         rescued fourth leave a remainder under the floor. Sizes derive from the constants so the
         scenario stays the reachable one."""
         total = resolution_presentation.RESOLUTION_SOURCE_TOTAL_MAX_CHARS
-        per_url = resolution_presentation.RESOLUTION_SOURCE_PER_URL_MAX_CHARS
+        per_url = RESOLUTION_SOURCE_POLICY.per_url_max_chars
+        assert per_url is not None
         leftover = resolution_presentation.RESOLUTION_SOURCE_MIN_SECTION_CHARS // 3
         fillers = [
             FetchResult(
@@ -760,7 +869,7 @@ class TestFormatResolutionSections:
             url=url,
             status="success",
             text=resolution_presentation._lead_then_capped_body(
-                wayback_lead(snapshot, 6.0, "blocked"), "x" * 8000, url
+                wayback_lead(snapshot, 6.0, "blocked"), "x" * 8000, url, cap=per_url
             ),
             http_status=200,
             content_type="text/html",
@@ -881,10 +990,8 @@ class TestAriaTableRewrite:
     def test_the_hospitalization_count_arrives_with_its_label(self):
         body = cdc_aria_stat_block_page()
 
-        before = resolution_source._extract_main_text(body, "https://www.cdc.gov/cyclosporiasis/")
-        after = resolution_source._extract_page_text(
-            body.decode(), body, "https://www.cdc.gov/cyclosporiasis/", 0.0
-        ).text
+        before = classify._extract_main_text(body, "https://www.cdc.gov/cyclosporiasis/")
+        after = classify._extract_page_text(body.decode(), body, "https://www.cdc.gov/cyclosporiasis/", 0.0).text
 
         assert before is not None
         assert after is not None
@@ -901,9 +1008,9 @@ class TestAriaTableRewrite:
         that already worked byte-identical — including its encoding detection."""
         assert rewrite_aria_tables(article_html.decode()) is None
 
-        assert resolution_source._extract_page_text(
+        assert classify._extract_page_text(
             article_html.decode(), article_html, "https://news.example.com/report", 0.0
-        ).text == resolution_source._extract_main_text(article_html, "https://news.example.com/report")
+        ).text == classify._extract_main_text(article_html, "https://news.example.com/report")
 
     def test_an_unclosed_role_element_is_still_rewritten(self):
         """A truncated capture (and plenty of live HTML) never closes its outer divs. Leaving
@@ -958,7 +1065,7 @@ class TestAriaTableRewrite:
         assert 0.0 < ratio < MAX_UNDECODABLE_CHAR_RATIO, "pins that the old gate admitted this page"
         assert "�" in html_text, "our own decode is what mangled it"
 
-        out = resolution_source._extract_page_text(html_text, body, "https://sante.example.com/qc", ratio).text
+        out = classify._extract_page_text(html_text, body, "https://sante.example.com/qc", ratio).text
 
         assert out is not None
         assert "Résumé" in out
@@ -971,16 +1078,16 @@ class TestAriaTableRewrite:
         threshold now hand trafilatura the original bytes."""
         body = cdc_aria_stat_block_page()
 
-        assert resolution_source._extract_page_text(
+        assert classify._extract_page_text(
             body.decode(), body, "https://www.cdc.gov/cyclosporiasis/", ratio
-        ).text == resolution_source._extract_main_text(body, "https://www.cdc.gov/cyclosporiasis/")
+        ).text == classify._extract_main_text(body, "https://www.cdc.gov/cyclosporiasis/")
 
     def test_a_cleanly_decoded_page_still_gets_the_rewrite(self):
         """Non-vacuity for the two cases above: at 0.0 the labelled row is present, so they
         are asserting a real fallback rather than an extraction that never differs."""
         body = cdc_aria_stat_block_page()
 
-        out = resolution_source._extract_page_text(body.decode(), body, "https://www.cdc.gov/cyclosporiasis/", 0.0).text
+        out = classify._extract_page_text(body.decode(), body, "https://www.cdc.gov/cyclosporiasis/", 0.0).text
 
         assert out is not None
         assert "| Hospitalizations | 922 |" in out

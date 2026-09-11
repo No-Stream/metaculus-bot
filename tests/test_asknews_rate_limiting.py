@@ -1,6 +1,6 @@
 """Test that AskNews integration properly handles rate limiting."""
 
-import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -17,14 +17,19 @@ def _make_q(text: str) -> MagicMock:
 
 
 @pytest.mark.asyncio
-async def test_asknews_rate_limiting_delay():
+async def test_asknews_rate_limiting_delay() -> None:
     """Test that AskNews provider waits between API calls to respect rate limits."""
 
-    # Mock the AsyncAskNewsSDK to track timing
-    call_times = []
+    events: list[tuple[str, str | float]] = []
+    elapsed = 0.0
+
+    async def record_sleep(delay: float) -> None:
+        nonlocal elapsed
+        elapsed += delay
+        events.append(("sleep", delay))
 
     async def mock_search_news(*args, **kwargs):
-        call_times.append(asyncio.get_event_loop().time())
+        events.append(("search", kwargs["strategy"]))
         # Create a minimal mock response
         mock_response = AsyncMock()
         mock_response.as_dicts = []
@@ -36,7 +41,12 @@ async def test_asknews_rate_limiting_delay():
             "ASKNEWS_SECRET": "test_secret",
         }.get(key, default)
 
-        with patch("asknews_sdk.AsyncAskNewsSDK") as mock_sdk_class:
+        with (
+            patch("asknews_sdk.AsyncAskNewsSDK") as mock_sdk_class,
+            patch("metaculus_bot.research.providers.asyncio.sleep", side_effect=record_sleep),
+            patch("metaculus_bot.research.providers.time", SimpleNamespace(monotonic=lambda: elapsed)),
+            patch("metaculus_bot.research.providers._ASKNEWS_LAST_CALL_TS", 0.0),
+        ):
             mock_sdk = AsyncMock()
             mock_sdk.news.search_news = mock_search_news
             mock_sdk_class.return_value.__aenter__.return_value = mock_sdk
@@ -44,13 +54,12 @@ async def test_asknews_rate_limiting_delay():
             provider = _asknews_provider()
             await provider(_make_q("test question"))
 
-            # Verify two calls were made
-            assert len(call_times) == 2
-
-            # Verify there was a delay between calls (should be ~1.2 seconds)
-            time_diff = call_times[1] - call_times[0]
-            assert time_diff >= 10.0, f"Expected delay >= 10.0s, got {time_diff:.2f}s"
-            assert time_diff <= 11.1, f"Expected delay <= 11.1s, got {time_diff:.2f}s"
+            assert [kind for kind, _ in events] == ["sleep", "search", "sleep", "search"]
+            assert events[1] == ("search", "latest news")
+            assert events[3] == ("search", "news knowledge")
+            for _, delay in (events[0], events[2]):
+                assert isinstance(delay, float)
+                assert 10.0 <= delay <= 11.1
 
 
 @pytest.mark.asyncio
@@ -71,7 +80,10 @@ async def test_asknews_calls_both_endpoints():
             "ASKNEWS_SECRET": "test_secret",
         }.get(key, default)
 
-        with patch("asknews_sdk.AsyncAskNewsSDK") as mock_sdk_class:
+        with (
+            patch("asknews_sdk.AsyncAskNewsSDK") as mock_sdk_class,
+            patch("metaculus_bot.research.providers.asyncio.sleep", new=AsyncMock()),
+        ):
             mock_sdk = AsyncMock()
             mock_sdk.news.search_news = mock_search_news
             mock_sdk_class.return_value.__aenter__.return_value = mock_sdk

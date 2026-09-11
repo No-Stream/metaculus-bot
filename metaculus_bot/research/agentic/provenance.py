@@ -62,13 +62,18 @@ _METHOD_TO_TIER: dict[str, str] = {
     "document": "fetched",
     "rendered": "fetched",
     "plain": "fetched",
-    # The impersonated retry read the host's own bytes through libcurl (tools._try_impersonated_fetch);
+    # The impersonated retry read the host's own bytes through the shared impersonated rung;
     # absent from here a page it really did retrieve would stay untiered and its discrepancy
     # silently demoted below the briefing, the 131.3 failure mode above.
     "impersonate": "fetched",
+    # The archive served the host's own bytes with the age disclosed in-text (the shared Wayback rung).
+    "wayback": "fetched",
+    # The page's own JSON feed, harvested during its render and served directly (the shared derived rung).
+    "derived_api": "fetched",
     "cache": "fetched",
     "pdf_local": "fetched",
     "digest_local": "fetched",
+    "known_api": "fetched",
     "search": "snippet",
     "news": "snippet",
 }
@@ -312,9 +317,11 @@ def _harvest_verification_tiers(tool_name: str, arguments: dict[str, Any], outco
 
     A **fetched-class** call (document/rendered/plain/cache) tiers ONLY the page
     it actually retrieved — the ``url`` argument the driver asked for — as
-    "fetched". A URL merely named in a free-text ``ask`` (or in the result
-    body/links) is a lead, not a page we read, so it earns no tier from this call
-    (F1: an ``ask``-URL must not inherit fetched authority). A **snippet-class**
+    "fetched". The explicit known-API tools have no ``url`` argument, so they tier
+    only the canonical source links their backend adapter owns. A URL merely named
+    in free text or an ordinary fetch result's body/links is a lead, not a page we
+    read, so it earns no tier from that call (F1: an ``ask``-URL must not inherit
+    fetched authority). A **snippet-class**
     call (search/news) tiers every URL it surfaced (the exact set provenance
     harvests — requested ``url``, body, links) as "snippet": the driver saw only
     the excerpt, never the page.
@@ -327,9 +334,12 @@ def _harvest_verification_tiers(tool_name: str, arguments: dict[str, Any], outco
     if tier == "fetched":
         # Only the requested page (the `url` argument) counts as retrieved.
         requested = arguments.get("url")
-        if not isinstance(requested, str):
-            return {}
-        return dict.fromkeys(_iter_normalized_urls(requested), tier)
+        if isinstance(requested, str):
+            return dict.fromkeys(_iter_normalized_urls(requested), tier)
+        if outcome.method == "known_api":
+            canonical_links = (_normalize_url(link) for link in outcome.links)
+            return {link: tier for link in canonical_links if link is not None}
+        return {}
     # snippet: every surfaced URL was seen only as an excerpt. Reuse provenance's
     # URL set so tier and provenance can't drift (F7).
     return dict.fromkeys(_surfaced_urls(arguments, outcome), tier)

@@ -19,7 +19,13 @@ All tests mock the ``claude -p`` subprocess primitive.
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
+import logging
+import os
+import re
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,7 +35,15 @@ from unittest.mock import AsyncMock
 import pytest
 from forecasting_tools import MetaculusQuestion
 
+from metaculus_bot.ablation import qa_iterate
 from metaculus_bot.ablation.cache import AblationCache
+from metaculus_bot.ablation.qa_iterate import (
+    RE_REDACTOR_SYSTEM_PROMPT,
+    VERIFIER_SYSTEM_PROMPT,
+    _extract_inner_result,
+    _parse_re_redactor_response,
+    _verifier_score_from_entry,
+)
 from metaculus_bot.backtest.scoring import GroundTruth
 
 
@@ -117,8 +131,6 @@ async def test_clean_first_pass_no_iteration(
     tmp_path: Path,
 ) -> None:
     """Initial screen + verifier both clean: no re-redaction fires."""
-    from metaculus_bot.ablation import qa_iterate
-
     qid = 100
     question = _make_question(qid)
     gt = _make_ground_truth(qid)
@@ -167,8 +179,6 @@ async def test_iterate_until_clean(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """First verifier flags leakage; second iteration produces clean blob."""
-    from metaculus_bot.ablation import qa_iterate
-
     qid = 200
     question = _make_question(qid)
     gt = _make_ground_truth(qid)
@@ -221,8 +231,6 @@ async def test_max_iterations_then_reject(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verifier always returns leakage_risk=0.5: auto-reject after max iterations."""
-    from metaculus_bot.ablation import qa_iterate
-
     qid = 300
     question = _make_question(qid)
     gt = _make_ground_truth(qid)
@@ -271,8 +279,6 @@ async def test_low_forecastability_rejects_qid(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verifier reports clean leakage but very low forecastability → reject."""
-    from metaculus_bot.ablation import qa_iterate
-
     qid = 400
     question = _make_question(qid)
     gt = _make_ground_truth(qid)
@@ -321,8 +327,6 @@ async def test_screen_disagrees_with_verifier_blocks_acceptance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Screen says clean but verifier flags leakage_risk=0.5: must iterate."""
-    from metaculus_bot.ablation import qa_iterate
-
     qid = 500
     question = _make_question(qid)
     gt = _make_ground_truth(qid)
@@ -370,8 +374,6 @@ async def test_screen_says_leaked_blocks_acceptance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Screen says leaked but verifier reports leakage_risk=0.1: must iterate."""
-    from metaculus_bot.ablation import qa_iterate
-
     qid = 600
     question = _make_question(qid)
     gt = _make_ground_truth(qid)
@@ -421,8 +423,6 @@ def test_read_manual_rejects_raises_with_path_on_malformed_json(tmp_path: Path) 
     workflow involves operators hand-editing the file; a clear error message
     saves debugging time on the next run.
     """
-    from metaculus_bot.ablation import qa_iterate
-
     rejects_path = tmp_path / "manual_rejects.json"
     rejects_path.write_text('{"version": 1, "rejects": {}, ', encoding="utf-8")  # trailing comma — invalid
 
@@ -433,8 +433,6 @@ def test_read_manual_rejects_raises_with_path_on_malformed_json(tmp_path: Path) 
 
 def test_existing_manual_reject_is_honored(tmp_path: Path) -> None:
     """A pre-existing entry in manual_rejects.json must NOT be overwritten."""
-    from metaculus_bot.ablation import qa_iterate
-
     rejects_path = tmp_path / "manual_rejects.json"
     rejects_path.write_text(
         json.dumps(
@@ -459,8 +457,6 @@ def test_existing_manual_reject_is_honored(tmp_path: Path) -> None:
 
 
 def test_write_manual_rejects_appends_without_clobbering_manual_entries(tmp_path: Path) -> None:
-    from metaculus_bot.ablation import qa_iterate
-
     rejects_path = tmp_path / "manual_rejects.json"
     rejects_path.write_text(
         json.dumps(
@@ -503,8 +499,6 @@ def test_write_manual_rejects_is_atomic(tmp_path: Path, monkeypatch: pytest.Monk
     the original file remains intact. Without atomic writes, ``write_text``
     truncates the file before raising, leaving an empty file on disk.
     """
-    from metaculus_bot.ablation import qa_iterate
-
     rejects_path = tmp_path / "manual_rejects.json"
     rejects_path.write_text(
         json.dumps({"version": 1, "rejects": {"123": {"reason": "manual:keep"}}}, indent=2),
@@ -512,15 +506,10 @@ def test_write_manual_rejects_is_atomic(tmp_path: Path, monkeypatch: pytest.Monk
     )
     original_contents = rejects_path.read_text(encoding="utf-8")
 
-    _qa_os = getattr(qa_iterate, "os", None)  # cache helper uses os.replace
-    real_replace = _qa_os.replace if _qa_os is not None else None
-
-    import os as _os
-
     def boom_replace(*args: Any, **kwargs: Any) -> None:
         raise RuntimeError("simulated kernel reboot during commit")
 
-    monkeypatch.setattr(_os, "replace", boom_replace)
+    monkeypatch.setattr(os, "replace", boom_replace)
 
     new_outcome = qa_iterate.IterateOutcome(
         qid=999,
@@ -541,23 +530,18 @@ def test_write_manual_rejects_is_atomic(tmp_path: Path, monkeypatch: pytest.Monk
     # No tempfile leak: only the original file should remain in the parent dir.
     leftover = [p for p in rejects_path.parent.iterdir() if p.name.startswith(f".{rejects_path.name}.")]
     assert leftover == []
-    _ = real_replace  # silence unused
 
 
 def test_render_qa_summary_uses_atomic_write(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """qa_summary_<ts>.md write must be atomic — crash mid-write preserves prior file."""
-    from metaculus_bot.ablation import qa_iterate
-
     summary_path = tmp_path / "qa_summary_test.md"
     summary_path.write_text("# previous summary\n", encoding="utf-8")
     original = summary_path.read_text(encoding="utf-8")
 
-    import os as _os
-
     def boom_replace(*args: Any, **kwargs: Any) -> None:
         raise RuntimeError("write interrupted")
 
-    monkeypatch.setattr(_os, "replace", boom_replace)
+    monkeypatch.setattr(os, "replace", boom_replace)
 
     outcomes = {
         1: qa_iterate.IterateOutcome(
@@ -580,8 +564,6 @@ def test_render_qa_summary_uses_atomic_write(tmp_path: Path, monkeypatch: pytest
 
 
 def test_iterate_outcome_serializable_to_json() -> None:
-    from metaculus_bot.ablation import qa_iterate
-
     score = qa_iterate.VerifierScore(
         iteration=1,
         leakage_risk=0.4,
@@ -611,8 +593,6 @@ def test_iterate_outcome_serializable_to_json() -> None:
 
 
 def test_render_qa_summary_includes_aggregate_stats(tmp_path: Path) -> None:
-    from metaculus_bot.ablation import qa_iterate
-
     outcomes = {
         1: qa_iterate.IterateOutcome(
             qid=1,
@@ -659,8 +639,7 @@ def test_render_qa_summary_includes_aggregate_stats(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Mode handling - the stage-level wrapper that lives in cli.py is tested in
-# test_ablation_cli.py. Here we exercise the qa_iterate-level helpers.
+# Batch helper (the cli.py stage wrapper is covered in test_ablation_cli_qa_iterate.py)
 # ---------------------------------------------------------------------------
 
 
@@ -670,8 +649,6 @@ async def test_run_qa_iterate_batch_returns_per_qid_outcomes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Batch helper aggregates per-qid outcomes."""
-    from metaculus_bot.ablation import qa_iterate
-
     qids = [10, 20]
     inputs: dict[int, dict[str, Any]] = {}
     for qid in qids:
@@ -729,16 +706,11 @@ async def test_run_qa_iterate_batch_isolates_per_qid_subprocess_failure(
 ) -> None:
     """A subprocess failure for one qid must NOT cancel other qids in the batch.
 
-    Prior to C1, ``asyncio.gather(*tasks)`` cancelled every in-flight task on
-    a single failure. Wrap ``_one`` in try/except that converts subprocess
-    failures into auto-rejected ``IterateOutcome`` (status=rejected_leakage,
-    reason=qa_iterate_failed: <ExceptionType>).
+    ``asyncio.gather`` with ``return_exceptions=True`` keeps the siblings running and the
+    loop over its outcomes converts the failure into an auto-rejected ``IterateOutcome``
+    (status=rejected_leakage, reason=qa_iterate_failed: <ExceptionType>) plus one ERROR
+    record carrying the traceback.
     """
-    import logging
-    import subprocess
-
-    from metaculus_bot.ablation import qa_iterate
-
     qids = [30, 31, 32]
     inputs: dict[int, dict[str, Any]] = {}
     for qid in qids:
@@ -763,9 +735,6 @@ async def test_run_qa_iterate_batch_isolates_per_qid_subprocess_failure(
             "screen_verdict": _make_screen_verdict(is_leaked=False),
         }
 
-    import asyncio
-    import re
-
     async def failing_verifier(prompt: str, **_kwargs: Any) -> str:
         await asyncio.sleep(0)
         if "qid=31" in prompt:
@@ -777,7 +746,7 @@ async def test_run_qa_iterate_batch_isolates_per_qid_subprocess_failure(
     monkeypatch.setattr("metaculus_bot.ablation.qa_iterate._invoke_verifier", failing_verifier)
     monkeypatch.setattr("metaculus_bot.ablation.qa_iterate._invoke_re_redactor", AsyncMock())
 
-    with caplog.at_level(logging.WARNING, logger="metaculus_bot.ablation.qa_iterate"):
+    with caplog.at_level(logging.ERROR, logger="metaculus_bot.ablation.qa_iterate"):
         outcomes = await qa_iterate.run_qa_iterate_batch(
             inputs,
             cache=cache,
@@ -794,8 +763,10 @@ async def test_run_qa_iterate_batch_isolates_per_qid_subprocess_failure(
     assert failed.reject_reason.startswith("qa_iterate_failed:")
     assert "CalledProcessError" in failed.reject_reason
 
-    warning_records = [r for r in caplog.records if r.levelno == logging.WARNING and "qid=31" in r.getMessage()]
-    assert warning_records, "expected a WARNING log for the failed qid"
+    error_records = [r for r in caplog.records if r.levelno == logging.ERROR and "qid=31" in r.getMessage()]
+    assert error_records, "expected an ERROR log for the failed qid"
+    assert error_records[0].exc_info is not None
+    assert isinstance(error_records[0].exc_info[1], subprocess.CalledProcessError)
 
 
 # ---------------------------------------------------------------------------
@@ -805,10 +776,6 @@ async def test_run_qa_iterate_batch_isolates_per_qid_subprocess_failure(
 
 @pytest.mark.asyncio
 async def test_invoke_verifier_uses_sonnet_and_correct_flags(monkeypatch: pytest.MonkeyPatch) -> None:
-    import asyncio
-
-    from metaculus_bot.ablation import qa_iterate
-
     captured: dict = {}
 
     async def fake_subproc(*args, **kwargs):
@@ -846,10 +813,6 @@ async def test_invoke_verifier_uses_sonnet_and_correct_flags(monkeypatch: pytest
 
 @pytest.mark.asyncio
 async def test_invoke_re_redactor_includes_verifier_notes_in_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
-    import asyncio
-
-    from metaculus_bot.ablation import qa_iterate
-
     captured: dict = {}
 
     async def fake_subproc(*args, **kwargs):
@@ -885,10 +848,6 @@ def test_extract_inner_result_warns_on_unparseable_stdout(caplog: pytest.LogCapt
     it through the ``qa_iterate`` re-export, which is the name the stage's
     other tests reach for.
     """
-    import logging
-
-    from metaculus_bot.ablation.qa_iterate import _extract_inner_result
-
     unparseable = "not json {{{"
 
     with caplog.at_level(logging.WARNING, logger="metaculus_bot.ablation.qa_iterate"):
@@ -900,8 +859,6 @@ def test_extract_inner_result_warns_on_unparseable_stdout(caplog: pytest.LogCapt
 
 
 def test_verifier_system_prompt_scores_three_axes() -> None:
-    from metaculus_bot.ablation.qa_iterate import VERIFIER_SYSTEM_PROMPT
-
     lower = VERIFIER_SYSTEM_PROMPT.lower()
     assert "leakage_risk" in lower
     assert "forecastability" in lower
@@ -909,8 +866,6 @@ def test_verifier_system_prompt_scores_three_axes() -> None:
 
 
 def test_re_redactor_system_prompt_references_verifier_notes() -> None:
-    from metaculus_bot.ablation.qa_iterate import RE_REDACTOR_SYSTEM_PROMPT
-
     lower = RE_REDACTOR_SYSTEM_PROMPT.lower()
     assert "second-pass" in lower or "second pass" in lower
     assert "verifier" in lower
@@ -933,11 +888,6 @@ async def test_run_claude_subprocess_timeout_kills_subprocess(
 
     Mutation: remove proc.kill(); this test fails (kill_calls == 0).
     """
-    import asyncio
-    import logging
-
-    from metaculus_bot.ablation import qa_iterate
-
     kill_calls = {"n": 0}
     wait_calls = {"n": 0}
 
@@ -987,24 +937,21 @@ async def test_run_claude_subprocess_timeout_kills_subprocess(
 
 
 # ---------------------------------------------------------------------------
-# CRIT-2: verifier schema-drift fail-loud
-#
-# Currently _verifier_score_from_entry silently defaults forecastability=0.0
-# when the verifier's JSON drops the field; that turns schema drift into mass
-# rejected_forecastability. Fail-loud raises ValueError so the per-qid
-# try/except converts it to qa_iterate_failed and the operator sees an
-# explicit reason.
+# CRIT-2: verifier schema drift fails loud
 # ---------------------------------------------------------------------------
 
 
 def test_verifier_score_from_entry_raises_on_missing_required_field() -> None:
     """Missing forecastability key: ValueError naming the missing field.
 
+    CRIT-2 receipt: ``_verifier_score_from_entry`` used to default a dropped
+    ``forecastability`` to 0.0, which turned verifier schema drift into mass
+    ``rejected_forecastability``. Raising ValueError lets the per-qid try/except
+    record ``qa_iterate_failed`` so the operator sees an explicit reason.
+
     Mutation: revert to .get(key, default) defaults and this test fails
     (no ValueError; silent default returns).
     """
-    from metaculus_bot.ablation.qa_iterate import _verifier_score_from_entry
-
     entry_missing_forecastability = {
         "leakage_risk": 0.1,
         # forecastability deliberately absent
@@ -1016,8 +963,6 @@ def test_verifier_score_from_entry_raises_on_missing_required_field() -> None:
 
 
 def test_verifier_score_from_entry_raises_on_missing_leakage_risk() -> None:
-    from metaculus_bot.ablation.qa_iterate import _verifier_score_from_entry
-
     entry_missing_leakage = {
         # leakage_risk deliberately absent
         "forecastability": 0.5,
@@ -1028,8 +973,6 @@ def test_verifier_score_from_entry_raises_on_missing_leakage_risk() -> None:
 
 
 def test_verifier_score_from_entry_succeeds_with_all_required_fields() -> None:
-    from metaculus_bot.ablation.qa_iterate import _verifier_score_from_entry
-
     entry = {
         "leakage_risk": 0.05,
         "forecastability": 0.7,
@@ -1046,8 +989,6 @@ def test_verifier_score_from_entry_succeeds_with_all_required_fields() -> None:
 
 def test_verifier_score_from_entry_notes_is_optional() -> None:
     """notes is legitimately optional (verifier may omit on terse verdicts)."""
-    from metaculus_bot.ablation.qa_iterate import _verifier_score_from_entry
-
     entry = {
         "leakage_risk": 0.05,
         "forecastability": 0.7,
@@ -1068,8 +1009,6 @@ def test_read_manual_rejects_raises_on_unsupported_version(tmp_path: Path) -> No
     naming the version mismatch. Without this, future schema bumps silently
     misinterpret old files.
     """
-    from metaculus_bot.ablation import qa_iterate
-
     rejects_path = tmp_path / "manual_rejects.json"
     rejects_path.write_text(
         json.dumps({"version": 99, "rejects": {"123": {"reason": "anything"}}}),
@@ -1081,8 +1020,6 @@ def test_read_manual_rejects_raises_on_unsupported_version(tmp_path: Path) -> No
 
 
 def test_read_manual_rejects_accepts_supported_version(tmp_path: Path) -> None:
-    from metaculus_bot.ablation import qa_iterate
-
     rejects_path = tmp_path / "manual_rejects.json"
     rejects_path.write_text(
         json.dumps(
@@ -1109,8 +1046,6 @@ async def test_run_qa_iterate_batch_propagates_memory_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """MemoryError must propagate; do not convert to qa_iterate_failed."""
-    from metaculus_bot.ablation import qa_iterate
-
     qid = 8888
     inputs: dict[int, dict[str, Any]] = {
         qid: {
@@ -1120,8 +1055,6 @@ async def test_run_qa_iterate_batch_propagates_memory_error(
             "screen_verdict": _make_screen_verdict(is_leaked=False),
         }
     }
-
-    import asyncio
 
     async def raise_memory_error(**_kwargs: Any) -> Any:
         await asyncio.sleep(0)
@@ -1134,15 +1067,47 @@ async def test_run_qa_iterate_batch_propagates_memory_error(
 
 
 @pytest.mark.asyncio
-async def test_run_qa_iterate_batch_still_catches_value_error_per_qid(
+async def test_run_qa_iterate_batch_propagates_cancellation(
     cache: AblationCache,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Application-level ValueError still gets caught and recorded as
-    qa_iterate_failed for that qid (regression guard for MAJ-3 carve-out).
-    """
-    from metaculus_bot.ablation import qa_iterate
+    """A cancelled child is not an ordinary per-qid failure: it must not become qa_iterate_failed."""
+    qid = 8889
+    inputs: dict[int, dict[str, Any]] = {
+        qid: {
+            "question": _make_question(qid),
+            "ground_truth": _make_ground_truth(qid),
+            "current_blob": "blob",
+            "screen_verdict": _make_screen_verdict(is_leaked=False),
+        }
+    }
 
+    async def raise_cancelled(**_kwargs: Any) -> Any:
+        await asyncio.sleep(0)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(qa_iterate, "run_qa_iterate_for_qid", raise_cancelled)
+
+    with pytest.raises(asyncio.CancelledError):
+        await qa_iterate.run_qa_iterate_batch(inputs, cache=cache, max_iterations=3)
+
+
+@pytest.mark.parametrize(
+    "raised",
+    [ValueError("verifier returned malformed JSON"), KeyError("payload bug")],
+    ids=["expected_parse_failure", "unexpected_bug"],
+)
+@pytest.mark.asyncio
+async def test_run_qa_iterate_batch_still_catches_ordinary_exceptions_per_qid(
+    cache: AblationCache,
+    monkeypatch: pytest.MonkeyPatch,
+    raised: Exception,
+) -> None:
+    """Every ordinary exception is recorded as qa_iterate_failed for that qid, bug classes included.
+
+    The batch is the failure boundary here, so a bug surfaces as an ERROR record with its
+    traceback rather than costing the rest of a paid run (regression guard for the MAJ-3 carve-out).
+    """
     qid = 9999
     inputs: dict[int, dict[str, Any]] = {
         qid: {
@@ -1153,31 +1118,19 @@ async def test_run_qa_iterate_batch_still_catches_value_error_per_qid(
         }
     }
 
-    import asyncio
-
-    async def raise_value_error(**_kwargs: Any) -> Any:
+    async def raise_it(**_kwargs: Any) -> Any:
         await asyncio.sleep(0)
-        raise ValueError("verifier returned malformed JSON")
+        raise raised
 
-    monkeypatch.setattr(qa_iterate, "run_qa_iterate_for_qid", raise_value_error)
+    monkeypatch.setattr(qa_iterate, "run_qa_iterate_for_qid", raise_it)
 
     outcomes = await qa_iterate.run_qa_iterate_batch(inputs, cache=cache, max_iterations=3)
     assert outcomes[qid].final_status == "rejected_leakage"
-    assert outcomes[qid].reject_reason == "qa_iterate_failed: ValueError"
+    assert outcomes[qid].reject_reason == f"qa_iterate_failed: {type(raised).__name__}"
 
 
 # ---------------------------------------------------------------------------
-# MAJ-5: rejected iter blob doesn't overwrite a prior cleaner blob
-#
-# Per the audit: when iter N writes its sanitized blob to research_pruned,
-# but the next iter (N+1) verifier rejects, the cache is left with the
-# leakier iter-N blob — a cleaner pre-iteration blob (or earlier-iter blob)
-# is gone. Operators recovering by hand-editing manual_rejects.json get the
-# leakiest version, not the cleanest one.
-#
-# Fix: snapshot the original pre-iteration blob; on rejected_leakage final
-# return path, restore the snapshot so the cache reflects the pre-iteration
-# state rather than a partially-redacted leaky version.
+# MAJ-5: a rejected iteration's blob must not overwrite a prior cleaner blob
 # ---------------------------------------------------------------------------
 
 
@@ -1186,16 +1139,19 @@ async def test_rejected_leakage_restores_original_blob_to_cache(
     cache: AblationCache,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When max_iterations exhaust without leakage acceptance, the cache
-    must NOT contain the latest re-redactor's leakier blob — it should
-    revert to the snapshot of whatever was in the cache when the iteration
-    loop started (or be cleared if nothing was there).
+    """Leakage exhaustion restores the cache to its pre-iteration snapshot.
+
+    MAJ-5 receipt: iteration N wrote its sanitized blob to research_pruned, then the
+    iteration N+1 verifier rejected, so the cache kept the leakier iteration-N blob
+    while the cleaner pre-iteration (or earlier-iteration) blob was gone. Operators
+    recovering by hand-editing manual_rejects.json got the leakiest version. The fix
+    snapshots the blob before the loop and, on the rejected_leakage return path,
+    restores it (or clears the entry if nothing was cached) instead of leaving a
+    partially-redacted leaky version.
 
     Mutation: remove the snapshot/restore logic; the cache will contain the
     iter-N leakier blob and this test fails.
     """
-    from metaculus_bot.ablation import qa_iterate
-
     qid = 12121
     question = _make_question(qid)
     gt = _make_ground_truth(qid)
@@ -1218,8 +1174,7 @@ async def test_rejected_leakage_restores_original_blob_to_cache(
     verifier_mock = AsyncMock(
         return_value=_verifier_response(qid, leakage_risk=0.8, forecastability=0.7, hallucination_risk=0.2, notes="bad")
     )
-    # Re-redactor produces ever-leakier blobs (test hook so we can verify
-    # which blob ended up in cache).
+    # Distinct blob per iteration, so the assertion can tell which one landed in the cache.
     redactor_mock = AsyncMock(
         side_effect=[
             _redactor_response(qid, "ITER1_REDACTED_BLOB"),
@@ -1241,10 +1196,7 @@ async def test_rejected_leakage_restores_original_blob_to_cache(
 
     assert outcome.final_status == "rejected_leakage"
 
-    # The cache must show the ORIGINAL baseline blob, not the iter-2 leakier one.
-    # An operator recovering this qid via manual_rejects.json hand-edit will
-    # then see the cleanest known version, not whatever the last re-redactor
-    # produced before exhaustion.
+    # An operator recovering this qid by hand must find the cleanest known blob, not the last re-redaction.
     cached = cache.read_pruned_research(qid)
     assert cached is not None, "snapshot/restore should leave the cache populated with the original"
     blob, _meta = cached
@@ -1264,15 +1216,12 @@ def test_forecastability_threshold_strict_less_than_at_boundary(
 ) -> None:
     """forecastability == threshold PASSES (strict less-than rejects only).
 
-    qid 43151 in the smoke run scored exactly 0.20 on iter 2 and passed —
-    the strict less-than convention is documented in the constant's
-    comment. This test pins the convention so a future "off-by-one fix"
-    can't silently flip the boundary.
+    qid 43151 in the smoke run scored exactly 0.20 on iter 2 and passed; the strict
+    less-than convention is documented on the constant. This test pins the convention
+    so a future "off-by-one fix" can't silently flip the boundary: the final assert
+    mirrors the production check, ``forecastability < threshold``, which is False at
+    the boundary, so the iteration counts as forecastable rather than rejected.
     """
-    from metaculus_bot.ablation import qa_iterate
-
-    # Behavior pin: a verifier that returns forecastability == threshold
-    # results in 'clean' (passes), not 'rejected_forecastability'.
     score_at_boundary = qa_iterate._verifier_score_from_entry(
         {
             "leakage_risk": 0.05,
@@ -1281,10 +1230,7 @@ def test_forecastability_threshold_strict_less_than_at_boundary(
         },
         iteration=1,
     )
-    # Score is exactly at threshold; the condition `forecastability < threshold`
-    # evaluates False, so this iteration is treated as forecastable.
     assert score_at_boundary.forecastability == qa_iterate.DEFAULT_FORECASTABILITY_THRESHOLD
-    # Pin the inequality direction by mirroring the production-code check.
     assert not (score_at_boundary.forecastability < qa_iterate.DEFAULT_FORECASTABILITY_THRESHOLD)
 
 
@@ -1293,10 +1239,6 @@ def test_forecastability_threshold_constant_documents_strict_less_than() -> None
     strict less-than at module scope — operator-tunable; the boundary is
     intentional.
     """
-    import inspect
-
-    from metaculus_bot.ablation import qa_iterate
-
     src = inspect.getsource(qa_iterate)
     # Find the assignment (= 0.2), not the __all__ reference.
     idx = src.find("DEFAULT_FORECASTABILITY_THRESHOLD = ")
@@ -1309,12 +1251,6 @@ def test_forecastability_threshold_constant_documents_strict_less_than() -> None
 
 # ---------------------------------------------------------------------------
 # Re-redactor verbatim-leak check is type-aware
-#
-# Phase B smoke run surfaced this: qid 42750 (binary, GT="no") had a correctly
-# sanitized re-redactor blob (verifier scored leakage_risk=0.35), but the
-# substring check matched "no" inside unrelated words like "not"/"now" and
-# wrongly raised ValueError, ending iteration at iter=0. Fix: route through the
-# type-aware ``verbatim_leak_check_passes`` already used by the prune layer.
 # ---------------------------------------------------------------------------
 
 
@@ -1341,6 +1277,12 @@ def _make_typed_ground_truth(qid: int, resolution_string: str, *, question_type:
 class TestReRedactorVerbatimCheck:
     """``_parse_re_redactor_response`` must apply the type-aware check.
 
+    Receipt: the Phase B smoke run's qid 42750 (binary, GT="no") had a correctly
+    sanitized re-redactor blob (verifier leakage_risk=0.35), but a plain substring
+    check matched "no" inside unrelated words like "not"/"now", wrongly raised
+    ValueError and ended iteration at iter=0. The fix routes through the type-aware
+    ``verbatim_leak_check_passes`` the prune layer already uses.
+
     Mirrors the prune-layer ``TestVerbatimLeakCheck`` in
     ``test_ablation_prune.py``: binary GTs in {yes,no,true,false} skip the
     surface check (the verifier subagent's leakage_risk score catches semantic
@@ -1351,8 +1293,6 @@ class TestReRedactorVerbatimCheck:
         """Regression: Phase B smoke surfaced this — GT='no' must NOT match
         'not'/'now'/'noteworthy' in sanitized blob. Iteration must continue.
         """
-        from metaculus_bot.ablation.qa_iterate import _parse_re_redactor_response
-
         qid = 42750
         gt = _make_typed_ground_truth(qid, "no", question_type="binary")
         sanitized_blob = (
@@ -1370,8 +1310,6 @@ class TestReRedactorVerbatimCheck:
         The semantic leak is caught downstream by the verifier subagent's
         leakage_risk score on the next iteration, not by surface substring.
         """
-        from metaculus_bot.ablation.qa_iterate import _parse_re_redactor_response
-
         qid = 42751
         gt = _make_typed_ground_truth(qid, "no", question_type="binary")
         sanitized_blob = "Final answer: no, the threshold was not crossed."
@@ -1385,8 +1323,6 @@ class TestReRedactorVerbatimCheck:
         """MC GT 'Red' embedded in 'Reduction' is not a word-boundary match;
         re-redactor parser should accept the blob.
         """
-        from metaculus_bot.ablation.qa_iterate import _parse_re_redactor_response
-
         qid = 42752
         gt = _make_typed_ground_truth(qid, "Red", question_type="multiple_choice")
         sanitized_blob = "Background context. The Reduction was significant."
@@ -1398,8 +1334,6 @@ class TestReRedactorVerbatimCheck:
 
     def test_mc_gt_word_boundary_rejects_when_standalone(self) -> None:
         """MC GT appearing as a standalone token sequence still raises."""
-        from metaculus_bot.ablation.qa_iterate import _parse_re_redactor_response
-
         qid = 42753
         gt = _make_typed_ground_truth(qid, "Nikkei 225", question_type="multiple_choice")
         sanitized_blob = "Background. The answer is Nikkei 225."
@@ -1410,8 +1344,6 @@ class TestReRedactorVerbatimCheck:
 
     def test_numeric_gt_substring_still_strict(self) -> None:
         """Numeric GTs SHOULD trigger the verbatim check on substring match."""
-        from metaculus_bot.ablation.qa_iterate import _parse_re_redactor_response
-
         qid = 42754
         gt = _make_typed_ground_truth(qid, "66.246", question_type="numeric")
         sanitized_blob = "Background context. The reported value was 66.246 percent."
@@ -1423,11 +1355,6 @@ class TestReRedactorVerbatimCheck:
 
 # ---------------------------------------------------------------------------
 # F6: the subprocess knobs reach the driver from a batch caller
-#
-# Before the driver was shared, ``run_qa_iterate_batch`` exposed neither
-# ``claude_executable`` nor ``timeout_seconds``, so ``_invoke_verifier``'s own
-# parameters were dead outside the test suite and the whole stage was pinned to
-# the 600s default while ``prune.run_prune_for_qids`` threaded both end-to-end.
 # ---------------------------------------------------------------------------
 
 
@@ -1436,9 +1363,13 @@ async def test_run_qa_iterate_batch_threads_subprocess_knobs(
     cache: AblationCache,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``claude_executable`` / ``timeout_seconds`` must reach both invokers."""
-    from metaculus_bot.ablation import qa_iterate
+    """``claude_executable`` / ``timeout_seconds`` must reach both invokers.
 
+    F6 receipt: before the driver was shared, ``run_qa_iterate_batch`` exposed neither
+    knob, so ``_invoke_verifier``'s own parameters were dead outside the test suite and
+    the whole stage was pinned to the 600s default while ``prune.run_prune_for_qids``
+    threaded both end-to-end.
+    """
     qid = 990
     verifier_calls: list[dict[str, Any]] = []
     redactor_calls: list[dict[str, Any]] = []
@@ -1486,10 +1417,6 @@ async def test_invoke_verifier_honors_custom_executable_and_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The threaded knobs land on the argv and on the wait_for timeout."""
-    import asyncio
-
-    from metaculus_bot.ablation import qa_iterate
-
     captured: dict[str, Any] = {}
 
     async def fake_subproc(*args: Any, **kwargs: Any) -> Any:
@@ -1507,10 +1434,8 @@ async def test_invoke_verifier_honors_custom_executable_and_timeout(
 
     real_wait_for = asyncio.wait_for
 
-    # *args/**kwargs rather than a named `timeout=` parameter: ruff's ASYNC109
-    # rejects the latter on an async def, and this spy only needs to record
-    # whatever asyncio.wait_for was handed.
     async def spying_wait_for(awaitable: Any, /, *args: Any, **kwargs: Any) -> Any:
+        """Record whatever wait_for was handed; *args/**kwargs because ruff ASYNC109 rejects a named timeout=."""
         captured.setdefault("timeouts", []).append(kwargs.get("timeout", args[0] if args else None))
         return await real_wait_for(awaitable, *args, **kwargs)
 

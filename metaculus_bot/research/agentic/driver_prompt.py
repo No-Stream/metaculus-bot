@@ -18,12 +18,16 @@ forecast is only meaningful against the real template).
 """
 
 from forecasting_tools import BinaryQuestion, MultipleChoiceQuestion, NumericQuestion
+from forecasting_tools.data_models.questions import DateQuestion
 
+from metaculus_bot.numeric.date_axis import as_epoch_question, format_epoch
 from metaculus_bot.numeric.utils import bound_messages, nominal_bounds
 from metaculus_bot.prompts import (
+    GAP_FILL_V1_SECTION_HEADER,
     MARKET_SNAPSHOT_SECTION_HEADER,
     _forecasting_window_str,
     binary_prompt,
+    date_prompt,
     multiple_choice_prompt,
     numeric_prompt,
 )
@@ -190,8 +194,10 @@ Most questions need little; a few need a lot. Spend accordingly.
   sake of it.
 
 RULES FOR FINDINGS (strictly enforced; violating findings are rejected):
-  - Each finding: one factual claim + source URL + verbatim quote + the
-    source's date + how you retrieved it.
+  - Each finding: one factual claim + source URL + verbatim quote from that
+    source + the source's date + how you retrieved it. For comparisons across
+    sources, record a separate finding for each source so every excerpt keeps
+    its own link. State each source's evidence in its own claim and quote.
   - DISCREPANCY findings (highest-value output): if a check shows the
     briefing states something the source does not support — a wrong number,
     a misread clause, a misattributed or hallucinated fact, a stale figure
@@ -240,21 +246,22 @@ complete the forecast yourself using the panel's template above, applying
 your findings. Output only the template's STRUCTURED FORECAST block.
 """
 
-# Question types the dry-run scaffold has a template for. Others (e.g. date
-# questions) are skipped by the caller before prompts are built.
-SupportedQuestion = BinaryQuestion | MultipleChoiceQuestion | NumericQuestion
+_GHOST_V1_PROMPT = """\
+The research phase is closed; your findings are final and will be delivered
+as-is. A second, independent research pass ran alongside yours; its section
+follows, exactly as the panel will read it beside your findings.
 
-# Fills the template builders' research slot. Everything else in the skeleton
-# (units, bounds, options, resolution criteria) is the question's REAL values.
-# It carries MARKET_SNAPSHOT_SECTION_HEADER because the panel's market-reading clause is
-# gated on that header being present in the research. Prod emits the header on effectively
-# every question: the provider omits it only on an empty pool, a soft-fail, a flag-off run
-# or benchmarking, measured present on 59 of the 60 newest archived artifact records. So
-# without it here the skeleton would drop a clause almost every real panel prompt carries.
-# Deliberately NOT extended to TS_ANCHOR_SECTION_HEADER, whose incidence runs the other way
-# (5 of 322 artifact records, 0 of the newest 30): hardcoding that one would manufacture a
-# divergence on ~98% of numeric prompts to close one on ~2%, and the numeric template already
-# names the anchor section in its resolution-metric bullets.
+{v1_section}
+
+Now, separately and privately — this will NOT be shown to the panel — complete
+the forecast yourself using the panel's template above, applying your findings
+AND the section above. Output only the template's STRUCTURED FORECAST block.
+"""
+
+# Every type the bot forecasts has a template here; a date brief renders its bounds as dates, never epoch floats.
+SupportedQuestion = BinaryQuestion | MultipleChoiceQuestion | NumericQuestion | DateQuestion
+
+# Carries the market header so the skeleton keeps the market clause; why not the anchor header: docs/agentic_gap_fill.md.
 _TEMPLATE_RESEARCH_PLACEHOLDER = (
     "[research placeholder — the actual briefing is in the 'Current briefing' section of this message]"
     f"\n\n{MARKET_SNAPSHOT_SECTION_HEADER}\n"
@@ -272,16 +279,31 @@ def build_ghost_prompt() -> str:
     return _GHOST_PROMPT
 
 
+def build_ghost_v1_prompt(v1_addendum: str) -> str:
+    """The plain ghost instruction plus gap-fill v1's section, under the header the bundle gives it."""
+    return _GHOST_V1_PROMPT.format(v1_section=f"{GAP_FILL_V1_SECTION_HEADER}\n\n{v1_addendum}")
+
+
 def _question_header(question: SupportedQuestion) -> str:
     if isinstance(question, BinaryQuestion):
         return f"{question.question_text}\n\nType: binary (probability of YES)"
     if isinstance(question, MultipleChoiceQuestion):
         options = ", ".join(question.options)
         return f"{question.question_text}\n\nType: multiple choice\nOptions: {options}"
-    nom_upper, nom_lower = nominal_bounds(question)
-    unit = question.unit_of_measure or "unspecified (assume unitless)"
     lower_kind = "open" if question.open_lower_bound else "closed"
     upper_kind = "open" if question.open_upper_bound else "closed"
+    if isinstance(question, DateQuestion):
+        view = as_epoch_question(question)
+        nom_upper, nom_lower = nominal_bounds(view)
+        return (
+            f"{question.question_text}\n\n"
+            f"Type: date (UTC)\n"
+            f"Displayed range: [{format_epoch(nom_lower, view.date_granularity)}, "
+            f"{format_epoch(nom_upper, view.date_granularity)}] "
+            f"(lower bound {lower_kind}, upper bound {upper_kind})"
+        )
+    nom_upper, nom_lower = nominal_bounds(question)
+    unit = question.unit_of_measure or "unspecified (assume unitless)"
     return (
         f"{question.question_text}\n\n"
         f"Type: numeric\n"
@@ -301,6 +323,10 @@ def _template_skeleton(question: SupportedQuestion) -> str:
         return binary_prompt(question, _TEMPLATE_RESEARCH_PLACEHOLDER)
     if isinstance(question, MultipleChoiceQuestion):
         return multiple_choice_prompt(question, _TEMPLATE_RESEARCH_PLACEHOLDER)
+    if isinstance(question, DateQuestion):
+        view = as_epoch_question(question)
+        upper_bound_message, lower_bound_message = bound_messages(view)
+        return date_prompt(view, _TEMPLATE_RESEARCH_PLACEHOLDER, lower_bound_message, upper_bound_message)
     upper_bound_message, lower_bound_message = bound_messages(question)
     return numeric_prompt(question, _TEMPLATE_RESEARCH_PLACEHOLDER, lower_bound_message, upper_bound_message)
 
@@ -323,4 +349,10 @@ def build_user_brief(question: SupportedQuestion, bundle_markdown: str) -> str:
     )
 
 
-__all__ = ["SupportedQuestion", "build_ghost_prompt", "build_system_prompt", "build_user_brief"]
+__all__ = [
+    "SupportedQuestion",
+    "build_ghost_prompt",
+    "build_ghost_v1_prompt",
+    "build_system_prompt",
+    "build_user_brief",
+]

@@ -11,12 +11,16 @@ class TestResearchPersistenceWriter:
     """Tests for ResearchPersistenceWriter accumulate-and-flush lifecycle."""
 
     def test_flush_with_no_records_returns_none(self, tmp_path: Path) -> None:
-        writer = ResearchPersistenceWriter(run_mode="tournament", tournament_id="test-123", run_id="local")
+        writer = ResearchPersistenceWriter(
+            run_mode="tournament", platform="metaculus", tournament_id="test-123", run_id="local"
+        )
         result = writer.flush(output_dir=str(tmp_path / "empty_output"))
         assert result is None
 
     def test_single_record_writes_valid_jsonl(self, tmp_path: Path) -> None:
-        writer = ResearchPersistenceWriter(run_mode="tournament", tournament_id="summer-2026", run_id="gh-42")
+        writer = ResearchPersistenceWriter(
+            run_mode="tournament", platform="metaculus", tournament_id="summer-2026", run_id="gh-42"
+        )
         writer.record(
             qid=12345,
             page_url="https://www.metaculus.com/questions/12345/will-x-happen/",
@@ -43,6 +47,7 @@ class TestResearchPersistenceWriter:
         assert record["gap_fill_used"] is True
         assert record["run_mode"] == "tournament"
         assert record["tournament_id"] == "summer-2026"
+        assert record["platform"] == "metaculus"
         assert record["run_id"] == "gh-42"
         assert record["research_chars"] == len("Some research about X happening.")
         assert record["schema_version"] == RESEARCH_SCHEMA_VERSION
@@ -51,7 +56,7 @@ class TestResearchPersistenceWriter:
         # The divergent 38880/38195 case: qid is the QUESTION id, post_id the POST id.
         # post_id is written as an explicit field so residual analysis can join to
         # post-id-keyed telemetry (GAP_FILL_V2 / GHOST_FORECAST) without URL parsing.
-        writer = ResearchPersistenceWriter(run_mode="tournament", tournament_id="t", run_id="r")
+        writer = ResearchPersistenceWriter(run_mode="tournament", platform="metaculus", tournament_id="t", run_id="r")
         writer.record(
             qid=38195,
             post_id=38880,
@@ -65,8 +70,29 @@ class TestResearchPersistenceWriter:
         assert record["qid"] == 38195
         assert record["post_id"] == 38880
 
+    def test_platform_is_stamped_from_the_writer(self, tmp_path: Path) -> None:
+        # Additive next to tournament_id: which question platform the record's ids belong to.
+        # Filenames are not namespaced and the archive groups on the bare qid, so this field is
+        # what tells a Mantic record from a Metaculus one; the id gap today is ~650 up to 14333
+        # (the evergreen test-question ids sit in the archive).
+        writer = ResearchPersistenceWriter(
+            run_mode="mantic", platform="mantic", tournament_id="preseason-2", run_id="r"
+        )
+        writer.record(
+            qid=650,
+            post_id=650,
+            page_url="https://competitions.mantic.com/questions/650/",
+            question_text="Q?",
+            research_text="body",
+            providers_used=[],
+            gap_fill_used=False,
+        )
+        record = writer._records[0]
+        assert record["platform"] == "mantic"
+        assert record["tournament_id"] == "preseason-2"
+
     def test_post_id_defaults_to_none_for_older_callers(self, tmp_path: Path) -> None:
-        writer = ResearchPersistenceWriter(run_mode="tournament", tournament_id="t", run_id="r")
+        writer = ResearchPersistenceWriter(run_mode="tournament", platform="metaculus", tournament_id="t", run_id="r")
         writer.record(
             qid=12345,
             page_url="https://www.metaculus.com/questions/12345/",
@@ -78,7 +104,9 @@ class TestResearchPersistenceWriter:
         assert writer._records[0]["post_id"] is None
 
     def test_multiple_records_produce_multiple_lines(self, tmp_path: Path) -> None:
-        writer = ResearchPersistenceWriter(run_mode="minibench", tournament_id="t-1", run_id="local")
+        writer = ResearchPersistenceWriter(
+            run_mode="minibench", platform="metaculus", tournament_id="t-1", run_id="local"
+        )
         for i in range(5):
             writer.record(
                 qid=100 + i,
@@ -101,7 +129,9 @@ class TestResearchPersistenceWriter:
             assert record["question_text"] == f"Question {i}"
 
     def test_schema_fields_present_and_typed(self, tmp_path: Path) -> None:
-        writer = ResearchPersistenceWriter(run_mode="tournament", tournament_id="tid", run_id="rid")
+        writer = ResearchPersistenceWriter(
+            run_mode="tournament", platform="metaculus", tournament_id="tid", run_id="rid"
+        )
         writer.record(
             qid=1,
             page_url="https://example.com/q/1/",
@@ -123,6 +153,7 @@ class TestResearchPersistenceWriter:
         assert isinstance(record["providers_used"], list)
         assert isinstance(record["run_mode"], str)
         assert isinstance(record["tournament_id"], str)
+        assert isinstance(record["platform"], str)
         assert isinstance(record["timestamp"], str)
         assert isinstance(record["run_id"], str)
         assert isinstance(record["research_chars"], int)
@@ -132,7 +163,7 @@ class TestResearchPersistenceWriter:
         nested_dir = tmp_path / "deeply" / "nested" / "output"
         assert not nested_dir.exists()
 
-        writer = ResearchPersistenceWriter(run_mode="tournament", tournament_id="t", run_id="r")
+        writer = ResearchPersistenceWriter(run_mode="tournament", platform="metaculus", tournament_id="t", run_id="r")
         writer.record(
             qid=1,
             page_url="https://example.com/q/1/",
@@ -149,7 +180,7 @@ class TestResearchPersistenceWriter:
 
     def test_timestamp_is_iso_format(self, tmp_path: Path) -> None:
         """Verify timestamp is valid ISO 8601 UTC."""
-        writer = ResearchPersistenceWriter(run_mode="tournament", tournament_id="t", run_id="r")
+        writer = ResearchPersistenceWriter(run_mode="tournament", platform="metaculus", tournament_id="t", run_id="r")
         writer.record(
             qid=1,
             page_url="u",
@@ -167,7 +198,7 @@ class TestResearchPersistenceWriter:
         assert ts.tzinfo == UTC
 
     def test_provider_results_persisted_at_schema_v2(self, tmp_path: Path) -> None:
-        writer = ResearchPersistenceWriter(run_mode="tournament", tournament_id="t", run_id="r")
+        writer = ResearchPersistenceWriter(run_mode="tournament", platform="metaculus", tournament_id="t", run_id="r")
         provider_results = [
             {
                 "name": "asknews",
@@ -213,7 +244,7 @@ class TestResearchPersistenceWriter:
 
     def test_record_works_without_new_args(self, tmp_path: Path) -> None:
         """Existing callers omit the v2 args; record() must still produce a valid record."""
-        writer = ResearchPersistenceWriter(run_mode="tournament", tournament_id="t", run_id="r")
+        writer = ResearchPersistenceWriter(run_mode="tournament", platform="metaculus", tournament_id="t", run_id="r")
         writer.record(
             qid=1,
             page_url="https://example.com/q/1/",
@@ -236,7 +267,7 @@ class TestResearchPersistenceWriter:
         """The raw pre-summarization AskNews text is archived as its own field
         (2026-07-18 audit hygiene) so summarizer replays and FETCH-vs-SUMMARIZE
         attribution don't require fresh paid pulls."""
-        writer = ResearchPersistenceWriter(run_mode="tournament", tournament_id="t", run_id="r")
+        writer = ResearchPersistenceWriter(run_mode="tournament", platform="metaculus", tournament_id="t", run_id="r")
         raw_articles = "**Article 1: Something happened (2026-07-14)**\nRaw article body."
         writer.record(
             qid=7,
@@ -258,7 +289,7 @@ class TestResearchPersistenceWriter:
     def test_asknews_raw_omitted_when_empty_or_absent(self, tmp_path: Path) -> None:
         """Empty raw text (AskNews didn't run / errored / prose fallback) must not
         add a key — records stay compact, matching provider_diagnostics_block."""
-        writer = ResearchPersistenceWriter(run_mode="tournament", tournament_id="t", run_id="r")
+        writer = ResearchPersistenceWriter(run_mode="tournament", platform="metaculus", tournament_id="t", run_id="r")
         writer.record(
             qid=1,
             page_url="https://example.com/q/1/",
@@ -283,7 +314,7 @@ class TestResearchPersistenceWriter:
         assert all("asknews_raw" not in r for r in records)
 
     def test_unicode_content_preserved(self, tmp_path: Path) -> None:
-        writer = ResearchPersistenceWriter(run_mode="tournament", tournament_id="t", run_id="r")
+        writer = ResearchPersistenceWriter(run_mode="tournament", platform="metaculus", tournament_id="t", run_id="r")
         unicode_text = "Probability of event: 73.2% — source: “Forecast Journal” \U0001f4c8"
         writer.record(
             qid=99,

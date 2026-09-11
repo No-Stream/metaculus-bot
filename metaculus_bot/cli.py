@@ -3,22 +3,29 @@ import asyncio
 import logging
 import os
 import sys
-from collections.abc import Awaitable, Callable
-from typing import Any, Literal
+from collections.abc import Awaitable, Callable, Iterable
+from typing import Any, Literal, NamedTuple, get_args
 
-from forecasting_tools import MetaculusApi
+from forecasting_tools import ForecastReport, MetaculusApi
 
 from metaculus_bot.aggregation_strategies import AggregationStrategy
-from metaculus_bot.api_preflight import verify_metaculus_api_identity
+from metaculus_bot.api_preflight import verify_api_identity, verify_metaculus_api_identity
 from metaculus_bot.constants import (
     CREDIT_ALERT_RESUME_DATE,
+    DONATED_OPENROUTER_KEY_ENABLED_ENV,
+    MANTIC_API_BASE_URL,
+    MANTIC_TOURNAMENT_END_DATE,
+    MANTIC_TOURNAMENT_ID,
     METACULUS_CUP_ID,
     PERSIST_RESEARCH_ENABLED_ENV,
+    PLATFORM_MANTIC,
+    PLATFORM_METACULUS,
     TEST_QUESTIONS_OVERRIDE_ENV,
     TOURNAMENT_ID,
     check_fall_cup_reminder,
     check_tournament_dates,
     credit_alerts_active,
+    donated_openrouter_key_enabled,
     env_flag_enabled,
 )
 from metaculus_bot.credit_telemetry import (
@@ -27,6 +34,7 @@ from metaculus_bot.credit_telemetry import (
     get_probed_donated_key_state,
     install_role_spend_tracker,
     log_role_spend,
+    log_run_summary,
 )
 from metaculus_bot.fallback_openrouter import (
     check_deprecation_alerts_and_exit,
@@ -45,20 +53,53 @@ from metaculus_bot.llm_configs import (
     STACKER_LLM,
     SUMMARIZER_LLM,
 )
+from metaculus_bot.mantic import (
+    build_mantic_client,
+    get_post_drop_count,
+    preflight_mantic_tournaments,
+    reset_post_drop_count,
+)
 from metaculus_bot.publish_hardening import apply_publish_hardening
 from metaculus_bot.research.persistence import ResearchPersistenceWriter
 
 logger = logging.getLogger(__name__)
 
 
-RunMode = Literal["tournament", "minibench", "quarterly_cup", "metaculus_cup", "test_questions"]
+RunMode = Literal["tournament", "minibench", "quarterly_cup", "metaculus_cup", "test_questions", "mantic"]
 
 
-def _configure_process() -> None:
+class CliArgs(NamedTuple):
+    """What argv decides: the run mode, and the optional ``--only-posts`` narrowing of it."""
+
+    run_mode: RunMode
+    only_posts: frozenset[int] | None
+
+
+def _assert_personal_keys_only() -> None:
+    """Fail shut unless the Metaculus-donated OpenRouter key is switched off for this process.
+
+    Metaculus donated ``OAI_ANTH_OPENROUTER_KEY`` for its own tournaments, so a run that
+    forecasts for Mantic may spend only the operator's personal keys. The switch has to be an
+    environment variable set BEFORE the process starts rather than something this function
+    could flip: the roster's module-level ``GeneralLlm`` objects (``llm_configs``) freeze their
+    api_key at import, and ``main.py`` imports them before ``main`` runs. So the only safe
+    thing to do when it still reads on is to stop, before any fetch or spend.
+    """
+    if donated_openrouter_key_enabled():
+        raise RuntimeError(
+            f"A Mantic run may spend only personal API keys, but {DONATED_OPENROUTER_KEY_ENABLED_ENV} does "
+            "not read false. Set it to false in the environment before starting the process: the roster "
+            "freezes its OpenRouter key at import, so the donated key cannot be switched off from here."
+        )
+
+
+def _configure_process(run_mode: RunMode) -> None:
     """Set up logging levels and install the client hardening / identity preflight.
 
     Done here (the runtime entry point) rather than at module import so test imports and
-    library consumers don't inherit these global mutations.
+    library consumers don't inherit these global mutations. The run mode decides which
+    platform host the identity preflight vets, and mantic mode fails shut on the
+    donated-key switch first.
     """
     logging.basicConfig(
         level=logging.INFO,
@@ -70,41 +111,67 @@ def _configure_process() -> None:
     litellm_logger.setLevel(logging.WARNING)
     litellm_logger.propagate = False
 
-    # Forecaster module logs at DEBUG for full per-question tracing; the
-    # openai-agents logger is noisy at INFO so pin it to ERROR.
+    # Per-question tracing at DEBUG; openai-agents is noisy at INFO. See docs/architecture.md "CLI startup wiring".
     logging.getLogger("metaculus_bot.forecaster").setLevel(logging.DEBUG)
     logging.getLogger("openai.agents").setLevel(logging.ERROR)
 
-    # Wrap MetaculusClient publish POSTs with timeout + retry. See
-    # metaculus_bot/publish_hardening.py for rationale (a single hung POST
-    # blocks the whole batch; we bound it tighter than the upstream default).
+    # A single hung publish POST would block the whole batch. See docs/architecture.md "CLI startup wiring".
     apply_publish_hardening()
 
-    # Wrap MetaculusClient question-list GET with bounded retry. See
-    # metaculus_bot/fetch_hardening.py for rationale (a single transient
-    # 403/429/5xx would otherwise kill the whole run).
+    # One transient 403/429/5xx would otherwise kill the run. See docs/architecture.md "CLI startup wiring".
     apply_fetch_hardening()
 
-    # One-shot, unauthenticated identity check before any mode sends the token.
-    # See metaculus_bot/api_preflight.py (DNS-parking incident): aborts non-zero
-    # if www.metaculus.com isn't answered by the real API, so we never leak
-    # METACULUS_TOKEN to a hijacked host.
-    verify_metaculus_api_identity()
+    # Reset here, not in forecast_questions: that fetch runs first. See docs/architecture.md "CLI startup wiring".
+    reset_post_drop_count()
+
+    # One-shot and unauthenticated, so no token reaches a hijacked host. See docs/architecture.md "CLI startup wiring".
+    if run_mode == "mantic":
+        _assert_personal_keys_only()
+        verify_api_identity(MANTIC_API_BASE_URL)
+    else:
+        verify_metaculus_api_identity()
 
 
-def _parse_run_mode() -> RunMode:
-    """Read ``--mode`` off argv."""
+def _parse_post_ids(text: str) -> frozenset[int]:
+    """The ``--only-posts`` value: comma-separated post ids, ``650`` or ``650,651``."""
+    try:
+        return frozenset(int(token) for token in text.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected comma-separated integer post ids, got {text!r}") from exc
+
+
+def _parse_cli_args() -> CliArgs:
+    """Read ``--mode`` and the optional ``--only-posts`` filter off argv.
+
+    ``--only-posts`` narrows a tournament-shaped mode to the listed post ids (the one-question
+    paid smoke run). It is refused with ``test_questions``, whose evergreen set is not a
+    tournament's open questions: a filter that silently did nothing on a paid run would be
+    worse than a usage error.
+    """
     parser = argparse.ArgumentParser(description="Run the Q1TemplateBot forecasting system")
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["tournament", "minibench", "quarterly_cup", "metaculus_cup", "test_questions"],
+        choices=list(get_args(RunMode)),
         default="tournament",
         help="Specify the run mode (default: tournament)",
     )
+    parser.add_argument(
+        "--only-posts",
+        type=_parse_post_ids,
+        default=None,
+        metavar="POST_IDS",
+        help=(
+            "Comma-separated post ids: forecast only these of the tournament's open questions "
+            "(the one-question smoke run). Tournament-shaped modes only."
+        ),
+    )
     args = parser.parse_args()
     run_mode: RunMode = args.mode
-    return run_mode
+    only_posts: frozenset[int] | None = args.only_posts
+    if only_posts is not None and run_mode == "test_questions":
+        parser.error("--only-posts narrows a tournament's open questions and does not apply to --mode test_questions")
+    return CliArgs(run_mode=run_mode, only_posts=only_posts)
 
 
 async def _forecast_with_callback_drain(start_forecast: Callable[[], Awaitable[list[Any]]]) -> list[Any]:
@@ -139,9 +206,7 @@ def _test_questions_source(template_bot: TemplateForecaster) -> Callable[[], Awa
     template_bot.skip_previously_forecasted_questions = (
         False  # obviously, we need to rerun test q predictions to test them :)
     )
-    # Optional override (test_bot_basic workflow): a comma/whitespace-
-    # separated list of Metaculus URLs to forecast instead of the full
-    # evergreen set. Unset -> the hardcoded EXAMPLE_QUESTIONS above.
+    # Unset falls back to EXAMPLE_QUESTIONS. See docs/operations.md "The one-question smoke test".
     override_urls = os.environ.get(TEST_QUESTIONS_OVERRIDE_ENV, "").replace(",", " ").split()
     question_urls = override_urls or EXAMPLE_QUESTIONS
     if override_urls:
@@ -153,7 +218,55 @@ def _test_questions_source(template_bot: TemplateForecaster) -> Callable[[], Awa
     return lambda: template_bot.forecast_questions(questions, return_exceptions=True)
 
 
-def _question_source(template_bot: TemplateForecaster, run_mode: RunMode) -> Callable[[], Awaitable[list[Any]]]:
+async def _forecast_nothing() -> list[Any]:
+    """The factory for an ``--only-posts`` filter that matched none of the open questions."""
+    return []
+
+
+def _post_ids_csv(post_ids: Iterable[int | None]) -> str:
+    """Sorted comma-separated ids for the ``ONLY_POSTS`` marker; ``none`` for an empty list."""
+    known_ids = sorted(post_id for post_id in post_ids if post_id is not None)
+    return ",".join(str(post_id) for post_id in known_ids) or "none"
+
+
+def _tournament_source(
+    template_bot: TemplateForecaster,
+    tournament_id: int | str,
+    only_posts: frozenset[int] | None,
+) -> Callable[[], Awaitable[list[Any]]]:
+    """Forecast-factory over one tournament's open questions, narrowed to ``only_posts`` when set.
+
+    Unfiltered, this is the framework's own ``forecast_on_tournament``, untouched. Filtered, the
+    question-list fetch it makes internally runs here instead, on the same injected client (the
+    ``ManticClient`` in mantic mode), and only the posts asked for reach ``forecast_questions``;
+    a filter that matches nothing forecasts nothing rather than the whole tournament. Like the
+    URL resolves in ``_test_questions_source`` the fetch is synchronous and stays outside the
+    event loop, with only the forecast deferred into the factory. The ``ONLY_POSTS`` marker
+    records the request against what the tournament held open, so a smoke run's log says
+    which question it spent on.
+    """
+    if only_posts is None:
+        return lambda: template_bot.forecast_on_tournament(tournament_id, return_exceptions=True)
+    open_questions = template_bot.metaculus_client.get_all_open_questions_from_tournament(tournament_id)
+    matched = [question for question in open_questions if question.id_of_post in only_posts]
+    logger.info(
+        f"ONLY_POSTS: requested={_post_ids_csv(only_posts)} "
+        f"matched={_post_ids_csv(question.id_of_post for question in matched)} "
+        f"dropped={len(open_questions) - len(matched)}"
+    )
+    if not matched:
+        logger.warning(
+            "--only-posts matched none of the %d open question(s) in tournament %s; forecasting nothing",
+            len(open_questions),
+            tournament_id,
+        )
+        return _forecast_nothing
+    return lambda: template_bot.forecast_questions(matched, return_exceptions=True)
+
+
+def _question_source(
+    template_bot: TemplateForecaster, run_mode: RunMode, *, only_posts: frozenset[int] | None
+) -> Callable[[], Awaitable[list[Any]]]:
     """Resolve one run mode to the factory that forecasts its questions.
 
     Returns a factory rather than forecasting here so that every mode goes through the
@@ -162,47 +275,54 @@ def _question_source(template_bot: TemplateForecaster, run_mode: RunMode) -> Cal
     silently report no per-role spend by forgetting to wrap itself.
 
     Every tournament-shaped mode pins ``skip_previously_forecasted_questions`` on so a
-    re-run can't re-spend on questions already forecast.
+    re-run can't re-spend on questions already forecast, and honours ``only_posts``
+    (``_tournament_source``); the parser refuses that filter for ``test_questions``.
     """
     if run_mode == "tournament":
-        check_tournament_dates(logging.getLogger(__name__))  # Warn/error if tournament dates are stale
-        # to not risk explosive spend, we won't update preds
+        # to not risk explosive spend, we won't update preds.
         template_bot.skip_previously_forecasted_questions = True
-        return lambda: template_bot.forecast_on_tournament(TOURNAMENT_ID, return_exceptions=True)
+        return _tournament_source(template_bot, TOURNAMENT_ID, only_posts)
     if run_mode == "minibench":
-        # to not risk explosive spend, we won't update preds
+        # to not risk explosive spend, we won't update preds.
         template_bot.skip_previously_forecasted_questions = True
-        return lambda: template_bot.forecast_on_tournament(MetaculusApi.CURRENT_MINIBENCH_ID, return_exceptions=True)
+        return _tournament_source(template_bot, MetaculusApi.CURRENT_MINIBENCH_ID, only_posts)
     if run_mode in ("quarterly_cup", "metaculus_cup"):
-        # The metaculus cup is a good way to test the bot's performance on regularly open questions
-        # to not risk explosive spend, we won't update preds
+        # Regularly open questions; to not risk explosive spend, we won't update preds.
         template_bot.skip_previously_forecasted_questions = True
-        return lambda: template_bot.forecast_on_tournament(METACULUS_CUP_ID, return_exceptions=True)
+        return _tournament_source(template_bot, METACULUS_CUP_ID, only_posts)
+    if run_mode == "mantic":
+        # Mantic's platform via the ManticClient main injects; to not risk explosive spend, we won't update preds.
+        template_bot.skip_previously_forecasted_questions = True
+        return _tournament_source(template_bot, MANTIC_TOURNAMENT_ID, only_posts)
     if run_mode == "test_questions":
         # Example questions are a good way to test the bot's performance on a single question
         return _test_questions_source(template_bot)
     raise ValueError(f"Invalid run mode: {run_mode}")
 
 
+def persisted_platform(run_mode: RunMode) -> str:
+    """The question platform this run's research records are archived under.
+
+    Additive next to ``tournament_id``. Archive filenames are not namespaced by platform, and
+    ``scripts/download_research.build_archive`` groups records on the bare qid, so this field
+    tells the two platforms apart inside a group and is what an analysis keyed on bare post
+    ids across both platforms has to filter on; it cannot stop a Mantic id and a Metaculus id
+    that meet from merging into one ``by_qid`` / ``latest`` / manifest entry. The margin is not
+    "hundreds versus tens of thousands": the evergreen ``test_questions`` set puts Metaculus
+    ids 578, 14333 and 20683 in the archive, so with the open Mantic posts in the 650s the next
+    Metaculus key above them is 14333, about 13,700 Mantic posts away.
+    """
+    return PLATFORM_MANTIC if run_mode == "mantic" else PLATFORM_METACULUS
+
+
 def persisted_tournament_id(run_mode: RunMode) -> str:
     """The tournament label this run's research records are archived under.
 
-    Pure, and keyed on the run mode rather than pinned to ``TOURNAMENT_ID``, because
-    ``ResearchPersistenceWriter`` stamps ``tournament_id`` on every record and residual
-    analysis buckets and joins on it. A cup run labelled with the BOT tournament's slug
-    files cup questions inside the tournament's config eras and inside the supply probe's
-    per-slug rows, which is a silent data-corruption bug rather than a cosmetic one: the
-    label is the only thing on the record that says which competition the question came
-    from, since ``run_mode`` distinguishes the pipeline and not the object.
-
-    ``test_questions`` deliberately keeps ``TOURNAMENT_ID``. The evergreen example set
-    belongs to no tournament, so no label is right; it is ``run_mode`` that separates those
-    records, and re-labelling them now would make the archive's existing test-run records
-    incomparable with future ones for no gain.
-
-    Raises on an unknown mode for the same reason ``_question_source`` does: a mode added
-    to ``RunMode`` without a decision here should fail loudly at startup rather than
-    mislabel a whole run's archive.
+    Pure, and keyed on the run mode rather than pinned to ``TOURNAMENT_ID``, because residual
+    analysis buckets and joins on this label: a cup run labelled with the BOT tournament's slug
+    is silent data corruption. ``test_questions`` deliberately keeps ``TOURNAMENT_ID``, and an
+    unknown mode raises rather than mislabel a whole run's archive. Reasoning:
+    docs/architecture.md "The research-archive label".
     """
     if run_mode in ("tournament", "test_questions"):
         return TOURNAMENT_ID
@@ -210,37 +330,62 @@ def persisted_tournament_id(run_mode: RunMode) -> str:
         return str(MetaculusApi.CURRENT_MINIBENCH_ID)
     if run_mode in ("quarterly_cup", "metaculus_cup"):
         return METACULUS_CUP_ID
+    if run_mode == "mantic":
+        return MANTIC_TOURNAMENT_ID
     raise ValueError(f"Invalid run mode: {run_mode}")
 
 
-def _run_forecasts(template_bot: TemplateForecaster, run_mode: RunMode) -> list[Any]:
+def _run_forecasts(
+    template_bot: TemplateForecaster, run_mode: RunMode, *, only_posts: frozenset[int] | None = None
+) -> list[Any]:
     """Forecast one run mode's questions, on one event loop, with the callback drain.
 
     The only ``asyncio.run`` in the module: the loop is created here and torn down on
     return, and ``_forecast_with_callback_drain`` drains litellm's success callbacks
     inside it while the queue bound to it is still alive.
     """
-    return asyncio.run(_forecast_with_callback_drain(_question_source(template_bot, run_mode)))
+    source = _question_source(template_bot, run_mode, only_posts=only_posts)
+    return asyncio.run(_forecast_with_callback_drain(source))
+
+
+def _check_tournament_dates(run_mode: RunMode) -> bool:
+    """Run the mode's stale-slug check at startup; True only when the MANTIC slug is past its end date.
+
+    ``check_tournament_dates`` (constants.py) warns from the UTC day after a slug's end date (the
+    constant names the last open day) and raises at the hard stop two weeks later, for the
+    Metaculus bot tournament and for Mantic alike. In between, the Metaculus tournament stays
+    advisory: its questions are open for weeks and a fortnight of warnings costs nothing. On
+    Mantic that fortnight is a silent forfeit. A zero-question run is green, Series 2 opens under
+    a slug that does not exist yet, and every hourly run would keep fetching the ended preseason
+    and exit 0, about seventy questions at Series 1's rate (edge review item 5). So in mantic mode
+    the verdict is held and reddens the run after publishing, the same shape as the fall-cup
+    reminder; the shared hard stop is untouched. The cup and minibench slugs carry no end date and
+    are not checked.
+    """
+    if run_mode == "tournament":
+        check_tournament_dates(logger)
+        return False
+    if run_mode == "mantic":
+        return check_tournament_dates(
+            logger, tournament_id=MANTIC_TOURNAMENT_ID, end_date_str=MANTIC_TOURNAMENT_END_DATE
+        )
+    return False
 
 
 def main() -> None:
     """Command-line entry-point for running the TemplateForecaster.
 
-    This code was moved verbatim from the bottom of main.py so external behaviour
-    (e.g. GitHub Actions invoking `python main.py`) remains identical.  The only
-    difference is that main.py now delegates to this function.
+    main.py delegates here, so GitHub Actions invoking ``python main.py`` and a direct
+    ``python -m metaculus_bot.cli`` behave identically. Order matters: the mode is parsed
+    first, then ``_configure_process`` installs the hardening patches and runs the
+    fail-shut and identity checks, and only then is any platform token read.
     """
-    _configure_process()
-    run_mode = _parse_run_mode()
+    run_mode, only_posts = _parse_cli_args()
+    _configure_process(run_mode)
 
-    # Fall-cup configuration reminder (constants.py): logs its ERROR here, at startup,
-    # so the operator sees it before the run's noise; the non-zero exit it demands
-    # happens in _report_degradation_and_exit AFTER forecasting/publishing complete,
-    # same shape as the credit-floor path. Checked in every run mode on purpose — the
-    # tournament crons stop reaching this from 2026-09-20 (check_tournament_dates
-    # raises), but the cup/minibench crons and manual runs keep reddening until the
-    # operator flips FALL_CUP_CONFIGURED.
+    # ERROR now, red exit after publishing, every run mode. See docs/operations.md "the exit ladder".
     fall_cup_reminder = check_fall_cup_reminder(logger)
+    mantic_tournament_stale = _check_tournament_dates(run_mode)
 
     # Wire research persistence if enabled (production GHA runs set this env var)
     research_writer = None
@@ -248,15 +393,13 @@ def main() -> None:
     if env_flag_enabled(PERSIST_RESEARCH_ENABLED_ENV):
         research_writer = ResearchPersistenceWriter(
             run_mode=run_mode,
+            platform=persisted_platform(run_mode),
             tournament_id=persisted_tournament_id(run_mode),
             run_id=os.environ.get("GITHUB_RUN_ID", "local"),
         )
         research_sink = research_writer.record
 
-    # "forecasters" holds a list[GeneralLlm]; the helper slots hold single GeneralLlm
-    # values. The parent ForecastBot.__init__ annotates llms as dict[str, str | GeneralLlm],
-    # which (being invariant) cannot express the list value, so annotate the heterogeneous
-    # dict as dict[str, Any]. prepare_llm_config consumes the "forecasters" list at runtime.
+    # dict[str, Any] because "forecasters" holds a list the parent's invariant annotation cannot express.
     llms: dict[str, Any] = {
         "forecasters": FORECASTER_LLMS,
         "stacker": STACKER_LLM,
@@ -265,6 +408,11 @@ def main() -> None:
         "parser": PARSER_LLM,
         "researcher": RESEARCHER_LLM,
     }
+    # Built after _configure_process, so the key check and identity preflight pass before the token is read.
+    metaculus_client = build_mantic_client() if run_mode == "mantic" else None
+    if metaculus_client is not None:
+        # Two authenticated GETs, still before any spend. See docs/operations.md "Startup checks and robustness rules".
+        preflight_mantic_tournaments(metaculus_client, MANTIC_TOURNAMENT_ID)
     template_bot = TemplateForecaster(
         research_reports_per_question=1,
         predictions_per_research_report=1,  # Ignored when 'forecasters' present
@@ -274,52 +422,31 @@ def main() -> None:
         aggregation_strategy=AggregationStrategy.CONDITIONAL_STACKING,
         research_sink=research_sink,
         llms=llms,
+        metaculus_client=metaculus_client,
     )
 
-    # Credit-balance telemetry: CREDIT_BALANCE/CREDIT_SPEND marker lines land in
-    # the run_logs/ artifact via the workflows' stdout tee, making per-run spend
-    # on the shared donated key durably grep-able. The end fetch runs in a
-    # finally so a crashed run still logs its spend; the floor check result is
-    # consumed AFTER forecasting/publishing below (reminder signal, not abort).
-    #
-    # The per-role ledger (CREDIT_ROLE_SPEND) rides the same finally. Its tracker is a
-    # litellm success callback, installed here before the first completion; the
-    # callbacks themselves are drained inside the forecast loop
-    # (_forecast_with_callback_drain), so by the time log_role_spend runs every
-    # completion of the run has been booked.
+    # Installed before the first completion. See docs/operations.md "Credit telemetry and the refill floor".
     install_role_spend_tracker()
     credit_telemetry = CreditTelemetry()
     credit_telemetry.log_start()
     donated_below_floor = False
+    # Empty until the forecasts return, so a crashed run's summary reads its money against zero questions.
+    forecast_reports: list[Any] = []
     try:
-        forecast_reports = _run_forecasts(template_bot, run_mode)
+        forecast_reports = _run_forecasts(template_bot, run_mode, only_posts=only_posts)
     finally:
         donated_below_floor = credit_telemetry.log_end_and_check_floor()
         log_role_spend()
-        # Flush inside the finally: records accumulate in memory for the whole run,
-        # so an exception escaping asyncio.run (an OSError, the invalid-run-mode
-        # ValueError above, a KeyboardInterrupt, the 300-minute timeout-minutes
-        # SIGTERM) would otherwise discard every question's research — a 40-question
-        # run that dies on the last question would archive nothing. The workflows'
-        # upload step is `if: always()`, so a crashed run's partial batch still
-        # reaches the GHA artifact.
+        log_run_summary(n_questions=sum(isinstance(report, ForecastReport) for report in forecast_reports))
+        # Records accumulate in memory all run: without this flush a crash archives nothing.
         if research_writer is not None:
             research_writer.flush()
 
-    # The report summary RAISES by design when any report is an exception
-    # (compact_log_report_summary re-raises so a failed question reddens CI under
-    # return_exceptions=True) — but it used to sit ABOVE the alertable block, so
-    # the one run that most needed a summary record left none: q45085's publish
-    # failure (2026-08-03) propagated here, ``alertable`` was never computed, and
-    # that run is the single forecasting run since 2026-07-26 with no
-    # run_alertable_summary line in the archive. Emit-then-raise: hold the error,
-    # emit the breakdown below on this path too, then re-raise — the original
-    # exception keeps its traceback and CI stays exactly as red as before.
+    # Emit-then-raise: the breakdown must be recorded before this propagates. See docs/operations.md "the exit ladder".
     report_summary_error: Exception | None = None
     try:
         TemplateForecaster.log_report_summary(forecast_reports)
-    # Boundary: holding ANY summary error (not narrowing it) is the point — the breakdown
-    # below must be emitted first, then this is re-raised with its original traceback.
+    # Boundary: holding ANY summary error, deliberately unnarrowed, is the point.
     except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except  # held until the breakdown is emitted, then re-raised
         report_summary_error = exc
 
@@ -328,6 +455,7 @@ def main() -> None:
         report_summary_error=report_summary_error,
         donated_below_floor=donated_below_floor,
         fall_cup_reminder=fall_cup_reminder,
+        mantic_tournament_stale=mantic_tournament_stale,
     )
 
 
@@ -337,6 +465,7 @@ def _report_degradation_and_exit(
     report_summary_error: Exception | None,
     donated_below_floor: bool,
     fall_cup_reminder: bool,
+    mantic_tournament_stale: bool,
 ) -> None:
     """Emit the one-line degradation breakdown and decide the process exit status.
 
@@ -351,34 +480,15 @@ def _report_degradation_and_exit(
     predicate below be their exact complement.
     """
     bot_alertable = template_bot.alertable_count
-    # Donated->personal key fallback: counted in fallback_openrouter at the
-    # wrapper level (process-global, since the wrapper has no link back to the
-    # bot). Each fallback was successful — the run completed using the paid
-    # personal key — but a call that should have hit the free donated key
-    # billed to the operator instead, so the operator should investigate.
-    # ``generic_fallback`` counts ALL fallback causes (401/402/429/guardrail/
-    # 404); ``donated_404`` and ``credit_fallback`` are two disjoint subsets of
-    # that total, broken out for diagnostics. Add only ``generic_fallback`` to
-    # ``alertable`` — adding either subset too would double-count events already
-    # inside that total.
-    #
-    # Credit suppression (while today is before CREDIT_ALERT_RESUME_DATE): inside
-    # that window an empty donated key is an accepted state and its fallbacks are
-    # SUBTRACTED back out of the total. Every other cause keeps its full weight,
-    # because 401/404/429/guardrail each mean real breakage. Each event is still
-    # counted exactly once: generic adds it, and at most one subset subtracts it.
-    #
-    # ``credit_fallback`` counts only the SUPPRESSIBLE credit subset — the
-    # donated key genuinely drained. A key that was revoked or re-capped to zero
-    # returns the same "Key limit exceeded" text but is classified separately by
-    # ``fallback_openrouter.is_suppressible_credit_error`` (which probes
-    # /auth/key), so it stays inside the generic total and keeps this run red.
+    # Only the all-causes total enters alertable; its subsets double-count. See docs/operations.md "the exit ladder".
     alerts_active = credit_alerts_active()
     generic_fallback = get_generic_key_fallback_count()
     donated_404 = get_donated_404_fallback_count()
     credit_fallback = get_credit_key_fallback_count()
     suppressed_credit_fallback = 0 if alerts_active else credit_fallback
-    alertable = bot_alertable + generic_fallback - suppressed_credit_fallback
+    # Only this process-global counter turns a forfeited post red. See docs/operations.md "Parse drops are counted".
+    mantic_post_drops = get_post_drop_count()
+    alertable = bot_alertable + generic_fallback - suppressed_credit_fallback + mantic_post_drops
 
     suppression_note = (
         ""
@@ -386,82 +496,45 @@ def _report_degradation_and_exit(
         else f" with {suppressed_credit_fallback} credit event(s) suppressed until "
         f"{CREDIT_ALERT_RESUME_DATE.isoformat()}"
     )
-    # Only rendered when a spend-cap failure actually made the wrapper probe the
-    # donated key. Omitted otherwise, because "unknown" would read as a failed
-    # probe rather than "no run this shape ever needed one".
+    # Omitted when nothing probed the donated key: "unknown" would read as a failed probe.
     probed_donated_key_state = get_probed_donated_key_state()
     donated_key_note = "" if probed_donated_key_state is None else f", donated_key={probed_donated_key_state.value}"
-    # One breakdown, EVERY path — degraded, suppressed-green, crashed, and fully
-    # clean. The green paths need it as much as the red one: when every donated-key
-    # call fell back and the credit subset cancels the whole generic total,
-    # ``alertable`` is 0 — the exact shape of the 2026-07-26 drained-key run — and
-    # gating this line on the exit status would leave that run's degradation and
-    # probe verdict entirely unrecorded.
-    #
-    # A fully clean run says so explicitly, under a distinguishable "clean" phrase
-    # that harvests as the same run_alertable_summary marker. It used to emit
-    # NOTHING, so that the line's presence would stay a signal rather than
-    # boilerplate; the operator OVERTURNED that on 2026-08-25. The reason: silence
-    # is not distinguishable from a run that died before reaching this block, and
-    # once the donated key is refilled (past CREDIT_ALERT_RESUME_DATE) the clean
-    # shape becomes the COMMON one, so the archive's per-run census would lose
-    # exactly the runs that went well. During the drained-key window the question
-    # was moot — every run fell back at least once, and 0 of the 73 archived
-    # records are the clean shape.
-    #
-    # A raising ``log_report_summary`` is never "clean" no matter what the counters
-    # read: that run lost a question. Its counters can legitimately be all-zero
-    # (q45085's shape), which is why the phrase, not the fields, is what marks a run
-    # clean.
-    #
-    # The predicate must be the exact complement of every non-zero exit path in
-    # this function — including the two that run AFTER this line (the credit-floor
-    # breach and the deprecation tripwire). Without those two terms, a run about
-    # to exit red could first stamp the archive's run_alertable_summary record
-    # with the clean token.
+    # Rendered only when a post dropped, so the term explaining a non-zero alertable appears when it applies.
+    mantic_drops_note = "" if mantic_post_drops == 0 else f", mantic_post_drops={mantic_post_drops}"
+    # Emitted on EVERY path, and the "clean" phrase marks a clean run. See docs/operations.md "the exit ladder".
     run_clean = (
         report_summary_error is None
         and alertable <= 0
         and generic_fallback <= 0
         and not (donated_below_floor and alerts_active)
         and not fall_cup_reminder
+        and not mantic_tournament_stale
         and not has_deprecation_alerts()
     )
     completion_phrase = "Run completed clean with" if run_clean else "Run completed with"
     breakdown = (
         f"{completion_phrase} {alertable} alertable degradation event(s) "
         f"(bot={bot_alertable}, personal_key_fallback={generic_fallback} of which "
-        f"donated_404={donated_404}, credit={credit_fallback}{suppression_note}{donated_key_note});"
+        f"donated_404={donated_404}, credit={credit_fallback}{suppression_note}{donated_key_note}{mantic_drops_note});"
     )
     if report_summary_error is not None:
-        # Emit-then-raise, never swallow: the breakdown line above is the record
-        # the archive needs, and re-raising (rather than sys.exit) preserves the
-        # forecasting failure's traceback in the log. Takes precedence over the
-        # alertable exit below because the exception is the richer red signal.
+        # Re-raise rather than sys.exit so the traceback survives; it outranks the alertable exit below.
         logger.warning("%s re-raising the forecasting failure so CI marks this run red.", breakdown)
         raise report_summary_error
     if alertable > 0:
         logger.warning("%s exiting non-zero so CI marks this run red.", breakdown)
         sys.exit(1)
     if generic_fallback > 0:
-        # Reachable only under suppression with every fallback credit-caused (the
-        # subtraction can't otherwise reach zero from a positive total), so state
-        # that rather than leaving a reader to derive it from the arithmetic.
+        # Reachable only under suppression with every fallback credit-caused, so the line says so.
         logger.info("%s every fallback was a suppressed credit event, so this run stays green.", breakdown)
     elif run_clean:
         # The all-clear census line (see ``run_clean`` above).
         logger.info("%s nothing degraded, so this run stays green.", breakdown)
     else:
-        # Counters are quiet but a red condition below (credit floor breach or the
-        # deprecation tripwire) still decides the exit status — no green claim.
+        # Counters are quiet but a red condition below still decides the exit, so no green claim here.
         logger.info("%s a post-summary check below decides the exit status.", breakdown)
 
-    # Donated-key balance below the early-warning floor (CREDIT_FLOOR_BREACH
-    # warning already logged by credit_telemetry). The run completed and published
-    # normally; exiting non-zero here is purely the ask-Metaculus-for-a-top-up
-    # signal — and it is suppressed while today is before CREDIT_ALERT_RESUME_DATE.
-    # The INFO line keeps the log self-explanatory: a reader who sees the breach
-    # WARNING but a green run should not have to guess why.
+    # Published normally; this is only the ask-Metaculus-for-a-top-up signal. See docs/operations.md "the exit ladder".
     if donated_below_floor:
         if alerts_active:
             sys.exit(1)
@@ -470,19 +543,21 @@ def _report_degradation_and_exit(
             CREDIT_ALERT_RESUME_DATE.isoformat(),
         )
 
-    # Fall-cup configuration reminder: the FALL_CUP_REMINDER error was already logged at
-    # startup (check_fall_cup_reminder, constants.py). Same shape as the credit-floor
-    # path above — the run completed and published normally, and this non-zero exit is
-    # purely the reminder-to-configure signal, retired by flipping FALL_CUP_CONFIGURED.
+    # Reminder signal only, retired by flipping FALL_CUP_CONFIGURED. See docs/operations.md "the exit ladder".
     if fall_cup_reminder:
         sys.exit(1)
 
-    # Post-submission deprecation tripwire. Runs LAST so submission has fully
-    # completed (and so other alertable conditions exit first with their own
-    # log lines). When OpenRouter retires a model the bot uses (e.g. the
-    # 2026-05-15 x-ai/grok-4.1-fast deprecation that silently 404'd for ~2
-    # days), this prints a loud banner + sys.exit(1) so GitHub Actions turns
-    # red. Returns silently when no deprecation was observed.
+    # A zero-question run is otherwise green. See docs/operations.md "Stale slug goes red".
+    if mantic_tournament_stale:
+        logger.error(
+            "Mantic tournament %s is past MANTIC_TOURNAMENT_END_DATE (%s); re-point MANTIC_TOURNAMENT_ID and "
+            "MANTIC_TOURNAMENT_END_DATE in constants.py. Exiting non-zero so CI marks this run red.",
+            MANTIC_TOURNAMENT_ID,
+            MANTIC_TOURNAMENT_END_DATE,
+        )
+        sys.exit(1)
+
+    # Runs LAST so submission completed and other exits fire first. See docs/operations.md "the exit ladder".
     check_deprecation_alerts_and_exit()
 
 

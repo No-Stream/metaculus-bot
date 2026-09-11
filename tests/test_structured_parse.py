@@ -13,6 +13,8 @@ Covers:
 
 from __future__ import annotations
 
+import time
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -22,6 +24,10 @@ from forecasting_tools.data_models.numeric_report import Percentile
 from metaculus_bot import structured_parse as sp
 from metaculus_bot.simple_types import OptionProbability
 from metaculus_bot.structured_parse import (
+    BinProbability,
+    BinProbabilityListWrapper,
+    DatePercentileListWrapper,
+    IsoDatePercentile,
     OptionProbabilityListWrapper,
     PercentileListWrapper,
     parse_structured,
@@ -177,8 +183,7 @@ class TestFallbackGuarantee:
     @pytest.mark.asyncio
     async def test_wrapper_json_validation_error_falls_back(self, parser_llm):
         """Constrained returns JSON that parses but fails Percentile validation → fallback."""
-        # `percentile` outside [0,1] fails Percentile's pydantic validators, so
-        # PercentileListWrapper.model_validate_json raises.
+        # A percentile outside [0,1] makes PercentileListWrapper.model_validate_json raise.
         canned = '{"percentiles": [{"percentile": 1.5, "value": 10.0}]}'
         constrained = _patch_build_constrained_llm(canned)
         fallback_result = [Percentile(percentile=0.5, value=99.0)]
@@ -229,3 +234,127 @@ class TestWrapperHelpers:
         )
         assert len(w.options) == 1
         assert w.options[0].option_name == "A"
+
+
+class TestDatePercentileWrapper:
+    """The date salvage rung reads ``value`` through the repo's one date parser, never pydantic's.
+
+    forecasting-tools' own date template lets pydantic coerce the value (a date-only string lands
+    at midnight naive, a bare integer becomes a 1970 unix timestamp) and then calls ``.timestamp()``
+    on the naive result, which is host-local time. ``IsoDatePercentile`` routes the raw string
+    through ``numeric.date_axis.parse_forecast_date`` instead.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_naive_date_only_value_parses_to_noon_utc_under_a_non_utc_host_tz(
+        self, parser_llm, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        canned = (
+            '{"percentiles": ['
+            '{"percentile": 0.1, "value": "2026-09-16"},'
+            '{"percentile": 0.5, "value": "2026-09-17T09:30:00"},'
+            '{"percentile": 0.9, "value": "2026-09-18T00:00:00Z"}'
+            "]}"
+        )
+        constrained = _patch_build_constrained_llm(canned)
+        monkeypatch.setenv("TZ", "America/Los_Angeles")
+        time.tzset()
+        try:
+            with patch.object(sp, "_build_constrained_llm", return_value=constrained):
+                result = await parse_structured("txt", list[IsoDatePercentile], parser_llm)
+        finally:
+            monkeypatch.delenv("TZ")
+            time.tzset()
+
+        assert [type(item) for item in result] == [IsoDatePercentile] * 3
+        assert result[0].value == datetime(2026, 9, 16, 12, tzinfo=UTC)
+        assert result[1].value == datetime(2026, 9, 17, 9, 30, tzinfo=UTC)
+        assert result[2].value == datetime(2026, 9, 18, tzinfo=UTC)
+        # The epoch the numeric pipeline will run on is the UTC one, whatever the host clock says.
+        assert result[0].value.timestamp() == datetime(2026, 9, 16, 12, tzinfo=UTC).timestamp()
+
+    @pytest.mark.asyncio
+    async def test_a_bare_number_or_truncated_date_fails_the_constrained_path(self, parser_llm) -> None:
+        """pydantic would read ``2027`` as a unix timestamp; the wrapper refuses, so the constrained
+        path fails and the ``structure_output`` fallback (typed on the same model) gets its turn."""
+        for bad in (
+            '{"percentiles": [{"percentile": 0.5, "value": 2027}]}',
+            '{"percentiles": [{"percentile": 0.5, "value": "2027-06-1"}]}',
+        ):
+            constrained = _patch_build_constrained_llm(bad)
+            fallback = AsyncMock(return_value=[])
+            with (
+                patch.object(sp, "_build_constrained_llm", return_value=constrained),
+                patch.object(sp, "structure_output", new=fallback),
+            ):
+                await parse_structured("t", list[IsoDatePercentile], parser_llm)
+            fallback.assert_awaited_once()
+            assert fallback.await_args is not None
+            assert fallback.await_args.kwargs["output_type"] == list[IsoDatePercentile]
+
+    def test_wrapper_shape_and_dispatch(self) -> None:
+        w = DatePercentileListWrapper.model_validate({"percentiles": [{"percentile": 0.5, "value": "2026-09-16"}]})
+        assert w.percentiles[0].value == datetime(2026, 9, 16, 12, tzinfo=UTC)
+        assert sp._get_wrapper_type(list[IsoDatePercentile]) == (DatePercentileListWrapper, "percentiles")
+        assert sp._get_wrapper_type(list[Percentile]) == (PercentileListWrapper, "percentiles")
+
+
+class TestBinProbabilityWrapper:
+    """The per-bin salvage rung: ``list[BinProbability]`` needs its own wrapper, or the constrained
+    schema falls back to a bare list and the parser LLM's output is unconstrained."""
+
+    @pytest.mark.asyncio
+    async def test_bin_probability_list_wrapper_unwrap(self, parser_llm) -> None:
+        canned = (
+            '{"bins": ['
+            '{"label": "below_range", "probability": 0.1},'
+            '{"label": "2026-09-16", "probability": 0.6},'
+            '{"label": "above_range", "probability": 0.3}'
+            "]}"
+        )
+        constrained = _patch_build_constrained_llm(canned)
+        with patch.object(sp, "_build_constrained_llm", return_value=constrained) as build_mock:
+            result = await parse_structured("txt", list[BinProbability], parser_llm)
+
+        assert [type(item) for item in result] == [BinProbability] * 3
+        assert [(item.label, item.probability) for item in result] == [
+            ("below_range", 0.1),
+            ("2026-09-16", 0.6),
+            ("above_range", 0.3),
+        ]
+        schema_model, _ = build_mock.call_args[0]
+        assert schema_model is BinProbabilityListWrapper
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_bin_list_falls_back_on_the_same_output_type(self, parser_llm) -> None:
+        constrained = _patch_build_constrained_llm('{"bins": [{"label": "0"}]}')
+        fallback = AsyncMock(return_value=[])
+        with (
+            patch.object(sp, "_build_constrained_llm", return_value=constrained),
+            patch.object(sp, "structure_output", new=fallback),
+        ):
+            await parse_structured("t", list[BinProbability], parser_llm)
+        fallback.assert_awaited_once()
+        assert fallback.await_args is not None
+        assert fallback.await_args.kwargs["output_type"] == list[BinProbability]
+
+    def test_wrapper_shape_and_dispatch(self) -> None:
+        w = BinProbabilityListWrapper.model_validate({"bins": [{"label": "7", "probability": 1.0}]})
+        assert w.bins[0].label == "7"
+        assert w.bins[0].probability == 1.0
+        assert sp._get_wrapper_type(list[BinProbability]) == (BinProbabilityListWrapper, "bins")
+
+
+class TestListWrapperTable:
+    """One table maps a list item type to its wrapper AND the wrapper's list field. Two parallel dispatch
+    chains let a wrapper land in one and miss the other, which fell off the end of the constrained path
+    into a second paid ``structure_output`` call with nothing logged."""
+
+    def test_every_wrapper_field_is_the_list_of_its_item_type(self) -> None:
+        assert set(sp._LIST_WRAPPERS) == {Percentile, IsoDatePercentile, OptionProbability, BinProbability}
+        for item_type, (wrapper, list_field) in sp._LIST_WRAPPERS.items():
+            assert wrapper.model_fields[list_field].annotation == list[item_type], (item_type, wrapper, list_field)
+
+    def test_a_non_list_or_unknown_item_type_has_no_wrapper(self) -> None:
+        assert sp._get_wrapper_type(BinaryPrediction) is None
+        assert sp._get_wrapper_type(list[BinaryPrediction]) is None

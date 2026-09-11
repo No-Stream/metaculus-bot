@@ -14,7 +14,7 @@ Cloudflare, CloudFront and DataDome hosts are IP-blocked.
 
 So this script runs four probes per URL and prints one table plus a ladder block:
 
-  A  the bot's REAL client — ``resolution_source._get_session()``, so the browser
+  A  the bot's REAL client — ``guard._get_session()``, so the browser
      headers, the SSRF FilteringResolver and the fetcher's own HTTP timeout are
      exactly what a live run uses.
   B  the same GET through curl_cffi with ``impersonate="chrome"``, which presents a
@@ -40,13 +40,13 @@ So this script runs four probes per URL and prints one table plus a ladder block
      ``success`` with the attempt still ``blocked``.
 
 Everything here is free: no LLM call, no API key spent, no paid provider, and no write
-of any kind. Column D runs the production escalation ladder, whose one PAID rung (the
-Gemini ``url_context`` read) is gated on ``RESOLUTION_SOURCE_URL_CONTEXT_ENABLED`` and a
-``GOOGLE_API_KEY``. Both would be present on a laptop mirroring prod, so :func:`main`
-forces the flag OFF in the process environment before any probe runs (see
-:func:`_disable_the_paid_rung`): the rung then declines on its flag before it looks for
-its key, whatever ``.env`` supplied. That makes the free property STRUCTURAL rather than
-a matter of which environment the script happened to run in.
+of any kind. Column D runs the production escalation ladder with its page-digest seat
+replaced by the deterministic BM25 implementation. Its paid Gemini ``url_context`` rung
+is gated on ``RESOLUTION_SOURCE_URL_CONTEXT_ENABLED`` and a ``GOOGLE_API_KEY``. Both would
+be present on a laptop mirroring prod, so :func:`main` forces the flag OFF in the process
+environment before any probe runs (see :func:`_disable_the_paid_rung`): the rung then
+declines on its flag before it looks for its key, whatever ``.env`` supplied. Together
+those two substitutions make the free property structural.
 
 Politeness: probes run strictly sequentially, with at least ``_HOST_SPACING_S``
 between two requests to the same host, and every request carries a timeout. Column D
@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Literal, NamedTuple
 from urllib.parse import urlparse
@@ -69,10 +70,13 @@ from curl_cffi import CurlError
 from curl_cffi import requests as curl_requests
 
 from metaculus_bot.constants import RESOLUTION_SOURCE_MAX_RESPONSE_BYTES, RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV
+from metaculus_bot.research.fetch_ladder.digest import bm25_digest
+from metaculus_bot.research.fetch_ladder.guard import _get_session, is_public_http_url
+from metaculus_bot.research.fetch_ladder.policy import RESOLUTION_SOURCE_POLICY
 from metaculus_bot.research.http_fetch import read_body_capped
 from metaculus_bot.research.impersonated_fetch import reset_impersonation_memo
 from metaculus_bot.research.resolution_fetch_result import FetchResult, RungAttempt
-from metaculus_bot.research.resolution_source import _get_session, fetch_resolution_sources, is_public_http_url
+from metaculus_bot.research.resolution_source import fetch_resolution_sources
 from metaculus_bot.research.wayback import parse_snapshot_url, snapshot_age_days, wayback_snapshot_url
 
 _HOST_SPACING_S = 1.0
@@ -322,10 +326,11 @@ async def probe_ladder(url: str) -> LadderOutcome:
     same page from the same egress: the direct fetch and, when that fails, the meta-refresh hop,
     the impersonated retry, the local PDF read, the browser render (which declines on a runner
     with no Chromium installed, as the ``renderer_unavailable`` skip), the derived feed and the
-    archive. The paid ``url_context`` rung declines on the flag :func:`main` forced off. ``query``
-    is empty because there is no question here; it only ranks which passages of a document a
-    forecaster sees. ``fast_path=False`` so no rung declines for the thin-window mode a real
-    question might be in.
+    archive. The paid ``url_context`` rung declines on the flag :func:`main` forced off, and the
+    production page-digest seat is replaced by its deterministic BM25 fallback. ``query`` is empty
+    because there is no question here; it only ranks which passages of a document a forecaster
+    sees. ``fast_path=False`` so no rung declines for the thin-window mode a real question might be
+    in.
 
     No exception is caught: a failed fetch comes back as a ``FetchResult`` with its own status,
     and anything that RAISES out of the provider is a bug this diagnostic should crash on.
@@ -336,7 +341,10 @@ async def probe_ladder(url: str) -> LadderOutcome:
     result is always first by construction (F5), and this is a contract of the provider, not a
     failure, so it is read rather than caught.
     """
-    results: list[FetchResult] = await fetch_resolution_sources([url], query="", fast_path=False)
+    diagnostic_policy = replace(RESOLUTION_SOURCE_POLICY, digest=bm25_digest)
+    results: list[FetchResult] = await fetch_resolution_sources(
+        [url], query="", fast_path=False, fetch_policy=diagnostic_policy
+    )
     result = results[0]
     return LadderOutcome(
         status=result.status,
@@ -411,7 +419,7 @@ def print_table(rows: list[ProbeRow]) -> None:
 
 def print_ladder(rows: list[ProbeRow]) -> None:
     """Column D on its own lines: the rung pairs are too wide for the table."""
-    print("D  production ladder (fetch_resolution_sources, paid url_context rung forced off)")
+    print("D  production ladder (page digest free; paid url_context rung forced off)")
     for index, row in enumerate(rows, start=1):
         print(f"  {index:>2}  {row.probe_url.source_class:<18}  {row.ladder.render()}")
     print()

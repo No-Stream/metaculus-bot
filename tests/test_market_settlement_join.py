@@ -173,6 +173,14 @@ class TestQuestionDomains:
     def test_self_reference_domains_are_the_two_measured_ones(self):
         assert frozenset({"kalshi.com", "metaculus.com"}) == SELF_REFERENCE_DOMAINS
 
+    def test_the_mantic_competition_site_is_a_self_reference_but_the_rest_of_mantic_com_is_not(self):
+        """The Mantic question site is excluded through `is_metaculus_self_ref` (hostname level)
+        and deliberately NOT through `SELF_REFERENCE_DOMAINS`, which is keyed on registrable
+        domains: `mantic.com` also carries the company's blog, a legitimate outside source, so the
+        set cannot name the competition host without swallowing the blog."""
+        assert question_domains("Companion question at https://competitions.mantic.com/questions/650/.") == set()
+        assert question_domains("Per https://blog.mantic.com/forecasting-the-fed/.") == {"mantic.com"}
+
 
 class TestSettlementDomainIndex:
     def test_indexes_event_level_settlement_sources(self, kalshi_events):

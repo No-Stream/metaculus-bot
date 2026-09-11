@@ -70,13 +70,29 @@ class TestKwargsPassthrough:
         assert kwargs["model"] == "openrouter/openai/gpt-5.6-luna"
         assert kwargs["parallel_tool_calls"] is True
         assert kwargs["reasoning_effort"] == "high"
-        # litellm's OpenrouterConfig doesn't map reasoning_effort; without the
-        # whitelist, litellm.drop_params=True (set globally by forecasting_tools)
-        # silently strips it and drivers run at model-default effort.
+        # Without the whitelist, forecasting_tools' global litellm.drop_params=True silently strips the effort.
         assert kwargs["allowed_openai_params"] == ["reasoning_effort"]
         assert kwargs["temperature"] is None
         assert kwargs["tools"] == tools
+        assert "tool_choice" not in kwargs
         assert kwargs["api_key"] == _PERSONAL
+
+    @pytest.mark.asyncio
+    async def test_tool_choice_is_forwarded_when_given(
+        self, acompletion: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The ghost phase sends the research turns' tools with ``tool_choice="none"`` so the cached
+        prompt prefix (which includes the tool definitions) still matches; both must reach litellm."""
+        _set_keys(monkeypatch, donated=None, personal=_PERSONAL)
+        monkeypatch.setattr(agentic_llm, "should_route_via_donated_key", lambda model: False)
+        call = agentic_llm.build_default_llm_call(_config())
+        tools = [{"type": "function", "function": {"name": "fetch"}}]
+
+        await call(_messages(), tools, tool_choice="none")
+
+        kwargs = _last_kwargs(acompletion)
+        assert kwargs["tools"] == tools
+        assert kwargs["tool_choice"] == "none"
 
     @pytest.mark.asyncio
     async def test_existing_prefix_not_doubled(self, acompletion: AsyncMock, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -139,6 +155,22 @@ class TestKeyRouting:
         assert second.kwargs["api_key"] == _PERSONAL
 
     @pytest.mark.asyncio
+    async def test_fallback_retry_keeps_tools_and_tool_choice(
+        self, acompletion: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _set_keys(monkeypatch, donated=_DONATED, personal=_PERSONAL)
+        monkeypatch.setattr(agentic_llm, "should_route_via_donated_key", lambda model: True)
+        monkeypatch.setattr(agentic_llm, "should_retry_with_general_key", lambda exc: True)
+        acompletion.side_effect = [RuntimeError("401 unauthorized: invalid api key"), {"ok": True}]
+        tools = [{"type": "function", "function": {"name": "fetch"}}]
+
+        await agentic_llm.build_default_llm_call(_config())(_messages(), tools, tool_choice="none")
+
+        for attempt in acompletion.await_args_list:
+            assert attempt.kwargs["tools"] == tools
+            assert attempt.kwargs["tool_choice"] == "none"
+
+    @pytest.mark.asyncio
     async def test_credit_role_metadata_names_the_key_each_attempt_bills(
         self, acompletion: AsyncMock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -169,6 +201,24 @@ class TestKeyRouting:
         )
 
     @pytest.mark.asyncio
+    async def test_question_ref_on_the_config_is_stamped_on_every_call(
+        self, acompletion: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The driver is the one transport built per question, so it is the one that can name the
+        question a PROMPT_SIZE_ALERT fired on."""
+        _set_keys(monkeypatch, donated=None, personal=_PERSONAL)
+        monkeypatch.setattr(agentic_llm, "should_route_via_donated_key", lambda model: False)
+        config = LoopConfig(model="openai/gpt-5.6-luna", question_ref="https://www.metaculus.com/questions/650/")
+
+        await agentic_llm.build_default_llm_call(config)(_messages(), None)
+
+        assert _last_kwargs(acompletion)["metadata"] == llm_call_metadata(
+            agentic_llm.GAP_FILL_V2_DRIVER_ROLE,
+            PERSONAL_KEY_ALIAS,
+            question_ref="https://www.metaculus.com/questions/650/",
+        )
+
+    @pytest.mark.asyncio
     async def test_fallback_is_counted_and_logged_like_the_wrapper(
         self, acompletion: AsyncMock, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -192,8 +242,7 @@ class TestKeyRouting:
             await call(_messages(), None)
 
         assert fallback_openrouter.get_generic_key_fallback_count() == 1
-        # A 401 is not a credit shortfall, so the suppression subset stays empty:
-        # generic adds once, at most one subset subtracts (CLAUDE.md invariant).
+        # A 401 is not a credit shortfall, so the credit subset stays empty (generic adds once, one subset at most).
         assert fallback_openrouter.get_credit_key_fallback_count() == 0
         assert any("PAID PERSONAL-KEY FALLBACK" in message for message in caplog.messages)
         assert any("openrouter/openai/gpt-5.6-luna" in message for message in caplog.messages)
@@ -291,3 +340,45 @@ class TestKeyRouting:
 
         acompletion.assert_awaited_once()
         assert _last_kwargs(acompletion)["api_key"] == _PERSONAL
+
+
+class TestDonatedMasterSwitch:
+    """The one place this file runs the REAL ``should_route_via_donated_key`` rather than a stub.
+
+    ``build_default_llm_call`` binds the predicate by name, so a Mantic run's
+    ``DONATED_OPENROUTER_KEY_ENABLED=false`` has to reach it through the real function. The
+    v2 driver is the highest-volume donated-key path in the bot, so it must bill the personal
+    key with no donated attempt and no fallback wrapper when the switch is off.
+    """
+
+    @pytest.mark.asyncio
+    async def test_switch_off_bills_personal_with_no_donated_attempt(
+        self, acompletion: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _set_keys(monkeypatch, donated=_DONATED, personal=_PERSONAL)
+        monkeypatch.setenv("DONATED_OPENROUTER_KEY_ENABLED", "false")
+
+        call = agentic_llm.build_default_llm_call(_config("openai/gpt-5.6-luna"))
+        await call(_messages(), None)
+
+        acompletion.assert_awaited_once()
+        kwargs = _last_kwargs(acompletion)
+        assert kwargs["api_key"] == _PERSONAL
+        assert kwargs["metadata"] == llm_call_metadata(agentic_llm.GAP_FILL_V2_DRIVER_ROLE, PERSONAL_KEY_ALIAS)
+
+    @pytest.mark.asyncio
+    async def test_switch_unset_routes_donated_first(
+        self, acompletion: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Companion: same keys, switch unset, and the real predicate picks the donated key, which
+        shows the test above is exercising the switch rather than a stub."""
+        _set_keys(monkeypatch, donated=_DONATED, personal=_PERSONAL)
+        monkeypatch.delenv("DONATED_OPENROUTER_KEY_ENABLED", raising=False)
+
+        call = agentic_llm.build_default_llm_call(_config("openai/gpt-5.6-luna"))
+        await call(_messages(), None)
+
+        acompletion.assert_awaited_once()
+        kwargs = _last_kwargs(acompletion)
+        assert kwargs["api_key"] == _DONATED
+        assert kwargs["metadata"] == llm_call_metadata(agentic_llm.GAP_FILL_V2_DRIVER_ROLE, DONATED_KEY_ALIAS)

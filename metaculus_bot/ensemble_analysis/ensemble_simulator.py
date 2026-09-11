@@ -223,9 +223,7 @@ class EnsembleSimulator:
                 q_id = report.question.id_of_question
                 if q_id not in question_data:
                     q_type = get_question_type(report)
-                    # DEPRECATED: community_prediction_at_access_time is always None for
-                    # newly-fetched questions (Metaculus removed aggregations from list API).
-                    # This field may still have values in historical benchmark data.
+                    # None on newly-fetched questions, set on historical benchmarks; see docs/operations.md.
                     bin_cp = (
                         getattr(report.question, "community_prediction_at_access_time", None)
                         if q_type == "binary"
@@ -351,13 +349,13 @@ class EnsembleSimulator:
                 score = self._score_aggregated_question(
                     data["question"], members, q_type=data["question_type"], strategy=strategy
                 )
-            except Exception as e:  # noqa: BLE001  # soft-fail boundary: one unaggregatable question must not abort the simulation
+            except ValueError as e:
+                # The only failure the _score_* methods raise for an unscoreable prediction; a bug still crashes.
                 logger.warning(f"Failed to aggregate predictions for question {q_id}: {e}")
                 continue
             if score is not None:
                 ensemble_scores.append(score)
 
-        # Return average ensemble performance across all questions
         result = float(np.mean(ensemble_scores)) if ensemble_scores else 0.0
         logger.debug(f"Ensemble {models} with {strategy}: {len(ensemble_scores)} questions, avg score {result:.2f}")
         return result
@@ -371,7 +369,7 @@ class EnsembleSimulator:
         if question_type != "binary":
             raise ValueError(f"Baseline scoring is only implemented for binary questions, got {question_type!r}")
 
-        # Use the exact formula from binary_report.py line 86.
+        # Formula copied from forecasting_tools.data_models.binary_report.BinaryReport.expected_baseline_score.
         c = float(community_prediction)
         p = float(prediction_value)
 

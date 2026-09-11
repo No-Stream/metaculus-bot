@@ -11,6 +11,8 @@ description + schema with its handler.
 
 from __future__ import annotations
 
+from metaculus_bot.constants import MANTIC_HOST, METACULUS_HOST
+
 SEARCH_NEWS_DESCRIPTION = (
     "Search recent and historical NEWS coverage (AskNews). Use for: events,\n"
     "announcements, things that happened, ongoing-situation updates. Query with a\n"
@@ -42,7 +44,11 @@ FETCH_DESCRIPTION = (
     "refetch). Links in the result are leads you can fetch next.\n"
     "Use read_document instead only when you need a specific question answered\n"
     "from inside a long/complex document.\n"
-    "Do NOT fetch metaculus.com URLs — the question brief already reflects them.\n"
+    f"Do NOT fetch {METACULUS_HOST} or {MANTIC_HOST} URLs — the question brief already reflects them.\n"
+    "FRED economic series, Kalshi and Polymarket market prices, and Yahoo Finance quotes are\n"
+    "already in the research briefing (its financial-data and prediction-market sections) via\n"
+    "their APIs — cite those rather than fetching these hosts as web pages.\n"
+    "Use fred_series or yahoo_history for a different date window, and market_snapshot for current prices.\n"
     'Example: fetch(url="https://www.ons.gov.uk/releases/gdpquarterly")\n'
     'Example: fetch(url="https://example.gov/long-report", start_char=12000)'
 )

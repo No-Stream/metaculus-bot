@@ -43,12 +43,14 @@ from dataclasses import dataclass
 QID_KIND_POST_ID = "post_id"
 QID_KIND_QUESTION_ID = "question_id"
 
-# The id embedded in a Metaculus page URL (a POST id, except comment-backfill
-# records which build the URL from the question id). Duplicated from
+# The id embedded in a question-platform page URL (a POST id, except comment-backfill
+# records which build the URL from the question id): Metaculus's question and community
+# URL shapes, and Mantic's (competitions.mantic.com, a Metaculus-platform fork; the rest
+# of mantic.com is not a question platform). Duplicated from
 # ``scripts.backfill_research_from_logs.QID_PATTERN`` because scripts stay free of
 # package imports (same convention as the telemetry markers' local qid_kind
 # literals); ``tests/test_id_mapping.py`` pins the two patterns equal.
-PAGE_URL_ID_PATTERN = re.compile(r"metaculus\.com/(?:questions|c/[^/]+)/(\d+)")
+PAGE_URL_ID_PATTERN = re.compile(r"(?:metaculus\.com/(?:questions|c/[^/]+)|competitions\.mantic\.com/questions)/(\d+)")
 
 
 def _coerce_int(value: object) -> int | None:

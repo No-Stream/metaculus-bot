@@ -22,9 +22,11 @@ from metaculus_bot.prompts import (
 )
 from tests.prompt_builders import (
     _binary_q,
+    _date_prompt_text,
     _extract_last_json_block,
     _mc_q,
     _numeric_q,
+    _pmf_prompt_text,
 )
 
 
@@ -190,6 +192,17 @@ class TestNumericPromptThirteenPercentiles:
         assert "all 13 percentiles" in lowered or "all 13 standard" in lowered
         assert "11 percentiles" not in lowered
 
+    def test_date_prompt_json_block_has_all_thirteen_keys_in_order(self) -> None:
+        """The date prompt renders the same 13 keys, in the same order, with ISO-date values."""
+        result = _date_prompt_text()
+        structured_section = result[result.find("STRUCTURED FORECAST") :]
+        indices = [structured_section.find(f'"{key}"') for key in self._PERCENTILE_KEYS]
+        assert all(index >= 0 for index in indices), f"missing percentile key in date example: {indices}"
+        assert indices == sorted(indices), f"date percentile keys out of order: {indices}"
+        lowered = " ".join(result.lower().split())
+        assert "13 standard percentiles" in lowered
+        assert "11 percentiles" not in lowered
+
     def test_stacking_numeric_prompt_json_block_has_all_thirteen_keys_in_order(self) -> None:
         result = stacking_numeric_prompt(
             _numeric_q(),
@@ -260,6 +273,8 @@ _EXAMPLE_BLOCK_BUILDERS = [
         lambda: numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm"),
         id="numeric",
     ),
+    pytest.param(_date_prompt_text, id="date"),
+    pytest.param(_pmf_prompt_text, id="pmf"),
     pytest.param(
         lambda: stacking_binary_prompt(_binary_q(), research="r", base_predictions=["a1", "a2"]),
         id="stacking_binary",
@@ -283,7 +298,7 @@ _EXAMPLE_BLOCK_BUILDERS = [
 
 class TestStructuredForecastExampleBlocks:
     """Every builder's STRUCTURED FORECAST example must PARSE, and must not re-grow a
-    key the 2026-09-02 de-bloat retired.
+    key the 2026-09-02 de-bloat retired. The per-bin example is the one built from a grid.
 
     These examples are static literals, so the only thing that breaks them is a source
     edit — and until this test existed most of them were guarded by substring checks only,
@@ -308,7 +323,7 @@ class TestStructuredForecastExampleBlocks:
     @pytest.mark.parametrize("build_prompt", _EXAMPLE_BLOCK_BUILDERS)
     def test_example_block_parses(self, build_prompt: Callable[[], str]) -> None:
         parsed = json.loads(_extract_last_json_block(build_prompt()))
-        assert parsed["question_type"] in {"binary", "multiple_choice", "numeric"}
+        assert parsed["question_type"] in {"binary", "multiple_choice", "numeric", "date", "pmf"}
 
     @pytest.mark.parametrize("build_prompt", _EXAMPLE_BLOCK_BUILDERS)
     def test_example_block_carries_no_retired_key(self, build_prompt: Callable[[], str]) -> None:
@@ -330,6 +345,9 @@ class TestStructuredForecastExampleBlocks:
         )
         assert json.loads(_extract_last_json_block(base))["outcome_type"] == "continuous"
         assert "outcome_type" not in json.loads(_extract_last_json_block(stacking))
+        # Nor the date prompt: integer snapping on an epoch axis is meaningless, and the date
+        # runner records no discrete vote.
+        assert "outcome_type" not in json.loads(_extract_last_json_block(_date_prompt_text()))
         # The stacking prompt still DESCRIBES the field where it names what the base
         # members' own blocks carry; what went is its own schema instruction.
         stacking_schema = stacking[stacking.rfind("STRUCTURED FORECAST") :]
@@ -340,6 +358,7 @@ class TestStructuredForecastExampleBlocks:
         Notes, in both numeric prompts. The header keeps it (it is the definition)."""
         for build in (
             lambda: numeric_prompt(_numeric_q(), research="r", lower_bound_message="lbm", upper_bound_message="ubm"),
+            _date_prompt_text,
             lambda: stacking_numeric_prompt(
                 _numeric_q(),
                 research="r",

@@ -30,10 +30,7 @@ logger: logging.Logger = logging.getLogger(__name__)
 DEFAULT_TIMEOUT_SECONDS = 600
 DEFAULT_CLAUDE_EXECUTABLE = "claude"
 
-# The judge needs NO tools: it reads a prompt (which embeds web-derived research
-# text — an injection surface) and emits JSON. Enumerated deny list rather than
-# an empty --allowedTools, whose parse shape correlated with past run failures
-# (see _build_argv docstring). Unknown names are harmless string matches.
+# An enumerated deny list, not the empty --allowedTools whose parse shape correlated with past run failures.
 _DISALLOWED_TOOLS = (
     "Bash,Edit,Write,MultiEdit,NotebookEdit,Read,Grep,Glob,LS,WebFetch,WebSearch,Task,Agent,TodoWrite,KillShell"
 )
@@ -46,38 +43,17 @@ def _settings_payload() -> str:
 def _build_argv(system_prompt: str, *, claude_executable: str = DEFAULT_CLAUDE_EXECUTABLE) -> list[str]:
     """Assemble the ``claude -p`` argv for a single headless invocation.
 
-    Flags:
-      -p / --print                 headless single-shot
-      --output-format text         plain text output (canonical pattern from a
-                                   sibling headless-Claude research harness; a
-                                   stage's response IS JSON because we ask for
-                                   it in the prompt — we don't need an outer
-                                   JSON envelope wrapping it).
-      --max-turns 1                one shot
-      --disallowedTools <list>     deny every tool (see _DISALLOWED_TOOLS)
-      --settings '{...}'           force-disable prompt-caching 1H beta (the
-                                   headless gateway rejects the
-                                   ``prompt-caching-2025-XX-XX`` beta header,
-                                   producing 400 invalid-beta-flag → exit 1).
-                                   Diagnosed 2026-05-06.
-      --append-system-prompt <s>   the calling stage's system prompt
-
-    NOTE: we deliberately do NOT pass ``--bare``. The successful run #5 of the
-    redactor pipeline DID use ``--bare`` but a follow-up run with the same flag
-    set failed — the precise cause is unclear, but the canonical pattern in that
-    sibling harness runs without ``--bare`` and is known to work for thousands
-    of headless invocations against the same gateway. Cargo-culting that
-    pattern.
-
-    Tool posture (hardened 2026-08-27 after a security review): the judge is a
-    pure text-in/JSON-out call whose prompt embeds WEB-DERIVED research text, so
-    a prompt injection steering one tool call was a real local-execution risk
-    under the old ``--permission-mode bypassPermissions``. Every tool is now
-    denied via the enumerated ``--disallowedTools`` list and the permission mode
-    is left at the headless default (deny). The historical fragility note stands
-    for the OTHER shape: ``--allowedTools ""`` (empty allowlist) was the flag
-    correlated with run failures and remains avoided — an enumerated deny list
-    does not share that parse shape.
+    Three of the flags carry receipts. ``--settings`` force-disables the 1H
+    prompt-caching beta, whose header the headless gateway rejects with a 400
+    invalid-beta-flag and exit 1 (diagnosed 2026-05-06). ``--bare`` is absent on
+    purpose: one redactor run succeeded with it and the next failed on the same
+    flag, while the sibling headless harness that runs thousands of invocations
+    against this gateway passes it never. ``--disallowedTools`` denies every tool
+    with the permission mode left at the headless default, hardened 2026-08-27
+    after a security review: the prompt embeds web-derived research text, so an
+    injection steering one tool call was a local-execution risk under the old
+    ``--permission-mode bypassPermissions``. The empty ``--allowedTools ""``
+    shape stays avoided, being the one correlated with run failures.
     """
     return [
         claude_executable,
@@ -119,10 +95,7 @@ async def _run_claude_subprocess(
             timeout=timeout_seconds,
         )
     except TimeoutError:
-        # asyncio.wait_for cancels the awaitable but does NOT terminate the
-        # underlying OS subprocess. Without proc.kill(), the orphan keeps
-        # running until the model finishes on its own. At 50q x 3 iterations
-        # the leaked FDs + process slots compound until fork() starts failing.
+        # wait_for cancels the await, not the child: at 50 questions x 3 iterations the orphans exhaust fork().
         logger.warning(
             "claude -p subprocess timeout (%ss); killing pid=%s",
             timeout_seconds,
@@ -130,11 +103,7 @@ async def _run_claude_subprocess(
         )
         proc.kill()
         try:
-            # must await proc.wait() here to reap the killed child; the outer
-            # `raise` re-raises the original TimeoutError after cleanup. If the
-            # task itself is cancelled mid-await the kill has already been
-            # issued, so the leak is bounded either way. Bounded by an inner
-            # 5s timeout so a child that refuses SIGKILL doesn't pin us.
+            # Reap the killed child, bounded so one refusing SIGKILL cannot pin the run.
             await asyncio.wait_for(proc.wait(), timeout=5.0)
         except TimeoutError:
             logger.error("claude -p subprocess pid=%s refused SIGKILL within 5s", proc.pid)
@@ -150,6 +119,11 @@ async def _run_claude_subprocess(
 
     stdout_text = stdout_bytes.decode("utf-8", errors="replace")
     return _extract_inner_result(stdout_text)
+
+
+def excerpt(text: str, *, limit: int) -> str:
+    """The head of ``text`` for a log line or error message; a subagent's blob runs to megabytes."""
+    return text[:limit]
 
 
 def _extract_inner_result(stdout_text: str) -> str:
@@ -171,12 +145,10 @@ def _extract_inner_result(stdout_text: str) -> str:
     try:
         envelope: Any = json.loads(stripped)
     except json.JSONDecodeError:
-        # Passthrough preserved for backwards compat with raw-JSON test stubs;
-        # log a warning so a Claude-CLI envelope-shape change doesn't surface
-        # as a misleading downstream parser error.
+        # Passthrough kept for raw-JSON test stubs; the warning keeps a CLI envelope change from reading as a parser error.
         logger.warning(
             "claude -p stdout was not parseable JSON; returning raw (first 200 chars: %r)",
-            stripped[:200],  # HARNESS-SCAN-EXEMPT-subsampling  # log-line display truncation
+            excerpt(stripped, limit=200),
         )
         return stripped
     if isinstance(envelope, list):

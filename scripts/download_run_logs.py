@@ -1,9 +1,9 @@
 """Download GHA run-log artifacts and harvest telemetry markers into a durable archive.
 
-All five bot workflows tee stdout+stderr to ``run_logs/`` and upload it:
+All six bot workflows tee stdout+stderr to ``run_logs/`` and upload it:
 
-* every one of them (the three PROD workflows tournament / metaculus_cup / minibench, plus
-  ``test_bot`` and ``test_bot_basic``) bundles ``run_logs/`` INSIDE the
+* every one of them (the four PROD workflows tournament / metaculus_cup / minibench / mantic,
+  plus ``test_bot`` and ``test_bot_basic``) bundles ``run_logs/`` INSIDE the
   ``research-<run_id>`` artifact, alongside ``research_outputs/``;
 * the two test workflows uploaded a SEPARATE ``logs-<run_id>`` artifact until 2026-08-03,
   and those stay on GHA until their 90-day retention expires.

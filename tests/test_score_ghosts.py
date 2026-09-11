@@ -12,6 +12,7 @@ import json
 import math
 import sys
 from pathlib import Path
+from typing import ClassVar
 
 import numpy as np
 import pytest
@@ -19,6 +20,7 @@ import pytest
 import metaculus_bot.numeric.pchip_cdf as pchip_mod
 from metaculus_bot.numeric.config import grid_step_constraints
 from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf
+from metaculus_bot.scoring_common import binary_log_score
 from scripts.score_ghosts import join_and_score, main, parse_ghost_summary, render_report
 
 
@@ -52,9 +54,7 @@ def _pre_ghost(qid: int, payload: dict, run_date: str = "2026-07-17T00:00:00Z", 
 
 
 def _binary_record(qid: int, resolution, our_prob_yes) -> dict:
-    # The scorer joins ghosts on ``post_id`` (a ghost's qid is the Metaculus post id
-    # parsed from page_url). ``question_id`` is the disjoint sub-question id, so set it
-    # to a deliberately-different value to keep the fixtures honest about the join key.
+    """A binary record whose ``question_id`` deliberately differs from ``post_id``, the scorer's join key."""
     return {
         "post_id": qid,
         "question_id": qid + 100_000,
@@ -76,8 +76,7 @@ def _numeric_record(
     open_upper=False,
     zero_point=None,
 ) -> dict:
-    # post_id is the join key (ghost qid == post id); question_id is the disjoint
-    # sub-question id — kept different on purpose (see _binary_record).
+    """A numeric record; like ``_binary_record``, its ``question_id`` differs from the ``post_id`` join key."""
     return {
         "post_id": qid,
         "question_id": qid + 100_000,
@@ -152,11 +151,7 @@ class TestJoinAndScore:
         assert summary["n_scored"] == 0
 
     def test_join_keys_on_post_id_not_question_id(self):
-        # A ghost's qid is the Metaculus POST id (from page_url); the collector emits
-        # post_id and the disjoint sub-question question_id separately. The join MUST
-        # key on post_id: a record whose question_id equals the ghost qid but whose
-        # post_id does not must NOT join (this is exactly what the old question_id-keyed
-        # code got wrong — it joined on the disjoint id space and always missed).
+        """Keying on the disjoint ``question_id`` instead of ``post_id`` was the old bug: it always missed."""
         ghost = [_legacy_ghost(42, "binary", "posterior_prob=0.90")]
         wrong_key = {
             "post_id": 999,  # ghost qid (42) != post_id -> no join
@@ -183,8 +178,7 @@ class TestJoinAndScore:
         assert summary["n_scored"] == 0
 
     def test_legacy_numeric_ghost_unscoreable_median_only(self):
-        # The legacy GHOST_FORECAST marker exposes only the numeric median, so a
-        # numeric log score isn't computable from it — reported as an honest gap.
+        """Legacy markers expose only the median, so no numeric log score is computable: an honest gap."""
         legacy = [_legacy_ghost(2, "numeric", "median=42.5")]
         records = [_numeric_record(2, 40.0, _pchip_cdf({5: 10, 50: 40, 95: 90}))]
         summary = join_and_score([], legacy, records)
@@ -228,7 +222,7 @@ class TestJsonSourceGhosts:
         assert summary["multiple_choice"]["mean_delta"] > 0
 
     def test_json_wins_over_legacy_for_same_qid(self):
-        # A malformed-but-present legacy ghost and a JSON ghost on the same qid: JSON wins.
+        """A malformed-but-present legacy ghost and a JSON ghost on the same qid: JSON wins."""
         legacy = [_legacy_ghost(1, "binary", "posterior_prob=0.10")]
         json_ghosts = [_json_ghost(1, {"qtype": "binary", "prob": 0.90})]
         summary = join_and_score(json_ghosts, legacy, [_binary_record(1, True, 0.50)])
@@ -411,7 +405,7 @@ class TestMainReadsThePreMarkerFromTheArchive:
         assert summary["split_by_pre_identity"]["no_pre_marker"]["n"] == 0
 
     def test_archive_without_the_pre_marker_file_still_scores(self, tmp_path: Path, monkeypatch):
-        # Pre-marker-era archives have no ghost_pre_json.jsonl at all.
+        """Pre-marker-era archives have no ghost_pre_json.jsonl at all."""
         summary = self._run_main(tmp_path, monkeypatch, [_json_ghost(1, {"qtype": "binary", "prob": 0.80})])
         assert summary["n_scored"] == 1
         assert summary["split_by_pre_identity"]["no_pre_marker"]["n"] == 1
@@ -419,9 +413,7 @@ class TestMainReadsThePreMarkerFromTheArchive:
 
 class TestNumericPairedScoring:
     def test_tight_json_numeric_ghost_beats_wide_published(self):
-        # Published is wide across [0,100]; the ghost is tight around the median.
-        # The resolution lands at 50, so the tight ghost concentrates more mass on
-        # the resolution bucket -> higher numeric log score -> positive delta.
+        """A tight ghost around the resolution out-scores a wide published CDF, so the delta is positive."""
         published_cdf = _pchip_cdf({5: 10, 25: 30, 50: 50, 75: 70, 95: 90})
         record = _numeric_record(1, 50.0, published_cdf)
         json_ghosts = [
@@ -441,7 +433,6 @@ class TestNumericPairedScoring:
         row = summary["numeric"]["rows"][0]
         assert isinstance(row["ghost_log_score"], float)
         assert isinstance(row["published_log_score"], float)
-        # Tight+correct ghost out-scores the wide published forecast.
         assert row["delta"] > 0
         assert summary["n_scored"] == 1
 
@@ -471,10 +462,7 @@ class TestNumericPairedScoring:
         assert "numeric: n=1" in report
 
     def test_open_lower_bound_numeric_scored(self):
-        # generate_pchip_cdf declares the flags as (open_upper, open_lower) and
-        # numeric_log_score as (open_lower, open_upper); both are keyword-only now, so a
-        # transposition can no longer typecheck. This still exercises the wiring end to
-        # end — that the open-lower flag reaches BOTH destinations (scores stay finite).
+        """The open-lower flag must reach both the ghost CDF build and the score, keeping both finite."""
         published_cdf = _pchip_cdf({5: 20, 50: 50, 95: 90}, open_lower=True)
         record = _numeric_record(1, 50.0, published_cdf, open_lower=True)
         json_ghosts = [_json_ghost(1, {"qtype": "numeric", "declared_percentiles": {0.05: 25, 0.5: 55, 0.95: 85}})]
@@ -487,7 +475,7 @@ class TestNumericPairedScoring:
         assert math.isfinite(row["delta"])
 
     def test_open_upper_bound_numeric_scored(self):
-        # Same wiring check for the other flag.
+        """Same wiring check for the other flag."""
         published_cdf = _pchip_cdf({5: 20, 50: 50, 95: 90}, open_upper=True)
         record = _numeric_record(1, 50.0, published_cdf, open_upper=True)
         json_ghosts = [_json_ghost(1, {"qtype": "numeric", "declared_percentiles": {0.05: 15, 0.5: 45, 0.95: 95}})]
@@ -500,8 +488,7 @@ class TestNumericPairedScoring:
         assert math.isfinite(row["delta"])
 
     def test_log_scale_zero_point_numeric_scored(self):
-        # Log-scaled question: zero_point=0 with a positive floor => geometric grid. The
-        # zero_point must thread identically through the ghost CDF build and both scores.
+        """A log-scaled question's ``zero_point`` must thread through the ghost CDF build and both scores."""
         published_cdf = _pchip_cdf({5: 30, 50: 100, 95: 300}, lower=1.0, upper=1000.0, zero_point=0.0)
         record = _numeric_record(1, 100.0, published_cdf, lower=1.0, upper=1000.0, zero_point=0.0)
         json_ghosts = [_json_ghost(1, {"qtype": "numeric", "declared_percentiles": {0.05: 40, 0.5: 110, 0.95: 260}})]
@@ -514,8 +501,7 @@ class TestNumericPairedScoring:
         assert math.isfinite(row["delta"])
 
     def test_numeric_unscoreable_when_scaling_missing_bounds(self):
-        # scaling without range_min => resolve_numeric_record_to_score_inputs returns None,
-        # so a valid published CDF + valid ghost percentiles still can't be paired.
+        """Scaling without ``range_min`` yields no score inputs, so a valid CDF and ghost cannot pair."""
         published_cdf = _pchip_cdf({5: 10, 50: 50, 95: 90})
         record = {
             "post_id": 1,
@@ -533,8 +519,7 @@ class TestNumericPairedScoring:
         assert summary["numeric"]["unscoreable_reasons"] == {"no_score_inputs": 1}
 
     def test_numeric_unscoreable_when_cdf_build_fails(self):
-        # Degenerate ghost percentiles at the fraction bounds (0.0 -> pct 0, 1.0 -> pct 100):
-        # generate_pchip_cdf filters both out and raises, classified as cdf_build_failed.
+        """Percentiles at the fraction bounds get filtered out, so the CDF build raises: cdf_build_failed."""
         published_cdf = _pchip_cdf({5: 10, 50: 50, 95: 90})
         record = _numeric_record(1, 50.0, published_cdf)
         json_ghosts = [_json_ghost(1, {"qtype": "numeric", "declared_percentiles": {0.0: 10, 1.0: 90}})]
@@ -543,13 +528,7 @@ class TestNumericPairedScoring:
         assert summary["numeric"]["unscoreable_reasons"] == {"cdf_build_failed": 1}
 
     def test_native_discrete_ghost_scored_on_reduced_grid(self):
-        # Native-discrete questions (Metaculus type == "discrete") publish a CDF on a
-        # reduced grid (cdf_size != 201). Prod resamples the aggregate onto that grid;
-        # _score_numeric mirrors it by building the ghost with num_points=len(published_cdf),
-        # so the reduced-grid case pairs cleanly instead of being dropped. (This is the
-        # discrete mechanism the scorer CAN reproduce from the record — integer-snap on
-        # 201-point continuous questions is a separate, prod-side-only decision; see the
-        # _score_numeric docstring.)
+        """Native-discrete questions publish on a reduced grid, so the ghost is built with the same num_points."""
         min_step = round(0.01 / 20, 9)
         published_cdf, _ = generate_pchip_cdf(
             {5: 5, 50: 10, 95: 15},
@@ -587,11 +566,9 @@ class TestGhostGridScaledMaxStep:
     """
 
     def test_concentrated_discrete_ghost_retains_bin_above_020(self, monkeypatch):
-        # grok's Q38880 concentrated low-count shape (~30% mass on integer 0), count 0-7,
-        # open upper. On a 9-point grid the P(0) bin (cdf[1]-cdf[0]) must stay above 0.25.
+        """grok's Q38880 shape (~30% mass on integer 0) must keep P(0) above 0.25 on the 9-point grid."""
         min_step, max_step = grid_step_constraints(9)
-        # Any valid 9-point published CDF fixes num_points=9; its shape only feeds the
-        # published log score, not the ghost CDF whose bins we assert on.
+        # Any valid 9-point published CDF fixes num_points=9; its shape feeds only the published score.
         published_cdf, _ = generate_pchip_cdf(
             {5: 1, 50: 3, 95: 6},
             open_upper_bound=True,
@@ -614,9 +591,7 @@ class TestGhostGridScaledMaxStep:
             captured["max_step"] = kwargs.get("max_step")
             return cdf, flag
 
-        # _score_numeric imports generate_pchip_cdf lazily from this module, so patching
-        # the module attribute captures the ghost build (published_cdf was built above,
-        # before the patch, with the real function).
+        # _score_numeric imports generate_pchip_cdf lazily, so patching the module attribute catches the ghost build.
         monkeypatch.setattr(pchip_mod, "generate_pchip_cdf", spy)
 
         record = _numeric_record(1, 0.0, published_cdf, lower=-0.5, upper=7.5, open_upper=True)
@@ -635,11 +610,7 @@ class TestGhostGridScaledMaxStep:
         assert p_zero > 0.25, f"ghost P(0)={p_zero} was clipped by the 0.2 cap"
 
     def test_paired_score_symmetric_on_concentrated_discrete_grid(self):
-        # Build the published CDF and the ghost from the SAME concentrated percentiles on
-        # the same coarse (9-point) grid. With the grid-scaled max-step the scorer rebuilds
-        # the ghost identically to the published side, so the paired delta is exactly 0.
-        # Under the bug the ghost was clipped at 0.2 while the published side was not — a
-        # spurious nonzero delta penalizing the concentrated ghost.
+        """Identical percentiles on the same coarse grid must give delta 0; the bug clipped only the ghost."""
         concentrated_pct = {20.0: 0.30, 40.0: 0.65, 50.0: 0.90, 80.0: 2.20, 90.0: 3.20, 99.0: 6.60}
         min_step, max_step = grid_step_constraints(9)
         published_cdf, _ = generate_pchip_cdf(
@@ -663,3 +634,157 @@ class TestGhostGridScaledMaxStep:
         assert summary["numeric"]["n_unscoreable"] == 0
         row = summary["numeric"]["rows"][0]
         assert row["delta"] == pytest.approx(0.0, abs=1e-9)
+
+
+class TestGhostsWithoutAScorer:
+    """Gap-fill v2 emits date ghosts and nothing here can score one: the residual dataset
+    excludes date questions by decision, so no date record exists to join, and the tally has no
+    date arm should one ever appear. Both facts are counted and named in the report; before this
+    a date ghost fell off the end of the type dispatch with no trace, so the operator read the
+    missing pairs as questions still waiting on resolutions."""
+
+    _DATE_PAYLOAD: ClassVar[dict] = {
+        "qtype": "date",
+        "declared_percentiles": {"0.1": 1_789_000_000.0, "0.5": 1_789_040_000.0, "0.9": 1_789_080_000.0},
+        "median": 1_789_040_000.0,
+    }
+
+    def test_date_ghosts_are_counted_in_the_inventory_and_named_in_the_report(self):
+        json_ghosts = [_json_ghost(1, self._DATE_PAYLOAD), _json_ghost(2, {"qtype": "binary", "prob": 0.9})]
+        summary = join_and_score(json_ghosts, [], [_binary_record(2, True, 0.5)])
+
+        assert summary["qtype_counts"] == {"binary": 1, "date": 1}
+        assert summary["n_joined"] == 1  # the date ghost had no record to join
+        assert summary["joined_without_scorer"] == {}
+        report = render_report(summary)
+        assert "by type: binary=1 date=1" in report
+        assert "date ghosts cannot be scored" in report
+
+    def test_a_joined_ghost_of_a_type_without_a_scorer_is_counted_not_dropped(self):
+        date_record = {**_numeric_record(1, 1_789_040_000.0, [0.0, 0.5, 1.0]), "type": "date"}
+        unparsed_legacy = [_legacy_ghost(3, "unknown", "")]
+        records = [date_record, _binary_record(3, True, 0.5)]
+        summary = join_and_score([_json_ghost(1, self._DATE_PAYLOAD)], unparsed_legacy, records)
+
+        assert summary["n_joined"] == 2
+        assert summary["n_scored"] == 0
+        assert summary["joined_without_scorer"] == {"date": 1, "unknown": 1}
+        assert "joined but no scorer for the type: date=1 unknown=1" in render_report(summary)
+
+    def test_a_report_without_date_ghosts_says_nothing_about_them(self):
+        summary = join_and_score([_json_ghost(1, {"qtype": "binary", "prob": 0.9})], [], [_binary_record(1, True, 0.5)])
+        report = render_report(summary)
+        assert "by type: binary=1" in report
+        assert "date ghosts" not in report
+        assert "no scorer" not in report
+
+
+def _v1_ghost(qid: int, payload: dict, run_date: str = "2026-07-17T00:00:00Z", run_id: str = "run-1") -> dict:
+    """A harvested GHOST_FORECAST_V1_JSON record: the ghost re-asked with gap-fill v1's section (2026-09-09)."""
+    return {
+        "marker": "ghost_forecast_v1_json",
+        "qid": qid,
+        "run_id": run_id,
+        "run_date": run_date,
+        "seq": 0,
+        "forecast_json": json.dumps(payload, separators=(",", ":")),
+    }
+
+
+class TestSameDriverPairedReads:
+    """Two ghost variants of the same driver, same question, same run, both scored against the resolution.
+
+    Pre versus post isolates what v2's own research did to the driver; plain versus with-v1 isolates
+    v1's section. Both are the same-model instrument the cost pass computed by hand on 2026-09-09
+    (``scratch/cost_pass_2026-09-09/ghost_pre_post.py``), so the ensemble never confounds the read.
+    """
+
+    def test_pre_post_read_scores_the_research_effect_on_the_moved_pairs_only(self):
+        json_ghosts = [
+            _json_ghost(1, {"qtype": "binary", "prob": 0.80}),
+            _json_ghost(2, {"qtype": "binary", "prob": 0.60}),
+        ]
+        pre_ghosts = [
+            _pre_ghost(1, {"qtype": "binary", "prob": 0.30}),
+            _pre_ghost(2, {"qtype": "binary", "prob": 0.60}),
+        ]
+        records = [_binary_record(1, True, 0.50), _binary_record(2, True, 0.50)]
+
+        block = join_and_score(json_ghosts, [], records, pre_ghosts=pre_ghosts)["pre_post"]
+
+        assert (block["n_paired"], block["n_identical"], block["moved"]["n"]) == (2, 1, 1)
+        expected = binary_log_score(0.80, True) - binary_log_score(0.30, True)
+        assert block["moved"]["mean_delta"] == pytest.approx(expected)
+        assert block["moved"]["median_delta"] == pytest.approx(expected)
+        assert (block["moved"]["n_toward"], block["moved"]["n_away"]) == (1, 0)
+        assert block["moved"]["by_type"] == {"binary": block["moved"]["by_type"]["binary"]}
+        assert block["moved"]["by_type"]["binary"]["n"] == 1
+        assert block["moved"]["left_mean"] == pytest.approx(binary_log_score(0.30, True))
+        assert block["moved"]["right_mean"] == pytest.approx(binary_log_score(0.80, True))
+        assert block["moved"]["published_mean"] == pytest.approx(binary_log_score(0.50, True))
+        assert block["unpaired"] == {}
+
+    def test_partners_from_other_runs_missing_or_unscoreable_are_counted_not_paired(self):
+        json_ghosts = [
+            _json_ghost(1, {"qtype": "binary", "prob": 0.80}, run_id="run-B"),
+            _json_ghost(2, {"qtype": "binary", "prob": 0.70}),
+            _json_ghost(3, {"qtype": "binary", "prob": 0.70}),
+            _json_ghost(4, {"qtype": "binary", "prob": 0.70}),
+        ]
+        pre_ghosts = [
+            _pre_ghost(1, {"qtype": "binary", "prob": 0.30}, run_id="run-A"),
+            _pre_ghost(3, {"qtype": "binary", "prob": 0.30}),
+            _pre_ghost(4, {"qtype": "multiple_choice", "option_probs": {"A": 1.0}}),
+        ]
+        records = [_binary_record(1, True, 0.5), _binary_record(2, True, 0.5), _binary_record(4, True, 0.5)]
+
+        block = join_and_score(json_ghosts, [], records, pre_ghosts=pre_ghosts)["pre_post"]
+
+        assert block["n_paired"] == 0
+        assert block["unpaired"] == {
+            "partner from a different run": 1,
+            "no partner marker": 1,
+            "no resolved record": 1,
+            "qtype mismatch": 1,
+        }
+        report = render_report(join_and_score(json_ghosts, [], records, pre_ghosts=pre_ghosts))
+        assert "Pre-research dry run vs concluding ghost" in report
+        assert "paired: 0 (no GHOST_PRE_JSON / GHOST_FORECAST_JSON pair on a resolved question yet)" in report
+
+    def test_v1_pairs_measure_v1s_marginal_value_on_the_driver(self):
+        json_ghosts = [
+            _json_ghost(1, {"qtype": "binary", "prob": 0.40}),
+            _json_ghost(2, {"qtype": "binary", "prob": 0.90}),
+        ]
+        v1_ghosts = [_v1_ghost(1, {"qtype": "binary", "prob": 0.70}), _v1_ghost(2, {"qtype": "binary", "prob": 0.60})]
+        records = [_binary_record(1, True, 0.50), _binary_record(2, True, 0.50)]
+
+        summary = join_and_score(json_ghosts, [], records, v1_ghosts=v1_ghosts)
+        block = summary["v1_pairs"]
+
+        assert (block["n_paired"], block["n_identical"], block["moved"]["n"]) == (2, 0, 2)
+        deltas = sorted(row["delta"] for row in block["rows"])
+        assert deltas[0] == pytest.approx(binary_log_score(0.60, True) - binary_log_score(0.90, True))
+        assert deltas[1] == pytest.approx(binary_log_score(0.70, True) - binary_log_score(0.40, True))
+        assert (block["moved"]["n_toward"], block["moved"]["n_away"]) == (1, 1)
+        assert block["moved"]["sign_test_p"] == pytest.approx(1.0)
+        report = render_report(summary)
+        assert "Ghost with gap-fill v1 vs plain ghost" in report
+        assert "paired: 2  byte-identical: 0  moved: 2" in report
+        assert "toward 1 / away 1, sign test p=1.000" in report
+        assert "ladder on the moved pairs: plain " in report
+
+    def test_v1_read_reports_waiting_while_the_marker_has_no_records(self):
+        summary = join_and_score([_json_ghost(1, {"qtype": "binary", "prob": 0.9})], [], [_binary_record(1, True, 0.5)])
+        assert summary["v1_pairs"]["n_paired"] == 0
+        assert "paired: 0 (GHOST_FORECAST_V1 ships 2026-09-09; waiting on resolutions)" in render_report(summary)
+
+
+class TestMainReadsTheV1MarkerFromTheArchive(TestMainReadsThePreMarkerFromTheArchive):
+    """Same load-or-it-is-deletable argument as the pre marker: ``main`` must read ``ghost_forecast_v1_json``."""
+
+    def test_v1_ghost_is_read_off_disk_and_paired(self, tmp_path: Path, monkeypatch):
+        records = [_json_ghost(1, {"qtype": "binary", "prob": 0.30}), _v1_ghost(1, {"qtype": "binary", "prob": 0.80})]
+        summary = self._run_main(tmp_path, monkeypatch, records)
+        assert summary["v1_pairs"]["n_paired"] == 1
+        assert summary["v1_pairs"]["moved"]["n_toward"] == 1

@@ -9,12 +9,15 @@ logger = logging.getLogger(__name__)
 
 RESEARCH_SCHEMA_VERSION = 2
 
+__all__ = ["RESEARCH_SCHEMA_VERSION", "ResearchPersistenceWriter"]
+
 
 class ResearchPersistenceWriter:
     """Accumulates research records during a bot run and flushes to JSONL."""
 
-    def __init__(self, run_mode: str, tournament_id: str, run_id: str) -> None:
+    def __init__(self, run_mode: str, platform: str, tournament_id: str, run_id: str) -> None:
         self._run_mode = run_mode
+        self._platform = platform
         self._tournament_id = tournament_id
         self._run_id = run_id
         self._records: list[dict] = []
@@ -38,38 +41,12 @@ class ResearchPersistenceWriter:
     ) -> None:
         """Record a single question's research output.
 
-        ``qid`` is the Metaculus QUESTION id (``id_of_question``); the archive keys
-        ``latest/<qid>.json`` on it. ``post_id`` is the separate POST id (the id in
-        ``page_url``) and diverges from ``qid`` on newer posts. It is written as an
-        explicit field so residual analysis can join a research record to telemetry
-        markers keyed on the post id (``GAP_FILL_V2`` / ``GHOST_FORECAST``) and to
-        the perf dataset WITHOUT re-parsing the page URL. Additive: it defaults to
-        None (older readers and the URL still carry the post id) so nothing breaks.
+        Several arguments are archive fields whose names do not say what they mean:
+        ``qid`` versus ``post_id``, the legacy ``providers_used``, the optional
+        ``gap_fill_v2`` / ``provider_diagnostics_block`` / ``asknews_raw`` keys, and the
+        ``platform`` tag. All of them are additive and safe for passthrough readers.
 
-        ``providers_used`` is legacy and ambiguous — in live-capture records it
-        meant "attempted", in comment-backfill records "succeeded-with-output".
-        It is kept for back-compat with old archive readers; ``provider_results``
-        is the authoritative per-provider outcome, with ``providers_attempted`` /
-        ``providers_succeeded`` as unambiguous derived lists. The new args default
-        to None so older callers (and backfill paths) keep working.
-
-        ``gap_fill_v2`` carries the agentic-loop trace (``transcript`` +
-        ``telemetry`` + ``ghost`` dicts, the last nullable) when the v2 loop
-        ran; the key is written only in that case so records stay compact when
-        the flag is off.
-
-        ``provider_diagnostics_block`` is the rendered ``## Provider Diagnostics``
-        markdown. Since the diagnostics seam (2026-07) it is no longer embedded in
-        ``research_text`` (forecasters must not see it), so it is archived as its
-        own field to keep records self-contained for grep-based triage.
-
-        ``asknews_raw`` is the raw pre-summarization AskNews article markdown
-        (2026-07-18 audit hygiene): ``research_text`` carries only the
-        summarizer's briefing, so without this field FETCH-vs-SUMMARIZE
-        attribution and summarizer replays require fresh paid AskNews pulls.
-        Written only when AskNews actually ran and returned articles (empty on
-        fallback/prose paths). Additive with passthrough readers — no
-        schema-version bump, same reasoning as ``provider_diagnostics_block``.
+        Field semantics: docs/performance_analysis.md "The research record's fields".
         """
         record: dict[str, object] = {
             "schema_version": RESEARCH_SCHEMA_VERSION,
@@ -83,6 +60,7 @@ class ResearchPersistenceWriter:
             "providers_succeeded": providers_succeeded if providers_succeeded is not None else [],
             "provider_results": provider_results if provider_results is not None else [],
             "run_mode": self._run_mode,
+            "platform": self._platform,
             "tournament_id": self._tournament_id,
             "timestamp": datetime.now(UTC).isoformat(),
             "run_id": self._run_id,

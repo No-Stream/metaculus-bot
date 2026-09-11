@@ -4,7 +4,7 @@ Measured 2026-09-04 from a GitHub Actions runner (`scripts/probes/fetch_diagnost
 Akamai-fronted federal hosts answered the bot's own aiohttp client 403 and the same GET through
 `curl_cffi` with Chrome impersonation 200, so the refusal was a fingerprint verdict and is
 recoverable client-side. The transport (`research/impersonated_fetch.py`) is patched at the
-import seam `resolution_source.fetch_impersonated` throughout; the suite's `_block_native_egress`
+import seam `fetch_ladder.rungs.fetch_impersonated` throughout; the suite's `_block_native_egress`
 guard stays armed underneath, so a rung that reached the real transport would fail at teardown.
 """
 
@@ -25,6 +25,10 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_MAX_RESPONSE_BYTES,
 )
 from metaculus_bot.research import impersonated_fetch, resolution_source
+from metaculus_bot.research.fetch_ladder import classify, rungs
+from metaculus_bot.research.fetch_ladder.context import LadderContext
+from metaculus_bot.research.fetch_ladder.ladder import _fetch_one
+from metaculus_bot.research.fetch_ladder.rungs import _WAYBACK_TRIGGER_STATUSES, _impersonate_rung_applies
 from metaculus_bot.research.impersonated_fetch import (
     IMPERSONATE_TRIGGER_STATUSES,
     ImpersonateBodyTooLarge,
@@ -39,13 +43,7 @@ from metaculus_bot.research.impersonated_fetch import (
 )
 from metaculus_bot.research.resolution_fetch_result import ROUTE_CAVEATS, FetchResult, FetchStatus
 from metaculus_bot.research.resolution_presentation import format_resolution_sections
-from metaculus_bot.research.resolution_source import (
-    _WAYBACK_TRIGGER_STATUSES,
-    FetchContext,
-    _fetch_one,
-    _impersonate_rung_applies,
-    _rung_counts,
-)
+from metaculus_bot.research.resolution_source import _rung_counts
 from metaculus_bot.research.wayback import wayback_snapshot_url
 from scripts.telemetry.markers import parse_log_text
 from tests.resolution_source_fakes import (
@@ -67,7 +65,8 @@ from tests.test_document_text import build_text_pdf
 
 _NOW = datetime(2026, 9, 4, tzinfo=UTC)
 _SECOND_URL = "https://tracker.example.com/house"
-_LOGGER = "metaculus_bot.research.resolution_source"
+# The package prefix: the rung's own lines sit under `fetch_ladder.rungs`, the markers under the fetcher.
+_LOGGER = "metaculus_bot.research"
 _META = {
     "run_id": "999",
     "workflow": "tournament",
@@ -104,7 +103,7 @@ def _arm_the_retry(monkeypatch):
 
 def _transport(monkeypatch, answer) -> list[dict[str, object]]:
     calls: list[dict[str, object]] = []
-    monkeypatch.setattr(resolution_source, "fetch_impersonated", fake_impersonated_fetch(answer, calls))
+    monkeypatch.setattr(rungs, "fetch_impersonated", fake_impersonated_fetch(answer, calls))
     return calls
 
 
@@ -160,7 +159,7 @@ class TestImpersonateRungRescue:
         calls = _transport(monkeypatch, _impersonated(200, body=_prose_page(_RENDERED_PROSE)))
         host_sems: dict[str, asyncio.Semaphore] = {}
 
-        result = await _fetch_one(_refused_page(), _URL, host_sems, FetchContext(now=_NOW))
+        result = await _fetch_one(_refused_page(), _URL, host_sems, LadderContext(now=_NOW))
 
         assert result.status == "success"
         assert result.route == "impersonate"
@@ -190,21 +189,21 @@ class TestImpersonateRungRescue:
         assert call["document_max_bytes"] == DOCUMENT_TEXT_PDF_MAX_BYTES
 
     async def test_the_retry_is_bounded_by_the_remaining_wall(self, monkeypatch):
-        monkeypatch.setattr(FetchContext, "rung_budget_s", lambda self: 7.5)
+        monkeypatch.setattr(LadderContext, "rung_budget_s", lambda self: 7.5)
         calls = _transport(monkeypatch, _impersonated(200, body=_prose_page(_RENDERED_PROSE)))
-        before = resolution_source.time.monotonic()
+        before = rungs.time.monotonic()
 
-        await _fetch_one(_refused_page(), _URL, {}, FetchContext(now=_NOW))
+        await _fetch_one(_refused_page(), _URL, {}, LadderContext(now=_NOW))
 
         (call,) = calls
         deadline = call["deadline_monotonic_s"]
         assert isinstance(deadline, float)
-        assert before + 7.5 <= deadline <= resolution_source.time.monotonic() + 7.5
+        assert before + 7.5 <= deadline <= rungs.time.monotonic() + 7.5
 
     async def test_the_rescue_renders_the_impersonate_caveat(self, monkeypatch):
         _transport(monkeypatch, _impersonated(200, body=_prose_page(_RENDERED_PROSE)))
 
-        result = await _fetch_one(_refused_page(), _URL, {}, FetchContext(now=_NOW))
+        result = await _fetch_one(_refused_page(), _URL, {}, LadderContext(now=_NOW))
         rendered = format_resolution_sections([result], _NOW)
 
         assert ROUTE_CAVEATS["impersonate"] in rendered
@@ -214,7 +213,7 @@ class TestImpersonateRungRescue:
         monkeypatch.setenv(RESOLUTION_SOURCE_IMPERSONATE_ENABLED_ENV, "true")
         calls = _transport(monkeypatch, _impersonated(200, body=_prose_page(_RENDERED_PROSE)))
 
-        result = await _fetch_one(_refused_page(), _URL, {}, FetchContext(now=_NOW))
+        result = await _fetch_one(_refused_page(), _URL, {}, LadderContext(now=_NOW))
 
         assert len(calls) == 1
         assert result.route == "impersonate"
@@ -224,7 +223,7 @@ class TestImpersonateRungRescue:
         the fast-path gate is reserved for the browser and the paid read."""
         calls = _transport(monkeypatch, _impersonated(200, body=_prose_page(_RENDERED_PROSE)))
 
-        result = await _fetch_one(_refused_page(), _URL, {}, FetchContext(now=_NOW, fast_path=True))
+        result = await _fetch_one(_refused_page(), _URL, {}, LadderContext(now=_NOW, fast_path=True))
 
         assert len(calls) == 1
         assert result.route == "impersonate"
@@ -239,7 +238,7 @@ class TestImpersonateRungStillRefused:
         _transport(monkeypatch, _impersonated(403, body=b"denied", server="AkamaiGHost"))
 
         with caplog.at_level(logging.INFO, logger=_LOGGER):
-            result = await _fetch_one(_refused_page(), _URL, {}, FetchContext(now=_NOW))
+            result = await _fetch_one(_refused_page(), _URL, {}, LadderContext(now=_NOW))
 
         # The DIRECT result, diagnostics intact, with the fired rung stamped onto it.
         assert result.status == "blocked"
@@ -266,7 +265,7 @@ class TestImpersonateRungStillRefused:
         `error` exactly as before while the host is still switched off for the run."""
         _transport(monkeypatch, _impersonated(status, body=b""))
 
-        result = await _fetch_one(_refused_page(), _URL, {}, FetchContext(now=_NOW))
+        result = await _fetch_one(_refused_page(), _URL, {}, LadderContext(now=_NOW))
 
         assert result.status == "blocked"
         assert [a.outcome for a in result.rung_attempts] == [outcome]
@@ -282,8 +281,8 @@ class TestImpersonateRungStillRefused:
         )
 
         with caplog.at_level(logging.INFO, logger=_LOGGER):
-            first = await _fetch_one(session, _URL, {}, FetchContext(now=_NOW))
-            second = await _fetch_one(session, _SECOND_URL, {}, FetchContext(now=_NOW))
+            first = await _fetch_one(session, _URL, {}, LadderContext(now=_NOW))
+            second = await _fetch_one(session, _SECOND_URL, {}, LadderContext(now=_NOW))
             resolution_source._log_fetch_outcome_markers(1, [second])
 
         assert len(calls) == 1
@@ -310,7 +309,7 @@ class TestImpersonateRungStillRefused:
         _transport(monkeypatch, _impersonated(403, body=b"denied", url=answered))
 
         with caplog.at_level(logging.INFO, logger=_LOGGER):
-            result = await _fetch_one(_refused_page(), _URL, {}, FetchContext(now=_NOW))
+            result = await _fetch_one(_refused_page(), _URL, {}, LadderContext(now=_NOW))
 
         assert result.status == "blocked"
         assert [a.outcome for a in result.rung_attempts] == ["blocked"]
@@ -331,7 +330,7 @@ class TestImpersonateRungStillRefused:
         interstitial, memoized above)."""
         _transport(monkeypatch, _impersonated(status, body=b""))
 
-        result = await _fetch_one(_refused_page(), _URL, {}, FetchContext(now=_NOW))
+        result = await _fetch_one(_refused_page(), _URL, {}, LadderContext(now=_NOW))
 
         assert result.status == "blocked"
         assert [a.outcome for a in result.rung_attempts] == [outcome]
@@ -349,8 +348,8 @@ class TestImpersonateRungStillRefused:
             }
         )
 
-        first = await _fetch_one(session, _URL, {}, FetchContext(now=_NOW))
-        second = await _fetch_one(session, _SECOND_URL, {}, FetchContext(now=_NOW))
+        first = await _fetch_one(session, _URL, {}, LadderContext(now=_NOW))
+        second = await _fetch_one(session, _SECOND_URL, {}, LadderContext(now=_NOW))
 
         assert first.status == "blocked"
         assert [a.outcome for a in first.rung_attempts] == ["not_found"]
@@ -359,10 +358,13 @@ class TestImpersonateRungStillRefused:
         assert second.route == "impersonate"
 
     async def test_a_200_that_classifies_as_unreadable_declines_and_leaves_the_paid_rung_reachable(self, monkeypatch):
-        """Replacing `blocked` with `js_wall` on the page's record would change the fetch line
-        without giving any later rung a way to act on it (the browser block keys on `direct`), so
-        the rung stamps its own verdict on the attempt and leaves the direct result standing."""
+        """Resolution-source keeps its original off-site fallback after an unreadable retry."""
         _transport(monkeypatch, _impersonated(200, body=_JS_SHELL))
+
+        async def _browser_must_not_run(*_args, **_kwargs):
+            raise AssertionError("resolution-source does not render an unreadable impersonated retry")
+
+        monkeypatch.setattr(rungs, "render_page", _browser_must_not_run)
         reader, reads = paid_reader()
         arm_paid_rung(monkeypatch, reader)
         session = FakeSession(
@@ -372,7 +374,7 @@ class TestImpersonateRungStillRefused:
             }
         )
 
-        result = await _fetch_one(session, _URL, {}, FetchContext(now=_NOW, query="ask"))
+        result = await _fetch_one(session, _URL, {}, LadderContext(now=_NOW, query="ask"))
 
         assert [call["url"] for call in reads] == [_URL]
         assert result.status == "success"
@@ -386,7 +388,7 @@ class TestImpersonateRungStillRefused:
     async def test_with_nothing_after_it_the_unreadable_200_leaves_blocked_standing(self, monkeypatch):
         _transport(monkeypatch, _impersonated(200, body=_JS_SHELL))
 
-        result = await _fetch_one(_refused_page(), _URL, {}, FetchContext(now=_NOW))
+        result = await _fetch_one(_refused_page(), _URL, {}, LadderContext(now=_NOW))
 
         assert result.status == "blocked"
         assert result.route == "impersonate"
@@ -401,7 +403,7 @@ class TestImpersonateRungStillRefused:
         fact with it."""
         _transport(monkeypatch, _impersonated(200, body=_menu_tree_page()))
 
-        result = await _fetch_one(_refused_page(), _URL, {}, FetchContext(now=_NOW))
+        result = await _fetch_one(_refused_page(), _URL, {}, LadderContext(now=_NOW))
 
         assert result.status == "blocked"
         assert result.route == "impersonate"
@@ -418,7 +420,7 @@ class TestImpersonateRungSkips:
         calls = _transport(monkeypatch, _impersonated(200, body=_prose_page(_RENDERED_PROSE)))
 
         with caplog.at_level(logging.INFO, logger=_LOGGER):
-            result = await _fetch_one(_refused_page(), _URL, {}, FetchContext(now=_NOW))
+            result = await _fetch_one(_refused_page(), _URL, {}, LadderContext(now=_NOW))
             resolution_source._log_fetch_outcome_markers(1, [result])
 
         assert calls == []
@@ -432,12 +434,12 @@ class TestImpersonateRungSkips:
 
     async def test_the_budget_floor_declines_before_anything_is_dialed(self, monkeypatch, caplog):
         monkeypatch.setattr(
-            FetchContext, "rung_budget_s", lambda self: RESOLUTION_SOURCE_IMPERSONATE_MIN_BUDGET_S - 0.5
+            LadderContext, "rung_budget_s", lambda self: RESOLUTION_SOURCE_IMPERSONATE_MIN_BUDGET_S - 0.5
         )
         calls = _transport(monkeypatch, _impersonated(200, body=_prose_page(_RENDERED_PROSE)))
 
         with caplog.at_level(logging.INFO, logger=_LOGGER):
-            result = await _fetch_one(_refused_page(), _URL, {}, FetchContext(now=_NOW))
+            result = await _fetch_one(_refused_page(), _URL, {}, LadderContext(now=_NOW))
             resolution_source._log_fetch_outcome_markers(1, [result])
 
         assert calls == []
@@ -457,7 +459,7 @@ class TestImpersonateRungSkips:
         _transport(monkeypatch, ImpersonateBudgetExhausted(waiting_on="the host gate"))
 
         with caplog.at_level(logging.INFO, logger=_LOGGER):
-            result = await _fetch_one(_refused_page(), _URL, {}, FetchContext(now=_NOW))
+            result = await _fetch_one(_refused_page(), _URL, {}, LadderContext(now=_NOW))
             resolution_source._log_fetch_outcome_markers(1, [result])
 
         assert result.status == "blocked"
@@ -479,7 +481,7 @@ class TestImpersonateRungSkips:
         _transport(monkeypatch, ImpersonateUnpinnable("tracker.example.com will not pin"))
 
         with caplog.at_level(logging.INFO, logger=_LOGGER):
-            result = await _fetch_one(_refused_page(), _URL, {}, FetchContext(now=_NOW))
+            result = await _fetch_one(_refused_page(), _URL, {}, LadderContext(now=_NOW))
             resolution_source._log_fetch_outcome_markers(1, [result])
 
         assert result.status == "blocked"
@@ -494,7 +496,7 @@ class TestImpersonateRungSkips:
         _transport(monkeypatch, ImpersonateTransportError(failure_class="tls", exc="SSLError"))
 
         with caplog.at_level(logging.INFO, logger=_LOGGER):
-            result = await _fetch_one(_refused_page(), _URL, {}, FetchContext(now=_NOW))
+            result = await _fetch_one(_refused_page(), _URL, {}, LadderContext(now=_NOW))
             resolution_source._log_fetch_outcome_markers(1, [result])
 
         assert result.status == "blocked"
@@ -530,7 +532,7 @@ class TestImpersonateRungSkips:
         _transport(monkeypatch, decline)
 
         with caplog.at_level(logging.INFO, logger=_LOGGER):
-            result = await _fetch_one(_refused_page(), _URL, {}, FetchContext(now=_NOW))
+            result = await _fetch_one(_refused_page(), _URL, {}, LadderContext(now=_NOW))
             resolution_source._log_fetch_outcome_markers(1, [result])
 
         assert result.status == "blocked"
@@ -567,7 +569,7 @@ class TestImpersonateRungLadderPosition:
 
     @pytest.fixture(autouse=True)
     def _arm_the_rungs_behind_it(self, monkeypatch):
-        monkeypatch.setattr(resolution_source, "_WAYBACK_TRIGGER_STATUSES", _WAYBACK_TRIGGER_STATUSES)
+        monkeypatch.setattr(rungs, "_WAYBACK_TRIGGER_STATUSES", _WAYBACK_TRIGGER_STATUSES)
 
     async def test_a_rescue_reaches_neither_the_archive_nor_the_paid_reader(self, monkeypatch):
         _transport(monkeypatch, _impersonated(200, body=_prose_page(_RENDERED_PROSE)))
@@ -575,7 +577,7 @@ class TestImpersonateRungLadderPosition:
         arm_paid_rung(monkeypatch, reader)
         session = self._session(archive_serves=True)
 
-        result = await _fetch_one(session, _URL, {}, FetchContext(now=_NOW, query="ask"))
+        result = await _fetch_one(session, _URL, {}, LadderContext(now=_NOW, query="ask"))
 
         assert result.route == "impersonate"
         assert [a.rung for a in result.rung_attempts] == ["impersonate"]
@@ -588,7 +590,7 @@ class TestImpersonateRungLadderPosition:
         arm_paid_rung(monkeypatch, reader)
         session = self._session(archive_serves=False)
 
-        result = await _fetch_one(session, _URL, {}, FetchContext(now=_NOW, query="ask"))
+        result = await _fetch_one(session, _URL, {}, LadderContext(now=_NOW, query="ask"))
 
         assert [a.rung for a in result.rung_attempts] == ["impersonate", "wayback", "url_context"]
         assert any(request.startswith("https://web.archive.org/") for request in session.requested)
@@ -599,7 +601,7 @@ class TestImpersonateRungLadderPosition:
         _transport(monkeypatch, _impersonated(403, body=b"denied"))
         session = self._session(archive_serves=True)
 
-        result = await _fetch_one(session, _URL, {}, FetchContext(now=_NOW))
+        result = await _fetch_one(session, _URL, {}, LadderContext(now=_NOW))
 
         assert result.route == "wayback"
         assert result.status == "success"
@@ -626,7 +628,7 @@ class TestImpersonateRungDialsTheLandingUrl:
     async def test_a_redirected_direct_fetch_hands_the_transport_its_final_url(self, monkeypatch):
         calls = _transport(monkeypatch, _impersonated(200, body=_prose_page(_RENDERED_PROSE), url=self._FINAL))
 
-        result = await _fetch_one(self._redirected_session(), _URL, {}, FetchContext(now=_NOW))
+        result = await _fetch_one(self._redirected_session(), _URL, {}, LadderContext(now=_NOW))
 
         assert [call["url"] for call in calls] == [self._FINAL]
         assert result.status == "success"
@@ -647,10 +649,10 @@ class TestImpersonateRungDialsTheLandingUrl:
         lives here too, and it declines before any attempt is opened."""
         calls = _transport(monkeypatch, _impersonated(200, body=_prose_page(_RENDERED_PROSE)))
         direct = FetchResult(url=landed, status="blocked", text="", http_status=403, content_type="text/html")
-        ctx = FetchContext(now=_NOW)
+        ctx = LadderContext(now=_NOW)
 
         with caplog.at_level(logging.WARNING, logger=_LOGGER):
-            result = await resolution_source._impersonate_rung(_URL, direct, host_sems={}, ctx=ctx)
+            result = await rungs._impersonate_rung(_URL, direct, host_sems={}, ctx=ctx)
 
         assert result is None
         assert calls == []
@@ -678,7 +680,7 @@ class TestImpersonateRungBodyClassification:
 
         with caplog.at_level(logging.INFO, logger=_LOGGER):
             result = await _fetch_one(
-                _refused_page(), _URL, {}, FetchContext(now=_NOW, query="hospitalizations reported")
+                _refused_page(), _URL, {}, LadderContext(now=_NOW, query="hospitalizations reported")
             )
             resolution_source._log_fetch_outcome_markers(1, [result])
 
@@ -703,7 +705,7 @@ class TestImpersonateRungBodyClassification:
     async def test_a_body_declared_pdf_that_is_not_one_is_unsupported_and_declines(self, monkeypatch):
         _transport(monkeypatch, _impersonated(200, body=b"<html>not a document</html>", content_type="application/pdf"))
 
-        result = await _fetch_one(_refused_page(), _URL, {}, FetchContext(now=_NOW))
+        result = await _fetch_one(_refused_page(), _URL, {}, LadderContext(now=_NOW))
 
         assert result.status == "blocked"
         assert [a.outcome for a in result.rung_attempts] == ["unsupported_type"]
@@ -719,7 +721,7 @@ class TestImpersonateRungBodyClassification:
     async def test_a_raw_body_rescue_goes_through_the_text_path(self, monkeypatch, content_type, body, expected):
         _transport(monkeypatch, _impersonated(200, body=body, content_type=content_type))
 
-        result = await _fetch_one(_refused_page(), _URL, {}, FetchContext(now=_NOW))
+        result = await _fetch_one(_refused_page(), _URL, {}, LadderContext(now=_NOW))
 
         assert result.status == "success"
         assert result.route == "impersonate"
@@ -730,7 +732,7 @@ class TestImpersonateRungBodyClassification:
     async def test_a_vacuous_raw_body_is_refused_and_declines(self, monkeypatch):
         _transport(monkeypatch, _impersonated(200, body=b"   \n", content_type="application/json"))
 
-        result = await _fetch_one(_refused_page(), _URL, {}, FetchContext(now=_NOW))
+        result = await _fetch_one(_refused_page(), _URL, {}, LadderContext(now=_NOW))
 
         assert result.status == "blocked"
         assert [a.outcome for a in result.rung_attempts] == ["empty_body"]
@@ -739,7 +741,7 @@ class TestImpersonateRungBodyClassification:
         """No header at all routes through the document branch and its `%PDF-` check."""
         _transport(monkeypatch, _impersonated(200, body=b"\x89PNG\r\n\x1a\nbinary", content_type=""))
 
-        result = await _fetch_one(_refused_page(), _URL, {}, FetchContext(now=_NOW))
+        result = await _fetch_one(_refused_page(), _URL, {}, LadderContext(now=_NOW))
 
         assert result.status == "blocked"
         assert [a.outcome for a in result.rung_attempts] == ["unsupported_type"]
@@ -771,15 +773,15 @@ class TestImpersonateRungBodyClassification:
         resolved through `_finish_document` on both sides, down to the `pdf_local` attempt each
         opens on its own context. Equal on every field a classification decides (`_shape`); the
         attempts are compared by rung and trigger because their wall times cannot be."""
-        direct_ctx = FetchContext(now=_NOW, query="hospitalizations reported")
-        impersonated_ctx = FetchContext(now=_NOW, query="hospitalizations reported")
+        direct_ctx = LadderContext(now=_NOW, query="hospitalizations reported")
+        impersonated_ctx = LadderContext(now=_NOW, query="hospitalizations reported")
 
-        via_direct = await resolution_source._resolution_response_outcome(
+        via_direct = await classify._resolution_response_outcome(
             FakeResponse(200, body=body, content_type=content_type), _URL, direct_ctx
         )
-        if isinstance(via_direct, resolution_source._PendingDocument):
-            via_direct = await resolution_source._finish_document(via_direct, direct_ctx)
-        via_impersonated = await resolution_source._impersonated_body_outcome(
+        if isinstance(via_direct, classify._PendingDocument):
+            via_direct = await classify._finish_document(via_direct, direct_ctx)
+        via_impersonated = await rungs._impersonated_body_outcome(
             _impersonated(200, body=body, content_type=content_type), impersonated_ctx
         )
 
@@ -820,17 +822,17 @@ class TestImpersonateRungMarkerLines:
         _transport(monkeypatch, _impersonated(200, body=_prose_page(_RENDERED_PROSE)))
 
         with caplog.at_level(logging.INFO, logger=_LOGGER):
-            result = await _fetch_one(_refused_page(), _URL, {}, FetchContext(now=_NOW))
+            result = await _fetch_one(_refused_page(), _URL, {}, LadderContext(now=_NOW))
             resolution_source._log_fetch_outcome_markers(44211, [result])
 
         assert (
-            f"RESOLUTION_SOURCE_FETCH: question=44211 url={_URL} status=ok http=200 embeds=none route=impersonate"
+            f"RESOLUTION_SOURCE_FETCH: question=44211 url={_URL} status=ok http=200 embeds=none route=impersonate caller=resolution_source"
             in caplog.messages
         )
         (line,) = _escalation_lines(caplog)
         assert re.fullmatch(
             rf"RESOLUTION_SOURCE_ESCALATION: question=44211 url={re.escape(_URL)} "
-            r"from_status=blocked rung=impersonate outcome=success wall_s=\d+\.\d\d",
+            r"from_status=blocked rung=impersonate outcome=success wall_s=\d+\.\d\d caller=resolution_source",
             line,
         )
         fetch, escalations = self._harvest(caplog)
@@ -852,12 +854,12 @@ class TestImpersonateRungMarkerLines:
         _transport(monkeypatch, _impersonated(403, body=b"denied", server="AkamaiGHost"))
 
         with caplog.at_level(logging.INFO, logger=_LOGGER):
-            result = await _fetch_one(_refused_page(), _URL, {}, FetchContext(now=_NOW))
+            result = await _fetch_one(_refused_page(), _URL, {}, LadderContext(now=_NOW))
             resolution_source._log_fetch_outcome_markers(44211, [result])
 
         assert (
             f"RESOLUTION_SOURCE_FETCH: question=44211 url={_URL} status=blocked http=403 embeds=none "
-            "route=impersonate failure_class=http_403 server=akamaighost"
+            "route=impersonate failure_class=http_403 server=akamaighost caller=resolution_source"
         ) in caplog.messages
         fetch, escalations = self._harvest(caplog)
         assert (fetch["status"], fetch["http"], fetch["route"]) == ("blocked", 403, "impersonate")

@@ -10,7 +10,7 @@ from forecasting_tools import NumericDistribution
 from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
 
-from metaculus_bot.numeric.config import OPEN_BOUND_PILING_THRESHOLD
+from metaculus_bot.numeric.config import MAX_CDF_PROB_STEP, OPEN_BOUND_PILING_THRESHOLD, grid_step_constraints
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +99,12 @@ def log_open_bound_piling_diagnostics(
     bound and false-firing on models that correctly placed percentiles above the ceiling.
     Terminal-bin mass is still read from the built ``prediction.cdf``.
 
+    ``threshold`` is calibrated against the 201-point grid, where one bin may hold up to
+    ``MAX_CDF_PROB_STEP``. On a finer grid the platform's per-bin cap is lower (0.0889 at
+    451 points, 0.02 at 2,001) and the max-step repair clips a crammed terminal bin down
+    to it, so a fixed 0.10 could never fire there; the trigger scales with the cap
+    instead, and stays at ``threshold`` on the 201-point and every coarser grid.
+
     Diagnostics only: never raises, never mutates the prediction.
     """
     if not question.open_upper_bound and not question.open_lower_bound:
@@ -108,6 +114,8 @@ def log_open_bound_piling_diagnostics(
     if not cdf or len(cdf) < 2 or not declared_percentiles:
         return
 
+    _, grid_max_step = grid_step_constraints(len(cdf))
+    threshold = threshold * min(1.0, grid_max_step / MAX_CDF_PROB_STEP)
     declared_values = [p.value for p in declared_percentiles]
 
     def _warn(bound: str, bin_mass: float, declared_edge: float, bound_value: float) -> None:

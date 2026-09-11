@@ -41,6 +41,7 @@ from urllib.parse import urlparse
 # `research.public_suffix` leaf, shared with the rendered-fetch JSON harvest; `registrable_domain`
 # is imported here at module scope so this join's callers and tests keep reading it off this
 # module.
+from metaculus_bot.constants import METACULUS_HOST
 from metaculus_bot.research.public_suffix import registrable_domain
 
 # Reuses the SHIPPED extractor and the SHIPPED Metaculus self-reference test rather than
@@ -54,9 +55,12 @@ logger = logging.getLogger(__name__)
 
 # Domains that name the venue or the question site rather than a settlement series. The
 # Metaculus half is ALSO enforced through `is_metaculus_self_ref` so there is one shipped
-# definition of "points back at Metaculus"; this set stays the declarative statement of both
-# facts. Don't collapse the two — the helper is where a future Metaculus host change lands.
-SELF_REFERENCE_DOMAINS: frozenset[str] = frozenset({"kalshi.com", "metaculus.com"})
+# definition of "points back at the question platform"; this set stays the declarative statement
+# of both facts. Don't collapse the two — the helper is where a platform host change lands. The
+# Mantic competition site (`competitions.mantic.com`) is excluded through the helper ALONE: this
+# set is keyed on registrable domains, and `mantic.com` also carries the company's blog, a
+# legitimate outside source, so the set cannot name the competition host without swallowing it.
+SELF_REFERENCE_DOMAINS: frozenset[str] = frozenset({"kalshi.com", METACULUS_HOST})
 
 _WWW_PREFIX_RE = re.compile(r"^www\d*\.")
 

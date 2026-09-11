@@ -193,7 +193,7 @@ class TestMcSummary:
 
 class TestNoBiasCheck:
     def test_detects_no_bias(self):
-        # Predict 30% when actual YES rate is 43% -> -13pp NO-bias
+        """Predicting 30% when the actual YES rate is 43% is a -13pp NO-bias."""
         records = [_binary_record(i, 0.30, True) for i in range(43)] + [
             _binary_record(100 + i, 0.30, False) for i in range(57)
         ]
@@ -204,9 +204,9 @@ class TestNoBiasCheck:
         assert result["bias_pp"] == pytest.approx(-13.0)
 
     def test_reports_low_range_subset(self):
-        # 20 records inside the 0.10-0.30 bucket: mean predicted ~0.205, actual
-        # yes-rate 0.50 (10 of 20 resolve YES). Plus 5 records at 0.70 outside
-        # the bucket, which must not leak into the low_range stats.
+        """20 records inside the 0.10-0.30 bucket: mean predicted ~0.205, actual yes-rate 0.50
+        (10 of 20 resolve YES). The 5 records at 0.70 sit outside the bucket and must not leak
+        into the low_range stats."""
         low_range = (
             [_binary_record(i, 0.15, True) for i in range(4)]
             + [_binary_record(10 + i, 0.25, True) for i in range(6)]
@@ -231,7 +231,7 @@ class TestNoBiasCheck:
 
 class TestFinancialVsNonfinancialPit:
     def test_splits_by_category(self):
-        # Simple linear CDFs so PIT is predictable
+        """Simple linear CDFs, so the PIT each record reads is predictable."""
         linear_cdf = [i / 200 for i in range(201)]
         records = [
             _numeric_record(1, linear_cdf, resolution=25.0, category="Economy & Business"),
@@ -257,7 +257,7 @@ class TestFinancialVsNonfinancialPit:
 
 class TestStackingEffectiveness:
     def test_computes_counterfactual_mean_brier_on_triggered(self):
-        # Triggered = per-model probability range exceeds threshold.
+        """Triggered means the per-model probability range exceeds the threshold."""
         high_spread = _binary_record(
             1,
             prob_yes=0.50,
@@ -296,7 +296,7 @@ class TestStackingEffectiveness:
 
 class TestDisagreementPredictsError:
     def test_positive_correlation_on_disagreement_and_error(self):
-        # Build records where high-spread questions are also the high-Brier ones.
+        """The records are built so the high-spread questions are also the high-Brier ones."""
         records = []
         for i in range(10):
             spread_tight = {"m1": f"{50 + i}%", "m2": f"{50 - i}%"}  # low spread
@@ -314,9 +314,11 @@ class TestDisagreementPredictsError:
         assert result["spearman_rho"] > 0.3
 
     def test_handles_few_records(self):
-        # With <3 records, can't compute meaningful correlation. Pair each
-        # record with a per_model dict so it actually contributes to the
-        # spread correlation.
+        """Under 3 records there is no meaningful correlation to compute.
+
+        Each record still carries a per_model dict, so it actually contributes to the spread
+        correlation and the None comes from the record count rather than from empty input.
+        """
         records = [
             _binary_record(1, 0.5, True, per_model={"m1": "40%", "m2": "60%"}),
             _binary_record(2, 0.6, True, per_model={"m1": "50%", "m2": "70%"}),
@@ -370,8 +372,8 @@ class TestPerModelCohort:
         assert per_model_cohort([stacked], cut="unit_test") == []
 
     def test_median_records_kept(self):
-        # The mirror of the case above: a record the detector confirms ran on
-        # MEDIAN keeps its per-model bullets.
+        """The mirror of the stacker-fired case: a record the detector confirms ran on MEDIAN
+        keeps its per-model bullets."""
         unstacked = _binary_record(
             1,
             prob_yes=0.60,
@@ -383,10 +385,9 @@ class TestPerModelCohort:
         assert per_model == {"claude-opus-4.8": "70%"}
 
     def test_high_spread_record_without_stacker_signals_is_kept(self):
-        # ``likely_stacker`` (high spread + published value far from the median)
-        # must NOT exclude: that shape is also what a MEAN-era aggregate looks
-        # like, and dropping it would silently remove the high-disagreement
-        # records these cuts exist to measure.
+        """``likely_stacker`` (high spread plus a published value far from the median) must NOT
+        exclude a record: that shape is also what a MEAN-era aggregate looks like, and dropping
+        it would silently remove the high-disagreement records these cuts exist to measure."""
         wide = _binary_record(1, prob_yes=0.10, resolution=True, per_model={"m1": "90%", "m2": "10%"})
         [(_record, per_model)] = per_model_cohort([wide], cut="unit_test")
         assert per_model == {"m1": "90%", "m2": "10%"}
@@ -420,9 +421,8 @@ class TestPerModelCohort:
         assert scores["gpt-5.6-sol"]["count"] == 2
 
     def test_aggregate_cuts_still_include_excluded_records(self):
-        # The operator keeps the aggregates over stacked / anonymously-attributed
-        # records — only the per-MODEL cuts drop them. Same three records, both
-        # aggregate paths must count all three.
+        """The aggregates keep stacked and anonymously-attributed records by decision; only the
+        per-MODEL cuts drop them, so both aggregate paths must count all three records here."""
         records = [
             _binary_record(1, 0.6, True, per_model={"Forecaster 1": "60%"}),
             _binary_record(2, 0.6, True, per_model={"claude-opus-4.8": "70%"}, was_stacked=True),
@@ -461,8 +461,7 @@ class TestAnonymousModelKey:
             "gpt-5.6-sol",
             "claude-opus-4.8",
             "gemini-3.1-pro-preview",
-            # Near-misses: real display names that merely start the same way, and
-            # a bullet-shaped string, must not be swept up.
+            # Near-misses, spelled out in the docstring below.
             "Forecaster",
             "Forecaster One",
             "Forecaster 1 (gpt-5.6-sol)",
@@ -470,7 +469,154 @@ class TestAnonymousModelKey:
         ],
     )
     def test_model_names_are_not_anonymous(self, key):
+        """A real model name is never anonymous, and neither are the near-misses: display names
+        that merely start the same way as the positional format, and a bullet-shaped string."""
         assert not is_anonymous_model_key(key)
+
+
+# ---------------------------------------------------------------------------
+# collector — the resolved-posts pull reads the list pages alone
+# ---------------------------------------------------------------------------
+
+
+class TestFetchResolvedQuestions:
+    """The scoring pull is the list pages and nothing else.
+
+    Under ``with_cp=true`` a list page's question dict carries everything the collector
+    reads: type, resolution, scaling, the open bounds, the timestamps and the token's own
+    ``my_forecasts`` with ``forecast_values`` and ``score_data``, on a single-question post
+    and on a group post's members alike (verified live 2026-09-09 against the detail
+    payload, where only post-level keys the collector never reads differ). The pull used to
+    page the list for ids and then GET every post one at a time behind a 0.5 s sleep, about
+    99 s per hundred posts against 1.8 s for the page that already held them all. The
+    pins: every page asks for ``with_cp``, the payloads come back as the list served them,
+    and no per-post GET is ever issued.
+    """
+
+    def _install_pages(self, monkeypatch, pages: list[list[dict]]) -> list[dict]:
+        seen: list[dict] = []
+        remaining = list(pages)
+
+        def fake_api_get(path: str, token: str, params: dict | None = None) -> dict:
+            seen.append({"path": path, "token": token, "params": dict(params or {})})
+            page = remaining.pop(0)
+            return {"results": page, "next": "next-page" if remaining else None}
+
+        monkeypatch.setattr(collector, "_api_get", fake_api_get)
+        monkeypatch.setattr(collector, "FETCH_DELAY_SECS", 0.0)
+        return seen
+
+    def test_returns_the_list_payloads_across_pages_with_no_per_post_get(self, monkeypatch):
+        first_page = [_binary_post(1, 11), _binary_post(2, 22)]
+        second_page = [_binary_post(3, 33)]
+        seen = self._install_pages(monkeypatch, [first_page, second_page])
+
+        posts = collector.fetch_resolved_questions("spring-aib-2026", "token")
+
+        assert posts == first_page + second_page
+        assert [call["path"] for call in seen] == ["/posts/", "/posts/"]
+        assert [call["params"]["offset"] for call in seen] == [0, collector.PAGE_SIZE]
+
+    def test_every_list_page_asks_for_the_tokens_own_forecasts(self, monkeypatch):
+        seen = self._install_pages(monkeypatch, [[_binary_post(1, 11)], [_binary_post(2, 22)]])
+
+        collector.fetch_resolved_questions("spring-aib-2026", "personal-token")
+
+        assert len(seen) == 2
+        for call in seen:
+            assert call["params"]["with_cp"] == "true"
+            assert call["params"]["tournaments"] == "spring-aib-2026"
+            assert call["params"]["statuses"] == "resolved"
+            assert call["params"]["limit"] == collector.PAGE_SIZE
+            assert call["token"] == "personal-token"
+
+    def test_an_empty_tournament_is_one_page_and_no_posts(self, monkeypatch):
+        seen = self._install_pages(monkeypatch, [[]])
+
+        assert collector.fetch_resolved_questions("spring-aib-2026", "token") == []
+        assert len(seen) == 1
+
+
+# ---------------------------------------------------------------------------
+# collector — the comment pull covers public and private comments
+# ---------------------------------------------------------------------------
+
+
+class TestFetchBotComments:
+    """The comment pull has to list the private comments as well as the public ones.
+
+    The bot POSTs every comment with ``is_private: true`` and Metaculus flips older ones
+    public server-side, so the default author listing served the 1,054 summer comments and
+    none of the six fall ones (verified live 2026-09-09), which is a residual round whose
+    records carry no comment text, no ``bot_comment_created_at`` and no per-model parse. The
+    pins: both param sets are requested, the return is their union, a comment served by both
+    appears once, and each listing still pages to exhaustion.
+    """
+
+    def _install_pages(
+        self, monkeypatch, public_pages: list[list[dict]], private_pages: list[list[dict]]
+    ) -> list[dict]:
+        seen: list[dict] = []
+        remaining = {False: list(public_pages), True: list(private_pages)}
+
+        def fake_api_get(path: str, token: str, params: dict | None = None) -> dict:
+            call_params = dict(params or {})
+            seen.append({"path": path, "token": token, "params": call_params})
+            pages = remaining[bool(call_params.get("is_private"))]
+            page = pages.pop(0)
+            return {"results": page, "next": "next-page" if pages else None}
+
+        monkeypatch.setattr(collector, "_api_get", fake_api_get)
+        monkeypatch.setattr(collector, "FETCH_DELAY_SECS", 0.0)
+        return seen
+
+    @staticmethod
+    def _comment(comment_id: int, post_id: int) -> dict:
+        return {"id": comment_id, "on_post": post_id, "text": f"*Forecaster 1*: {comment_id}%\n"}
+
+    def test_returns_the_union_of_the_public_and_private_listings(self, monkeypatch):
+        public = self._comment(1, 11)
+        private = self._comment(2, 22)
+        seen = self._install_pages(monkeypatch, [[public]], [[private]])
+
+        comments = collector.fetch_bot_comments(275109, "bot-token")
+
+        assert comments == [public, private]
+        assert [call["path"] for call in seen] == ["/comments/", "/comments/"]
+        assert [call["params"].get("is_private") for call in seen] == [None, "true"]
+        for call in seen:
+            assert call["params"]["author"] == 275109
+            assert call["params"]["limit"] == collector.PAGE_SIZE
+            assert call["token"] == "bot-token"
+
+    def test_a_comment_served_by_both_listings_appears_once(self, monkeypatch):
+        """Metaculus flips comments public in place, so the two listings overlap during the
+        flip and a duplicate would give one post two records of the same forecast."""
+        flipped = self._comment(7, 77)
+        self._install_pages(monkeypatch, [[flipped, self._comment(8, 88)]], [[flipped]])
+
+        comments = collector.fetch_bot_comments(275109, "bot-token")
+
+        assert [c["id"] for c in comments] == [7, 8]
+
+    def test_each_listing_pages_to_exhaustion(self, monkeypatch):
+        public_pages = [[self._comment(1, 11)], [self._comment(2, 22)]]
+        private_pages = [[self._comment(3, 33)], [self._comment(4, 44)], [self._comment(5, 55)]]
+        seen = self._install_pages(monkeypatch, public_pages, private_pages)
+
+        comments = collector.fetch_bot_comments(275109, "bot-token")
+
+        assert [c["id"] for c in comments] == [1, 2, 3, 4, 5]
+        public_offsets = [c["params"]["offset"] for c in seen if c["params"].get("is_private") is None]
+        private_offsets = [c["params"]["offset"] for c in seen if c["params"].get("is_private") == "true"]
+        assert public_offsets == [0, collector.PAGE_SIZE]
+        assert private_offsets == [0, collector.PAGE_SIZE, 2 * collector.PAGE_SIZE]
+
+    def test_an_author_with_no_comments_is_one_page_per_listing(self, monkeypatch):
+        seen = self._install_pages(monkeypatch, [[]], [[]])
+
+        assert collector.fetch_bot_comments(275109, "bot-token") == []
+        assert len(seen) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -512,9 +658,11 @@ class TestCollectorCommentCreatedAt:
         assert records[0]["metadata"]["nr_forecasters"] == 170
 
     def test_a_post_with_no_crowd_field_reads_none_not_zero(self):
-        # None means "the post didn't say", which a crowd-size cut can drop. A 0 would
-        # average a fabricated empty crowd into the cut, and would also silently kill
-        # audit.py's `n/a` fallback (a real 0 is not a missing key).
+        """None means "the post didn't say", which a crowd-size cut can drop.
+
+        A 0 would average a fabricated empty crowd into the cut, and would also silently kill
+        audit.py's ``n/a`` fallback, since a real 0 is not a missing key.
+        """
         post = _binary_post(6, 66)
         post.pop("nr_forecasters", None)
         records = _process_post(post, {})
@@ -529,8 +677,8 @@ class TestCollectorCommentCreatedAt:
         assert records[0]["bot_comment_created_at"] is None
 
     def test_stacker_skip_reason_marker_round_trips_onto_record(self):
-        # The additive STACKER_SKIP_REASON marker must reach the record dict —
-        # its documented durable path is the comment, not the run log.
+        """The additive STACKER_SKIP_REASON marker must reach the record dict, because its
+        documented durable path is the published comment rather than the run log."""
         post = _binary_post(4, 44)
         comment = {
             "id": 1001,
@@ -549,12 +697,44 @@ class TestCollectorCommentCreatedAt:
         assert records[0]["stacker_skip_reason"] is None
 
     def test_practice_posts_produce_no_records(self):
-        # Practice questions are not tournament scoring surface; they must never enter
-        # the dataset (they would otherwise land in every calibration cut).
+        """Practice questions are not tournament scoring surface, so they must never enter the
+        dataset; they would otherwise land in every calibration cut."""
         post = _binary_post(6, 66)
         post["title"] = "[PRACTICE] Will this be scored?"
         comment = {"id": 1003, "text": "*Forecaster 1*: 70%\n", "on_post": 6}
         assert _process_post(post, {6: comment}) == []
+
+
+class TestCollectorExcludesDateQuestions:
+    """The live bot forecasts date questions (on the epoch-seconds axis), so a resolved one
+    reaches the collector; the residual dataset stays date-free by decision, the same exclusion
+    ``backtest/question_prep.py`` and ``ablation/run_pdf.py`` carry at their seams. The skip has
+    to be explicit and named in the log: ``parse_resolution``'s unknown-type fallthrough would
+    file the same question as a parser bug."""
+
+    @pytest.mark.parametrize("resolution", ["above_upper_bound", "2026-07-20T12:00:00Z"])
+    def test_a_resolved_date_question_is_skipped_by_type_with_one_named_warning(self, resolution, caplog):
+        """The fixture is the wire shape of a resolved date question.
+
+        Taken from ``tests/data/mantic_series1_date_post_500_2026_09_08.json``: ``type`` is
+        ``date``, the ``scaling`` bounds are epoch seconds, and the resolution is either an
+        out-of-range token or an ISO timestamp.
+        """
+        post = _binary_post(500, 5000, resolution=resolution)
+        post["question"]["type"] = "date"
+        post["question"]["open_upper_bound"] = True
+        post["question"]["scaling"] = {"range_min": 1781708400.0, "range_max": 1786536000.0, "zero_point": None}
+        post["question"]["my_forecasts"]["latest"]["forecast_values"] = [0.0, 0.4, 0.9]
+        comment = {"id": 1004, "text": "*Forecaster 1*: 2026-07-20\n", "on_post": 500}
+
+        with caplog.at_level(logging.WARNING, logger="metaculus_bot.performance_analysis"):
+            assert _process_post(post, {500: comment}) == []
+
+        warnings = [(r.name, r.getMessage()) for r in caplog.records if r.levelno == logging.WARNING]
+        (message,) = [text for name, text in warnings if name.endswith(".collector")]
+        assert "Q5000" in message
+        assert "date question" in message
+        assert not any("Unknown question type" in text for _, text in warnings)
 
 
 # ---------------------------------------------------------------------------
@@ -586,9 +766,9 @@ class TestCollectorStackerOutcome:
         assert rec["stacker_outcome_source"] == "marker_outcome"
 
     def test_outcome_marker_fallback_median_distinguished_from_skipped(self):
-        # The load-bearing case: pre-fix this would round-trip as STACKED=true
-        # → was_stacked=True with no way to tell median-fallback from primary.
-        # Now stacker_outcome="fallback_median" is preserved on the record.
+        """The load-bearing case: this used to round-trip as ``STACKED=true`` and
+        ``was_stacked=True``, with no way to tell median-fallback from primary. The richer
+        ``stacker_outcome="fallback_median"`` is now preserved on the record."""
         rec = self._run(2, 22, "*Forecaster 1*: 70%\n<!-- STACKER_OUTCOME=fallback_median -->\n")
         assert rec["stacker_outcome"] == "fallback_median"
         assert rec["stacker_outcome_source"] == "marker_outcome"
@@ -599,9 +779,9 @@ class TestCollectorStackerOutcome:
         assert rec["stacker_outcome_source"] == "marker_outcome"
 
     def test_outcome_marker_skipped_config_off(self):
-        # Config-suppressed skip (per-type gate off despite high spread) must
-        # survive the collector round-trip distinct from plain "skipped" — this
-        # is the field the 0/22-numeric-suppression re-attribution needed.
+        """A config-suppressed skip (the per-type gate off despite high spread) must survive the
+        collector round-trip distinct from a plain "skipped": this is the field the
+        0-of-22-numeric-suppression re-attribution needed."""
         rec = self._run(3, 33, "*Forecaster 1*: 70%\n<!-- STACKER_OUTCOME=skipped_config_off -->\n")
         assert rec["stacker_outcome"] == "skipped_config_off"
         assert rec["stacker_outcome_source"] == "marker_outcome"
@@ -617,9 +797,9 @@ class TestCollectorStackerOutcome:
         assert rec["stacker_outcome_source"] == "marker_legacy"
 
     def test_historical_body_inferred_primary(self):
-        # Pre-marker comment from spring-aib-2026 dataset: no STACKED= or
-        # STACKER_OUTCOME= marker, but the Forecaster 1 body opens with
-        # "## Stacker Meta-Analysis", which only the stacker pipeline produces.
+        """A pre-marker comment from the spring-aib-2026 dataset: no ``STACKED=`` or
+        ``STACKER_OUTCOME=`` marker, but the Forecaster 1 body opens with
+        "## Stacker Meta-Analysis", which only the stacker pipeline produces."""
         comment = (
             "# SUMMARY\n"
             "*Forecaster 1*: 70%\n\n"
@@ -643,9 +823,9 @@ class TestCollectorStackerOutcome:
         assert rec["stacker_outcome_source"] == "none"
 
     def test_outcome_marker_takes_precedence_over_legacy(self):
-        # Both markers coexist for one round of back-compat. The collector
-        # must prefer the richer STACKER_OUTCOME= signal so median-fallback
-        # isn't silently downgraded to "primary".
+        """Both markers coexist for one round of back-compat, so the collector must prefer the
+        richer ``STACKER_OUTCOME=`` signal, or median-fallback is silently downgraded to
+        "primary"."""
         comment = "*Forecaster 1*: 70%\n<!-- STACKER_OUTCOME=fallback_median -->\n<!-- STACKED=false -->\n"
         rec = self._run(9, 99, comment)
         assert rec["stacker_outcome"] == "fallback_median"
@@ -664,8 +844,8 @@ class TestInterpolatePit:
     log-scaled resolutions by up to ~0.24."""
 
     def test_linear_question_matches_old_behavior(self):
-        # Linear grid: new value-grid interpolation must equal the old linear-index
-        # interpolation within float tolerance (mathematically equivalent).
+        """On a linear grid the two maps are mathematically equivalent, so the value-grid
+        interpolation must equal the old linear-index one within float tolerance."""
         lower, upper = 0.0, 100.0
         cdf = [float(value) for value in np.linspace(0.0, 1.0, 201)]  # straight-line CDF
         grid = list(build_cdf_value_grid(lower, upper, None, num_points=201))
@@ -683,14 +863,17 @@ class TestInterpolatePit:
         assert _interpolate_pit(50.0, lower, upper, cdf, value_grid=grid) == pytest.approx(0.5)
 
     def test_log_scaled_question_differs_and_is_correct(self):
-        # Log-scaled (zero_point) question: the value grid is geometric, so the
-        # resolution lands on a different CDF index than the linear-index map.
+        """On a log-scaled (zero_point) question the value grid is geometric, so the resolution
+        lands on a different CDF index than the linear-index map put it.
+
+        Resolution 31.6 is only ~0.1% along the range linearly but a meaningful chunk of
+        probability on the geometric grid, which is where the fix has to bite: the new reading
+        is the geometric-midpoint PIT (~0.5), not the near-zero PIT the linear-index map gives.
+        """
         lower, upper, zero_point = 1.0, 1000.0, 0.0
         cdf = [float(value) for value in np.linspace(0.0, 1.0, 201)]  # uniform-in-index CDF
         geo_grid = build_cdf_value_grid(lower, upper, zero_point, num_points=201)
 
-        # Resolution near the low end of a log scale: linearly it's ~0.1% of the
-        # range, but on the geometric grid it's a meaningful chunk of probability.
         resolution = 31.6  # ~10^1.5 -> roughly the geometric midpoint of [1, 1000]
 
         new = _interpolate_pit(resolution, lower, upper, cdf, value_grid=list(geo_grid), zero_point=zero_point)
@@ -701,14 +884,13 @@ class TestInterpolatePit:
 
         # The fix must bite: geometric vs linear-index map differ materially here.
         assert abs(new - old) > 0.2
-        # And the new value is the geometric-midpoint-ish PIT (~0.5), not the
-        # near-zero PIT the linear-index map produces.
+        # And the new value is the geometric-midpoint PIT, not the linear-index map's near-zero one.
         assert new == pytest.approx(0.5, abs=0.02)
         assert old < 0.05
 
     def test_falls_back_to_zero_point_grid_when_value_grid_absent(self):
-        # No continuous_range supplied -> reconstruct the geometric grid from
-        # zero_point. Result must match interpolation against the rebuilt grid.
+        """With no continuous_range supplied the geometric grid is reconstructed from zero_point,
+        and the result must match interpolation against that rebuilt grid."""
         lower, upper, zero_point = 1.0, 1000.0, 0.0
         cdf = [float(value) for value in np.linspace(0.0, 1.0, 201)]
         resolution = 31.6
@@ -719,7 +901,8 @@ class TestInterpolatePit:
         assert no_grid == pytest.approx(expected, abs=1e-12)
 
     def test_mismatched_value_grid_length_falls_back(self):
-        # A value_grid whose length != cdf is ignored; we rebuild from bounds/zero_point.
+        """A value_grid whose length disagrees with the CDF is ignored, and the grid is rebuilt
+        from the bounds and zero_point instead."""
         lower, upper = 0.0, 100.0
         cdf = [float(value) for value in np.linspace(0.0, 1.0, 201)]
         bad_grid = [0.0, 50.0, 100.0]  # wrong length
@@ -758,8 +941,8 @@ class TestInterpolatePitOutOfGrid:
         return list(build_cdf_value_grid(self._LOWER, self._UPPER, None, num_points=201))
 
     def test_below_grid_resolution_reads_low_tail_not_the_clamp(self):
-        # Resolution 50 is below every declared value of every member: each curve reads
-        # its lowest declared percentile (P10 -> 0.10). The clamp would say 0.90.
+        """Resolution 50 sits below every declared value of every member, so each curve reads its
+        lowest declared percentile (P10, giving 0.10). The grid clamp would have said 0.90."""
         pit = _interpolate_pit(
             50.0,
             self._LOWER,
@@ -771,7 +954,7 @@ class TestInterpolatePitOutOfGrid:
         assert pit == pytest.approx(0.10, abs=1e-9)
 
     def test_fallback_is_median_of_member_curves(self):
-        # Resolution 95: model-a interpolates 0.6333, model-b reads its P50 = 0.50.
+        """At resolution 95 model-a interpolates to 0.6333 and model-b reads its P50 of 0.50."""
         pit = _interpolate_pit(
             95.0,
             self._LOWER,
@@ -783,13 +966,14 @@ class TestInterpolatePitOutOfGrid:
         assert pit == pytest.approx((0.6333333 + 0.50) / 2, abs=1e-6)
 
     def test_no_member_curves_keeps_grid_read(self):
-        # Degraded path (no per-model percentiles recoverable): grid-endpoint read kept.
+        """The degraded path, with no per-model percentiles recoverable, keeps the grid-endpoint
+        read."""
         pit = _interpolate_pit(50.0, self._LOWER, self._UPPER, self._CDF, value_grid=self._grid())
         assert pit == pytest.approx(0.90, abs=1e-9)
 
     def test_at_bound_resolution_keeps_endpoint_read(self):
-        # AT a bound the clamp IS the correct PIT (F(bound) = cdf[0]); the fallback
-        # must only engage strictly beyond the grid.
+        """AT a bound the clamp IS the correct PIT, since F(bound) equals cdf[0], so the
+        declared-percentile fallback must engage only strictly beyond the grid."""
         pit = _interpolate_pit(
             self._LOWER,
             self._LOWER,
@@ -867,9 +1051,9 @@ class TestDeclaredPercentileCurveTolerance:
     _GOOD: ClassVar[list[list[float]]] = [[10.0, 85.0], [50.0, 95.0], [90.0, 110.0]]
 
     def test_non_numeric_declared_value_drops_only_that_curve(self):
-        # A percentile line that parsed to a non-number: the median is taken over the
-        # surviving curve alone (model-b at 50 reads its P10 = 0.10), not over a
-        # coerced zero that would drag the quantile.
+        """One percentile line parsed to a non-number, so the median is taken over the surviving
+        curve alone (model-b at 50 reads its P10 of 0.10) rather than over a coerced zero that
+        would drag the quantile."""
         curves = cast(
             "dict[str, list[list[float]]]",
             {"model-a": [[10.0, "n/a"], [50.0, 90.0], [90.0, 105.0]], "model-b": self._GOOD},
@@ -877,7 +1061,7 @@ class TestDeclaredPercentileCurveTolerance:
         assert declared_percentile_pit(curves, 50.0) == pytest.approx(0.10, abs=1e-9)
 
     def test_pair_missing_its_value_is_unusable(self):
-        # A truncated line recovered as a bare percentile with no value.
+        """A truncated line recovered as a bare percentile with no value beside it."""
         assert _single_curve_pit([[10.0], [50.0]], 50.0) is None
 
     def test_anonymous_keys_are_excluded_from_the_median_of_members(self):
@@ -899,8 +1083,8 @@ class TestDeclaredPercentileCurveTolerance:
         assert declared_percentile_pit(curves, 50.0) is None
 
     def test_duplicate_declared_values_stay_usable(self):
-        # A flat tail (P10 == P50) is legitimate model output: jitter it into strict
-        # monotonicity rather than discarding the whole curve.
+        """A flat tail, where P10 equals P50, is legitimate model output, so jitter it into
+        strict monotonicity rather than discarding the whole curve."""
         flat_tail = [[10.0, 80.0], [50.0, 80.0], [90.0, 105.0]]
         assert _single_curve_pit(flat_tail, 50.0) == pytest.approx(0.10, abs=1e-9)
         # Between the duplicated value and P90 the curve still interpolates.
@@ -909,16 +1093,19 @@ class TestDeclaredPercentileCurveTolerance:
         assert 0.5 < mid < 0.9
 
     def test_non_finite_declared_values_are_unusable(self):
-        # Jitter cannot rescue non-finite values; the curve must read as no-curve
-        # instead of returning a nan PIT into the median. errstate only silences the
-        # expected nan arithmetic inside the guard, which is the code under test.
+        """Jitter cannot rescue non-finite values, so the curve must read as no-curve instead of
+        returning a nan PIT into the median.
+
+        ``np.errstate`` only silences the expected nan arithmetic inside the guard, which is the
+        code under test here.
+        """
         with np.errstate(invalid="ignore"):
             assert _single_curve_pit([[10.0, float("inf")], [90.0, float("inf")]], 50.0) is None
             assert _single_curve_pit([[10.0, float("nan")], [50.0, 90.0]], 50.0) is None
 
     def test_all_curves_unusable_reads_as_no_fallback(self):
-        # declared_percentile_pit returning None is what makes _interpolate_pit /
-        # compute_pit_details keep the grid-endpoint read.
+        """``declared_percentile_pit`` returning None is what makes ``_interpolate_pit`` and
+        ``compute_pit_details`` keep the grid-endpoint read."""
         junk = cast("dict[str, list[list[float]]]", {"model-a": [[50.0, "junk"]]})
         assert declared_percentile_pit(junk, 50.0) is None
         assert declared_percentile_pit(None, 50.0) is None
@@ -926,18 +1113,20 @@ class TestDeclaredPercentileCurveTolerance:
 
 class TestMaxStepClampScreen:
     """The q43913 signature: a published bin pinned at the per-bin max-step cap while
-    every member's own declared curve wanted materially more mass there. The cap is
-    era-correct — flat 0.2 before the grid-scaled cap reached main (b4e9df0), the
-    grid's own ``grid_step_constraints`` max after — so a post-fix coarse-grid
-    discrete that legitimately holds a 0.2 bin must NOT fire."""
+    every member's own declared curve wanted materially more mass there.
+
+    The cap is era-correct — flat 0.2 before the grid-scaled cap reached main (b4e9df0),
+    the grid's own ``grid_step_constraints`` max after — so a post-fix coarse-grid
+    discrete that legitimately holds a 0.2 bin must NOT fire. The fixture member curves
+    are 11-ANCHOR on purpose: the screen drops any member under MIN_SCOREABLE_ANCHORS,
+    because its verdict turns on the MINIMUM member bin mass and a 3-anchor interpolation
+    across one bin is not the distribution the model declared.
+    """
 
     # 11-point integer grid; steps[1] (the [1, 2] bin) is exactly 0.20.
     _GRID: ClassVar[list[float]] = [float(v) for v in range(11)]
     _CDF: ClassVar[list[float]] = [0.0, 0.05, 0.25, 0.45, 0.65, 0.85, 0.90, 0.93, 0.96, 0.98, 1.0]
-    # Both members concentrate ~0.70 of their mass on the [1, 2] bin. Curves are
-    # 11-ANCHOR on purpose: the screen now drops any member under
-    # MIN_SCOREABLE_ANCHORS, because its verdict turns on the MINIMUM member bin mass
-    # and a 3-anchor interpolation across one bin is not the declared distribution.
+    # Both members concentrate ~0.70 of their mass on the [1, 2] bin.
     _LABELS: ClassVar[list[float]] = [5.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 95.0]
     _MEMBERS: ClassVar[dict[str, list[list[float]]]] = {
         "model-a": [
@@ -982,7 +1171,7 @@ class TestMaxStepClampScreen:
         assert screen["min_member_bin_mass"] > 0.6
 
     def test_post_fix_coarse_grid_point_two_bin_does_not_fire(self):
-        # After 9f1175c an 11-point grid's cap is 1.0, so a 0.2 bin means nothing.
+        """After 9f1175c an 11-point grid's cap is 1.0, so a 0.2 bin means nothing."""
         screen = max_step_clamp_screen(self._record(submitted=self._POST_FIX_TS))
         assert screen["suspected"] is False
         assert screen["submitted_before_grid_scaled_cap"] is False
@@ -990,8 +1179,8 @@ class TestMaxStepClampScreen:
         assert screen["resolution_bin_at_cap"] is False
 
     def test_post_fix_standard_grid_cap_still_fires(self):
-        # On the 201-point grid the era-correct cap is still 0.2, so the screen keeps
-        # catching genuine clamps after the fix.
+        """On the 201-point grid the era-correct cap is still 0.2, so the screen keeps catching
+        genuine clamps after the fix."""
         steps = np.full(200, 0.8 / 199)
         steps[100] = 0.2
         cdf = np.concatenate([[0.0], np.cumsum(steps)]).tolist()
@@ -1053,8 +1242,8 @@ class TestMaxStepClampScreen:
         assert screen["resolution_bin_cap_fraction"] == pytest.approx(0.989, abs=1e-3)
 
     def test_bin_well_below_the_cap_is_not_cap_bound(self):
-        # 0.15 against a 0.2 cap is 75% — below _CLAMP_CAP_NEAR_FRAC, so not cap-bound
-        # even though every member wanted materially more mass there.
+        """0.15 against a 0.2 cap is 75%, below ``_CLAMP_CAP_NEAR_FRAC``, so the bin is not
+        cap-bound even though every member wanted materially more mass there."""
         screen = max_step_clamp_screen(self._fine_grid_record(0.15))
         assert screen["resolution_bin_cap_bound"] is False
         assert screen["suspected"] is False
@@ -1065,21 +1254,21 @@ class TestMaxStepClampScreen:
         assert screen["max_step_cap"] == pytest.approx(0.2)
 
     def test_unparseable_timestamp_treated_as_pre_fix(self):
-        # Same rule as a missing one: the undated (and undatable) archive records all
-        # predate the fix, so an unreadable timestamp must not be read as post-fix.
+        """Same rule as a missing timestamp: the undated (and undatable) archive records all
+        predate the fix, so an unreadable timestamp must not be read as post-fix."""
         screen = max_step_clamp_screen(self._record(submitted="not-a-date"))
         assert screen["submitted_before_grid_scaled_cap"] is True
         assert screen["max_step_cap"] == pytest.approx(0.2)
 
     def test_timestamp_with_an_offset_is_compared_in_utc(self):
-        # A post-fix instant written with a local offset must read as post-fix: a naive
-        # (offset-dropping) comparison shifts it hours across the boundary.
+        """A post-fix instant written with a local offset must read as post-fix, because a naive
+        offset-dropping comparison shifts it hours across the era boundary."""
         screen = max_step_clamp_screen(self._record(submitted="2026-07-21T11:07:37-07:00"))
         assert screen["submitted_before_grid_scaled_cap"] is False
 
     def test_members_not_materially_more_does_not_fire(self):
-        # Members' own curves put ~0.2 on the bin too: the cap coincided with what
-        # the ensemble wanted, so nothing was overridden.
+        """The members' own curves put ~0.2 on the bin too, so the cap coincided with what the
+        ensemble wanted and nothing was overridden."""
         diffuse = {
             "model-a": [[10.0, 0.0], [50.0, 3.0], [90.0, 8.0]],
             "model-b": [[10.0, 0.5], [50.0, 3.5], [90.0, 8.5]],
@@ -1093,27 +1282,29 @@ class TestMaxStepClampScreen:
         assert max_step_clamp_screen(self._record(submitted=self._PRE_FIX_TS, members=one))["suspected"] is False
 
     def test_anonymous_member_keys_are_excluded(self):
-        # A positional key on a stacked record can hold the stacker's aggregate.
+        """A positional key on a stacked record can hold the stacker's aggregate."""
         anon = {"Forecaster 1": self._MEMBERS["model-a"], "Forecaster 2": self._MEMBERS["model-b"]}
         screen = max_step_clamp_screen(self._record(submitted=self._PRE_FIX_TS, members=anon))
         assert screen["member_bin_masses"] == {}
         assert screen["suspected"] is False
 
     def test_resolution_exactly_on_grid_point_screens_the_bin_below(self):
-        # A resolution sitting exactly ON a grid edge belongs to the bin BELOW it —
-        # the platform scorer's convention (resolution_to_bucket_index). On this
-        # fixture, resolution 2.0 must screen the [1, 2] bin whose 0.20 step sits at
-        # the pre-fix cap; the old side="right" screened [2, 3] and missed the
-        # q43913 signature entirely.
+        """A resolution sitting exactly ON a grid edge belongs to the bin BELOW it, which is the
+        platform scorer's convention in ``resolution_to_bucket_index``.
+
+        On this fixture resolution 2.0 must screen the [1, 2] bin whose 0.20 step sits at the
+        pre-fix cap; the old ``side="right"`` screened [2, 3] and missed the q43913 signature
+        entirely.
+        """
         screen = max_step_clamp_screen(self._record(submitted=self._PRE_FIX_TS, resolution=2.0))
         assert screen["resolution_bin"] == [1.0, 2.0]
         assert screen["published_bin_mass"] == pytest.approx(0.2, abs=1e-9)
         assert screen["suspected"] is True
 
     def test_single_pair_member_curve_is_unusable(self):
-        # One recovered (percentile, value) pair interpolates to a constant PIT at
-        # every resolution — the member is dropped, leaving one usable curve, which
-        # is below the >=2-curves requirement.
+        """One recovered (percentile, value) pair interpolates to a constant PIT at every
+        resolution, so the member is dropped, leaving one usable curve, which is below the
+        two-curve minimum the screen requires."""
         one_pair = {
             "model-a": [[50.0, 90.0]],
             "model-b": self._MEMBERS["model-b"],
@@ -1138,9 +1329,9 @@ class TestMaxStepClampScreen:
         assert screen["suspected"] is False
 
     def test_a_uniformly_sparse_record_reports_no_member_masses(self):
-        # The sparse-era shape: no curve clears the floor, so the screen has no member
-        # evidence at all rather than ranking equals against each other (a bin-mass
-        # comparison is absolute, unlike ranking_cohort's relative one).
+        """The sparse-era shape: no curve clears the anchor floor, so the screen has no member
+        evidence at all rather than ranking equals against each other. A bin-mass comparison is
+        absolute, unlike ``ranking_cohort``'s relative one."""
         sparse = {
             "model-a": [[10.0, 0.9], [50.0, 1.3], [90.0, 2.1]],
             "model-b": [[10.0, 0.95], [50.0, 1.4], [90.0, 2.2]],
@@ -1152,7 +1343,7 @@ class TestMaxStepClampScreen:
         assert screen["suspected"] is False
 
     def test_non_monotonic_member_curve_is_unusable(self):
-        # Percentiles that DECREASE as values increase invert the curve — drop it.
+        """Percentiles that DECREASE as values increase invert the curve, so it is dropped."""
         inverted = {
             "model-a": [[90.0, 0.9], [50.0, 1.3], [10.0, 2.1]],
             "model-b": self._MEMBERS["model-b"],
@@ -1167,10 +1358,12 @@ class TestMaxStepClampScreen:
         assert screen["reason"] == "non-numeric resolution"
 
     def test_records_without_a_usable_grid_report_that_reason(self):
-        # The screen needs the question's own value grid to locate the realized bin.
-        # Comment-backfilled records often carry no continuous_range, and a grid whose
-        # length disagrees with the published CDF can't be indexed either — both must
-        # report a reason instead of screening an arbitrary bin.
+        """The screen needs the question's own value grid to locate the realized bin.
+
+        Comment-backfilled records often carry no continuous_range, and a grid whose length
+        disagrees with the published CDF cannot be indexed either, so both must report a reason
+        instead of screening an arbitrary bin.
+        """
         no_grid = self._record(submitted=self._PRE_FIX_TS)
         no_grid["scaling"] = {"range_min": 0.0, "range_max": 10.0}
         assert max_step_clamp_screen(no_grid)["reason"] == "no usable grid"
@@ -1207,13 +1400,14 @@ class TestNumericPitAnalysisValueGrid:
         }
 
     def test_continuous_range_used_directly_for_log_scaled(self):
+        """One linear record at its midpoint resolution and one log-scaled record at its
+        geometric midpoint both read PIT ~0.5, where the linear-index map called the log-scaled
+        one ~0.03."""
         cdf = list(np.linspace(0.0, 1.0, 201))
         # Linear question, midpoint resolution -> PIT 0.5.
         lin_grid = list(build_cdf_value_grid(0.0, 100.0, None, num_points=201))
         linear_rec = self._record(1, cdf, 50.0, 0.0, 100.0, None, lin_grid)
 
-        # Log-scaled question; resolution at geometric midpoint -> PIT ~0.5,
-        # which the linear-index map would have called ~0.03.
         geo_grid = list(build_cdf_value_grid(1.0, 1000.0, 0.0, num_points=201))
         log_rec = self._record(2, cdf, 31.6, 1.0, 1000.0, 0.0, geo_grid)
 
@@ -1225,12 +1419,14 @@ class TestNumericPitAnalysisValueGrid:
         assert result["coverage_50"] == pytest.approx(1.0)
 
     def test_zero_point_zero_without_continuous_range_reconstructs_geometric(self):
-        # Regression for the zero_point sentinel bug on the analysis fallback path:
-        # a log-scale record serializes zero_point==0 with range_min>0 but carries
-        # NO continuous_range (old archive / schema drift). numeric_pit_analysis
-        # must reconstruct the GEOMETRIC grid (via grid_zero_point), not a linear
-        # one. On [1, 1000] the geometric midpoint (~31.6) is PIT ~0.5; the buggy
-        # linear-grid reconstruction would call it near-zero.
+        """Regression for the zero_point sentinel bug on the analysis fallback path.
+
+        A log-scale record serializes ``zero_point == 0`` with a positive ``range_min`` but
+        carries NO continuous_range, from an old archive or schema drift, and
+        ``numeric_pit_analysis`` must then reconstruct the GEOMETRIC grid via
+        ``grid_zero_point`` rather than a linear one. On [1, 1000] the geometric midpoint
+        (~31.6) is PIT ~0.5, where the buggy linear-grid reconstruction called it near-zero.
+        """
         cdf = list(np.linspace(0.0, 1.0, 201))
         log_rec = self._record(1, cdf, 31.6, 1.0, 1000.0, 0, None)
         result = numeric_pit_analysis([log_rec])
@@ -1281,9 +1477,9 @@ class TestSetValuedOutOfRangePit:
         assert out_of_range_pit_reading(50.0, [0.0, 1.0]) is None
 
     def test_a_closed_bound_interval_collapses_to_the_old_point_convention(self):
-        # With no mass beyond the bound, [cdf[-1], 1] == [1, 1]: the set-valued reading
-        # degenerates to exactly the 1.0 the old convention forced, so nothing changes on
-        # records that put nothing out of range.
+        """With no mass beyond the bound, ``[cdf[-1], 1]`` is ``[1, 1]``, so the set-valued
+        reading degenerates to exactly the 1.0 the old convention forced and nothing changes on
+        records that put nothing out of range."""
         reading = out_of_range_pit_reading("above_upper_bound", list(np.linspace(0.0, 1.0, 201)))
         assert reading is not None
         assert not reading.is_interval
@@ -1311,8 +1507,8 @@ class TestSetValuedOutOfRangePit:
         assert sum(result["histogram"]) == 0
 
     def test_a_starved_tail_is_still_outside_the_coverage_band(self):
-        # cdf[-1] = 0.999 is the open-bound structural floor: [0.999, 1] lies wholly above
-        # 0.95, so this record is the band miss the q44842 shape is not.
+        """``cdf[-1] = 0.999`` is the open-bound structural floor, so [0.999, 1] lies wholly
+        above 0.95 and this record is the band miss that the q44842 shape is not."""
         result = numeric_pit_analysis([self._record("above_upper_bound", cdf_end=0.999)])
         assert result["coverage_90"] == pytest.approx(0.0)
 
@@ -1380,7 +1576,7 @@ class TestRescoreRecords:
         assert record["numeric_log_score"] == healed
 
     def test_unrecomputable_score_is_never_deleted(self):
-        # Missing scaling bounds -> recomputation yields None -> keep the stored value.
+        """Missing scaling bounds make recomputation yield None, so the stored value is kept."""
         record = self._stale_record()
         record["scaling"] = {}
         stored = record["numeric_log_score"]
@@ -1397,8 +1593,8 @@ class TestRescoreRecords:
         assert rescore_records([{"no_type": True}, "not-a-dict"]) == 0  # type: ignore[list-item]
 
     def test_partial_records_are_skipped_not_crashed(self):
-        # rescore takes arbitrary cached JSON: every record missing a field that
-        # _compute_scores subscripts must be skipped, never raise KeyError.
+        """Rescoring takes arbitrary cached JSON, so every record missing a field that
+        ``_compute_scores`` subscripts must be skipped rather than raise KeyError."""
         partial = [
             {"type": "binary", "resolution_parsed": True},  # no our_forecast_values
             {"type": "binary", "resolution_parsed": True, "our_forecast_values": [0.3, 0.7]},  # no our_prob_yes
@@ -1422,8 +1618,8 @@ class TestRescoreRecords:
         )
 
     def test_load_dataset_is_idempotent_on_an_already_healed_file(self, tmp_path: Path):
-        # Re-loading a file whose scores already agree with the scorer must leave every
-        # value byte-identical: healing is a repair, not a rewrite of live data.
+        """Re-loading a file whose scores already agree with the scorer must leave every value
+        byte-identical, because healing is a repair rather than a rewrite of live data."""
         healed = self._stale_record()
         rescore_records([healed])
         path = tmp_path / "healed.json"
@@ -1432,9 +1628,9 @@ class TestRescoreRecords:
         assert reloaded["numeric_log_score"] == healed["numeric_log_score"]
 
     def test_scoring_failure_on_a_record_without_post_id_only_warns(self, caplog):
-        # rescore walks arbitrary cached JSON, so a record can lack post_id entirely.
-        # The scoring-failure log lines must read it defensively — a subscript there
-        # turns one unscoreable record into a KeyError that kills the whole load.
+        """Rescoring walks arbitrary cached JSON, so a record can lack post_id entirely, and the
+        scoring-failure log lines must read it defensively: a subscript there turns one
+        unscoreable record into a KeyError that kills the whole load."""
         unscoreable_numeric = {
             "type": "numeric",
             "resolution_parsed": 5.0,
@@ -1499,8 +1695,8 @@ class TestBuildPerformanceDatasetResearchTags:
         assert records[0]["research_source_class"] == "artifact"
 
     def test_question_without_an_archive_record_gets_none_not_false(self, tmp_path: Path, monkeypatch):
-        # Absence of evidence is not an untreated record: a missing archive file (or a
-        # whole missing archive) must never look like a measured False in the cuts.
+        """Absence of evidence is not an untreated record: a missing archive file, or a whole
+        missing archive, must never look like a measured False in the cuts."""
         monkeypatch.setattr(
             collector, "fetch_resolved_questions", lambda tournament, token: [_binary_post(2, 22, score_data={})]
         )
@@ -1539,10 +1735,12 @@ class TestBuildPerformanceDatasetPriorDiff:
         assert records[0]["prior_resolution"] == "no"
 
     def test_no_prior_leaves_the_tags_none_not_false(self, tmp_path: Path, monkeypatch):
-        # "Not compared" and "compared, nothing moved" are different facts; a default build
-        # must produce the first, or every downstream cut reads silence as stability. The
-        # keys are absent rather than explicitly None on this path, which is the same "not
-        # compared" answer to every reader (the diff and the renderer both use ``.get``).
+        """ "Not compared" and "compared, nothing moved" are different facts, and a default build
+        must produce the first, or every downstream cut reads silence as stability.
+
+        The keys are absent rather than explicitly None on this path, which is the same "not
+        compared" answer to every reader, since the diff and the renderer both use ``.get``.
+        """
         self._fetchers(monkeypatch, _binary_post(4, 44, score_data={}))
 
         records = build_performance_dataset(tournament="t", token="fake", research_archive_dir=tmp_path)
@@ -1582,16 +1780,16 @@ class TestResolveNumericScoreInputsZeroPoint:
         }
 
     def test_zero_point_zero_stays_log_when_range_min_positive(self):
-        # This is the sibling of the width_monitor fix: a log-scale question with a
-        # positive floor carries zero_point==0, which must survive as 0.0 so
-        # numeric_log_score buckets on the geometric grid.
+        """The sibling of the width_monitor fix: a log-scale question with a positive floor
+        carries ``zero_point == 0``, which must survive as 0.0 so ``numeric_log_score`` buckets
+        on the geometric grid."""
         inputs = resolve_numeric_record_to_score_inputs(self._record(0, 1.0, 1000.0))
         assert inputs is not None
         _res, _lo, _hi, zero_point = inputs
         assert zero_point == 0.0
 
     def test_zero_point_zero_dropped_when_range_min_nonpositive(self):
-        # A non-positive floor rules out a log transform -> linear (None).
+        """A non-positive floor rules out a log transform, so the axis is linear (None)."""
         inputs = resolve_numeric_record_to_score_inputs(self._record(0, 0.0, 100.0))
         assert inputs is not None
         assert inputs[3] is None

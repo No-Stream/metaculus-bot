@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Awaitable, Callable
-from typing import Any
+from collections.abc import Awaitable
+from typing import Any, Protocol
 
 from litellm import acompletion
 
@@ -15,7 +15,25 @@ from metaculus_bot.fallback_openrouter import (
 )
 from metaculus_bot.research.agentic.types import LoopConfig
 
-LlmCall = Callable[[list[dict[str, Any]], list[dict[str, Any]] | None], Awaitable[Any]]
+
+class LlmCall(Protocol):
+    """One driver completion: the message list, the tool list to offer, and ``tool_choice``.
+
+    ``tool_choice`` is forwarded as the API parameter of that name; ``None`` leaves the
+    provider default. The ghost phase offers the research turns' tool list with
+    ``tool_choice="none"`` so its request still matches the cached prompt prefix
+    (docs/agentic_gap_fill.md "The ghost forecast").
+    """
+
+    def __call__(
+        self,
+        messages: list[dict[str, Any]],
+        tools_json: list[dict[str, Any]] | None,
+        /,
+        *,
+        tool_choice: str | None = None,
+    ) -> Awaitable[Any]: ...
+
 
 # The CREDIT_ROLE_SPEND line for the v2 driver's tool-loop completions.
 GAP_FILL_V2_DRIVER_ROLE = "gap_fill_v2_driver"
@@ -30,66 +48,59 @@ def build_default_llm_call(config: LoopConfig) -> LlmCall:
     async def _call_once(
         messages: list[dict[str, Any]],
         tools_json: list[dict[str, Any]] | None,
+        *,
+        tool_choice: str | None,
         api_key: str | None,
         key_alias: str,
     ) -> Any:
         kwargs: dict[str, Any] = {
             "model": model,
-            # Shallow copy: litellm may mutate the caller's list in place in some
-            # code paths; copying the container preserves the loop's append-only
-            # prefix (dict identity is kept — providers cache on it).
+            # Shallow copy: litellm may mutate the caller's list, and dict identity must survive for caching.
             "messages": list(messages),
-            # CREDIT_ROLE_SPEND tag. The GeneralLlm builders stamp this once at
-            # construction; this raw-acompletion path stamps it per call, with the key
-            # alias of the key this attempt actually bills.
-            "metadata": llm_call_metadata(GAP_FILL_V2_DRIVER_ROLE, key_alias),
+            # CREDIT_ROLE_SPEND tag, stamped per call because the alias names the key this attempt bills.
+            "metadata": llm_call_metadata(GAP_FILL_V2_DRIVER_ROLE, key_alias, question_ref=config.question_ref),
             "parallel_tool_calls": True,
             "reasoning_effort": config.reasoning_effort,
-            # litellm's OpenrouterConfig doesn't map reasoning_effort; without this
-            # it survives only because forecasting_tools sets litellm.drop_params=True
-            # globally (silently stripping it). Whitelisting passes the raw param
-            # through to OpenRouter (validated live by scratch/driver_replay_2026-07-17).
+            # Without this whitelist litellm drops reasoning_effort; see docs/agentic_gap_fill.md.
             "allowed_openai_params": ["reasoning_effort"],
             "temperature": None,
-            # litellm ≥1.92 eagerly imports its proxy MCP-gateway handler (which
-            # requires fastapi, a proxy-only extra we don't install) whenever `tools`
-            # is passed — even for plain function tools that never touch the gateway.
-            # We run our own tool-dispatch loop, so skip the import. Private litellm
-            # kwarg, popped before the provider sees it; verified against the locked
-            # litellm 1.92 (both the eager-import defect and this skip kwarg are
-            # 1.92-era). If a future litellm drops the kwarg, this crashes loudly
-            # rather than silently regressing.
+            # Private litellm kwarg skipping a proxy-only eager import; see docs/agentic_gap_fill.md.
             "_skip_mcp_handler": True,
         }
         if tools_json is not None:
             kwargs["tools"] = tools_json
+        if tool_choice is not None:
+            kwargs["tool_choice"] = tool_choice
         if api_key:
             kwargs["api_key"] = api_key
         return await acompletion(**kwargs)
 
-    async def _call(messages: list[dict[str, Any]], tools_json: list[dict[str, Any]] | None) -> Any:
+    async def _call(
+        messages: list[dict[str, Any]],
+        tools_json: list[dict[str, Any]] | None,
+        *,
+        tool_choice: str | None = None,
+    ) -> Any:
         if use_fallback:
             assert donated_key is not None
             assert personal_key is not None
             try:
-                return await _call_once(messages, tools_json, donated_key, DONATED_KEY_ALIAS)
+                return await _call_once(
+                    messages, tools_json, tool_choice=tool_choice, api_key=donated_key, key_alias=DONATED_KEY_ALIAS
+                )
             except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except  # classifier re-raises non-key-scoped errors
                 if not should_retry_with_general_key(exc):
                     raise
-                # Same accounting as FallbackOpenRouterLlm.invoke: counted once in the
-                # generic total (plus at most one subset) and logged as a PAID
-                # PERSONAL-KEY FALLBACK. Without this the highest-volume donated-key
-                # path in the bot — v2 runs on every question in all four prod
-                # workflows — failed over to the paid key completely silently.
+                # Without this the bot's highest-volume donated-key path failed to the paid key silently.
                 await record_donated_key_fallback(model, exc)
-                return await _call_once(messages, tools_json, personal_key, PERSONAL_KEY_ALIAS)
+                return await _call_once(
+                    messages, tools_json, tool_choice=tool_choice, api_key=personal_key, key_alias=PERSONAL_KEY_ALIAS
+                )
 
         use_donated = bool(should_route_via_donated_key(model) and donated_key)
         api_key = donated_key if use_donated else personal_key
-        # The counted/logged fallback DECISION is now shared with fallback_openrouter
-        # (record_donated_key_fallback). Only the transport differs: this path calls
-        # raw litellm.acompletion for tool-loop support, where the wrapper goes
-        # through GeneralLlm. Share the transport too if this grows a retry ladder.
-        return await _call_once(messages, tools_json, api_key, DONATED_KEY_ALIAS if use_donated else PERSONAL_KEY_ALIAS)
+        # Fallback decision shared with fallback_openrouter; only the transport differs.
+        key_alias = DONATED_KEY_ALIAS if use_donated else PERSONAL_KEY_ALIAS
+        return await _call_once(messages, tools_json, tool_choice=tool_choice, api_key=api_key, key_alias=key_alias)
 
     return _call

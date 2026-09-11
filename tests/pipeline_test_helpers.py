@@ -8,13 +8,20 @@ tests exercise the FULL production code path with deterministic outputs.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
-from forecasting_tools import BinaryQuestion, GeneralLlm, MultipleChoiceQuestion, NumericQuestion
+import numpy as np
+from forecasting_tools import BinaryQuestion, GeneralLlm, MultipleChoiceQuestion, NumericDistribution, NumericQuestion
+from forecasting_tools.data_models.numeric_report import Percentile
+from forecasting_tools.data_models.questions import DateQuestion, DiscreteQuestion, MetaculusQuestion
 
 from main import TemplateForecaster
 from metaculus_bot.aggregation_strategies import AggregationStrategy
+from metaculus_bot.constants import MANTIC_SITE_URL
+from metaculus_bot.numeric.config import PMF_ELICITATION_MAX_BINS, PMF_FLOOR_MARGIN, grid_step_constraints
+from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
+from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
 
 # ---------------------------------------------------------------------------
 # Canned LLM responses
@@ -167,16 +174,15 @@ class LlmRouter:
         return any(signal.lower() in prompt.lower() for signal in stacker_signals)
 
     def _is_forecaster_prompt(self, prompt: str) -> bool:
-        # All forecaster + stacker prompts now emit a fenced STRUCTURED FORECAST
-        # JSON block. Stacker prompts also match — the __call__ order routes them
-        # via ``_is_stacker_prompt`` first, so this signal only sees non-stacker
-        # LLM calls. The old ``"Probability:"`` cue is gone: the base binary
-        # prompt no longer requests a trailing "Probability: NN%" line.
+        """Every forecaster and stacker prompt asks for a fenced STRUCTURED FORECAST block.
+
+        Stacker prompts match too; ``__call__`` routes them through ``_is_stacker_prompt`` first,
+        so this signal only sees non-stacker LLM calls.
+        """
         return "STRUCTURED FORECAST" in prompt
 
     def _detect_question_type(self, prompt: str) -> str:
-        # Numeric prompt talks about "percentiles" extensively; MC prompt has an
-        # "Options (in resolution order):" line the others lack. Otherwise binary.
+        """Numeric prompts talk about percentiles, MC prompts list the options in resolution order; else binary."""
         if "percentile" in prompt.lower():
             return "numeric"
         if "options (in resolution order)" in prompt.lower():
@@ -200,6 +206,25 @@ _OPEN_TIME = datetime(2026, 1, 1)
 _RESOLVE_TIME = datetime(2026, 12, 31)
 
 
+def metaculus_url(post_id: int | None) -> str:
+    """The ``page_url`` the framework writes on every question it parses, whichever host served the payload."""
+    return f"https://www.metaculus.com/questions/{post_id}/"
+
+
+def mantic_url(post_id: int | None) -> str:
+    """The ``page_url`` ``ManticClient`` rewrites onto every question it parses; ``question_platform`` reads the host."""
+    return f"{MANTIC_SITE_URL}/questions/{post_id}/"
+
+
+def on_mantic[Q: MetaculusQuestion](question: Q) -> Q:
+    """``question`` as ``ManticClient`` hands it over.
+
+    The framework parses every payload with a metaculus.com ``page_url``; the client rewrites it to the
+    Mantic host, which is the one fact every platform gate reads.
+    """
+    return question.model_copy(update={"page_url": mantic_url(question.id_of_post)})
+
+
 def make_real_binary_question(qid: int = 1001, close_time: datetime | None = None) -> BinaryQuestion:
     """A real BinaryQuestion. ``close_time`` drives the per-question time budget.
 
@@ -210,7 +235,7 @@ def make_real_binary_question(qid: int = 1001, close_time: datetime | None = Non
         question_text="Will the US unemployment rate exceed 5% by December 2026?",
         id_of_question=qid,
         id_of_post=qid + 10000,
-        page_url=f"https://www.metaculus.com/questions/{qid}/",
+        page_url=metaculus_url(qid),
         background_info=(
             "The US unemployment rate has been between 3.4% and 4.2% for the past year. "
             "Historical data shows that spikes above 5% are typically associated with recessions."
@@ -240,7 +265,7 @@ def make_real_numeric_question(
         question_text="What will the US unemployment rate be in December 2026?",
         id_of_question=qid,
         id_of_post=qid + 10000,
-        page_url=f"https://www.metaculus.com/questions/{qid}/",
+        page_url=metaculus_url(qid),
         background_info=(
             "The US unemployment rate is reported monthly by the Bureau of Labor Statistics. "
             "It has ranged from 3.4% to 4.2% over the past 12 months."
@@ -261,6 +286,96 @@ def make_real_numeric_question(
     )
 
 
+def make_count_question(
+    bins: int,
+    *,
+    page_url: str | None = None,
+    open_lower: bool = False,
+    open_upper: bool = True,
+    qid: int = 700,
+) -> DiscreteQuestion:
+    """A count question on ``bins`` integer bins, 0 through ``bins - 1``, in the platform's discrete convention.
+
+    Half-step range bounds (``-0.5`` to ``bins - 0.5``), ``cdf_size = bins + 1`` and nominal bounds on
+    the first and last count: the shape the framework parses for every Metaculus discrete question and
+    ``ManticClient`` for every Mantic quantitative one. ``page_url`` defaults to the Mantic host, where
+    a grid of ``PMF_ELICITATION_MAX_BINS`` bins or fewer is elicited per bin; pass ``metaculus_url(qid)``
+    for the same grid off the platform.
+    """
+    return DiscreteQuestion(
+        id_of_question=qid,
+        id_of_post=qid,
+        page_url=mantic_url(qid) if page_url is None else page_url,
+        question_text="How many?",
+        background_info="",
+        resolution_criteria="",
+        fine_print="",
+        published_time=None,
+        close_time=None,
+        lower_bound=-0.5,
+        upper_bound=bins - 0.5,
+        open_lower_bound=open_lower,
+        open_upper_bound=open_upper,
+        unit_of_measure="",
+        zero_point=None,
+        cdf_size=bins + 1,
+        nominal_lower_bound=0.0,
+        nominal_upper_bound=float(bins - 1),
+    )
+
+
+def make_real_date_question(
+    qid: int = 4001,
+    *,
+    lower_bound: datetime = datetime(2026, 9, 8, tzinfo=UTC),
+    upper_bound: datetime = datetime(2026, 9, 20, tzinfo=UTC),
+    open_lower_bound: bool = False,
+    open_upper_bound: bool = False,
+    cdf_size: int = 13,
+    date_granularity: str = "day",
+    with_scaling: bool = True,
+) -> DateQuestion:
+    """A real DateQuestion in post 651's shape: twelve one-day bins, both bounds closed.
+
+    ``api_json`` carries the ``question.scaling`` block the epoch adapter reads its nominal bounds
+    from, in the wire convention: ``nominal_max`` one bin below ``range_max`` on a day- or
+    week-granularity question, equal to it on a legacy one. ``with_scaling=False`` omits the block,
+    the shape of a question not built from API JSON.
+    """
+    question_json: dict[str, Any] = {"date_granularity": date_granularity}
+    if with_scaling:
+        bin_width = (upper_bound - lower_bound) / (cdf_size - 1)
+        nominal_max = upper_bound - bin_width if date_granularity in ("day", "week") else upper_bound
+        question_json["scaling"] = {
+            "range_min": lower_bound.timestamp(),
+            "range_max": upper_bound.timestamp(),
+            "nominal_min": lower_bound.timestamp(),
+            "nominal_max": nominal_max.timestamp(),
+            "zero_point": None,
+            "inbound_outcome_count": cdf_size - 1,
+        }
+    return DateQuestion(
+        question_text="On which date will the S&P 500 post its largest single-day percentage move?",
+        id_of_question=qid,
+        id_of_post=qid + 10000,
+        page_url=mantic_url(qid),
+        background_info="The window covers the trading days between the open and the close of the question.",
+        resolution_criteria=(
+            "Resolves to the UTC calendar date of the trading day with the largest absolute percentage "
+            "move in the S&P 500 index during the window."
+        ),
+        fine_print="Ties resolve to the earlier date.",
+        open_time=_OPEN_TIME,
+        scheduled_resolution_time=_RESOLVE_TIME,
+        lower_bound=lower_bound,
+        upper_bound=upper_bound,
+        open_lower_bound=open_lower_bound,
+        open_upper_bound=open_upper_bound,
+        cdf_size=cdf_size,
+        api_json={"question": question_json, "my_forecasts": {"latest": {"forecast_values": None}}},
+    )
+
+
 def make_real_mc_question(
     qid: int = 3001,
     options: list[str] | None = None,
@@ -270,7 +385,7 @@ def make_real_mc_question(
         question_text="Which economic scenario is most likely for the US in 2026?",
         id_of_question=qid,
         id_of_post=qid + 10000,
-        page_url=f"https://www.metaculus.com/questions/{qid}/",
+        page_url=metaculus_url(qid),
         background_info=(
             "Multiple economic scenarios are possible depending on Fed policy, "
             "geopolitical developments, and consumer spending trends."
@@ -316,3 +431,86 @@ def make_e2e_bot(
     }
     defaults.update(overrides)
     return TemplateForecaster(**defaults)
+
+
+# ---------------------------------------------------------------------------
+# Platform CDF acceptance replica
+# ---------------------------------------------------------------------------
+
+
+# The per-bin oracle set: five grid sizes across the elicitable range, the smallest coarse Mantic grid to the threshold.
+ORACLE_BIN_COUNTS = (3, 4, 12, 21, PMF_ELICITATION_MAX_BINS)
+
+
+def server_min_step(inbound: int) -> float:
+    """The platform's per-bin minimum for ``inbound`` bins, rounded the way the server rounds it."""
+    return round(0.01 / inbound, 9)
+
+
+def server_max_step(inbound: int) -> float:
+    """The platform's per-bin maximum for ``inbound`` bins, UNROUNDED, as the server compares it."""
+    return 0.2 * 200 / inbound
+
+
+def assert_server_accepts_cdf(probs: np.ndarray, *, cdf_size: int, open_lower: bool, open_upper: bool) -> None:
+    """Fail exactly where the platform's ``continuous_cdf`` validator would reject the submission.
+
+    Replicated from ``questions/serializers/common.py`` in the open-source Metaculus backend,
+    which Mantic forked with identical constants: the CDF is rounded to 10 decimals, its PMF to
+    9, and the rounded PMF is compared against the rounded min step and the UNROUNDED max step.
+    """
+    inbound = cdf_size - 1
+    assert len(probs) == inbound + 1, f"len(continuous_cdf)={len(probs)} != inbound_outcome_count + 1={inbound + 1}"
+    assert not np.any(np.isnan(probs))
+
+    rounded = np.round(probs, 10)
+    pmf = np.round(np.diff(rounded), 9)
+    min_diff = server_min_step(inbound)
+    max_diff = server_max_step(inbound)
+    assert np.all(pmf >= min_diff), f"step below server min {min_diff}: min pmf {pmf.min()} at {int(np.argmin(pmf))}"
+    assert np.all(pmf <= max_diff), f"step above server max {max_diff}: max pmf {pmf.max()} at {int(np.argmax(pmf))}"
+
+    if open_lower:
+        assert rounded[0] >= 0.001, f"open lower bound cdf[0]={rounded[0]} < 0.001"
+    else:
+        assert rounded[0] == 0.0, f"closed lower bound cdf[0]={rounded[0]} != 0.0"
+    if open_upper:
+        assert rounded[-1] <= 0.999, f"open upper bound cdf[-1]={rounded[-1]} > 0.999"
+    else:
+        assert rounded[-1] == 1.0, f"closed upper bound cdf[-1]={rounded[-1]} != 1.0"
+
+
+def cdf_heights(distribution: NumericDistribution) -> np.ndarray:
+    """The CDF heights of a built distribution, one per grid point, as the server receives them."""
+    return np.asarray([point.percentile for point in distribution.get_cdf()], dtype=float)
+
+
+def pmf_of(distribution: NumericDistribution) -> np.ndarray:
+    """The per-bin mass of a built distribution: the first difference of its CDF heights."""
+    return np.diff(cdf_heights(distribution))
+
+
+def distribution_from_heights(heights: np.ndarray, question: NumericQuestion) -> NumericDistribution:
+    """A published-shape distribution with exactly these CDF heights on the question's canonical grid."""
+    values = build_cdf_value_grid(question.lower_bound, question.upper_bound, None, len(heights))
+    declared = [Percentile(percentile=float(h), value=float(v)) for h, v in zip(heights, values, strict=True)]
+    return create_pchip_numeric_distribution(
+        pchip_cdf=[float(h) for h in heights], percentile_list=declared, question=question, zero_point=None
+    )
+
+
+def certain_of_bin(view: NumericQuestion, bin_index: int) -> NumericDistribution:
+    """A per-bin member certain of one bin on ``view``'s grid: the platform floor on every other bin.
+
+    The shape the per-bin floor blend hands the aggregator: a zero declared on a bin lands at
+    ``min_step + PMF_FLOOR_MARGIN`` and the believed bin keeps the rest. Built straight from the
+    heights, the way the tail floor rebuilds a published aggregate, so it needs no elicitation and no
+    percentiles.
+    """
+    min_step, _ = grid_step_constraints(view.cdf_size)
+    floor = min_step + PMF_FLOOR_MARGIN
+    pmf = np.full(view.cdf_size - 1, floor)
+    pmf[bin_index] = 1.0 - (pmf.size - 1) * floor
+    heights = np.concatenate(([0.0], np.cumsum(pmf)))
+    heights[-1] = 1.0
+    return distribution_from_heights(heights, view)

@@ -10,7 +10,6 @@ import os
 import re
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, cast
-from urllib.parse import unquote
 
 import pandas as pd
 import yfinance
@@ -26,12 +25,14 @@ from metaculus_bot.constants import (
     FINANCIAL_YFINANCE_RECENT_DAYS,
     FRED_API_KEY_ENV,
     MAX_FINANCIAL_IDENTIFIERS,
+    TS_ANCHOR_HTTP_TIMEOUT,
 )
 from metaculus_bot.fallback_openrouter import build_llm_with_openrouter_fallback
 from metaculus_bot.llm_retry import invoke_with_transient_retry
 from metaculus_bot.research.currency_pegs import peg_disclosure_lines, peg_for_ticker
 from metaculus_bot.research.fred_rendering import UnknownFredSeries, _fetch_fred_data, _fetch_fred_data_ceiling
 from metaculus_bot.research.fx_identifiers import is_fx_identifier
+from metaculus_bot.research.known_api import parse as known_api_parse
 from metaculus_bot.research.noise_flag import noise_flag_line, screen_for_quote_noise
 from metaculus_bot.research.provider_diagnostics import is_lost_source, record_provider_detail
 from metaculus_bot.research.providers import ResearchCallable
@@ -45,11 +46,6 @@ from metaculus_bot.research.ts_estimators import (
 )
 
 logger: logging.Logger = logging.getLogger(__name__)
-
-# FRED series IDs are alphanumeric + underscore (e.g. DGS10, BAMLH0A0HYM2, T10Y2Y).
-# Yahoo tickers add `^`, `=`, `.`, `-` (e.g. ^TNX, CL=F, BTC-USD, EURUSD=X).
-_FRED_SERIES_URL_RE = re.compile(r"fred\.stlouisfed\.org/series/([A-Za-z0-9_]+)")
-_YAHOO_TICKER_URL_RE = re.compile(r"finance\.yahoo\.com/quote/([A-Za-z0-9.^=\-]+)")
 
 # Full-string char-class guards (same classes the extraction regexes enforce), used
 # to sanitize classifier-emitted IDs — which come from comma-splitting with NO
@@ -228,23 +224,14 @@ def _sanitize_classifier_ids(items: list[str], char_re: re.Pattern[str], kind: s
 
 
 def extract_financial_identifiers_from_criteria(text: str) -> dict[str, list[str]]:
-    """Deterministically extract the resolving FRED series / Yahoo tickers from URLs.
+    """Deterministically extract the resolving FRED series / Yahoo tickers cited in ``text``.
 
-    Resolution criteria usually name the exact source the question resolves on
-    (e.g. https://fred.stlouisfed.org/series/DGS10). Extracting these directly
-    guarantees the resolving series fires regardless of the LLM classifier's guess.
-
-    URL-decodes first so `%5ETNX` -> `^TNX` matches the Yahoo ticker pattern.
-    Returns {"tickers": [...], "fred_series": [...]}, deduped, order-preserving.
+    Shares the known-API registry's parsers (``known_api.parse``) so the extraction and the
+    rung-0 translation cannot drift: it reads the series page, the graph CSV/XLS and ALFRED
+    forms for FRED, and the quote pages (regional hosts included) and the chart data endpoint for
+    Yahoo. Returns ``{"tickers": [...], "fred_series": [...]}``, deduped, order-preserving.
     """
-    decoded = unquote(text)
-    fred_series = _dedupe_preserving_order(_FRED_SERIES_URL_RE.findall(decoded))
-    # The Yahoo char class includes `.` with no right boundary, so a sentence-final
-    # URL captures the trailing period (e.g. `.../quote/%5ETNX.` -> `^TNX.`), which
-    # isn't in KNOWN_TICKERS and fails the yfinance lookup. `.rstrip(".")` only trims
-    # trailing dots — internal dots (e.g. `DX-Y.NYB`) are preserved.
-    tickers = _dedupe_preserving_order([t.rstrip(".") for t in _YAHOO_TICKER_URL_RE.findall(decoded)])
-    return {"tickers": tickers, "fred_series": fred_series}
+    return {"tickers": known_api_parse.yahoo_symbols(text), "fred_series": known_api_parse.fred_series_ids(text)}
 
 
 # Exchange-rate routing rule, interpolated into CLASSIFIER_PROMPT below.
@@ -375,8 +362,8 @@ def _yfinance_history(ticker_obj: Any, window_end: datetime, *, is_benchmarking:
     start = (window_end - timedelta(days=FINANCIAL_YFINANCE_LOOKBACK_DAYS)).date()
     if is_benchmarking:
         end = (window_end + timedelta(days=1)).date()  # yfinance end is EXCLUSIVE → +1d makes as_of inclusive
-        return ticker_obj.history(start=start.isoformat(), end=end.isoformat())
-    return ticker_obj.history(start=start.isoformat())
+        return ticker_obj.history(start=start.isoformat(), end=end.isoformat(), timeout=TS_ANCHOR_HTTP_TIMEOUT)
+    return ticker_obj.history(start=start.isoformat(), timeout=TS_ANCHOR_HTTP_TIMEOUT)
 
 
 def _yfinance_latest_lines(

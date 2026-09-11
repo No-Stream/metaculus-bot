@@ -20,6 +20,11 @@ import aiohttp
 import pytest
 
 from metaculus_bot.research import impersonated_fetch, resolution_chart_data, resolution_presentation, resolution_source
+from metaculus_bot.research.fetch_ladder import classify, direct_fetch, guard, rungs, verdict
+from metaculus_bot.research.fetch_ladder.context import LadderContext
+from metaculus_bot.research.fetch_ladder.ladder import _fetch_one
+from metaculus_bot.research.fetch_ladder.policy import RESOLUTION_SOURCE_POLICY
+from metaculus_bot.research.fetch_ladder.verdict import looks_like_js_wall, looks_like_page_chrome
 from metaculus_bot.research.http_fetch import host_semaphores, pdf_parse_semaphore, semaphore_for_host
 from metaculus_bot.research.impersonated_fetch import IMPERSONATE_TRIGGER_STATUSES
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail
@@ -29,14 +34,10 @@ from metaculus_bot.research.resolution_presentation import (
     format_resolution_sections,
 )
 from metaculus_bot.research.resolution_source import (
-    FetchContext,
     FetchResult,
-    _fetch_one,
     _fetch_result_sources,
     _rung_counts,
     fetch_resolution_sources,
-    looks_like_js_wall,
-    looks_like_page_chrome,
     resolution_source_provider,
 )
 from scripts.telemetry.markers import MARKER_SPECS
@@ -53,6 +54,7 @@ from tests.resolution_source_fakes import (
     _mid_band_chart_page,
     _mock_question,
     _prose_page,
+    capped_ctx,
     cdc_aria_stat_block_page,
     fake_impersonated_fetch,
 )
@@ -61,12 +63,11 @@ from tests.test_document_text import build_text_pdf
 
 class TestFetchOne:
     async def test_success_html_extracts_and_truncates(self, article_html, monkeypatch):
-        # Tighten the per-URL cap so we can also verify truncation lands.
-        monkeypatch.setattr(resolution_presentation, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", 200)
+        """The per-URL cap is tightened here so that truncation lands too and can be verified."""
         session = FakeSession(
             {"https://news.example.com/report": FakeResponse(200, body=article_html, content_type="text/html")}
         )
-        result = await _fetch_one(session, "https://news.example.com/report", {})
+        result = await _fetch_one(session, "https://news.example.com/report", {}, capped_ctx(200))
         assert result.status == "success"
         assert result.http_status == 200
         # Real trafilatura ran on the article — a known substring survives.
@@ -75,27 +76,24 @@ class TestFetchOne:
         assert len(result.text) <= 200
 
     async def test_html_truncation_appends_marker(self, article_html, monkeypatch):
-        # Live run analysis (2026-07-10): the per-URL cap truncates mid-sentence
-        # with no marker so forecasters can't tell the snapshot is partial.
-        # When truncation fires, a marker line naming the cap and URL must
-        # appear, and total text length must remain bounded by the cap.
+        """Live run analysis (2026-07-10) found the per-URL cap truncating mid-sentence with no marker, so
+        forecasters could not tell the snapshot was partial. When truncation fires, a marker line naming the
+        cap and the URL must appear, and the total text length must remain bounded by the cap."""
         cap = 200
-        monkeypatch.setattr(resolution_presentation, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", cap)
         session = FakeSession(
             {"https://news.example.com/report": FakeResponse(200, body=article_html, content_type="text/html")}
         )
-        result = await _fetch_one(session, "https://news.example.com/report", {})
+        result = await _fetch_one(session, "https://news.example.com/report", {}, capped_ctx(cap))
         assert result.status == "success"
         assert f"[truncated at {cap} chars — full source at https://news.example.com/report]" in result.text
         assert len(result.text) <= cap
 
     async def test_no_truncation_marker_when_fits_under_cap(self, article_html, monkeypatch):
-        # Extraction fits entirely under the cap -> NO marker appended.
-        monkeypatch.setattr(resolution_presentation, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", 100_000)
+        """An extraction that fits entirely under the cap gets NO marker appended."""
         session = FakeSession(
             {"https://news.example.com/report": FakeResponse(200, body=article_html, content_type="text/html")}
         )
-        result = await _fetch_one(session, "https://news.example.com/report", {})
+        result = await _fetch_one(session, "https://news.example.com/report", {}, capped_ctx(100_000))
         assert result.status == "success"
         assert "truncated at" not in result.text
 
@@ -113,7 +111,7 @@ class TestFetchOne:
         assert result.http_status == 404
 
     async def test_js_wall_short_html_flagged(self):
-        # 200 OK but the extracted text is short: js_wall.
+        """A 200 OK whose extracted text is short is a js_wall."""
         tiny = b"<!doctype html><html><body><div id='root'></div></body></html>"
         session = FakeSession({"https://spa.example.com/x": FakeResponse(200, body=tiny, content_type="text/html")})
         result = await _fetch_one(session, "https://spa.example.com/x", {})
@@ -122,8 +120,8 @@ class TestFetchOne:
         assert result.text == ""
 
     async def test_oversize_body_is_dropped(self, monkeypatch):
-        # Force a 100-byte cap; the body exceeds it.
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_MAX_RESPONSE_BYTES", 100)
+        """A 100-byte cap is forced here so that the body exceeds it."""
+        monkeypatch.setattr(classify, "RESOLUTION_SOURCE_MAX_RESPONSE_BYTES", 100)
         oversized = b"<html><body>" + b"A" * 500 + b"</body></html>"
         session = FakeSession(
             {"https://big.example.com/x": FakeResponse(200, body=oversized, content_type="text/html")}
@@ -147,12 +145,11 @@ class TestFetchOne:
 
     async def test_json_content_type_returns_raw_truncated(self, monkeypatch):
         cap = 200
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", cap)
         payload = b'{"vulnerabilities":[{"cveID":"CVE-2026-0001","description":"' + b"x" * 500 + b'"}]}'
         session = FakeSession(
             {"https://json.example.com/kev": FakeResponse(200, body=payload, content_type="application/json")}
         )
-        result = await _fetch_one(session, "https://json.example.com/kev", {})
+        result = await _fetch_one(session, "https://json.example.com/kev", {}, capped_ctx(cap))
         assert result.status == "success"
         assert result.content_type is not None
         assert "json" in result.content_type
@@ -257,11 +254,10 @@ class TestFetchOne:
         assert result.route == "direct"
 
     async def test_missing_content_type_on_a_non_document_is_unsupported_type(self):
-        # A 200 OK served without a Content-Type header matches no routing prefix and
-        # reaches the document rung, which reads the body, finds no `%PDF-` magic, and
-        # classifies it `unsupported_type` exactly as before. HTML served with no
-        # content type is still not extracted: sniffing is scoped to documents, where
-        # the label is demonstrably unreliable and the payoff is a whole cited source.
+        """A 200 OK served without a Content-Type header matches no routing prefix and reaches the document
+        rung, which reads the body, finds no `%PDF-` magic, and classifies it `unsupported_type` exactly as
+        before. HTML served with no content type is still not extracted: sniffing is scoped to documents,
+        where the label is demonstrably unreliable and the payoff is a whole cited source."""
         resp = FakeResponse(200, body=b"<html><body>hello there</body></html>")
         del resp.headers["Content-Type"]
         session = FakeSession({"https://noct.example.com/x": resp})
@@ -317,7 +313,11 @@ class TestEmbedShapedPages:
         """The 44554 page itself: 2.9k chars of real background around the embed. Withholding
         it would throw away readable evidence, so the text stays and the section says plainly
         that the embedded figures are not in it — the caveat above it claims primary grading
-        evidence, so an unqualified success overstated what was retrieved."""
+        evidence, so an unqualified success overstated what was retrieved.
+
+        The note LEADS the page text and says "below" because of it; as a trailer, a head-preserving trim
+        deleted it, which the aggregate-trim test below pins.
+        """
         session = FakeSession(
             {"https://tracker.example.com/senate/26": FakeResponse(200, body=tracker_with_infogram_html)}
         )
@@ -328,19 +328,16 @@ class TestEmbedShapedPages:
         assert "simulate the election 50,000 times" in result.text
         assert result.unreadable_embeds == ["infogram"]
         assert "infogram embed(s) that this fetch cannot read" in result.text
-        # The note LEADS the page text, and says "below" because of it — as a trailer
-        # a head-preserving trim deleted it (see the aggregate-trim test below).
         assert result.text.startswith("[This page displays data through infogram")
         assert "NOT in the page text below" in result.text
 
     async def test_the_disclosure_is_budgeted_inside_the_per_url_cap(self, tracker_with_infogram_html, monkeypatch):
-        # The note is budgeted out of the cap (like the Tier-2 dataset lead), never added
-        # on top of it, so the per-URL bound the section budget relies on still holds.
+        """The note is budgeted out of the cap (like the Tier-2 dataset lead) and never added on top of it, so
+        the per-URL bound the section budget relies on still holds."""
         cap = 500
-        monkeypatch.setattr(resolution_presentation, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", cap)
         session = FakeSession({"https://t.example.com/p": FakeResponse(200, body=tracker_with_infogram_html)})
 
-        result = await _fetch_one(session, "https://t.example.com/p", {})
+        result = await _fetch_one(session, "https://t.example.com/p", {}, capped_ctx(cap))
 
         assert result.status == "success"
         assert len(result.text) <= cap
@@ -357,15 +354,15 @@ class TestEmbedShapedPages:
         prevent. Sizes are derived from the prod constants so the scenario stays a REACHABLE
         one: earlier full-size pages spend most of the total, and the embed page lands last.
         """
-        per_url = resolution_presentation.RESOLUTION_SOURCE_PER_URL_MAX_CHARS
+        per_url = RESOLUTION_SOURCE_POLICY.per_url_max_chars
+        assert per_url is not None
         total = resolution_presentation.RESOLUTION_SOURCE_TOTAL_MAX_CHARS
         leftover = per_url // 2  # what the embed page is left to render in
         spend = total - leftover
         filler_sizes = [per_url] * (spend // per_url)
         if spend % per_url:
             filler_sizes.append(spend % per_url)
-        # Reachable on prod constants, which is what makes this a regression rather
-        # than a hypothetical: the pages fit inside RESOLUTION_SOURCE_MAX_URLS.
+        # Reachable on prod constants rather than hypothetical: the pages fit inside RESOLUTION_SOURCE_MAX_URLS.
         assert len(filler_sizes) + 1 <= resolution_source.RESOLUTION_SOURCE_MAX_URLS
 
         fillers = [
@@ -379,7 +376,7 @@ class TestEmbedShapedPages:
             for i, size in enumerate(filler_sizes)
         ]
         embed_text = resolution_presentation._page_text_with_leads(
-            "lorem ipsum " * (per_url // 2), "https://tracker.example.com/senate", ["infogram"]
+            "lorem ipsum " * (per_url // 2), "https://tracker.example.com/senate", ["infogram"], "", cap=per_url
         )
         embed = FetchResult(
             url="https://tracker.example.com/senate",
@@ -409,8 +406,8 @@ class TestEmbedShapedPages:
         assert "cannot read" not in result.text
 
     def test_the_chrome_floor_sits_above_the_js_wall_floor(self):
-        # Both floors read module globals so tests can retune them; the ordering is what
-        # keeps `js_wall` its own population instead of a subset the chrome floor swallowed.
+        """Both floors read module globals so tests can retune them, and the ordering is what keeps `js_wall`
+        its own population instead of a subset the chrome floor swallowed."""
         assert looks_like_page_chrome("x" * 300) is True
         assert looks_like_js_wall("x" * 300) is False
         assert looks_like_page_chrome("x" * 500) is False
@@ -450,8 +447,8 @@ class TestEmbedShapedPages:
         assert "weight other evidence accordingly" in out
 
     def test_a_blank_no_resolving_content_result_constructs(self):
-        # The success-implies-content guard must not fire on the new status: it is a
-        # FAILURE status and its text is empty by construction.
+        """The success-implies-content guard must not fire on the new status: it is a FAILURE status and its
+        text is empty by construction."""
         assert FetchResult(
             url="https://t.example.com/p",
             status="no_resolving_content",
@@ -464,10 +461,12 @@ class TestEmbedShapedPages:
         """The elbow, from both sides. The archive census puts the shortest extraction
         that carries the resolving content at exactly 401 chars
         (myfloridaelections.com's election-date table), so the floor has to withhold at
-        399 and publish at 401 or it is throwing away terse-but-real data tables."""
-        floor = resolution_source.RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS
-        # Trafilatura keeps the <article> paragraph verbatim, so the extraction length is
-        # the paragraph length; "ab " * n is a word-shaped filler it does not collapse.
+        399 and publish at 401 or it is throwing away terse-but-real data tables.
+
+        Trafilatura keeps the <article> paragraph verbatim, so the extraction length is the paragraph length,
+        and "ab " * n is a word-shaped filler it does not collapse.
+        """
+        floor = verdict.RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS
         above = _prose_page("ab " * ((floor + 40) // 3))
         below = _prose_page("ab " * ((floor - 40) // 3))
         session = FakeSession(
@@ -530,7 +529,7 @@ class TestInlineChartData:
         band, which is 7 of the 8 archived sub-400 chrome extractions.
         """
         body = _mid_band_chart_page()
-        extracted = resolution_source._extract_main_text(body, "https://iom.example.com/mid") or ""
+        extracted = classify._extract_main_text(body, "https://iom.example.com/mid") or ""
         # The fixture is only meaningful if it really sits between the two floors.
         assert looks_like_page_chrome(extracted) is True
         assert looks_like_js_wall(extracted) is False
@@ -546,7 +545,7 @@ class TestInlineChartData:
         """The negative twin: with the chart block empty the identical page is withheld —
         and as `thin_page`, not `js_wall`, which is what makes the rescue above the chart
         rung's doing rather than the floors'."""
-        monkeypatch.setattr(resolution_source, "render_inline_chart_data", lambda _: "")
+        monkeypatch.setattr(classify, "render_inline_chart_data", lambda _: "")
         session = FakeSession({"https://iom.example.com/mid": FakeResponse(200, body=_mid_band_chart_page())})
 
         result = await _fetch_one(session, "https://iom.example.com/mid", {})
@@ -556,9 +555,9 @@ class TestInlineChartData:
         assert result.text == ""
 
     async def test_a_malformed_chart_payload_is_ignored_rather_than_raising(self):
-        # A truncated attribute (`{"series":[{"name":}]`) is what a mid-response cut or a
-        # non-JSON JS literal looks like. It must cost the page nothing: the prose still
-        # publishes, with no chart block and no exception out of the provider.
+        """A truncated attribute (`{"series":[{"name":}]`) is what a mid-response cut or a non-JSON JS literal
+        looks like. It must cost the page nothing: the prose still publishes, with no chart block and no
+        exception out of the provider."""
         body = (
             "<!doctype html><html><body><article><h1>Counts</h1><p>"
             "Background prose long enough to clear the chrome floor on its own. " * 8 + "</p>"
@@ -643,9 +642,9 @@ class TestInlineChartData:
         assert "-0" not in out
 
     def test_a_declared_datetime_axis_renders_dates_not_epoch_millis(self):
-        # Highcharts defines a datetime axis in ms since the epoch, UTC. Without the
-        # conversion a tracker's own daily series renders `1756771200000=42`, which is
-        # the shape most likely to matter rendered as noise.
+        """Highcharts defines a datetime axis in ms since the epoch, UTC. Without the conversion a tracker's
+        own daily series renders `1756771200000=42`, which is the shape most likely to matter rendered as
+        noise."""
         html_text = (
             '<div data-chart="'
             + _escape_config(
@@ -660,8 +659,8 @@ class TestInlineChartData:
         assert "Daily: 2026-09-01=41, 2026-09-02=42" in render_inline_chart_data(html_text)
 
     def test_a_numeric_x_axis_without_the_datetime_declaration_is_left_alone(self):
-        # The conversion is keyed on the axis's own declaration, never on the magnitude
-        # of the x values, so a chart plotting a large quantity on x is not re-dated.
+        """The conversion is keyed on the axis's own declaration, never on the magnitude of the x values, so a
+        chart plotting a large quantity on x is not re-dated."""
         html_text = '<div data-chart="' + _escape_config({"series": [{"data": [[1788220800000, 41]]}]}) + '"></div>'
 
         out = render_inline_chart_data(html_text)
@@ -670,7 +669,7 @@ class TestInlineChartData:
         assert "2026-" not in out
 
     def test_long_series_keep_the_newest_points_and_say_so(self):
-        # The resolving value is the newest one, so the window is taken from the END.
+        """The resolving value is the newest one, so the window is taken from the END."""
         n = resolution_chart_data.RESOLUTION_SOURCE_CHART_MAX_POINTS + 5
         html_text = (
             '<div data-chart="'
@@ -690,8 +689,8 @@ class TestInlineChartData:
         assert "m0=0" not in out
 
     def test_the_block_is_bounded_and_drops_whole_charts(self):
-        # A half-rendered row reads like a complete series, so charts are dropped whole
-        # and the omitted count is stated. The bound has to hold including that note.
+        """A half-rendered row reads like a complete series, so charts are dropped whole and the omitted count
+        is stated. The bound has to hold including that note."""
         big = _escape_config(
             {
                 "xAxis": [{"categories": [f"category-label-{i}" for i in range(16)]}],
@@ -706,15 +705,15 @@ class TestInlineChartData:
         assert "further chart(s) on this page omitted — chart-data budget" in out
 
     def test_at_most_max_charts_are_rendered(self):
+        """The chart cap leaves readable charts off the page, so it is an omission like the char budget and has
+        to be stated. It used to `break` silently, which made the "the omitted count is stated" claim above
+        false on this exact shape."""
         one = _escape_config({"series": [{"name": "S", "data": [1]}]})
         html_text = "".join(f'<div data-chart="{one}"></div>' for _ in range(8))
 
         out = render_inline_chart_data(html_text)
 
         assert out.count("\nChart ") == resolution_chart_data.RESOLUTION_SOURCE_CHART_MAX_CHARTS
-        # The cap leaves readable charts off the page, so it is an omission like the char
-        # budget and has to be stated: it used to `break` silently, which made the
-        # docstring's "the omitted count is stated" false on this exact shape.
         omitted = 8 - resolution_chart_data.RESOLUTION_SOURCE_CHART_MAX_CHARTS
         assert f"[{omitted} further chart(s) on this page omitted" in out
 
@@ -751,8 +750,7 @@ class TestInlineChartData:
         session = FakeSession({"https://spin.example.com/p": FakeResponse(200, body=body)})
         result = await _fetch_one(session, "https://spin.example.com/p", {})
 
-        # And the page itself is unaffected: a body full of unparseable decoration costs
-        # the chart rung a bounded scan and the page nothing.
+        # The page itself is unaffected: unparseable decoration costs the chart rung a bounded scan, the page nothing.
         assert result.status == "success"
         assert CHART_DATA_LEAD not in result.text
         assert "compiled from monthly returns" in result.text
@@ -807,13 +805,12 @@ class TestInlineChartData:
         assert resolution_chart_data._balanced_object("{" + "a" * 200 + "}", 0) is None
 
     async def test_the_chart_block_is_budgeted_inside_the_per_url_cap(self, monkeypatch):
-        # Same rule as the embed disclosure: leads come OUT of the per-URL cap, never on
-        # top of it, so the aggregate section budget's arithmetic still holds.
+        """Same rule as the embed disclosure: leads come OUT of the per-URL cap and never on top of it, so the
+        aggregate section budget's arithmetic still holds."""
         cap = 400
-        monkeypatch.setattr(resolution_presentation, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", cap)
         session = FakeSession({"https://iom.example.com/med": FakeResponse(200, body=_iom_shaped_page())})
 
-        result = await _fetch_one(session, "https://iom.example.com/med", {})
+        result = await _fetch_one(session, "https://iom.example.com/med", {}, capped_ctx(cap))
 
         assert result.status == "success"
         assert len(result.text) <= cap
@@ -828,6 +825,8 @@ class TestResolutionSourceFetchMarker:
     """
 
     async def test_one_line_per_fetched_url_with_status_and_http_code(self, article_html, monkeypatch, caplog):
+        """One line per fetched URL. The 403 carries its failure_class (server absent, since the fake response
+        sends no Server header), which is what separates an egress-reputation refusal from a host fault."""
         monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
         session = FakeSession(
             {
@@ -835,19 +834,17 @@ class TestResolutionSourceFetchMarker:
                 "https://cbp.gov/data": FakeResponse(403, body=b"", content_type="text/html"),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
         q = _mock_question(resolution_criteria="See https://www.bls.gov/cpi/ and https://cbp.gov/data")
 
         with caplog.at_level("INFO", logger="metaculus_bot.research.resolution_source"):
             await resolution_source_provider(is_benchmarking=False)(q)
 
         lines = [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")]
-        # The 403 carries its failure_class (server absent: the fake response sends no Server
-        # header), which is what separates an egress-reputation refusal from a host fault.
         assert lines == [
-            "RESOLUTION_SOURCE_FETCH: question=999 url=https://www.bls.gov/cpi/ status=ok http=200 embeds=none",
+            "RESOLUTION_SOURCE_FETCH: question=999 url=https://www.bls.gov/cpi/ status=ok http=200 embeds=none caller=resolution_source",
             "RESOLUTION_SOURCE_FETCH: question=999 url=https://cbp.gov/data "
-            "status=blocked http=403 embeds=none failure_class=http_403",
+            "status=blocked http=403 embeds=none failure_class=http_403 caller=resolution_source",
         ]
 
     async def test_a_spaced_server_header_stays_one_marker_token(self, monkeypatch, caplog):
@@ -867,7 +864,7 @@ class TestResolutionSourceFetchMarker:
                 )
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
         q = _mock_question(resolution_criteria="See https://cbp.gov/data")
 
         with caplog.at_level("INFO", logger="metaculus_bot.research.resolution_source"):
@@ -876,7 +873,7 @@ class TestResolutionSourceFetchMarker:
         (line,) = [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")]
         assert line == (
             "RESOLUTION_SOURCE_FETCH: question=999 url=https://cbp.gov/data "
-            "status=blocked http=403 embeds=none failure_class=http_403 server=apache/2.4.62_(debian)"
+            "status=blocked http=403 embeds=none failure_class=http_403 server=apache/2.4.62_(debian) caller=resolution_source"
         )
         spec = next(s for s in MARKER_SPECS if s.name == "resolution_source_fetch")
         match = spec.regex.search(line)
@@ -892,18 +889,22 @@ class TestResolutionSourceFetchMarker:
             "failure_class": "http_403",
             "exc": None,
             "server": "apache/2.4.62_(debian)",
+            "passages_returned": None,
+            "passages_grounded": None,
+            "fallback_used": None,
+            "caller": "resolution_source",
         }
 
     async def test_the_marker_names_the_unreadable_embed_providers(
         self, tracker_with_infogram_html, monkeypatch, caplog
     ):
-        # The whole point on the 44554 shape: the fetch is a legitimate `success`, so the
-        # only thing that makes the missing numbers queryable is this field.
+        """The whole point on the 44554 shape: the fetch is a legitimate `success`, so the only thing that
+        makes the missing numbers queryable is this field."""
         monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
         session = FakeSession(
             {"https://www.racetothewh.com/senate/26": FakeResponse(200, body=tracker_with_infogram_html)}
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
         q = _mock_question(resolution_criteria="See https://www.racetothewh.com/senate/26")
 
         with caplog.at_level("INFO", logger="metaculus_bot.research.resolution_source"):
@@ -911,7 +912,7 @@ class TestResolutionSourceFetchMarker:
 
         assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
             "RESOLUTION_SOURCE_FETCH: question=999 url=https://www.racetothewh.com/senate/26 "
-            "status=ok http=200 embeds=infogram"
+            "status=ok http=200 embeds=infogram caller=resolution_source"
         ]
 
     async def test_the_marker_names_which_rule_withheld_the_page(self, infogram_shell_html, monkeypatch, caplog):
@@ -925,7 +926,7 @@ class TestResolutionSourceFetchMarker:
                 "https://data.example.com/": FakeResponse(200, body=_embed_shell_page("<div>tabs</div>")),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
         q = _mock_question(resolution_criteria="See https://tracker.example.com/senate and https://data.example.com/")
 
         with caplog.at_level("INFO", logger="metaculus_bot.research.resolution_source"):
@@ -933,25 +934,25 @@ class TestResolutionSourceFetchMarker:
 
         assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
             "RESOLUTION_SOURCE_FETCH: question=999 url=https://tracker.example.com/senate "
-            "status=no_resolving_content http=200 embeds=infogram reason=embed_shell",
+            "status=no_resolving_content http=200 embeds=infogram reason=embed_shell caller=resolution_source",
             "RESOLUTION_SOURCE_FETCH: question=999 url=https://data.example.com/ "
-            "status=no_resolving_content http=200 embeds=none reason=thin_page",
+            "status=no_resolving_content http=200 embeds=none reason=thin_page caller=resolution_source",
         ]
 
     async def test_a_fetch_that_never_got_a_response_reports_http_n_a(self, monkeypatch, caplog):
+        """A transport failure carries its class and the exception's name, so the archive tells a timeout from
+        a TLS or DNS refusal without re-scraping the run log."""
         monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
         session = FakeSession({"https://slow.example.com/x": TimeoutError()})
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
         q = _mock_question(resolution_criteria="See https://slow.example.com/x")
 
         with caplog.at_level("INFO", logger="metaculus_bot.research.resolution_source"):
             await resolution_source_provider(is_benchmarking=False)(q)
 
-        # A transport failure carries its class and the exception's name, so the archive tells a
-        # timeout from a TLS or DNS refusal without re-scraping the run log.
         assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
             "RESOLUTION_SOURCE_FETCH: question=999 url=https://slow.example.com/x "
-            "status=error http=n/a embeds=none failure_class=timeout exc=TimeoutError"
+            "status=error http=n/a embeds=none failure_class=timeout exc=TimeoutError caller=resolution_source"
         ]
 
     async def test_no_fetch_is_logged_twice(self, article_html, monkeypatch, caplog):
@@ -966,7 +967,7 @@ class TestResolutionSourceFetchMarker:
                 "https://cbp.gov/data": FakeResponse(403, body=b"", content_type="text/html"),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
         q = _mock_question(resolution_criteria="See https://www.bls.gov/cpi/ and https://cbp.gov/data")
 
         with caplog.at_level("INFO", logger="metaculus_bot.research.resolution_source"):
@@ -979,7 +980,11 @@ class TestResolutionSourceFetchMarker:
     ):
         """`route` is what separates a page a rung rescued from one the direct read got, and
         the escalation line is the only place the trigger status and the rung's cost appear —
-        the fetch line above it carries the FINAL outcome only."""
+        the fetch line above it carries the FINAL outcome only.
+
+        The escalation's `url` is the URL the rung was invoked ON, the stub rather than the target the fetch
+        line names, because that is where the ladder engaged and what `from_status` describes.
+        """
         monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
         session = FakeSession(
             {
@@ -987,7 +992,7 @@ class TestResolutionSourceFetchMarker:
                 "https://cdc.example.com/data/current": FakeResponse(200, body=article_html),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
         q = _mock_question(resolution_criteria="See https://cdc.example.com/surveillance")
 
         with caplog.at_level("INFO", logger="metaculus_bot.research.resolution_source"):
@@ -995,15 +1000,13 @@ class TestResolutionSourceFetchMarker:
 
         assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
             "RESOLUTION_SOURCE_FETCH: question=999 url=https://cdc.example.com/data/current "
-            "status=ok http=200 embeds=none route=meta_refresh"
+            "status=ok http=200 embeds=none route=meta_refresh caller=resolution_source"
         ]
         escalations = [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_ESCALATION:")]
         assert len(escalations) == 1
-        # `url` is the URL the rung was invoked ON — the stub, not the target the fetch line
-        # names — because that is where the ladder engaged and what `from_status` describes.
         assert re.fullmatch(
             r"RESOLUTION_SOURCE_ESCALATION: question=999 url=https://cdc\.example\.com/surveillance "
-            r"from_status=js_wall rung=meta_refresh outcome=success wall_s=\d+\.\d\d",
+            r"from_status=js_wall rung=meta_refresh outcome=success wall_s=\d+\.\d\d caller=resolution_source",
             escalations[0],
         ), escalations[0]
 
@@ -1013,7 +1016,7 @@ class TestResolutionSourceFetchMarker:
         session = FakeSession(
             {"https://cdc.example.com/r.pdf": FakeResponse(200, body=body, content_type="application/pdf")}
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
         q = _mock_question(resolution_criteria="Resolves per https://cdc.example.com/r.pdf hospitalizations")
 
         with caplog.at_level("INFO", logger="metaculus_bot.research.resolution_source"):
@@ -1021,11 +1024,11 @@ class TestResolutionSourceFetchMarker:
 
         assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
             "RESOLUTION_SOURCE_FETCH: question=999 url=https://cdc.example.com/r.pdf "
-            "status=ok http=200 embeds=none route=pdf_local"
+            "status=ok http=200 embeds=none route=pdf_local caller=resolution_source"
         ]
         assert re.fullmatch(
             r"RESOLUTION_SOURCE_ESCALATION: question=999 url=https://cdc\.example\.com/r\.pdf "
-            r"from_status=unsupported_type rung=pdf_local outcome=success wall_s=\d+\.\d\d",
+            r"from_status=unsupported_type rung=pdf_local outcome=success wall_s=\d+\.\d\d caller=resolution_source",
             next(m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_ESCALATION:")),
         )
 
@@ -1033,13 +1036,17 @@ class TestResolutionSourceFetchMarker:
         """`status=ok` on a zero-passage digest was byte-identical to one carrying the
         resolving paragraph, on the surface whose contract is that success means CONTENT. The
         line now carries both halves: the withholding status AND the reason it was withheld,
-        which is what separates it from a page whose chrome we could not read."""
+        which is what separates it from a page whose chrome we could not read.
+
+        The rung FIRED and the withhold is its outcome, which is the convention that keeps a rung that fires
+        often and rescues nothing distinguishable from one that never fires.
+        """
         monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
         body = build_text_pdf([["Hospitalizations reported: 922", "Deaths reported: 2 as of August 24"]])
         session = FakeSession(
             {"https://cdc.example.com/r.pdf": FakeResponse(200, body=body, content_type="application/pdf")}
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
         q = _mock_question(resolution_criteria="Resolves per https://cdc.example.com/r.pdf corn futures settlement")
 
         with caplog.at_level("INFO", logger="metaculus_bot.research.resolution_source"):
@@ -1047,26 +1054,34 @@ class TestResolutionSourceFetchMarker:
 
         assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
             "RESOLUTION_SOURCE_FETCH: question=999 url=https://cdc.example.com/r.pdf "
-            "status=no_resolving_content http=200 embeds=none reason=no_matching_passage route=pdf_local"
+            "status=no_resolving_content http=200 embeds=none reason=no_matching_passage route=pdf_local caller=resolution_source"
         ]
-        # The rung FIRED and the withhold is its outcome, which is the convention that keeps a
-        # rung that fires often and rescues nothing distinguishable from one that never fires.
         assert re.fullmatch(
             r"RESOLUTION_SOURCE_ESCALATION: question=999 url=https://cdc\.example\.com/r\.pdf "
-            r"from_status=unsupported_type rung=pdf_local outcome=no_resolving_content wall_s=\d+\.\d\d",
+            r"from_status=unsupported_type rung=pdf_local outcome=no_resolving_content wall_s=\d+\.\d\d caller=resolution_source",
             next(m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_ESCALATION:")),
         )
 
     async def test_a_skipped_rung_is_counted_but_not_reported_as_an_escalation(self, monkeypatch, caplog):
         """The marker means "a rung fired". A rung that never ran for want of wall budget
         rides `details["counts"]` instead, where it stays queryable without inflating the
-        rung's own fire rate."""
+        rung's own fire rate.
+
+        Four things the counts assertions below pin. The rung's own FIRE count stays zero, because a skip must
+        not inflate the rate at which the rung is measured to work. The withheld page also earned a browser
+        attempt, which this package's autouse fixture declines, so the second skip is the transport reporting
+        itself unavailable rather than another budget skip. The same budget skip appears once more under its
+        per-rung key, so the archive can say WHICH rung the wall bound, and the aggregate stays as it was.
+        The last assertion is a total rather than an exact dict because the key SET grows every time a rung
+        lands, and a literal there made three unrelated commits edit this one test; the total is three rather
+        than two because the budget skip is counted in the aggregate AND in its per-rung key.
+        """
         monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_META_REFRESH_MIN_BUDGET_S", 1_000_000.0)
+        monkeypatch.setattr(classify, "RESOLUTION_SOURCE_META_REFRESH_MIN_BUDGET_S", 1_000_000.0)
         session = FakeSession(
             {"https://cdc.example.com/surveillance": FakeResponse(200, body=_meta_refresh_stub("/data/current"))}
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
         q = _mock_question(resolution_criteria="See https://cdc.example.com/surveillance")
 
         with caplog.at_level("INFO", logger="metaculus_bot.research.resolution_source"):
@@ -1074,24 +1089,14 @@ class TestResolutionSourceFetchMarker:
 
         assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
             "RESOLUTION_SOURCE_FETCH: question=999 url=https://cdc.example.com/surveillance "
-            "status=js_wall http=200 embeds=none"
+            "status=js_wall http=200 embeds=none caller=resolution_source"
         ]
         assert not [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_ESCALATION:")]
         counts = pop_provider_detail(q.id_of_question, "resolution_source")["counts"]
         assert counts["rung_budget_skips"] == 1
-        # The rung's own FIRE count stays zero, which is the whole point: a skip must not inflate
-        # the rate at which the rung is measured to work.
         assert counts["meta_refresh_hops"] == 0
-        # The withheld page also earned a browser attempt, which this package's autouse fixture
-        # declines — so the second skip is the transport reporting itself unavailable rather than
-        # another budget skip.
         assert counts["renderer_unavailable_skips"] == 1
-        # The same budget skip once more under its per-rung key, so the archive can say WHICH
-        # rung the wall bound; the aggregate stays as it was.
         assert counts["meta_refresh_budget_skips"] == 1
-        # A total rather than an exact dict: the key SET grows every time a rung lands, and a
-        # literal here made three unrelated commits edit this one test. Three, not two, because
-        # the budget skip is counted in the aggregate AND in its per-rung key.
         assert sum(counts.values()) == 3
 
 
@@ -1106,10 +1111,10 @@ class TestFetchResolutionSources:
         slow_hosts_seen: dict[str, int] = {}
 
         async def slow_read(self: FakeResponse) -> bytes:
+            """A microscopic sleep gives the event loop a chance to schedule the second same-host coroutine,
+            which the semaphore must hold back."""
             host_probe = "same-host"  # marker for diagnostic only
             slow_hosts_seen[host_probe] = slow_hosts_seen.get(host_probe, 0) + 1
-            # A microscopic sleep gives the event loop a chance to schedule the
-            # second same-host coroutine — the semaphore must hold it back.
             await asyncio.sleep(0.01)
             return await original_read(self)  # type: ignore[misc]
 
@@ -1123,7 +1128,7 @@ class TestFetchResolutionSources:
                 "https://b.example.com/three": FakeResponse(200, body=article_html, content_type="text/html"),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         results = await fetch_resolution_sources(
             [
@@ -1148,9 +1153,10 @@ class TestFetchResolutionSources:
 
         class SlowReadResponse(FakeResponse):
             async def read(self) -> bytes:
-                # Keep the final-host GET context open long enough for the
-                # other task's GET to arrive — without per-hop semaphores the
-                # two windows overlap and host_peak records 2.
+                """Keep the final-host GET context open long enough for the other task's GET to arrive.
+
+                Without per-hop semaphores the two windows overlap and host_peak records 2.
+                """
                 await asyncio.sleep(0.01)
                 return self._body
 
@@ -1161,14 +1167,13 @@ class TestFetchResolutionSources:
                 "https://c.example.com/final": SlowReadResponse(200, body=article_html, content_type="text/html"),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         results = await fetch_resolution_sources(
             ["https://a.example.com/one", "https://b.example.com/two"],
         )
         assert [r.status for r in results] == ["success", "success"]
-        # The politeness guarantee holds at the CONVERGED host, not just the
-        # original ones: never more than one in-flight request to c.example.com.
+        # The politeness guarantee holds at the CONVERGED host, not just at the original ones.
         assert session.host_peak["c.example.com"] == 1
 
     async def test_redirect_revisiting_initial_host_does_not_deadlock(self, article_html, monkeypatch):
@@ -1183,7 +1188,7 @@ class TestFetchResolutionSources:
                 "https://a.example.com/final": FakeResponse(200, body=article_html, content_type="text/html"),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         results = await asyncio.wait_for(
             fetch_resolution_sources(["https://a.example.com/start"]),
@@ -1218,12 +1223,11 @@ class TestFetchResolutionSources:
         session = _EventSession(
             {
                 "https://slow.example.com/x": _HangingResponse(200, body=b"", content_type="text/html"),
-                # RuntimeError is outside the (ClientError, TimeoutError) the fetcher
-                # handles, so it propagates out of the gather.
+                # Outside the (ClientError, TimeoutError) the fetcher handles, so the gather re-raises it.
                 "https://broken.example.com/y": RuntimeError("driver blew up mid-fetch"),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         with pytest.raises(RuntimeError, match="driver blew up mid-fetch"):
             await asyncio.wait_for(
@@ -1307,6 +1311,7 @@ class TestMetaRefreshHop:
         result = await _fetch_one(session, "https://tracker.example.com/p", {})
 
         assert result.status == "blocked"
+        assert result.status_reason == "metaculus_self_ref"
         assert session.requested == ["https://tracker.example.com/p"]
 
     async def test_the_hop_consumes_a_redirect_slot(self):
@@ -1318,7 +1323,7 @@ class TestMetaRefreshHop:
         result = await _fetch_one(session, "https://loop.example.com/p", {})
 
         assert result.status == "error"
-        assert len(session.requested) == resolution_source.MAX_REDIRECTS + 1
+        assert len(session.requested) == direct_fetch.MAX_REDIRECTS + 1
 
     async def test_a_page_that_already_has_content_is_served_as_is(self, article_html):
         """Some content-management systems emit a refresh tag beside real content (a
@@ -1342,16 +1347,15 @@ class TestMetaRefreshHop:
         session = FakeSession(
             {"https://cdc.example.com/surveillance": FakeResponse(200, body=_meta_refresh_stub("/data/current"))}
         )
-        spent = FetchContext(started=time.monotonic() - resolution_source.RESOLUTION_SOURCE_WALL_TIMEOUT)
+        spent = LadderContext(started=time.monotonic() - resolution_source.RESOLUTION_SOURCE_WALL_TIMEOUT)
 
-        with caplog.at_level("WARNING", logger="metaculus_bot.research.resolution_source"):
+        with caplog.at_level("WARNING", logger="metaculus_bot.research.fetch_ladder.context"):
             result = await _fetch_one(session, "https://cdc.example.com/surveillance", {}, spent)
 
         assert result.status == "js_wall"
         assert result.route == "direct"
         assert session.requested == ["https://cdc.example.com/surveillance"]
-        # Two skips, both for want of wall: the meta-refresh hop and then the browser rung,
-        # each self-bounded against the same spent budget.
+        # Two skips for want of wall, each self-bounded against the same spent budget.
         assert [(a.rung, a.skipped_reason) for a in result.rung_attempts] == [
             ("meta_refresh", "wall_budget"),
             ("rendered", "wall_budget"),
@@ -1376,26 +1380,29 @@ class TestTheHopRefusalPolicy:
     async def test_publicness_is_checked_first(self):
         """The order is a telemetry contract: a URL that is both non-public and a self-reference
         has always been recorded as ``ssrf_blocked``, never as the self-reference's ``blocked``."""
-        assert await resolution_source._hop_refusal(self._BOTH) == "ssrf_blocked"
-        assert await resolution_source._hop_refusal("https://www.metaculus.com/questions/999/") == "metaculus_self_ref"
-        assert await resolution_source._hop_refusal("https://tracker.example.com/senate") is None
+        assert await guard._hop_refusal(self._BOTH) == "ssrf_blocked"
+        assert await guard._hop_refusal("https://www.metaculus.com/questions/999/") == "metaculus_self_ref"
+        assert await guard._hop_refusal("https://tracker.example.com/senate") is None
 
     async def test_the_terminal_site_keeps_its_status_strings(self):
-        blocked_both_ways = await resolution_source._vetted_hop_target(
-            self._BOTH, "https://tracker.example.com/p", http_status=302, content_type="", kind="redirect"
+        """The reason is what keeps the paid rung off a URL we refused (`_url_context_rung_applies`) while the
+        `blocked` status contract stays intact, and it rides the fetch marker as `reason=`."""
+        blocked_both_ways = await guard._vetted_hop_target(
+            self._BOTH, "https://tracker.example.com/p", content_type="", kind="redirect"
         )
-        self_ref_only = await resolution_source._vetted_hop_target(
+        self_ref_only = await guard._vetted_hop_target(
             "https://www.metaculus.com/questions/999/",
             "https://tracker.example.com/p",
-            http_status=302,
             content_type="",
             kind="redirect",
         )
 
         assert isinstance(blocked_both_ways, FetchResult)
         assert blocked_both_ways.status == "ssrf_blocked"
+        assert blocked_both_ways.status_reason is None
         assert isinstance(self_ref_only, FetchResult)
         assert self_ref_only.status == "blocked"
+        assert self_ref_only.status_reason == "metaculus_self_ref"
 
     async def test_the_render_landing_is_decided_by_the_same_helper(self, monkeypatch, caplog):
         """The decline site with the highest stakes routes through the helper rather than a copy: a
@@ -1407,14 +1414,14 @@ class TestTheHopRefusalPolicy:
             await asyncio.sleep(0)
             return "ssrf_blocked"
 
-        monkeypatch.setattr(resolution_source, "_hop_refusal", _refuse)
+        monkeypatch.setattr(guard, "_hop_refusal", _refuse)
         renders: list[dict[str, object]] = []
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(None, renders))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(None, renders))
         landed = "https://www.tracker.example.com/senate"
         direct = FetchResult(url=landed, status="js_wall", text="", http_status=200, content_type="text/html")
 
-        with caplog.at_level("WARNING", logger="metaculus_bot.research.resolution_source"):
-            result = await resolution_source._rendered_rung(_URL, direct, {}, FetchContext())
+        with caplog.at_level("WARNING", logger="metaculus_bot.research.fetch_ladder.guard"):
+            result = await rungs._rendered_rung(_URL, direct, {}, LadderContext())
 
         assert result is None
         assert calls == [landed]
@@ -1433,13 +1440,13 @@ class TestTheHopRefusalPolicy:
             await asyncio.sleep(0)
             return "ssrf_blocked" if "10.0.0.8" in candidate_url else None
 
-        monkeypatch.setattr(resolution_source, "_hop_refusal", _refuse)
+        monkeypatch.setattr(guard, "_hop_refusal", _refuse)
         allowed_landing = "https://www.tracker.example.com/senate"
 
-        with caplog.at_level("WARNING", logger="metaculus_bot.research.resolution_source"):
-            same = await resolution_source._landing_refused(_URL, _URL, action="rendering")
-            allowed = await resolution_source._landing_refused(allowed_landing, _URL, action="rendering")
-            refused = await resolution_source._landing_refused("http://10.0.0.8/status", _URL, action="re-dialing")
+        with caplog.at_level("WARNING", logger="metaculus_bot.research.fetch_ladder.guard"):
+            same = await guard._landing_refused(_URL, _URL, action="rendering")
+            allowed = await guard._landing_refused(allowed_landing, _URL, action="rendering")
+            refused = await guard._landing_refused("http://10.0.0.8/status", _URL, action="re-dialing")
 
         assert (same, allowed, refused) == (False, False, True)
         assert calls == [allowed_landing, "http://10.0.0.8/status"]
@@ -1461,23 +1468,23 @@ class TestTheHopRefusalPolicy:
             await asyncio.sleep(0)
             return True
 
-        monkeypatch.setattr(resolution_source, "_landing_refused", _refused)
+        monkeypatch.setattr(guard, "_landing_refused", _refused)
         monkeypatch.setattr(impersonated_fetch, "IMPERSONATE_TRIGGER_STATUSES", IMPERSONATE_TRIGGER_STATUSES)
         renders: list[dict[str, object]] = []
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(None, renders))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(None, renders))
         dials: list[dict[str, object]] = []
         monkeypatch.setattr(
-            resolution_source,
+            rungs,
             "fetch_impersonated",
             fake_impersonated_fetch(_impersonated(200, body=_prose_page("Whatever the host served.")), dials),
         )
         landed = "https://www.tracker.example.com/senate"
         walled = FetchResult(url=landed, status="js_wall", text="", http_status=200, content_type="text/html")
         refused = FetchResult(url=landed, status="blocked", text="", http_status=403, content_type="text/html")
-        ctx = FetchContext()
+        ctx = LadderContext()
 
-        assert await resolution_source._rendered_rung(_URL, walled, {}, ctx) is None
-        assert await resolution_source._impersonate_rung(_URL, refused, host_sems={}, ctx=ctx) is None
+        assert await rungs._rendered_rung(_URL, walled, {}, ctx) is None
+        assert await rungs._impersonate_rung(_URL, refused, host_sems={}, ctx=ctx) is None
 
         assert seen == [(landed, _URL, "rendering"), (landed, _URL, "re-dialing")]
         assert renders == []
@@ -1504,7 +1511,7 @@ class TestLocalPdfReading:
         session = self._session()
 
         result = await _fetch_one(
-            session, "https://cdc.example.com/report.pdf", {}, FetchContext(query="hospitalizations reported")
+            session, "https://cdc.example.com/report.pdf", {}, LadderContext(query="hospitalizations reported")
         )
 
         assert result.status == "success"
@@ -1521,7 +1528,7 @@ class TestLocalPdfReading:
         session = self._session(content_type="application/octet-stream")
 
         result = await _fetch_one(
-            session, "https://cdc.example.com/report.pdf", {}, FetchContext(query="deaths reported")
+            session, "https://cdc.example.com/report.pdf", {}, LadderContext(query="deaths reported")
         )
 
         assert result.status == "success"
@@ -1534,7 +1541,7 @@ class TestLocalPdfReading:
         the second is worth a paid document read later, so they must not be the same token."""
         session = self._session(pages=[["1"]])
 
-        result = await _fetch_one(session, "https://cdc.example.com/report.pdf", {}, FetchContext(query="anything"))
+        result = await _fetch_one(session, "https://cdc.example.com/report.pdf", {}, LadderContext(query="anything"))
 
         assert result.status == "unreadable_document"
         assert result.status_reason == "no_text_layer"
@@ -1550,18 +1557,17 @@ class TestLocalPdfReading:
             }
         )
 
-        result = await _fetch_one(session, "https://cdc.example.com/report.pdf", {}, FetchContext(query="anything"))
+        result = await _fetch_one(session, "https://cdc.example.com/report.pdf", {}, LadderContext(query="anything"))
 
         assert result.status == "unreadable_document"
         assert result.status_reason == "malformed"
 
     async def test_the_digest_is_bounded_by_the_per_url_cap(self, monkeypatch):
         cap = 300
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", cap)
         session = self._session(pages=[["Hospitalizations reported: 922 " * 20]])
 
         result = await _fetch_one(
-            session, "https://cdc.example.com/report.pdf", {}, FetchContext(query="hospitalizations")
+            session, "https://cdc.example.com/report.pdf", {}, capped_ctx(cap, query="hospitalizations")
         )
 
         assert result.status == "success"
@@ -1573,27 +1579,27 @@ class TestLocalPdfReading:
         DECLARED document gets the document cap. An undeclared body keeps the smaller one:
         it is far likelier to be an image than a report, and buffering 40 MiB of it per URL
         across every concurrent question buys nothing."""
-        monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_MAX_RESPONSE_BYTES", 200)
-        monkeypatch.setattr(resolution_source, "DOCUMENT_TEXT_PDF_MAX_BYTES", 10_000_000)
+        monkeypatch.setattr(classify, "RESOLUTION_SOURCE_MAX_RESPONSE_BYTES", 200)
+        monkeypatch.setattr(classify, "DOCUMENT_TEXT_PDF_MAX_BYTES", 10_000_000)
 
         declared = await _fetch_one(
-            self._session(), "https://cdc.example.com/report.pdf", {}, FetchContext(query="hospitalizations")
+            self._session(), "https://cdc.example.com/report.pdf", {}, LadderContext(query="hospitalizations")
         )
         undeclared = await _fetch_one(
             self._session(content_type="application/octet-stream"),
             "https://cdc.example.com/report.pdf",
             {},
-            FetchContext(query="hospitalizations"),
+            LadderContext(query="hospitalizations"),
         )
 
         assert declared.status == "success"
         assert undeclared.status == "error", "oversize under the general cap, as before"
 
     async def test_an_oversize_document_is_dropped(self, monkeypatch):
-        monkeypatch.setattr(resolution_source, "DOCUMENT_TEXT_PDF_MAX_BYTES", 100)
+        monkeypatch.setattr(classify, "DOCUMENT_TEXT_PDF_MAX_BYTES", 100)
 
         result = await _fetch_one(
-            self._session(), "https://cdc.example.com/report.pdf", {}, FetchContext(query="hospitalizations")
+            self._session(), "https://cdc.example.com/report.pdf", {}, LadderContext(query="hospitalizations")
         )
 
         assert result.status == "error"
@@ -1602,11 +1608,11 @@ class TestLocalPdfReading:
     async def test_the_read_is_skipped_when_the_wall_budget_is_spent(self, caplog):
         """The parse is CPU-bound and the outer `wait_for` throws away finished work, so with
         no budget left the document is left unread rather than risking the whole question."""
-        spent = FetchContext(
+        spent = LadderContext(
             query="hospitalizations", started=time.monotonic() - resolution_source.RESOLUTION_SOURCE_WALL_TIMEOUT
         )
 
-        with caplog.at_level("WARNING", logger="metaculus_bot.research.resolution_source"):
+        with caplog.at_level("WARNING", logger="metaculus_bot.research.fetch_ladder.context"):
             result = await _fetch_one(self._session(), "https://cdc.example.com/report.pdf", {}, spent)
 
         assert result.status == "unsupported_type"
@@ -1627,14 +1633,13 @@ class TestLocalPdfReading:
         session = self._session()
 
         result = await _fetch_one(
-            session, "https://cdc.example.com/report.pdf", {}, FetchContext(query="corn futures settlement")
+            session, "https://cdc.example.com/report.pdf", {}, LadderContext(query="corn futures settlement")
         )
 
         assert result.status == "no_resolving_content"
         assert result.status_reason == "no_matching_passage"
         assert result.text == ""
-        # The rung still fired and still owns the outcome, so "what did the ladder buy" stays a
-        # query and the withhold is not filed as a direct fetch.
+        # The rung still fired and owns the outcome, so "what did the ladder buy" stays a query, not a direct fetch.
         assert result.route == "pdf_local"
 
     async def test_a_withheld_document_is_named_in_the_failure_notice(self):
@@ -1643,14 +1648,13 @@ class TestLocalPdfReading:
         session = self._session()
 
         result = await _fetch_one(
-            session, "https://cdc.example.com/report.pdf", {}, FetchContext(query="corn futures settlement")
+            session, "https://cdc.example.com/report.pdf", {}, LadderContext(query="corn futures settlement")
         )
         rendered = format_resolution_sections([result], datetime(2026, 9, 3, tzinfo=UTC))
 
         assert "1 resolution source(s) yielded no usable content" in rendered
         assert "cdc.example.com: no_resolving_content" in rendered
-        # Nothing from the document is published, so neither is the caveat that describes how a
-        # published PDF was extracted.
+        # Nothing from the document is published, so neither is the caveat describing how a published PDF is read.
         assert "No passage in this document matched the query" not in rendered
         assert "query-relevant passages of a cited PDF" not in rendered
 
@@ -1660,7 +1664,7 @@ class TestLocalPdfReading:
         session = self._session()
 
         result = await _fetch_one(
-            session, "https://cdc.example.com/report.pdf", {}, FetchContext(query="hospitalizations reported")
+            session, "https://cdc.example.com/report.pdf", {}, LadderContext(query="hospitalizations reported")
         )
 
         assert result.status == "success"
@@ -1686,24 +1690,26 @@ class TestPdfParseGate:
     async def test_the_host_gate_is_released_before_the_parse_runs(self, monkeypatch):
         """The per-host gate is loop-wide, so a parse held inside it blocks every other
         concurrent question's fetch of that host for the whole parse — and this population
-        is a handful of government hosts, so same-host collisions are the expected case."""
+        is a handful of government hosts, so same-host collisions are the expected case.
+
+        The host gate is fetched get-or-create up front because the stub below reads `.locked()` off that
+        object rather than looking the map up: it runs in the parse's worker thread, where there is no running
+        loop, which is itself the point of the split.
+        """
         url = "https://cdc.example.com/report.pdf"
         sems = host_semaphores()
-        # Get-or-create up front: the stub reads `.locked()` off this object rather than
-        # looking the map up, because it runs in the parse's worker thread where there is
-        # no running loop — which is itself the point of the split.
         host_gate = semaphore_for_host(url, sems)
         locked_during_parse = None
-        real_extract = resolution_source.extract_pdf_text
+        real_extract = classify.extract_pdf_text
 
         def observing_extract(body: bytes, **kwargs):
             nonlocal locked_during_parse
             locked_during_parse = host_gate.locked()
             return real_extract(body, **kwargs)
 
-        monkeypatch.setattr(resolution_source, "extract_pdf_text", observing_extract)
+        monkeypatch.setattr(classify, "extract_pdf_text", observing_extract)
 
-        result = await _fetch_one(self._session(url), url, sems, FetchContext(query="hospitalizations"))
+        result = await _fetch_one(self._session(url), url, sems, LadderContext(query="hospitalizations"))
 
         assert locked_during_parse is False, "the parse ran while the host was still gated"
         # The rung's own telemetry is unchanged by moving where the parse happens.
@@ -1715,7 +1721,7 @@ class TestPdfParseGate:
     async def test_no_more_than_two_documents_parse_at_once(self, monkeypatch):
         in_flight = 0
         peak = 0
-        real_extract = resolution_source.extract_pdf_text
+        real_extract = classify.extract_pdf_text
 
         def counting_extract(body: bytes, **kwargs):
             nonlocal in_flight, peak
@@ -1727,11 +1733,11 @@ class TestPdfParseGate:
             finally:
                 in_flight -= 1
 
-        monkeypatch.setattr(resolution_source, "extract_pdf_text", counting_extract)
+        monkeypatch.setattr(classify, "extract_pdf_text", counting_extract)
         hosts = [f"https://h{i}.example.com/report.pdf" for i in range(5)]
 
         results = await asyncio.gather(
-            *(_fetch_one(self._session(url), url, {}, FetchContext(query="hospitalizations")) for url in hosts)
+            *(_fetch_one(self._session(url), url, {}, LadderContext(query="hospitalizations")) for url in hosts)
         )
 
         assert peak <= 2, f"the gate admitted {peak} concurrent parses"
@@ -1750,19 +1756,19 @@ class TestPdfParseGate:
 
         await hold_the_gate()
         # Budget just above the floor, so the bounded acquire gives up almost immediately.
-        spent = FetchContext(
+        spent = LadderContext(
             query="hospitalizations",
             started=time.monotonic()
             - (
                 resolution_source.RESOLUTION_SOURCE_WALL_TIMEOUT
-                - resolution_source.RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S
-                - resolution_source.RESOLUTION_SOURCE_PDF_MIN_BUDGET_S
+                - RESOLUTION_SOURCE_POLICY.rung_wall_margin_s
+                - classify.RESOLUTION_SOURCE_PDF_MIN_BUDGET_S
                 - 0.05
             ),
         )
         url = "https://busy.example.com/report.pdf"
 
-        with caplog.at_level("WARNING", logger="metaculus_bot.research.resolution_source"):
+        with caplog.at_level("WARNING", logger="metaculus_bot.research.fetch_ladder.classify"):
             result = await _fetch_one(self._session(url), url, {}, spent)
 
         assert result.status == "unsupported_type"
@@ -1794,7 +1800,7 @@ class TestSharedHostGate:
                 "https://a.example.com/two": SlowReadResponse(200, body=article_html, content_type="text/html"),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         await asyncio.gather(
             fetch_resolution_sources(["https://a.example.com/one"]),
@@ -1821,24 +1827,24 @@ class TestPerHopRequestTimeout:
     async def test_a_fresh_fetch_still_gets_the_full_per_request_timeout(self, article_html):
         session = self._session(article_html)
 
-        await _fetch_one(session, "https://slow.example.com/page", {}, FetchContext())
+        await _fetch_one(session, "https://slow.example.com/page", {}, LadderContext())
 
-        assert session.get_kwargs[0]["timeout"].total == resolution_source.RESOLUTION_SOURCE_HTTP_TIMEOUT
+        assert session.get_kwargs[0]["timeout"].total == direct_fetch.RESOLUTION_SOURCE_HTTP_TIMEOUT
 
     async def test_a_hop_late_in_the_wall_is_clamped_to_the_remaining_budget(self, article_html):
         session = self._session(article_html)
         elapsed = 35.0
         expected = (
-            resolution_source.RESOLUTION_SOURCE_WALL_TIMEOUT
-            - elapsed
-            - resolution_source.RESOLUTION_SOURCE_RUNG_WALL_MARGIN_S
+            resolution_source.RESOLUTION_SOURCE_WALL_TIMEOUT - elapsed - RESOLUTION_SOURCE_POLICY.rung_wall_margin_s
         )
 
-        await _fetch_one(session, "https://slow.example.com/page", {}, FetchContext(started=time.monotonic() - elapsed))
+        await _fetch_one(
+            session, "https://slow.example.com/page", {}, LadderContext(started=time.monotonic() - elapsed)
+        )
 
         timeout = session.get_kwargs[0]["timeout"]
         assert timeout.total == pytest.approx(expected, abs=0.5)
-        assert timeout.total < resolution_source.RESOLUTION_SOURCE_HTTP_TIMEOUT
+        assert timeout.total < direct_fetch.RESOLUTION_SOURCE_HTTP_TIMEOUT
         assert timeout.sock_read == timeout.total, "a per-request ClientTimeout replaces the session's, so both fields"
 
     async def test_a_spent_budget_still_gets_a_token_attempt_rather_than_a_zero_timeout(self, article_html):
@@ -1850,8 +1856,8 @@ class TestPerHopRequestTimeout:
             session,
             "https://slow.example.com/page",
             {},
-            FetchContext(started=time.monotonic() - 2 * resolution_source.RESOLUTION_SOURCE_WALL_TIMEOUT),
+            LadderContext(started=time.monotonic() - 2 * resolution_source.RESOLUTION_SOURCE_WALL_TIMEOUT),
         )
 
-        assert session.get_kwargs[0]["timeout"].total == resolution_source.RESOLUTION_SOURCE_MIN_HOP_TIMEOUT_S
+        assert session.get_kwargs[0]["timeout"].total == direct_fetch.RESOLUTION_SOURCE_MIN_HOP_TIMEOUT_S
         assert result.status == "success", "the floor is a real attempt, not a formality"

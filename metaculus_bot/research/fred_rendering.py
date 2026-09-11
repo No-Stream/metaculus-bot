@@ -19,16 +19,46 @@ whose displayed range was four index points wide, and the Fed balance sheet into
 import logging
 from datetime import datetime
 from typing import cast
-from xml.etree.ElementTree import ParseError
+from xml.etree.ElementTree import Element
 
 import pandas as pd
-from fredapi import Fred
+import requests
+from defusedxml import ElementTree as ET
+from defusedxml.ElementTree import ParseError
+from fredapi import Fred as _Fred
 
 from metaculus_bot.constants import FINANCIAL_FRED_VINTAGE_PRINTS
 from metaculus_bot.research.number_format import format_decimal_change, format_decimal_value
-from metaculus_bot.research.ts_fetch import FRED_NON_REVISING_SERIES, FetchError, SeriesSpec, fetch_series
+from metaculus_bot.research.ts_fetch import (
+    FRED_NON_REVISING_SERIES,
+    FetchError,
+    SeriesSpec,
+    _http_get_response,
+    fetch_series,
+)
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+class Fred(_Fred):
+    """fredapi client with a socket timeout on every API request.
+
+    fredapi 0.5.2 hardcodes a blocking ``urllib.request.urlopen(url)`` without a timeout. Its public methods
+    all dispatch through the private ``_Fred__fetch_data`` helper, so overriding that one seam
+    keeps the package's parsing and API surface while giving every keyed FRED request a real
+    client-side bound.
+    """
+
+    def _Fred__fetch_data(self, url: str) -> Element:
+        url += "&api_key=" + cast(str, self.api_key)
+        try:
+            status_code, content = _http_get_response(url, {})
+        except requests.RequestException as exc:
+            raise OSError(f"FRED request failed ({type(exc).__name__})") from exc
+        root = ET.fromstring(content)
+        if status_code != 200:
+            raise ValueError(root.get("message"))
+        return root
 
 
 class UnknownFredSeries(Exception):

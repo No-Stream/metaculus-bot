@@ -1,36 +1,12 @@
 """Pins the Metaculus peer-score delta convention, per question type.
 
-Why this file exists: the same arithmetic has been got wrong in two opposite directions by
-residual-round scripts, and the repo had nothing that stated the convention in executable
-form. Both errors are silent — they produce a plausible number with the wrong magnitude.
-
-* **Continuous, doubled.** ``scratch/residual_2026-08-31/q45065_capbug_replay.py`` (lines
-  297 and 307) printed a ``d_peer(100ln)`` column as ``2 * (baseline_cf - baseline_pub)``.
-  Metaculus HALVES a continuous peer score, and ``numeric_log_score`` already carries that
-  halving (it returns ``50 * ln(...)``), so the difference was already in spot-peer points
-  and the doubling made every figure in the column 2x too large. It priced a one-bin-miss
-  counterfactual at +404 when the truth is +202.
-* **Binary / multiple choice, mis-scaled by ln(K).** ``binary_log_score`` and
-  ``mc_log_score`` are log-base-K BASELINE scores, so their differences are in ``log_K``
-  units and reaching peer points takes a ``ln(K)`` factor. Which way an uncorrected figure
-  errs depends on K, so this bullet carries no direction: the quoted-over-true ratio is
-  ``1/ln(K)``, which is 1.44 at K=2 (binary OVER-states, correct it by multiplying by
-  ``ln 2`` ≈ 0.693) but 0.91 at K=3 and 0.40 at K=12 (multiple choice with three or more
-  options UNDER-states). Thirteen dossier scripts in the 2026-09-01 round used a log2 form
-  for a binary peer delta, so every one of those figures is 1.44x too large.
-
-The platform formulas these assert against were read from Metaculus's own
-``scoring/score_math.py`` on 2026-09-02 (fetched copy:
-``scratch/residual_2026-09-01/dossiers/44798_verify_metaculus_score_math.py``):
-``evaluate_forecasts_peer_spot_forecast`` computes ``100 * (N/(N-1)) * ln(p/gmp)``, then
-``/= 2`` when the question type is in ``QUESTION_CONTINUOUS_TYPES``
-(``[numeric, date, discrete]``). The crowd's geometric mean includes us, so the
-``N/(N-1)`` factor collapses the expression to
-``100 * (ln p_us - mean_others ln p_i)``: changing only OUR forecast moves the score by
-``100 * ln(new/old)``, halved for continuous, with no crowd term surviving.
-
-Receipt for the corrected q45065 figures:
-``scratch/residual_2026-09-01/DOSSIER_SYNTHESIS.md`` section 7.2.
+The same arithmetic has been got wrong in two opposite directions by residual-round scripts, and
+both errors are silent: a continuous baseline-score difference was DOUBLED (``numeric_log_score``
+already carries the platform's halving, so the q45065 near-miss counterfactual came out at +404
+instead of +202), and binary / multiple-choice baseline deltas were quoted as peer points without
+the ``ln K`` factor (1.44x too large at K=2, too small from K=3 up). The platform formulas, the
+receipts and the corrected figures are in docs/performance_analysis.md "Price a counterfactual with
+spot_peer_delta"; this module states the convention in executable form.
 """
 
 import math
@@ -41,14 +17,14 @@ import pytest
 from metaculus_bot.scoring_common import (
     CONTINUOUS_PEER_DIVISOR,
     CONTINUOUS_QUESTION_TYPES,
+    baseline_to_peer_factor,
     binary_log_score,
     mc_log_score,
     numeric_log_score,
     spot_peer_delta,
 )
 
-# A closed-bound 201-point grid over [0, 200] whose resolution lands in one known bucket,
-# so the whole pmf can be described by "how much mass sits on the resolving outcome".
+# A closed-bound 201-point grid whose resolution lands in one known bucket, so a pmf is "the mass on that bucket".
 GRID_POINTS = 201
 N_INBOUND = GRID_POINTS - 1
 RESOLUTION = 100.5
@@ -91,18 +67,15 @@ class TestContinuousPeerDeltaIsNotDoubled:
         )
 
     def test_the_q45065_near_miss_is_priced_at_two_hundred_not_four_hundred(self):
-        # Masses from scratch/residual_2026-08-31/q45065_capbug_replay_stdout.txt, resolution
-        # row 12: published 0.00351, counterfactual 0.20000. The script printed 404.23 for
-        # that row; the platform's continuous halving makes it 202.11. The tolerance is 0.1
-        # because the stdout rounds the masses to five decimals and its own 202.11 came from
-        # the unrounded pair, so these inputs land at 202.14.
+        """Row 12 of the q45065 replay (published 0.00351, counterfactual 0.20000) printed 404.23; the
+        halving makes it 202.11, and the five-decimal masses land at 202.14, hence the 0.1 tolerance."""
         peer_delta = spot_peer_delta(old_prob=0.00351, new_prob=0.20000, question_type="discrete")
 
         assert peer_delta == pytest.approx(202.11, abs=0.1)
         assert peer_delta != pytest.approx(404.23, abs=1.0)
 
     def test_the_realized_q45065_outcome_moved_half_a_point_not_one(self):
-        # Same table, the row marked ACTUAL: 0.19780 -> 0.20000, printed as 1.11.
+        """The same table's ACTUAL row, 0.19780 -> 0.20000, printed as 1.11."""
         assert spot_peer_delta(old_prob=0.19780, new_prob=0.20000, question_type="discrete") == pytest.approx(
             0.55, abs=0.01
         )
@@ -160,10 +133,28 @@ class TestBaselineToPeerConversionOnTheOtherTypes:
         )
 
         assert baseline_delta * math.log(n_options) == pytest.approx(peer_delta, rel=1e-12)
-        # The error direction flips with K, which is why the module docstring's bullet states
-        # none: at three or more options an uncorrected log_K delta UNDER-states the peer delta
-        # (ratio 1/ln K < 1), the opposite of binary's 1.44x inflation.
+        # From K=3 up an uncorrected log_K delta UNDER-states the peer delta, the opposite of binary's inflation.
         assert baseline_delta < peer_delta
+
+    def test_the_factor_helper_states_the_same_conversion(self):
+        """``baseline_to_peer_factor`` is the score-side twin of ``spot_peer_delta``: a native
+        binary or MC score difference times the factor is the peer delta, and a continuous one is
+        already a peer delta."""
+        binary_delta = binary_log_score(0.63, True) - binary_log_score(0.12, True)
+        assert binary_delta * baseline_to_peer_factor("binary") == pytest.approx(
+            spot_peer_delta(old_prob=0.12, new_prob=0.63, question_type="binary"), rel=1e-12
+        )
+        mc_delta = mc_log_score([0.55, 0.45], 0) - mc_log_score([0.10, 0.90], 0)
+        assert mc_delta * baseline_to_peer_factor("multiple_choice", n_options=2) == pytest.approx(
+            spot_peer_delta(old_prob=0.10, new_prob=0.55, question_type="multiple_choice"), rel=1e-12
+        )
+        assert baseline_to_peer_factor("multiple_choice", n_options=5) == pytest.approx(math.log(5))
+        for continuous in sorted(CONTINUOUS_QUESTION_TYPES):
+            assert baseline_to_peer_factor(continuous) == 1.0
+        with pytest.raises(ValueError, match="option count"):
+            baseline_to_peer_factor("multiple_choice")
+        with pytest.raises(ValueError, match="unrecognized question_type"):
+            baseline_to_peer_factor("conditional_binary")
 
 
 class TestFailFast:

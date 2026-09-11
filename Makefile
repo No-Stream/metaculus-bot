@@ -1,4 +1,4 @@
-.PHONY: install lock test test_verbose all lint lint_imports deps format typecheck typecheck_ty cov audit run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research sync_telemetry sync_raw_research sync_all resync_from_store backfill_research download_research download_run_logs download_raw_research backfill_comments score_ghosts close_margin_watch supply_probe backtest_with_cache
+.PHONY: install lock test test_verbose all lint lint_imports deps format typecheck typecheck_ty cov audit run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research sync_telemetry sync_raw_research sync_all resync_from_store backfill_research download_research download_run_logs download_raw_research backfill_comments score_ghosts close_margin_watch supply_probe supply_probe_mantic cost_report dispatch_watch cronjob_dispatch_setup backtest_with_cache run_mantic run_mantic_one strip_bench probe_resolver replay_ladder
 
 # Stream logs live from recipes; avoid per-target buffering
 MAKEFLAGS += --output-sync=none
@@ -96,6 +96,18 @@ all: format lint deps lint_imports typecheck test_verbose
 
 run:
 	$(call RUN_UNBUFFERED,main.py)
+
+# PAID and PUBLISHES (ask-first gate, see AGENTS.md): forecasts the Mantic Crucible tournament
+# on the operator's PERSONAL keys only. The env var below is what lets cli start a Mantic run;
+# without it the run fails shut before any fetch or spend. ~$2.60 per question.
+run_mantic:
+	DONATED_OPENROUTER_KEY_ENABLED=false $(call RUN_UNBUFFERED,main.py --mode mantic)
+
+# PAID and PUBLISHES (ask-first gate, see AGENTS.md): the one-question Mantic smoke run. The same
+# run as run_mantic, narrowed to the open post id(s) in POST (comma-separated): make run_mantic_one POST=650
+run_mantic_one:
+	$(if $(POST),,$(error run_mantic_one needs POST=<post id>[,<post id>...], e.g. make run_mantic_one POST=650))
+	DONATED_OPENROUTER_KEY_ENABLED=false $(call RUN_UNBUFFERED,main.py --mode mantic --only-posts $(POST))
 
 # DEPRECATED: Community benchmark baseline scoring is broken because Metaculus removed
 # the aggregations field from their list API. Use backtest_* targets instead.
@@ -308,6 +320,64 @@ close_margin_watch:
 supply_probe:
 	uv run python scripts/supply_probe.py $(ARGS)
 
+# The same probe against Mantic's Crucible (competitions.mantic.com), read-only + free: its
+# posts list is public, so MANTIC_TOKEN is optional and only lets closed-but-unresolved
+# questions classify; resolved ones classify from the public spot-time snapshot. Adds the
+# miss-rate-per-UTC-release-hour table that answers the cron-cadence question.
+supply_probe_mantic:
+	uv run python scripts/supply_probe.py --platform mantic $(ARGS)
+
+# Cost per question off the telemetry archive (read-only + free; run sync_telemetry first): per
+# run (questions, charged $, $/question), per role ($/question, prompt and output tokens per
+# question, prompt-cache share, largest single prompt) and the week-over-week median $/question.
+# The question denominator is CREDIT_RUN_SUMMARY where a run has one, else its
+# FORECASTERS_SURVIVED lines. ARGS="--days 7" to narrow the window (default 30).
+cost_report:
+	uv run python scripts/cost_report.py $(ARGS)
+
+# One-question probe of gap-fill v1's per-gap resolver: replays the gaps the archive recorded
+# for question QUESTION=<question id> through the production resolver path
+# (gap_fill_search_prompt + build_native_search_llm) at every model x search_context_size cell
+# of a grid (default: the current resolver model and gpt-5.6-luna, each at high/medium/low),
+# and writes the answers side by side with OpenRouter's per-call cost and tokens to
+# scratch/probes/. PAID (ask-first gate, see AGENTS.md): gaps x cells resolver calls at up to
+# ~$0.20 each on the operator's PERSONAL OpenRouter key (the donated key is forced off); the
+# script prints its ceiling first and refuses without ARGS="--i-accept-spend". Narrow with
+# ARGS="--grid current:high luna:low" or ARGS="--gaps 1,2".
+probe_resolver:
+	$(if $(QUESTION),,$(error probe_resolver needs QUESTION=<question id>, e.g. make probe_resolver QUESTION=44267))
+	uv run python scripts/probes/gap_fill_resolver_probe.py --question $(QUESTION) $(ARGS)
+
+# Trigger-delivery watch: per bot workflow and per UTC day, how many `schedule` and
+# `workflow_dispatch` runs GitHub Actions ran and how they concluded, against the cron entries
+# in .github/workflows and the external dispatcher's cadence (2/h by default), flagging a day
+# whose dispatched runs fall short or whose cron delivery is below half. Read-only + free (one
+# `gh run list`; no dispatch, no LLM, no publish). ARGS="--days 14", ARGS="--expected-dispatch-per-hour 0".
+dispatch_watch:
+	uv run python scripts/dispatch_watch.py $(ARGS)
+
+# Replay the archived per-URL fetch outcomes through the unified fetch ladder's rung selection: for
+# each archived direct outcome, which rungs each LadderPolicy preset would consult and in what
+# order, plus any archived rescue (impersonate, rendered, derived_api, wayback, url_context) the new
+# dispatcher no longer attempts. Every rung is stubbed to decline, so nothing is dialed: read-only
+# and free, no network, no LLM, no publish. A LOCAL pre-merge check, never CI. Point --archive-dir
+# at a checkout that HAS the gitignored archive. ARGS="--format json", ARGS="--policy NAME",
+# ARGS="--limit 200".
+replay_ladder:
+	uv run python scripts/fetch_ladder_replay.py $(ARGS)
+
+# Idempotent setup of the cron-job.org jobs that dispatch the bot workflows twice an hour each
+# (GitHub delivers about 22% of scheduled cron firings, see docs/operations.md "Scheduling
+# reliability"; workflow_dispatch events are not dropped, and a run that finds no new question
+# spends nothing). The default is a DRY RUN: it prints the three job payloads with the GitHub
+# token redacted and, when CRONJOB_API_KEY and GH_DISPATCH_TOKEN are both set, the
+# create/update/unchanged plan from a read-only list of the account; it never writes.
+# ARGS="--apply" is PAID (ask-first gate, see AGENTS.md): it creates or changes a live schedule,
+# and every firing it adds is a paid, publishing bot run. ARGS="--apply --enable-mantic" once
+# run_bot_on_mantic.yaml is on main.
+cronjob_dispatch_setup:
+	uv run python scripts/cronjob_dispatch_setup.py $(ARGS)
+
 # Download run-log artifacts + harvest telemetry only (no research sync). Same script
 # as sync_telemetry; kept as a named target for parity with download_research.
 download_run_logs:
@@ -343,3 +413,12 @@ backtest_with_cache:
 # to limit which key is queried (default: both).
 check_credits:
 	@uv run python -m metaculus_bot.check_openrouter_credits $(ARGS)
+
+# PAID, PERSONAL KEY ONLY (ask-first gate, see AGENTS.md): the paired section-strip bench forecasts
+# every resolved gap-fill pair four ways (full bundle, minus v1, minus v2, minus both) with one cheap
+# model on OPENROUTER_API_KEY and scores the arms against the resolutions. Nothing publishes and no
+# research runs; the estimate at the default 3 replicates is about $1.25. A bare `make strip_bench`
+# prints the plan and refuses; ARGS="--dry-run" is the free view; ARGS="--i-accept-spend" runs it
+# under --max-spend-usd (default 10); ARGS="--rescore <run dir>" rebuilds results offline.
+strip_bench:
+	uv run python -m scripts.probes.section_strip_bench $(ARGS)

@@ -24,6 +24,7 @@ from metaculus_bot.degradation_counters import (
     format_degradation_summary,
 )
 from metaculus_bot.research import prediction_market, provider_health
+from tests.provider_health_fakes import observe_venue
 
 
 def _bot(mock_general_llm, *, with_stacker: bool = False, **kwargs: Any) -> TemplateForecaster:
@@ -51,6 +52,7 @@ def _snapshot(**overrides: int) -> DegradationSnapshot:
         "stacker_fallback_failed": 0,
         "research_provider_failures": 0,
         "summarizer_failures": 0,
+        "gap_fill_v1_errors": 0,
         "gap_fill_v2_errors": 0,
         "prediction_market_degraded": 0,
         "prediction_market_source_losses": 0,
@@ -109,7 +111,8 @@ def test_forecaster_reads_a_fresh_snapshot_after_counter_updates(mock_general_ll
 
 
 def test_alertable_count_sums_all_degradation_counters(mock_general_llm, monkeypatch):
-    """Property must sum all thirteen degradation counters. Using distinct powers of 2
+    """Property must sum every degradation counter: fifteen of ``alertable_total``'s sixteen
+    terms are driven here (``publish_skipped_closed`` is pinned on the summary line below). Using distinct powers of 2
     makes an off-by-one or missing-counter bug visible: the resulting sum
     uniquely identifies which subset was counted.
     """
@@ -121,40 +124,63 @@ def test_alertable_count_sums_all_degradation_counters(mock_general_llm, monkeyp
     bot._pipeline.counters.stacker_fallback_used_count = 8
     bot._pipeline.counters.stacker_fallback_failed_count = 16
     bot._research_provider_failure_count = 32
+    bot._research.gap_fill_v1_error_count = 16384
     bot._gap_fill_v2_error_count = 64
-    # prediction_market_degraded is read-only — it reads the prediction-market
-    # module's per-run global — so stub the accessor the property imports rather
-    # than bumping the counter 128 times.
+    # A read-only accessor, not a bot attribute; see docs/telemetry_markers.md "DEGRADATION_COUNTERS".
     monkeypatch.setattr(prediction_market, "kalshi_catalogue_fetch_failures", lambda: 128)
-    # Same shape for the source-loss counter (operator decision: any prediction-market
-    # source losing a fetch reddens CI), so a dropped or double-counted ninth term
-    # shows up in the sum.
+    # Read-only too, and alertable by operator decision; see docs/operations.md "Reading run logs".
     monkeypatch.setattr(prediction_market, "prediction_market_source_losses", lambda: 256)
-    # Tenth term: a dead AskNews summarizer silently ships raw ungated articles on
-    # every question.
+    # A dead AskNews summarizer silently ships raw ungated articles on every question.
     bot._summarizer_failure_count = 512
-    # Eleventh term: a provider that populated but degraded — a liquidity field dead
-    # across 100% of a venue's rows, or a venue contributing nothing while its
-    # siblings answered. Same read-only shape as the two above, so stub the accessor
-    # the property imports rather than recording 1024 observations.
+    # Read-only too; a provider that populated but degraded, per docs/telemetry_markers.md "PROVIDER_DEGRADATION".
     monkeypatch.setattr(provider_health, "provider_degradation_count", lambda: 1024)
-    # Twelfth term: a publish POST that exhausted the publish-hardening retry
-    # budget (q45085's 405 shape) — the module global the bot property reads.
+    # The publish-hardening module global, not a bot attribute; see docs/telemetry_markers.md "DEGRADATION_COUNTERS".
     monkeypatch.setattr(publish_hardening, "_PUBLISH_ATTEMPT_FAILURES", 2048)
-    # Thirteenth term: a question whose close time was too near for the full
-    # pipeline, so the optional research stages were dropped (time_budget.py).
+    # A close time too near for the full pipeline, so the optional research stages were dropped.
     bot._time_budget_fast_path_count = 4096
-    # Fourteenth term: budget-driven research degradation OFF the fast path — a
-    # provider cancelled at the research-window deadline or gap-fill cut/skipped
-    # for budget on a question that never fast-pathed (orchestrator-side,
-    # deduplicated per question).
+    # Budget-driven research loss off the fast path; see docs/research.md "Orchestrator implementation notes".
     bot._research.research_budget_cut_count = 8192
 
-    assert bot.alertable_count == 16383
+    assert bot.alertable_count == 32767
+
+
+def test_v1_gap_fill_failure_is_part_of_the_actual_alertable_total(mock_general_llm):
+    """A v1 stage failure reaches the bot property that drives the CLI exit."""
+    bot = _bot(mock_general_llm)
+
+    bot._research.gap_fill_v1_error_count = 1
+
+    assert bot.alertable_count == 1
+    assert "gap_fill_v1_errors=1" in format_degradation_summary(bot._degradation_snapshot())
+
+
+def test_an_empty_v1_gap_fill_result_does_not_alert(mock_general_llm):
+    """A legitimate no-gaps result leaves the run all-clear."""
+    bot = _bot(mock_general_llm)
+
+    assert bot._research.gap_fill_v1_error_count == 0
+    assert bot.alertable_count == 0
 
 
 def test_alertable_count_zero_by_default(mock_general_llm):
     """Fresh bot with no degradation events must report alertable_count == 0."""
+    assert _bot(mock_general_llm).alertable_count == 0
+
+
+def test_a_leaked_observation_stays_inside_its_own_test(mock_general_llm):
+    """First half of an ORDERED PAIR with the test below, which must stay next to it.
+
+    This one deliberately leaves a degradation in the module-global observation store; the
+    next asserts it is gone. Together they pin conftest's ``_isolate_alertable_counters``,
+    whose absence surfaces only as some unrelated file's fresh-bot ``alertable_count == 0``
+    failing in some collection orders.
+    """
+    observe_venue("kalshi", fields=frozenset())
+    assert _bot(mock_general_llm).alertable_count == 1
+
+
+def test_the_following_test_sees_zeroed_counters(mock_general_llm):
+    """Second half of the pair above: that test's leaked observation must not be visible here."""
     assert _bot(mock_general_llm).alertable_count == 0
 
 
@@ -179,6 +205,7 @@ async def test_run_summary_lines_name_what_they_count(mock_general_llm, caplog):
     assert "research_provider_failures=3" in degradation
     assert "research_provider_timeouts" not in degradation
     assert "summarizer_failures=1" in degradation
+    assert "gap_fill_v1_errors=0" in degradation
     assert "prediction_market_source_losses=0" in degradation
     assert "prediction_market_platform_failures" not in degradation
 
@@ -206,9 +233,7 @@ async def test_provider_degradation_rides_the_run_summary(mock_general_llm, capl
     assert "provider_degradation=0" in degradation, degradation
     assert "publish_attempt_failures=0" in degradation, degradation
     assert "publish_skipped_closed=0" in degradation, degradation
-    # The newest key is the tail, and the tail is where the telemetry parser's optional
-    # groups end — appending past it without extending that regex breaks the whole
-    # line's harvest, because the pattern is $-anchored.
+    # The suite pins the tail key order; see docs/telemetry_markers.md "DEGRADATION_COUNTERS".
     assert "time_budget_fast_path=0" in degradation, degradation
     assert degradation.endswith("research_budget_cuts=0"), degradation
     assert any(line.startswith("PROVIDER_DEGRADATION:") for line in caplog.messages), caplog.messages
@@ -223,15 +248,7 @@ async def test_run_start_resets_provider_health_observations(mock_general_llm):
     """
     bot = _bot(mock_general_llm)
 
-    provider_health.record_venue_observation(
-        provider_health.VenueObservation(
-            qid=1,
-            venue="kalshi",
-            candidates_pre_filter=3,
-            rows_post_filter=3,
-            liquidity_fields_present=frozenset(),
-        )
-    )
+    observe_venue("kalshi", fields=frozenset())
     assert bot.alertable_count == 1
 
     await bot.forecast_questions([])

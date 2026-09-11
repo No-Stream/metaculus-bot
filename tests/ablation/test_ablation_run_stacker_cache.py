@@ -35,7 +35,7 @@ class TestCacheBehavior:
         fallback_stacker_llm: MagicMock,
         parser_llm: MagicMock,
     ) -> None:
-        # Pre-write a stacker output for (qid=1, arm=A)
+        """A pre-written ``(qid, arm)`` payload comes back from cache with no LLM or tool call."""
         cached_payload = {
             "success": True,
             "arm": ARM_STACK,
@@ -144,16 +144,17 @@ class TestCacheBehavior:
 
 # ===========================================================================
 # Per-stacker cache keying (stacker_slug)
-#
-# stack / stack_aug payloads are keyed by the active stacker so a stacker swap
-# (opus-4.5 free-tier vs opus-4.8 prod) never overwrites another stacker's
-# results while deterministic arms + forecaster outputs stay shared. The slug
-# is supplied by the CLI (derived from the stacker model via
-# model_slug_to_filename); these tests pass it explicitly to the runner.
 # ===========================================================================
 
 
 class TestPerStackerCacheKeying:
+    """A stacker swap must not overwrite the previous stacker's ``stack`` / ``stack_aug`` payloads.
+
+    Only those two arms are keyed by the slug; deterministic arms and forecaster outputs stay
+    shared. The CLI derives the slug from the stacker model through ``model_slug_to_filename``,
+    and these tests pass it to the runner explicitly.
+    """
+
     def test_stack_arm_writes_slugged_file(
         self,
         cache: AblationCache,
@@ -420,11 +421,10 @@ class TestPerStackerCacheKeying:
                 "metaculus_bot.ablation.run_stacker.stacking.run_stacking_binary",
                 new=AsyncMock(side_effect=_stacker),
             ),
-            # Only reached in the median_failed scenario (the nonfinite stacker
-            # "succeeds", so no fallback fires); harmless otherwise.
+            # Reached only in the median_failed scenario, and raising the ValueError the aggregators really raise.
             patch(
                 "metaculus_bot.ablation.run_stacker._median_fallback_prediction",
-                side_effect=RuntimeError("median boom"),
+                side_effect=ValueError("median boom"),
             ),
         ):
             payload = _run(

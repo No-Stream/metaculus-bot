@@ -1,24 +1,32 @@
 """Tests for metaculus_bot.forecaster_runners — extracted per-type forecast functions.
 
-Exercises the three public functions (run_binary_forecast, run_mc_forecast,
-run_numeric_forecast) to verify they produce the same results as the original
+Exercises the public runners (run_binary_forecast, run_mc_forecast, run_numeric_forecast,
+run_date_forecast) to verify they produce the same results as the original
 TemplateForecaster methods they replaced.
 
 The runners now delegate value extraction to the deterministic-first
 ``value_extraction`` ladder (block → repair → llm). Tests here mostly patch the
 top-level ladder entrypoints (``extract_binary``, ``extract_mc``,
-``extract_numeric``) so we exercise the caller's post-processing without
+``extract_numeric``, ``extract_pmf``) so we exercise the caller's post-processing without
 re-testing ladder internals. A handful of integration-style tests feed a
 rationale with a real fenced JSON block so the ladder runs end-to-end and we
 can assert an ``EXTRACTION_RUNG`` telemetry line was emitted.
+
+``TestPerBinBranch`` covers the per-bin path a coarse Mantic grid takes (``elicit_per_bin``):
+the numeric and date runners branch into ``_run_pmf_forecast`` and none of the percentile
+machinery (discrete vote, sanitizer, PCHIP build, unit-mismatch guard) is called.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import litellm.exceptions as litellm_exc
+import numpy as np
 import pytest
 from forecasting_tools import (
     BinaryQuestion,
@@ -34,12 +42,29 @@ from forecasting_tools.data_models.multiple_choice_report import PredictedOption
 from forecasting_tools.data_models.numeric_report import Percentile
 from pydantic import ValidationError
 
-from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN
+from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN, MANTIC_SITE_URL, PMF_ABOVE_RANGE_KEY
 from metaculus_bot.exceptions import UnitMismatchError
-from metaculus_bot.forecaster_runners import run_binary_forecast, run_mc_forecast, run_numeric_forecast
+from metaculus_bot.forecaster_runners import (
+    build_pmf_parse_notes,
+    run_binary_forecast,
+    run_date_forecast,
+    run_mc_forecast,
+    run_numeric_forecast,
+)
 from metaculus_bot.llm_retry import TRANSIENT_RETRY_MAX_ELAPSED_S
+from metaculus_bot.numeric.config import PCHIP_CDF_POINTS
+from metaculus_bot.numeric.date_axis import EpochDateQuestion, as_epoch_question
 from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
-from metaculus_bot.value_extraction import ExtractionOutcome, McForecast
+from metaculus_bot.numeric.pmf_grid import PmfGrid, pmf_grid
+from metaculus_bot.value_extraction import ExtractionOutcome, McForecast, PmfForecast
+from tests.pipeline_test_helpers import (
+    assert_server_accepts_cdf,
+    cdf_heights,
+    make_count_question,
+    make_real_date_question,
+    make_real_numeric_question,
+    server_min_step,
+)
 
 
 @pytest.fixture
@@ -81,6 +106,7 @@ def numeric_question():
     q.open_lower_bound = False
     q.open_upper_bound = True
     q.unit_of_measure = "widgets"
+    q.cdf_size = PCHIP_CDF_POINTS  # the standard continuous grid: the per-bin gate reads it
     return q
 
 
@@ -609,3 +635,304 @@ class TestRunNumericForecast:
             _, discrete_vote = await run_numeric_forecast(numeric_question, "research", forecaster_llm, parser_llm)
 
         assert discrete_vote is None
+
+
+_MANTIC_URL = f"{MANTIC_SITE_URL}/questions/5001/"
+_METACULUS_URL = "https://www.metaculus.com/questions/5001/"
+
+# Post 651's shape: 80% on bin 8, the rest over the other trading days, 0 on the weekend bins 4, 5 and 11.
+_DATE_DECLARED = [0.0, 0.01, 0.01, 0.02, 0.03, 0.0, 0.0, 0.05, 0.06, 0.80, 0.01, 0.01, 0.0, 0.0]
+_DATE_WEEKEND_BINS = (4, 5, 11)
+# An 11-bin count question with an open ceiling: certain of 3, a token on above_range.
+_COUNT_DECLARED = [0.0, 0.0, 0.0, 0.05, 0.85, 0.05, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.05]
+
+
+def _pmf_outcome(declared: list[float]) -> ExtractionOutcome[PmfForecast]:
+    return ExtractionOutcome(value=PmfForecast(declared=list(declared)), rung="block", block_present=True)
+
+
+def _compact(values: list[float]) -> str:
+    return json.dumps(values, separators=(",", ":"))
+
+
+@contextmanager
+def _percentile_path_never_runs() -> Iterator[None]:
+    """Patches that fail the test if the per-bin branch touches the percentile machinery."""
+    never = AsyncMock(side_effect=AssertionError("the per-bin branch must not take the percentile path"))
+    with (
+        patch("metaculus_bot.forecaster_runners._resolve_discrete_vote", new=never),
+        patch("metaculus_bot.forecaster_runners.extract_numeric", new=never),
+        patch("metaculus_bot.forecaster_runners.extract_date", new=never),
+        patch("metaculus_bot.forecaster_runners.parse_structured", new=never),
+        patch("metaculus_bot.forecaster_runners.sanitize_percentiles", side_effect=AssertionError("sanitize")),
+        patch("metaculus_bot.forecaster_runners.build_numeric_distribution", side_effect=AssertionError("pchip")),
+        patch("metaculus_bot.forecaster_runners.detect_unit_mismatch", side_effect=AssertionError("unit guard")),
+    ):
+        yield
+
+
+@contextmanager
+def _percentile_path_stubs() -> Iterator[None]:
+    """The percentile runner's collaborators stubbed, for a question that must NOT take the per-bin branch."""
+    with (
+        patch("metaculus_bot.forecaster_runners.numeric_prompt", return_value="PERCENTILE PROMPT"),
+        patch(
+            "metaculus_bot.forecaster_runners.parse_structured",
+            new=AsyncMock(return_value=OutcomeTypeResult(is_discrete_integer=False)),
+        ),
+        patch("metaculus_bot.forecaster_runners.sanitize_percentiles", return_value=(_STANDARD_PERCENTILES, None)),
+        patch("metaculus_bot.forecaster_runners.build_numeric_distribution", return_value=MagicMock()),
+        patch("metaculus_bot.forecaster_runners.detect_unit_mismatch", return_value=(False, "")),
+        patch("metaculus_bot.forecaster_runners.log_final_prediction"),
+        patch("metaculus_bot.forecaster_runners.log_open_bound_piling_diagnostics"),
+    ):
+        yield
+
+
+class TestPerBinBranch:
+    """A coarse Mantic grid is elicited per bin: prompt, ``extract_pmf``, ``build_pmf_distribution``.
+
+    The gate is ``numeric.config.elicit_per_bin``: Mantic host, an outcome-space grid, at most 31
+    bins. On that path there are no percentiles, so nothing that consumes percentiles may run: the
+    discrete vote (a paid parser call on a block that has no ``outcome_type``), the sanitizer, the
+    PCHIP build and the unit-mismatch guard (which on grid input would be fail-open). The
+    ``MEMBER_FORECAST`` line carries ``elicitation=pmf`` with the platform's ``N + 2`` PMF as both
+    ``raw`` (as declared) and ``published`` (after the floor blend).
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_12_bin_mantic_date_question_takes_the_per_bin_path(
+        self, forecaster_llm, parser_llm, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.INFO, logger="metaculus_bot.forecaster_runners")
+        question = make_real_date_question()
+        invoke = AsyncMock(return_value="per-bin reasoning")
+        extract = AsyncMock(return_value=_pmf_outcome(_DATE_DECLARED))
+        with (
+            _percentile_path_never_runs(),
+            patch("metaculus_bot.forecaster_runners.pmf_prompt", return_value="PMF PROMPT") as prompt,
+            patch.object(forecaster_llm, "invoke", new=invoke),
+            patch("metaculus_bot.forecaster_runners.extract_pmf", new=extract),
+        ):
+            result = await run_date_forecast(question, "research", forecaster_llm, parser_llm)
+
+        assert _last_invoke_arg(invoke) == "PMF PROMPT"
+        prompt.assert_called_once()
+        view = prompt.call_args.args[0]  # the prompt renders the epoch view, as date_prompt does
+        assert isinstance(view, EpochDateQuestion)
+        assert view.id_of_question == question.id_of_question
+        assert prompt.call_args.args[1] == "research"
+
+        extract.assert_awaited_once()
+        assert extract.await_args is not None
+        assert extract.await_args.args[0] == "per-bin reasoning"
+        grid = extract.await_args.args[1]
+        assert isinstance(grid, PmfGrid)
+        assert grid.labels == tuple(f"2026-09-{day:02d}" for day in range(8, 20))
+        assert extract.await_args.args[2] is parser_llm
+        assert extract.await_args.kwargs["question_id"] == question.id_of_question
+        assert extract.await_args.kwargs["model_name"] == forecaster_llm.model
+        assert extract.await_args.kwargs["prompt_notes"] == build_pmf_parse_notes(grid)
+
+        prediction = result.prediction_value
+        assert isinstance(prediction, NumericDistribution)
+        assert prediction.is_date is True
+        assert result.reasoning == "per-bin reasoning"
+        heights = cdf_heights(prediction)
+        assert len(heights) == 13
+        assert heights[0] == 0.0
+        assert heights[-1] == 1.0
+        assert_server_accepts_cdf(heights, cdf_size=13, open_lower=False, open_upper=False)
+        mass = np.diff(heights)
+        assert int(np.argmax(mass)) == 8
+        assert mass[8] > 0.78
+        for weekend_bin in _DATE_WEEKEND_BINS:
+            assert mass[weekend_bin] == pytest.approx(server_min_step(12), abs=2e-9)
+
+        (line,) = _member_forecast_lines(caplog)
+        assert line.startswith(
+            f"MEMBER_FORECAST: question={question.id_of_question} model=test-forecaster role=member qtype=date "
+            f"raw={_compact(_DATE_DECLARED)} published="
+        )
+        assert line.endswith(" oor_low=0.000000 oor_high=0.000000 elicitation=pmf")
+        published = json.loads(line.split(" published=", 1)[1].split(" ", 1)[0])
+        assert len(published) == 14
+        assert published[0] == 0.0
+        assert published[-1] == 0.0
+        assert published[1:-1] == pytest.approx(mass.tolist())
+
+    @pytest.mark.asyncio
+    async def test_an_11_bin_mantic_count_question_takes_the_per_bin_path_and_casts_no_vote(
+        self, forecaster_llm, parser_llm, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The numeric runner's return keeps its shape: ``(prediction, None)``, no discrete vote."""
+        caplog.set_level(logging.INFO, logger="metaculus_bot.forecaster_runners")
+        question = make_count_question(11)
+        extract = AsyncMock(return_value=_pmf_outcome(_COUNT_DECLARED))
+        with (
+            _percentile_path_never_runs(),
+            patch("metaculus_bot.forecaster_runners.pmf_prompt", return_value="PMF PROMPT") as prompt,
+            patch.object(forecaster_llm, "invoke", new=AsyncMock(return_value="count reasoning")),
+            patch("metaculus_bot.forecaster_runners.extract_pmf", new=extract),
+        ):
+            result, discrete_vote = await run_numeric_forecast(question, "research", forecaster_llm, parser_llm)
+
+        assert discrete_vote is None
+        assert prompt.call_args.args[0] is question  # the view of a numeric question is the question itself
+        grid = extract.await_args.args[1]  # type: ignore[union-attr]
+        assert grid.keys == (*(str(count) for count in range(11)), PMF_ABOVE_RANGE_KEY)
+
+        heights = cdf_heights(result.prediction_value)
+        assert len(heights) == 12
+        assert heights[0] == 0.0
+        assert_server_accepts_cdf(heights, cdf_size=12, open_lower=False, open_upper=True)
+        mass = np.diff(heights)
+        assert int(np.argmax(mass)) == 3
+        assert 1.0 - heights[-1] == pytest.approx(0.05, abs=0.001)
+
+        (line,) = _member_forecast_lines(caplog)
+        assert " qtype=numeric " in line
+        assert f" raw={_compact(_COUNT_DECLARED)} " in line
+        assert line.endswith(" elicitation=pmf")
+        oor_high = float(line.rsplit("oor_high=", 1)[1].split(" ", 1)[0])
+        assert oor_high == pytest.approx(1.0 - heights[-1], abs=1e-6)
+
+    @pytest.mark.asyncio
+    async def test_the_declaration_is_handed_to_the_builder_with_the_model_name(
+        self, forecaster_llm, parser_llm
+    ) -> None:
+        """The call sequence, with the builder stubbed: the ladder's declared vector goes to
+        ``build_pmf_distribution`` unchanged, and the model name rides along for the clip marker."""
+        question = make_count_question(11)
+        built = MagicMock(spec=NumericDistribution)
+        with (
+            _percentile_path_never_runs(),
+            patch("metaculus_bot.forecaster_runners.pmf_prompt", return_value="PMF PROMPT"),
+            patch.object(forecaster_llm, "invoke", new=AsyncMock(return_value="count reasoning")),
+            patch(
+                "metaculus_bot.forecaster_runners.extract_pmf",
+                new=AsyncMock(return_value=_pmf_outcome(_COUNT_DECLARED)),
+            ),
+            patch("metaculus_bot.forecaster_runners.build_pmf_distribution", return_value=built) as build,
+            patch("metaculus_bot.forecaster_runners.published_pmf", return_value=_COUNT_DECLARED),
+            patch("metaculus_bot.forecaster_runners.out_of_range_mass", return_value=(0.0, 0.05)),
+            patch("metaculus_bot.forecaster_runners.log_final_prediction") as final_log,
+        ):
+            result, _ = await run_numeric_forecast(question, "research", forecaster_llm, parser_llm)
+
+        assert result.prediction_value is built
+        build.assert_called_once_with(_COUNT_DECLARED, question, model_name=forecaster_llm.model)
+        final_log.assert_called_once_with(built, question)
+
+    @pytest.mark.asyncio
+    async def test_a_declaration_the_builder_refuses_propagates(self, forecaster_llm, parser_llm) -> None:
+        """A guard fails shut: mass declared in a closed tail raises out of the runner, never publishes."""
+        question = make_count_question(11)
+        below_a_closed_floor = [0.3, *_COUNT_DECLARED[1:]]
+        with (
+            _percentile_path_never_runs(),
+            patch("metaculus_bot.forecaster_runners.pmf_prompt", return_value="PMF PROMPT"),
+            patch.object(forecaster_llm, "invoke", new=AsyncMock(return_value="count reasoning")),
+            patch(
+                "metaculus_bot.forecaster_runners.extract_pmf",
+                new=AsyncMock(return_value=_pmf_outcome(below_a_closed_floor)),
+            ),
+            pytest.raises(ValueError, match="closed lower bound"),
+        ):
+            await run_numeric_forecast(question, "research", forecaster_llm, parser_llm)
+
+    @pytest.mark.parametrize(
+        "question",
+        [
+            pytest.param(
+                make_real_numeric_question().model_copy(update={"page_url": _MANTIC_URL}),
+                id="mantic-201-point-continuous-grid",
+            ),
+            pytest.param(make_count_question(200), id="mantic-200-bin-discrete"),
+            pytest.param(make_count_question(11, page_url=_METACULUS_URL), id="metaculus-11-bin-discrete"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_the_branch_is_not_taken_off_the_gate(
+        self, question: NumericQuestion, forecaster_llm, parser_llm
+    ) -> None:
+        """A 201-point continuous grid is not an outcome space, 200 bins is above the threshold, and
+        Metaculus is not in ``PMF_ELICITATION_PLATFORMS``: each stays on percentiles, byte for byte."""
+        never = AsyncMock(side_effect=AssertionError("extract_pmf must not run off the per-bin gate"))
+        with (
+            _percentile_path_stubs(),
+            patch("metaculus_bot.forecaster_runners.pmf_prompt", side_effect=AssertionError("pmf_prompt")),
+            patch("metaculus_bot.forecaster_runners.extract_pmf", new=never),
+            patch.object(forecaster_llm, "invoke", new=AsyncMock(return_value="percentile reasoning")) as invoke,
+            patch("metaculus_bot.forecaster_runners.extract_numeric") as extract_numeric,
+        ):
+            extract_numeric.return_value = ExtractionOutcome(
+                value=_STANDARD_PERCENTILES, rung="block", block_present=True
+            )
+            await run_numeric_forecast(question, "research", forecaster_llm, parser_llm)
+
+        assert _last_invoke_arg(invoke) == "PERCENTILE PROMPT"
+        extract_numeric.assert_awaited_once()
+        never.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_metaculus_hosted_date_question_stays_on_percentiles(self, forecaster_llm, parser_llm) -> None:
+        """Same 12-bin grid as post 651, Metaculus host: the platform clause alone keeps it on percentiles."""
+        question = make_real_date_question().model_copy(
+            update={"page_url": "https://www.metaculus.com/questions/4001/"}
+        )
+        never = AsyncMock(side_effect=AssertionError("extract_pmf must not run on a Metaculus question"))
+        with (
+            patch("metaculus_bot.forecaster_runners.date_prompt", return_value="DATE PROMPT"),
+            patch("metaculus_bot.forecaster_runners.extract_pmf", new=never),
+            patch.object(forecaster_llm, "invoke", new=AsyncMock(return_value="date reasoning")),
+            patch("metaculus_bot.forecaster_runners.extract_date") as extract_date,
+            patch("metaculus_bot.forecaster_runners.build_guarded_numeric_distribution") as build,
+        ):
+            extract_date.return_value = ExtractionOutcome(value=_STANDARD_PERCENTILES, rung="block", block_present=True)
+            await run_date_forecast(question, "research", forecaster_llm, parser_llm)
+
+        extract_date.assert_awaited_once()
+        build.assert_called_once()
+        never.assert_not_awaited()
+
+
+class TestBuildPmfParseNotes:
+    def test_lists_every_key_verbatim_and_the_count(self) -> None:
+        grid = pmf_grid(make_count_question(11))
+        notes = build_pmf_parse_notes(grid)
+        for key in grid.keys:
+            assert f"'{key}'" in notes
+        assert f"exactly {len(grid.keys)} keys" in notes
+        assert "'label'" in notes
+        assert "'probability'" in notes
+        assert PMF_ABOVE_RANGE_KEY in notes
+        assert "below_range" not in notes  # the lower bound is closed: no such key to spell
+
+    def test_an_unstated_key_is_left_out_never_written_as_zero(self) -> None:
+        """The notes used to say both "never fill it in" and "a key the forecaster gave no probability is 0",
+        and a parser obeying the second invented an ``above_range: 0`` that then satisfied the every-key rule.
+        A key the forecaster never priced is left out, so ``extract_pmf`` drops the member instead."""
+        notes = build_pmf_parse_notes(pmf_grid(make_count_question(11)))
+        assert "gave no probability" not in notes
+        assert "leave that key out" in notes
+        assert "never" in notes.lower()
+        assert "fill in" in notes
+        assert "ruled out is 0" in notes  # an explicit "cannot happen" IS a stated probability
+
+    def test_a_date_grid_spells_dates_and_no_epoch_second(self) -> None:
+        grid = pmf_grid(as_epoch_question(make_real_date_question()))
+        notes = build_pmf_parse_notes(grid)
+        assert "'2026-09-08'" in notes
+        assert "'2026-09-19'" in notes
+        assert "1789776000" not in notes
+        assert "above_range" not in notes
+        assert "below_range" not in notes
+
+    def test_both_open_bounds_spell_both_reserved_keys(self) -> None:
+        question = make_real_numeric_question(open_lower_bound=True, open_upper_bound=True).model_copy(
+            update={"page_url": _MANTIC_URL, "cdf_size": 21}
+        )
+        notes = build_pmf_parse_notes(pmf_grid(question))
+        assert "'below_range'" in notes
+        assert "'above_range'" in notes

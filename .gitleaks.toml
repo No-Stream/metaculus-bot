@@ -39,6 +39,7 @@ condition = "AND"
 paths = [
   '''^tests/test_check_openrouter_credits\.py$''',
   '''^tests/test_credit_telemetry\.py$''',
+  '''^tests/test_credit_role_spend\.py$''',
 ]
 regexTarget = "line"
 regexes = ['''sk-or-v1-(DONATED|PERSONAL)secret[A-Z0-9]{4}''']

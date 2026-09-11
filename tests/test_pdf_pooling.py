@@ -13,7 +13,8 @@ import pytest
 from forecasting_tools.data_models.numeric_report import Percentile
 from scipy.stats import norm
 
-from metaculus_bot.numeric.config import MIN_CDF_PROB_STEP, PCHIP_CDF_POINTS, grid_step_constraints
+from metaculus_bot.constants import NUM_MIN_PROB_STEP
+from metaculus_bot.numeric.config import PCHIP_CDF_POINTS, grid_step_constraints
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
 from metaculus_bot.probabilistic_tools.pdf_pooling import (
     _question_grid,
@@ -61,7 +62,7 @@ def _assert_valid_cdf(
     question,
     *,
     n_points: int = PCHIP_CDF_POINTS,
-    min_step: float = MIN_CDF_PROB_STEP,
+    min_step: float = NUM_MIN_PROB_STEP,
     expected_grid: np.ndarray | None = None,
 ) -> None:
     """Validity = right length, strictly increasing probs, in [0,1], endpoints respect
@@ -185,7 +186,7 @@ class TestApplyTailFloor:
         # Open upper => some mass reserved above the grid.
         assert out[-1] <= 0.999 + 1e-9
         # Monotonic + min-step preserved.
-        assert np.all(np.diff(out) >= MIN_CDF_PROB_STEP - 1e-10)
+        assert np.all(np.diff(out) >= NUM_MIN_PROB_STEP - 1e-10)
 
     def test_already_diffuse_cdf_barely_changes(self):
         # A near-uniform CDF already exceeds floor_eps everywhere; output stays close.
@@ -378,8 +379,8 @@ class TestNonStandardGridLength:
         )
 
     def _discrete_min_step(self, n: int) -> float:
-        # Server min-step for an n-point CDF: max(MIN_CDF_PROB_STEP, 0.01 / (n - 1)).
-        return max(MIN_CDF_PROB_STEP, 0.01 / (n - 1))
+        # Server min-step for an n-point CDF: round(0.01 / (n - 1), 9).
+        return round(0.01 / (n - 1), 9)
 
     def test_log_pool_at_discrete_length(self):
         question = self._discrete_question()

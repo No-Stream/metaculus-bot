@@ -14,22 +14,14 @@ from typing import get_args
 
 import pytest
 
-from metaculus_bot.research import resolution_source
+from metaculus_bot.research.fetch_ladder import guard, rungs
+from metaculus_bot.research.fetch_ladder.context import _BUDGET_GATED_RUNGS, _RUNG_WALL_SKIP_PHRASE, LadderContext
+from metaculus_bot.research.fetch_ladder.ladder import _fetch_one, _run_rung
+from metaculus_bot.research.fetch_ladder.rungs import _WAYBACK_TRIGGER_STATUSES
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail
 from metaculus_bot.research.rendered_fetch import RenderedPage
-from metaculus_bot.research.resolution_fetch_result import RungSkipReason
-from metaculus_bot.research.resolution_source import (
-    _BUDGET_GATED_RUNGS,
-    _RUNG_WALL_SKIP_PHRASE,
-    _WAYBACK_TRIGGER_STATUSES,
-    FetchContext,
-    FetchResult,
-    FetchStatus,
-    _fetch_one,
-    _run_rung,
-    _rung_counts,
-    resolution_source_provider,
-)
+from metaculus_bot.research.resolution_fetch_result import FetchStatus, RungSkipReason
+from metaculus_bot.research.resolution_source import FetchResult, _rung_counts, resolution_source_provider
 from metaculus_bot.research.robots_policy import reset_robots_cache
 from metaculus_bot.research.wayback import wayback_snapshot_url
 from tests.resolution_source_fakes import (
@@ -56,7 +48,7 @@ class TestRunRung:
     """The bracket every dispatcher site used to copy: read the length first, close afterwards."""
 
     async def test_a_rung_that_returns_a_result_closes_its_attempts_on_that_status(self):
-        ctx = FetchContext()
+        ctx = LadderContext()
 
         async def _rung() -> FetchResult | None:
             ctx.start_rung("wayback", "blocked", _URL)
@@ -71,7 +63,7 @@ class TestRunRung:
         assert ctx.rungs[0].wall_s is not None
 
     async def test_a_rung_that_declines_closes_its_attempts_on_the_fallback(self):
-        ctx = FetchContext()
+        ctx = LadderContext()
 
         async def _rung() -> FetchResult | None:
             ctx.start_rung("url_context", "blocked", _URL)
@@ -83,7 +75,7 @@ class TestRunRung:
 
     async def test_only_the_attempts_the_rung_opened_are_closed(self):
         """An attempt an EARLIER rung left open keeps its own outcome; a skipped one is left alone."""
-        ctx = FetchContext()
+        ctx = LadderContext()
         earlier = ctx.start_rung("derived_api", "js_wall", _URL)
         earlier.outcome = "js_wall"
         ctx.skip_rung("rendered", "js_wall", _URL, "fast_path")
@@ -116,7 +108,7 @@ class TestAVerdictKeepsItsOwnRoute:
 
     @pytest.fixture(autouse=True)
     def _arm_both_rungs(self, monkeypatch):
-        monkeypatch.setattr(resolution_source, "_WAYBACK_TRIGGER_STATUSES", _WAYBACK_TRIGGER_STATUSES)
+        monkeypatch.setattr(rungs, "_WAYBACK_TRIGGER_STATUSES", _WAYBACK_TRIGGER_STATUSES)
         monkeypatch.setenv("RESOLUTION_SOURCE_URL_CONTEXT_ENABLED", "true")
         monkeypatch.setenv("GOOGLE_API_KEY", "key")
         reset_robots_cache()
@@ -138,9 +130,9 @@ class TestAVerdictKeepsItsOwnRoute:
         def _boom(*_args, **_kwargs):
             raise RuntimeError("reader exploded")
 
-        monkeypatch.setattr(resolution_source, "run_url_context_read", _boom)
+        monkeypatch.setattr(rungs, "run_url_context_read", _boom)
 
-        result = await _fetch_one(self._session(), _URL, {}, FetchContext(now=self._NOW, query="ask"))
+        result = await _fetch_one(self._session(), _URL, {}, LadderContext(now=self._NOW, query="ask"))
 
         assert result.status == "stale_data"
         assert result.route == "wayback"
@@ -162,9 +154,9 @@ class TestAVerdictKeepsItsOwnRoute:
             del url, ask, kwargs
             return ("The page reports 12 major work stoppages.", 1, ["URL_RETRIEVAL_STATUS_SUCCESS"])
 
-        monkeypatch.setattr(resolution_source, "run_url_context_read", _read)
+        monkeypatch.setattr(rungs, "run_url_context_read", _read)
 
-        result = await _fetch_one(self._session(), _URL, {}, FetchContext(now=self._NOW, query="ask"))
+        result = await _fetch_one(self._session(), _URL, {}, LadderContext(now=self._NOW, query="ask"))
 
         assert result.status == "success"
         assert result.route == "url_context"
@@ -178,7 +170,7 @@ class TestAVerdictKeepsItsOwnRoute:
         the pre-stamped route agrees with what the dispatcher would have chosen."""
         monkeypatch.delenv("GOOGLE_API_KEY")
 
-        result = await _fetch_one(self._session(), _URL, {}, FetchContext(now=self._NOW, query="ask"))
+        result = await _fetch_one(self._session(), _URL, {}, LadderContext(now=self._NOW, query="ask"))
 
         assert result.status == "stale_data"
         assert result.route == "wayback"
@@ -199,7 +191,7 @@ class TestRungSkipReasonCounts:
 
     @pytest.mark.parametrize("reason", get_args(RungSkipReason))
     def test_every_skip_reason_moves_a_counts_key(self, reason: RungSkipReason):
-        ctx = FetchContext()
+        ctx = LadderContext()
         ctx.skip_rung("rendered", "js_wall", _URL, reason)
         skipped = _result("js_wall")
         skipped.rung_attempts = list(ctx.rungs)
@@ -214,7 +206,7 @@ class TestRungSkipReasonCounts:
 
     @pytest.mark.parametrize("rung", _BUDGET_GATED_RUNGS)
     def test_every_budget_gated_rung_has_its_own_budget_skip_key(self, rung):
-        ctx = FetchContext()
+        ctx = LadderContext()
         ctx.skip_rung(rung, "blocked", _URL, "wall_budget")
         skipped = _result("blocked")
         skipped.rung_attempts = list(ctx.rungs)
@@ -278,7 +270,7 @@ class TestChromeMetricWithholdCounts:
 
     async def test_a_withhold_the_rendered_rung_rescued_is_counted_under_both_keys(self, monkeypatch):
         page = RenderedPage(url=_URL, content_type="text/html", html=_prose_page(_RENDERED_PROSE).decode())
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(page, []))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(page, []))
         session = FakeSession({_URL: FakeResponse(200, body=_MENU_TREE)})
 
         result = await _fetch_one(session, _URL, {})
@@ -324,9 +316,9 @@ class TestChromeMetricWithholdCounts:
     async def test_the_rescued_key_reaches_the_provider_detail(self, monkeypatch):
         monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
         page = RenderedPage(url=_URL, content_type="text/html", html=_prose_page(_RENDERED_PROSE).decode())
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(page, []))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(page, []))
         session = FakeSession({_URL: FakeResponse(200, body=_MENU_TREE)})
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
         q = _mock_question(resolution_criteria=f"Resolves per {_URL} on release.")
 
         await resolution_source_provider(is_benchmarking=False)(q)

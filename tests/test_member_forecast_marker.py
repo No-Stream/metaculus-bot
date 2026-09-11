@@ -29,6 +29,7 @@ from forecasting_tools import (
     BinaryQuestion,
     GeneralLlm,
     MultipleChoiceQuestion,
+    NumericDistribution,
     NumericQuestion,
     Percentile,
     PredictedOption,
@@ -44,13 +45,16 @@ from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN, MC_PROB_MI
 from metaculus_bot.exceptions import UnitMismatchError
 from metaculus_bot.forecaster_runners import run_binary_forecast, run_mc_forecast, run_numeric_forecast
 from metaculus_bot.member_forecast import (
+    ELICITATION_PMF,
     MEMBER_FORECAST_ROLE_MEMBER,
     MEMBER_FORECAST_ROLE_STACKER,
     format_member_forecast_marker,
+    format_numeric_aggregate_marker,
     option_vector,
+    out_of_range_mass,
     percentile_pairs,
 )
-from metaculus_bot.numeric.config import STANDARD_PERCENTILES
+from metaculus_bot.numeric.config import STANDARD_PERCENTILES, grid_step_constraints
 from metaculus_bot.numeric.discrete_snap import OutcomeTypeResult
 from metaculus_bot.simple_types import OptionProbability
 from metaculus_bot.value_extraction import ExtractionOutcome, McForecast, extract_mc
@@ -67,6 +71,23 @@ _MC_OPTIONS = ["Option 0", "Option 1", "Option 2"]
 # Thirteen declared pairs on the canonical set, with the float noise sanitize leaves behind.
 _DECLARED = [Percentile(percentile=p, value=8.7 + 0.8729999999999905 * i) for i, p in enumerate(STANDARD_PERCENTILES)]
 _SANITIZED = [Percentile(percentile=p.percentile, value=p.value + 0.001) for p in _DECLARED]
+# A built CDF with mass beyond both bounds: 0.2% below the lower, 3.75% above the upper.
+_BUILT_CDF = [0.002, 0.1, 0.3, 0.5, 0.7, 0.9, 0.9625]
+
+# A per-bin member of post 651 certain of bin 8, as the platform's N + 2 vector: raw as read, published after the floor blend.
+_PMF_BINS = 12
+_PMF_FLOOR = grid_step_constraints(_PMF_BINS + 1)[0] + 1e-9
+_PMF_RAW = [0.0] + [1.0 if k == 8 else 0.0 for k in range(_PMF_BINS)] + [0.0]
+_PMF_PUBLISHED = [0.0] + [1.0 - 11 * _PMF_FLOOR if k == 8 else _PMF_FLOOR for k in range(_PMF_BINS)] + [0.0]
+
+
+def _fake_distribution(cdf_heights: list[float]) -> MagicMock:
+    """A stand-in for the built distribution: ``get_cdf()`` returns the heights as Percentiles."""
+    distribution = MagicMock()
+    distribution.get_cdf.return_value = [
+        Percentile(percentile=height, value=float(index)) for index, height in enumerate(cdf_heights)
+    ]
+    return distribution
 
 
 def _harvest(line: str) -> dict[str, Any]:
@@ -86,6 +107,21 @@ def _harvest(line: str) -> dict[str, Any]:
     others = {name: recs for name, recs in harvested.items() if recs and name != "member_forecast"}
     assert not others, f"line was claimed by another spec: {others}"
     records = harvested["member_forecast"]
+    assert len(records) == 1, records
+    return records[0]
+
+
+def _harvest_any(line: str) -> dict[str, Any]:
+    """Run one line through the real harvester and return whichever single record it produced."""
+    harvested = parse_log_text(
+        PFX + line,
+        run_id="900",
+        workflow="run_bot_on_tournament",
+        artifact="research-900",
+        run_date="2026-09-02",
+        log_file="x.log",
+    )
+    records = [record for records in harvested.values() for record in records]
     assert len(records) == 1, records
     return records[0]
 
@@ -174,6 +210,93 @@ class TestFormatter:
         assert option_vector(_pol([0.2, 0.5, 0.3])) == [0.2, 0.5, 0.3]
         assert percentile_pairs(_DECLARED[:2]) == [[0.01, 8.7], [0.025, 8.7 + 0.8729999999999905]]
 
+    def test_out_of_range_mass_reads_the_built_cdf_tails(self):
+        assert out_of_range_mass(_fake_distribution(_BUILT_CDF)) == pytest.approx((0.002, 0.0375))
+        # Both bounds closed: no mass outside, exactly.
+        assert out_of_range_mass(_fake_distribution([0.0, 0.5, 1.0])) == (0.0, 0.0)
+
+    def test_the_tail_fields_end_a_numeric_line_and_are_absent_otherwise(self):
+        with_tails = format_member_forecast_marker(
+            question_id=QID,
+            model=MODEL,
+            role=MEMBER_FORECAST_ROLE_MEMBER,
+            qtype="numeric",
+            raw=percentile_pairs(_DECLARED[:2]),
+            published=percentile_pairs(_SANITIZED[:2]),
+            out_of_range=(0.002, 0.0375),
+        )
+        assert with_tails.endswith(" oor_low=0.002000 oor_high=0.037500")
+        without = format_member_forecast_marker(
+            question_id=QID, model=MODEL, role=MEMBER_FORECAST_ROLE_MEMBER, qtype="binary", raw=0.005, published=0.02
+        )
+        assert "oor_" not in without
+
+    def test_a_pmf_line_ends_with_the_elicitation_field_after_the_tails(self):
+        """On a per-bin line ``raw`` and ``published`` are the platform's N + 2 vector, and the
+        field that says so comes LAST, after the tails, so every older consumer reads the same
+        positions it always did and a new one reads ``elicitation`` before interpreting ``raw``."""
+        line = format_member_forecast_marker(
+            question_id=651,
+            model=MODEL,
+            role=MEMBER_FORECAST_ROLE_MEMBER,
+            qtype="date",
+            raw=_PMF_RAW,
+            published=_PMF_PUBLISHED,
+            out_of_range=(_PMF_PUBLISHED[0], _PMF_PUBLISHED[-1]),
+            elicitation=ELICITATION_PMF,
+        )
+        assert line.startswith(f"MEMBER_FORECAST: question=651 model={MODEL} role=member qtype=date raw=[0.0,")
+        assert line.endswith(" oor_low=0.000000 oor_high=0.000000 elicitation=pmf")
+        assert json.loads(line.split(" raw=", 1)[1].split(" ", 1)[0]) == _PMF_RAW
+        assert len(json.loads(line.split(" published=", 1)[1].split(" ", 1)[0])) == _PMF_BINS + 2
+
+    def test_the_elicitation_field_is_absent_unless_given(self):
+        """Absent means percentiles: the meaning every archived numeric and date line already has."""
+        line = format_member_forecast_marker(
+            question_id=QID,
+            model=MODEL,
+            role=MEMBER_FORECAST_ROLE_MEMBER,
+            qtype="numeric",
+            raw=percentile_pairs(_DECLARED[:2]),
+            published=percentile_pairs(_SANITIZED[:2]),
+            out_of_range=(0.002, 0.0375),
+        )
+        assert "elicitation" not in line
+        assert ELICITATION_PMF == "pmf"
+
+    def test_numeric_aggregate_marker_names_grid_tails_and_method(self):
+        line = format_numeric_aggregate_marker(
+            question_id=651,
+            qtype="date",
+            cdf_size=13,
+            out_of_range=(0.0, 0.0),
+            out_of_range_raw=(0.0, 0.0),
+            tail_floor=0.0,
+            method="mean",
+        )
+        assert line == (
+            "NUMERIC_AGGREGATE: question=651 qtype=date cdf_size=13 oor_low=0.000000 oor_high=0.000000"
+            " oor_low_raw=0.000000 oor_high_raw=0.000000 tail_floor=0.000000 method=mean"
+        )
+        rec = _harvest_any(line)
+        assert rec["marker"] == "numeric_aggregate"
+        assert rec["qid"] == 651
+        assert rec["cdf_size"] == 13
+        assert rec["method"] == "mean"
+
+    def test_the_aggregate_marker_requires_a_method(self):
+        """Written on EVERY numeric and date question, so the combine rule is auditable per question:
+        a caller cannot leave it out."""
+        with pytest.raises(TypeError, match="method"):
+            format_numeric_aggregate_marker(  # type: ignore[call-arg]
+                question_id=651,
+                qtype="date",
+                cdf_size=13,
+                out_of_range=(0.0, 0.0),
+                out_of_range_raw=(0.0, 0.0),
+                tail_floor=0.0,
+            )
+
 
 class TestRoundTripThroughMarkerSpec:
     """Format -> harvest -> json.loads reproduces every value, for all three types."""
@@ -200,6 +323,47 @@ class TestRoundTripThroughMarkerSpec:
         assert rec["qtype"] == qtype
         assert json.loads(rec["raw"]) == raw
         assert json.loads(rec["published"]) == published
+
+    def test_a_pmf_line_round_trips_with_its_elicitation_and_tails(self):
+        rec = _harvest(
+            format_member_forecast_marker(
+                question_id=651,
+                model=MODEL,
+                role=MEMBER_FORECAST_ROLE_MEMBER,
+                qtype="date",
+                raw=_PMF_RAW,
+                published=_PMF_PUBLISHED,
+                out_of_range=(_PMF_PUBLISHED[0], _PMF_PUBLISHED[-1]),
+                elicitation=ELICITATION_PMF,
+            )
+        )
+        assert rec["qtype"] == "date"
+        assert rec["elicitation"] == "pmf"
+        assert json.loads(rec["raw"]) == _PMF_RAW
+        assert json.loads(rec["published"]) == pytest.approx(_PMF_PUBLISHED)
+        assert (rec["oor_low"], rec["oor_high"]) == (0.0, 0.0)
+
+    @pytest.mark.parametrize(
+        ("qtype", "raw", "published"),
+        [
+            ("binary", 0.005, BINARY_PROB_MIN),
+            ("multiple_choice", [0.9, 0.005, 0.095], [0.891, 0.01, 0.099]),
+            ("numeric", percentile_pairs(_DECLARED), percentile_pairs(_SANITIZED)),
+        ],
+    )
+    def test_a_line_without_the_field_reads_percentiles(self, qtype, raw, published):
+        """``None``, never a default token: absent is what every archived line says."""
+        rec = _harvest(
+            format_member_forecast_marker(
+                question_id=QID,
+                model=MODEL,
+                role=MEMBER_FORECAST_ROLE_MEMBER,
+                qtype=qtype,
+                raw=raw,
+                published=published,
+            )
+        )
+        assert rec["elicitation"] is None
 
     def test_values_are_kept_verbatim_so_a_consumer_always_json_loads(self):
         """Without the spec's raw_fields the binary line would coerce to a float while the
@@ -433,7 +597,10 @@ class TestMemberEmission:
                 new=AsyncMock(return_value=ExtractionOutcome(value=_DECLARED, rung="block", block_present=True)),
             ),
             patch("metaculus_bot.forecaster_runners.sanitize_percentiles", return_value=(_SANITIZED, None)),
-            patch("metaculus_bot.forecaster_runners.build_numeric_distribution", return_value=MagicMock()),
+            patch(
+                "metaculus_bot.forecaster_runners.build_numeric_distribution",
+                return_value=_fake_distribution(_BUILT_CDF),
+            ),
             patch("metaculus_bot.forecaster_runners.detect_unit_mismatch", return_value=mismatch),
             patch("metaculus_bot.forecaster_runners.log_final_prediction"),
             patch("metaculus_bot.forecaster_runners.log_open_bound_piling_diagnostics"),
@@ -455,6 +622,9 @@ class TestMemberEmission:
         assert rec["qtype"] == "numeric"
         assert json.loads(rec["raw"]) == percentile_pairs(_DECLARED)
         assert json.loads(rec["published"]) == percentile_pairs(_SANITIZED)
+        # The built CDF's tails ride the same line: cdf[0] below the lower bound, 1 - cdf[-1] above.
+        assert rec["oor_low"] == pytest.approx(_BUILT_CDF[0])
+        assert rec["oor_high"] == pytest.approx(1.0 - _BUILT_CDF[-1])
 
     @pytest.mark.asyncio
     async def test_numeric_line_precedes_the_unit_mismatch_guard(
@@ -588,7 +758,7 @@ class TestStackerEmission:
             ),
             patch("metaculus_bot.aggregation_pipeline.sanitize_percentiles", return_value=(sanitized, None)),
         ):
-            await pipeline.run_stacking(question, "research", reasoned)
+            stacked = await pipeline.run_stacking(question, "research", reasoned)
 
         (line,) = _member_lines(caplog)
         rec = _harvest(line)
@@ -599,3 +769,10 @@ class TestStackerEmission:
         assert json.loads(rec["raw"]) == percentile_pairs(percentiles)
         assert json.loads(rec["published"]) == percentile_pairs(sanitized)
         assert percentile_pairs(sanitized) != percentile_pairs(percentiles)
+        # The stacker is the one emitter the member-side twin does not cover: the CDF is built
+        # before the guard precisely so this line can carry the built tails, and the formatter
+        # and the registry regex both make the fields optional, so only the call site pins them.
+        assert isinstance(stacked, NumericDistribution)
+        assert rec["oor_low"] is not None
+        assert rec["oor_high"] is not None
+        assert (rec["oor_low"], rec["oor_high"]) == pytest.approx(out_of_range_mass(stacked))

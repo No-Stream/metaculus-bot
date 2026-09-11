@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator, Mapping
+from dataclasses import replace
 from datetime import datetime
 from html import escape as html_escape
 from pathlib import Path
@@ -28,7 +29,8 @@ from unittest.mock import MagicMock
 from urllib.parse import urlparse
 
 from metaculus_bot.constants import GOOGLE_API_KEY_ENV, RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV
-from metaculus_bot.research import resolution_source
+from metaculus_bot.research.fetch_ladder import context, rungs, verdict
+from metaculus_bot.research.fetch_ladder.policy import RESOLUTION_SOURCE_POLICY
 from metaculus_bot.research.impersonated_fetch import ImpersonatedResponse
 from metaculus_bot.research.rendered_fetch import RenderedPage
 
@@ -262,8 +264,8 @@ def _mid_band_chart_page() -> bytes:
     `_IOM_PROSE` extracts 425, only 25 chars above the chrome floor — so neither of them
     exercises the middle.
     """
-    js_wall_floor = resolution_source.RESOLUTION_SOURCE_JS_WALL_MIN_CHARS
-    chrome_floor = resolution_source.RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS
+    js_wall_floor = verdict.RESOLUTION_SOURCE_JS_WALL_MIN_CHARS
+    chrome_floor = verdict.RESOLUTION_SOURCE_EMBED_SHELL_MAX_CHARS
     # Trafilatura emits the h1 and then the paragraph twice, so the extraction is
     # 13 + 6n chars for an `"ab " * n` paragraph. The tests that use this measure the
     # result rather than trusting that arithmetic.
@@ -456,6 +458,16 @@ def paid_reader(
     return _read, calls
 
 
+def capped_ctx(cap: int, **kwargs: Any) -> context.LadderContext:
+    """A fetcher context whose policy caps one URL's published text at ``cap``.
+
+    The per-URL cap is a policy knob rather than a module constant, so a test that tunes it hands
+    the ladder its own preset and the tuning provably reaches the classifier; every other knob is
+    the fetcher's own. ``kwargs`` are :class:`LadderContext`'s (``query``, ``now``, ...).
+    """
+    return context.LadderContext(policy=replace(RESOLUTION_SOURCE_POLICY, per_url_max_chars=cap), **kwargs)
+
+
 def arm_paid_rung(monkeypatch: Any, reader: Any, *, budget_s: float | None = None) -> None:
     """Open the flag, the key and the reader, so the only closed gate is the one under test.
 
@@ -466,9 +478,9 @@ def arm_paid_rung(monkeypatch: Any, reader: Any, *, budget_s: float | None = Non
     """
     monkeypatch.setenv(RESOLUTION_SOURCE_URL_CONTEXT_ENABLED_ENV, "true")
     monkeypatch.setenv(GOOGLE_API_KEY_ENV, "key")
-    monkeypatch.setattr(resolution_source, "run_url_context_read", reader)
+    monkeypatch.setattr(rungs, "run_url_context_read", reader)
     if budget_s is not None:
-        monkeypatch.setattr(resolution_source.FetchContext, "rung_budget_s", lambda self: budget_s)
+        monkeypatch.setattr(context.LadderContext, "rung_budget_s", lambda self: budget_s)
 
 
 def refused_page_with_robots(*, robots: bytes = ROBOTS_ALLOW_ALL, extra: _Handlers | None = None) -> FakeSession:
@@ -490,7 +502,7 @@ def refused_page_with_robots(*, robots: bytes = ROBOTS_ALLOW_ALL, extra: _Handle
 # --- Impersonated-retry scaffolding (shared by the Tier-1 rung, SSRF, dispatch and fetch modules
 # and by gap-fill v2's `tests/test_agentic_tools.py`) ---
 # The transport is `research/impersonated_fetch.py`; every test patches its own ladder's import
-# seam (`resolution_source.fetch_impersonated` for Tier 1, `agentic_tools.fetch_impersonated` for
+# seam (`fetch_ladder.rungs.fetch_impersonated` for Tier 1, `agentic_tools.fetch_impersonated` for
 # gap-fill v2) with the double below rather than the transport's own session, so the suite's
 # `_block_native_egress` guard stays armed underneath it.
 

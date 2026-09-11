@@ -6,10 +6,13 @@ returned section. Contract mirrors v1 (``research/targeted.py``
 ``run_gap_fill_pass``): never raises, returns ``""`` when disabled,
 benchmarking, unsupported question type, or on any failure.
 
-Archive persistence: pass ``archive_sink`` to receive the loop transcript +
-telemetry when the loop actually ran (mirrors the orchestrator's
-``research_sink`` callback pattern) — the findings string alone is not enough
-for the research-archive trace requirement.
+Two callbacks mirror the orchestrator's ``research_sink`` pattern. ``archive_sink``
+receives the loop transcript, telemetry and ghost when the loop actually ran (the
+findings string alone is not enough for the research-archive trace requirement).
+``ghost_context_sink`` receives the loop's :class:`GhostContext` when the plain
+ghost ran, so the stage can issue the v1 ghost (``run_gap_fill_v2_ghost_v1``)
+once gap-fill v1's section has landed: v1 and v2 run concurrently, so the loop
+itself never sees that section (docs/agentic_gap_fill.md "The ghost forecast").
 """
 
 import dataclasses
@@ -30,27 +33,36 @@ from metaculus_bot.constants import (
     GAP_FILL_V2_WALL_DEADLINE,
     env_flag_enabled,
 )
-from metaculus_bot.research.agentic import LoopConfig, build_gap_fill_tools, run_agentic_loop
+from metaculus_bot.research.agentic import (
+    GhostContext,
+    GhostForecast,
+    LoopConfig,
+    build_gap_fill_tools,
+    run_agentic_loop,
+    run_ghost_v1,
+)
 from metaculus_bot.research.agentic.driver_prompt import (
     SupportedQuestion as _SupportedQuestion,
 )
 from metaculus_bot.research.agentic.driver_prompt import (
     build_ghost_prompt,
+    build_ghost_v1_prompt,
     build_system_prompt,
     build_user_brief,
 )
+from metaculus_bot.research.agentic.tools import question_ladder_context
+from metaculus_bot.research.fetch_ladder import guard
 
-__all__ = ["run_gap_fill_v2"]
+__all__ = ["run_gap_fill_v2", "run_gap_fill_v2_ghost_v1"]
 
 logger = logging.getLogger(__name__)
 
-# Broad by design, same policy and rationale as v1's
-# _GAP_FILL_SOFT_FAIL_EXCEPTIONS (research/targeted.py): gap-fill is an
-# optional enrichment layer, and a forecast with only first-pass research is
-# strictly better than no forecast. run_agentic_loop already soft-fails
-# internally; this seam is belt-and-suspenders for prompt/tool construction
-# errors. CancelledError propagates (BaseException).
+# Broad by design, v1's policy (targeted.py _GAP_FILL_SOFT_FAIL_EXCEPTIONS): an enrichment layer never costs the forecast.
 _GAP_FILL_V2_SOFT_FAIL_EXCEPTIONS: tuple[type[BaseException], ...] = (Exception,)
+
+
+def _question_ref(question: MetaculusQuestion) -> str:
+    return question.page_url or str(question.id_of_question)
 
 
 async def run_gap_fill_v2(
@@ -59,69 +71,61 @@ async def run_gap_fill_v2(
     *,
     is_benchmarking: bool,
     archive_sink: Callable[[dict[str, Any]], None] | None = None,
+    ghost_context_sink: Callable[[GhostContext], None] | None = None,
     on_error: Callable[[BaseException], None] | None = None,
 ) -> str:
     """Run the agentic gap-fill v2 loop and return its findings section.
 
-    Returns ``""`` (and makes zero LLM calls) when the ``GAP_FILL_V2_ENABLED``
-    flag is off, when benchmarking, or for question types the dry-run scaffold
-    has no template for. Soft-fails to ``""`` on any error. When the loop ran,
-    ``archive_sink`` (if given) receives
-    ``{"transcript": ..., "telemetry": ..., "ghost": ...}`` for research-archive
-    persistence — including empty-findings runs, whose telemetry is still worth
-    keeping. ``ghost`` is the serialized ghost forecast (or ``None`` when the
-    ghost phase did not run or failed).
-
-    ``on_error`` (if given) is called with the exception when this seam's
-    prompt/tool-construction step CRASHES — the belt-and-suspenders soft-fail
-    below. It fires ONLY on that construction-error path, which produces no
-    marker and no archive payload, so it is the only crash signal the caller can
-    observe for it (the loop-internal soft-fail is instead observable via the
-    archive payload's ``telemetry["error"]``, and an import failure never reaches
-    here). It is NOT called on the legitimate flag-off / benchmarking /
-    unsupported-qtype early returns — those are skips, not crashes. Mirrors the
-    ``archive_sink`` callback pattern so the orchestrator stays thin.
+    Returns ``""`` with zero LLM calls when ``GAP_FILL_V2_ENABLED`` is off, when benchmarking
+    (live search sees post-resolution information, the prediction-market provider's leakage
+    rule), or for a question type the dry-run scaffold has no template for; soft-fails to
+    ``""`` on any error. ``archive_sink`` receives ``{"transcript", "telemetry", "ghost"}`` when
+    the loop ran, empty-findings runs included (``ghost`` is None when the ghost phase did not
+    run); ``ghost_context_sink`` receives the loop's ``GhostContext`` when the plain ghost ran.
+    ``on_error`` fires only when prompt or tool CONSTRUCTION crashes, the one crash path with
+    no marker and no payload, never on the flag-off, benchmarking or unsupported-type skips.
     """
     if not env_flag_enabled(GAP_FILL_V2_ENABLED_ENV):
         return ""
     if is_benchmarking:
-        # Same leakage rationale as the prediction-market provider: live search
-        # sees post-resolution information on a large fraction of resolved
-        # questions, so v2 is hard-off in benchmarking runs.
         return ""
     if not isinstance(question, _SupportedQuestion):
-        # The dry-run scaffold embeds the panel's per-qtype template; question
-        # types without one (e.g. date questions) skip v2 entirely.
+        # Every type the bot forecasts has a template, so only a conditional question reaches this branch.
         logger.info(
             "Gap-fill v2 skipped: unsupported question type %s",
             type(question).__name__,
         )
         return ""
     try:
-        # UTC so the driver's "today" agrees with the forecaster prompt bundle's
-        # "Today:" line (``prompts._forecasting_window_str`` normalizes to UTC),
-        # regardless of host timezone. Prod runs on UTC hosts, so unchanged there.
+        # UTC, so the driver's "today" matches the forecaster bundle's "Today:" line regardless of host timezone.
         today = datetime.now(UTC).strftime("%Y-%m-%d")
         system_prompt = build_system_prompt(today)
         user_brief = build_user_brief(question, bundle_markdown)
-        tools = build_gap_fill_tools(question.question_text)
-        config = LoopConfig(
-            model=GAP_FILL_V2_DRIVER_MODEL,
-            reasoning_effort=GAP_FILL_V2_DRIVER_EFFORT,
-            max_tool_calls=GAP_FILL_V2_MAX_TOOL_CALLS,
-            wall_deadline_s=GAP_FILL_V2_WALL_DEADLINE,
-            conclude_threshold_s=GAP_FILL_V2_CONCLUDE_THRESHOLD,
-            max_gaps=GAP_FILL_V2_MAX_GAPS,
-        )
-        question_ref = question.page_url or str(question.id_of_question)
-        result = await run_agentic_loop(
-            system_prompt,
-            user_brief,
-            tools,
-            config,
-            ghost_prompt=build_ghost_prompt(),
-            log_prefix=f"question={question_ref} ",
-        )
+        # ONE fetch-ladder session and context per question, so known-API tools and rung 0 share
+        # both the connector and the Kalshi detail-GET budget across the driver's tool calls.
+        async with guard._get_session() as session:
+            tools = build_gap_fill_tools(
+                question.question_text,
+                ctx=question_ladder_context(session=session),
+            )
+            question_ref = _question_ref(question)
+            config = LoopConfig(
+                model=GAP_FILL_V2_DRIVER_MODEL,
+                reasoning_effort=GAP_FILL_V2_DRIVER_EFFORT,
+                max_tool_calls=GAP_FILL_V2_MAX_TOOL_CALLS,
+                wall_deadline_s=GAP_FILL_V2_WALL_DEADLINE,
+                conclude_threshold_s=GAP_FILL_V2_CONCLUDE_THRESHOLD,
+                max_gaps=GAP_FILL_V2_MAX_GAPS,
+                question_ref=question_ref,
+            )
+            result = await run_agentic_loop(
+                system_prompt,
+                user_brief,
+                tools,
+                config,
+                ghost_prompt=build_ghost_prompt(),
+                log_prefix=f"question={question_ref} ",
+            )
         if archive_sink is not None:
             archive_sink(
                 {
@@ -130,9 +134,25 @@ async def run_gap_fill_v2(
                     "ghost": result.ghost.model_dump() if result.ghost is not None else None,
                 }
             )
+        if ghost_context_sink is not None and result.ghost_context is not None:
+            ghost_context_sink(result.ghost_context)
         return result.findings_markdown
     except _GAP_FILL_V2_SOFT_FAIL_EXCEPTIONS as exc:
         logger.exception("Gap-fill v2 seam failed; continuing without v2 findings")
         if on_error is not None:
             on_error(exc)
         return ""
+
+
+async def run_gap_fill_v2_ghost_v1(
+    question: MetaculusQuestion, context: GhostContext, v1_addendum: str
+) -> GhostForecast | None:
+    """The v1 ghost: the plain ghost's brief plus gap-fill v1's section, on the loop's cached prefix.
+
+    Issued by the stage once both passes have landed, because v1 and v2 run concurrently and
+    the loop never sees v1's section. Telemetry only, never published, never raises; paired
+    against the plain ghost it measures v1's marginal value on the driver.
+    """
+    return await run_ghost_v1(
+        context, build_ghost_v1_prompt(v1_addendum), log_prefix=f"question={_question_ref(question)} "
+    )

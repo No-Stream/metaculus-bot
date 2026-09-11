@@ -1,0 +1,231 @@
+{
+ "took": 36,
+ "timed_out": false,
+ "hits": {
+  "total": {
+   "value": 15,
+   "relation": "eq"
+  },
+  "max_score": 16.778782,
+  "hits": [
+   {
+    "_index": "edgar_file",
+    "_id": "0001552781-26-000382:e26302_ex2-1.htm",
+    "_source": {
+     "ciks": [
+      "0001543151"
+     ],
+     "period_ending": "2026-07-16",
+     "file_num": [
+      "001-38902"
+     ],
+     "display_names": [
+      "Uber Technologies, Inc  (UBER)  (CIK 0001543151)"
+     ],
+     "xsl": null,
+     "sequence": "2",
+     "root_forms": [
+      "8-K"
+     ],
+     "file_date": "2026-07-16",
+     "biz_states": [
+      "CA"
+     ],
+     "sics": [
+      "7389"
+     ],
+     "form": "8-K",
+     "adsh": "0001552781-26-000382",
+     "film_num": [
+      "261178652"
+     ],
+     "biz_locations": [
+      "San Francisco, CA"
+     ],
+     "file_type": "EX-2.1",
+     "file_description": null,
+     "inc_states": [
+      "DE"
+     ],
+     "items": [
+      "1.01",
+      "2.03",
+      "7.01",
+      "9.01"
+     ]
+    }
+   },
+   {
+    "_index": "edgar_file",
+    "_id": "0001552781-26-000382:e26302_uber-8k.htm",
+    "_source": {
+     "ciks": [
+      "0001543151"
+     ],
+     "period_ending": "2026-07-16",
+     "file_num": [
+      "001-38902"
+     ],
+     "display_names": [
+      "Uber Technologies, Inc  (UBER)  (CIK 0001543151)"
+     ],
+     "xsl": null,
+     "sequence": 1,
+     "root_forms": [
+      "8-K"
+     ],
+     "file_date": "2026-07-16",
+     "biz_states": [
+      "CA"
+     ],
+     "sics": [
+      "7389"
+     ],
+     "form": "8-K",
+     "adsh": "0001552781-26-000382",
+     "film_num": [
+      "261178652"
+     ],
+     "biz_locations": [
+      "San Francisco, CA"
+     ],
+     "file_type": "8-K",
+     "file_description": null,
+     "inc_states": [
+      "DE"
+     ],
+     "items": [
+      "1.01",
+      "2.03",
+      "7.01",
+      "9.01"
+     ]
+    }
+   },
+   {
+    "_index": "edgar_file",
+    "_id": "0001543151-26-000015:uber-20251231.htm",
+    "_source": {
+     "ciks": [
+      "0001543151"
+     ],
+     "period_ending": "2025-12-31",
+     "file_num": [
+      "001-38902"
+     ],
+     "display_names": [
+      "Uber Technologies, Inc  (UBER)  (CIK 0001543151)"
+     ],
+     "xsl": null,
+     "sequence": 1,
+     "root_forms": [
+      "10-K"
+     ],
+     "file_date": "2026-02-13",
+     "biz_states": [
+      "CA"
+     ],
+     "sics": [
+      "7389"
+     ],
+     "form": "10-K",
+     "adsh": "0001543151-26-000015",
+     "film_num": [
+      "26632772"
+     ],
+     "biz_locations": [
+      "San Francisco, CA"
+     ],
+     "file_type": "10-K",
+     "file_description": "10-K",
+     "inc_states": [
+      "DE"
+     ],
+     "items": []
+    }
+   }
+  ]
+ },
+ "aggregations": {
+  "form_filter": {
+   "doc_count_error_upper_bound": 0,
+   "sum_other_doc_count": 0,
+   "buckets": [
+    {
+     "key": "8-K",
+     "doc_count": 11
+    },
+    {
+     "key": "10-K",
+     "doc_count": 4
+    }
+   ]
+  }
+ },
+ "query": {
+  "_source": {
+   "exclude": [
+    "doc_text"
+   ]
+  },
+  "query": {
+   "bool": {
+    "must": [
+     {
+      "match_phrase": {
+       "doc_text": "Delivery Hero"
+      }
+     }
+    ],
+    "must_not": [],
+    "should": [],
+    "filter": [
+     {
+      "terms": {
+       "root_forms": [
+        "8-K",
+        "10-K"
+       ]
+      }
+     },
+     {
+      "range": {
+       "file_date": {
+        "gte": "2026-01-01",
+        "lte": "2026-09-01"
+       }
+      }
+     }
+    ]
+   }
+  },
+  "from": 0,
+  "size": 100,
+  "aggregations": {
+   "form_filter": {
+    "terms": {
+     "field": "root_forms",
+     "size": 30
+    }
+   },
+   "entity_filter": {
+    "terms": {
+     "field": "display_names.raw",
+     "size": 30
+    }
+   },
+   "sic_filter": {
+    "terms": {
+     "field": "sics",
+     "size": 30
+    }
+   },
+   "biz_states_filter": {
+    "terms": {
+     "field": "biz_states",
+     "size": 30
+    }
+   }
+  }
+ }
+}

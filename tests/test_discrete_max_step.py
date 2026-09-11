@@ -119,10 +119,11 @@ class TestGridStepConstraints:
         assert min_step == pytest.approx(0.01 / 8)
         assert max_step == pytest.approx(1.0)
 
-    def test_fine_grid_tightens_max_step(self):
-        # cdf_size=401 -> inbound=400 -> server max-step 0.2*200/400 = 0.1.
+    def test_fine_grid_tightens_both_steps(self):
+        # cdf_size=401 -> inbound=400 -> server min-step round(0.01/400, 9) = 2.5e-5 (no 5e-5
+        # floor: the server asks for LESS per bin on a finer grid) and max-step 0.2*200/400 = 0.1.
         min_step, max_step = grid_step_constraints(401)
-        assert min_step == pytest.approx(5e-5)  # floored at NUM_MIN_PROB_STEP
+        assert min_step == 2.5e-5
         assert max_step == pytest.approx(0.1)
 
 

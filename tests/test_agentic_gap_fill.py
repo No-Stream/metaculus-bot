@@ -30,6 +30,7 @@ from tests.agentic_fakes import response as _response
 from tests.agentic_fakes import tool_call as _tool_call
 from tests.pipeline_test_helpers import (
     make_real_binary_question,
+    make_real_date_question,
     make_real_mc_question,
     make_real_numeric_question,
 )
@@ -86,8 +87,7 @@ def _happy_path_llm() -> FakeLlm:
 
 def _fake_tools() -> list[ToolSpec]:
     async def _search(**_: Any) -> ToolOutcome:
-        # Surface the finding's source URL the way a real search result would,
-        # so the provenance gate (loop._check_url_provenance) accepts _FINDING.
+        """Surfaces the finding's source URL like a real search result, so the provenance gate accepts _FINDING."""
         return ToolOutcome(
             content_markdown="result: BLS release found",
             links=[_FINDING["source_url"]],
@@ -95,10 +95,7 @@ def _fake_tools() -> list[ToolSpec]:
         )
 
     async def _fetch(**_: Any) -> ToolOutcome:
-        # A rendered fetch of the finding's source page: a fetched-class outcome
-        # tiers the call's `url` argument "fetched", satisfying both the provenance
-        # gate and the conclude gate's fetch floor with a real primary-source
-        # retrieval (which the finding's prose claims — not prose alone).
+        """A rendered fetch of the source page: tiers the URL "fetched", clearing the provenance and fetch-floor gates."""
         return ToolOutcome(
             content_markdown="BLS release: The unemployment rate was 4.1 percent in June.",
             method="rendered",
@@ -155,8 +152,8 @@ class TestRunGapFillV2Seam:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "question_factory",
-        [make_real_binary_question, make_real_mc_question, make_real_numeric_question],
-        ids=["binary", "mc", "numeric"],
+        [make_real_binary_question, make_real_mc_question, make_real_numeric_question, make_real_date_question],
+        ids=["binary", "mc", "numeric", "date"],
     )
     async def test_happy_path_returns_findings_and_emits_markers(
         self,
@@ -164,24 +161,27 @@ class TestRunGapFillV2Seam:
         caplog: pytest.LogCaptureFixture,
         question_factory,
     ) -> None:
+        """Every type the bot forecasts passes the ``_SupportedQuestion`` gate: with the Mantic workflow
+        running v2 and date questions about 40% of that pool, a date type dropped from the union would
+        forecast them with no agentic pass and no test would notice."""
         monkeypatch.setenv("GAP_FILL_V2_ENABLED", "true")
         caplog.set_level(logging.INFO, logger="metaculus_bot.research.agentic.loop")
+        question = question_factory()
         fake_llm = _happy_path_llm()
         llm_patch, tools_patch = _patch_loop_internals(fake_llm)
         with llm_patch, tools_patch:
-            result = await run_gap_fill_v2(question_factory(), BUNDLE, is_benchmarking=False)
+            result = await run_gap_fill_v2(question, BUNDLE, is_benchmarking=False)
 
         assert "## Agentic Research Findings" in result
         assert _FINDING["claim"] in result
         messages = [record.getMessage() for record in caplog.records]
         assert any("GAP_FILL_V2:" in m for m in messages)
         assert any("GHOST_FORECAST:" in m for m in messages)
-        # The ghost block must actually parse (non-empty summary), not just log
-        # a marker — a broken parse degrades to qtype=unknown with summary="".
+        # The block must parse (non-empty summary): a broken parse degrades to qtype=unknown with summary="".
         ghost_lines = [m for m in messages if "GHOST_FORECAST:" in m]
         assert any("qtype=binary" in m and "summary=posterior_prob=0.1200" in m for m in ghost_lines)
         # log_prefix carries the question reference on the marker lines.
-        assert any("question=https://www.metaculus.com/questions/" in m for m in messages if "GAP_FILL_V2:" in m)
+        assert any(f"question={question.page_url}" in m for m in messages if "GAP_FILL_V2:" in m)
 
     @pytest.mark.asyncio
     async def test_user_brief_embeds_question_and_bundle(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -204,6 +204,22 @@ class TestRunGapFillV2Seam:
         assert "The upper bound is open" in brief
 
     @pytest.mark.asyncio
+    async def test_driver_config_carries_the_question_ref_the_log_prefix_uses(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The transport stamps ``LoopConfig.question_ref`` on each call's ledger metadata so a
+        PROMPT_SIZE_ALERT names its question in the same ref space as the ghost markers."""
+        monkeypatch.setenv("GAP_FILL_V2_ENABLED", "true")
+        question = make_real_binary_question()
+        fake_llm = _happy_path_llm()
+        llm_patch, tools_patch = _patch_loop_internals(fake_llm)
+        with llm_patch as build_llm_call, tools_patch:
+            await run_gap_fill_v2(question, BUNDLE, is_benchmarking=False)
+
+        (config,) = build_llm_call.call_args.args
+        assert config.question_ref == question.page_url
+
+    @pytest.mark.asyncio
     async def test_seam_exception_soft_fails_to_empty(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -219,9 +235,7 @@ class TestRunGapFillV2Seam:
             )
         assert result == ""
         assert any("Gap-fill v2 seam failed" in record.getMessage() for record in caplog.records)
-        # The construction-error soft-fail must fire on_error with the exception —
-        # this is the orchestrator's only crash signal for this path (no marker,
-        # no archive payload). It is the crash-counter's path (b) hook.
+        # on_error is the orchestrator's only crash signal for this path (no marker, no payload): counter path (b).
         assert len(errors) == 1
         assert isinstance(errors[0], RuntimeError)
 
@@ -254,13 +268,10 @@ class TestRunGapFillV2Seam:
         payload = captured[0]
         assert payload["telemetry"]["findings_count"] == 1
         assert payload["telemetry"]["tool_calls"] == 3  # set_research_plan + fetch + conclude
-        roles = [
-            message["role"] for message in payload["transcript"]
-        ]  # HARNESS-SCAN-EXEMPT-object-explosion — tiny transcript list, not a DataFrame
+        roles = [message["role"] for message in payload["transcript"]]
         assert roles[0] == "system"
         assert "tool" in roles
-        # The serialized ghost forecast is archived alongside transcript+telemetry
-        # (dict, not a GhostForecast) so the payload stays an opaque JSON blob.
+        # Archived as a dict, not a GhostForecast, so the payload stays an opaque JSON blob.
         ghost = payload["ghost"]
         assert isinstance(ghost, dict)
         assert ghost["qtype"] == "binary"
@@ -273,10 +284,7 @@ class TestRunGapFillV2Seam:
         triggers the ghost phase) → payload carries ghost=None, not a missing key."""
         monkeypatch.setenv("GAP_FILL_V2_ENABLED", "true")
         captured: list[dict] = []
-        # Search, then two bare no-tool-call turns: the first triggers the
-        # single no-action nudge, the second stops the loop. conclude is never
-        # called, so state.explicit_conclude stays False and the ghost phase is
-        # skipped (ghost=None).
+        # A search then two no-tool-call turns (nudge, then stop): conclude never runs, so the ghost phase is skipped.
         fake_llm = FakeLlm(
             [
                 _response(tool_calls=[_tool_call("c1", "search_web", {"query": "q"})]),
@@ -583,8 +591,7 @@ class TestOrchestratorBothFlags:
         ):
             research = await orch.run_research(make_real_binary_question())
 
-        # The orchestrator gates on the v2 flag before awaiting the seam, so
-        # run_gap_fill_v2 is never called when the flag is off.
+        # The stage gates on the v2 flag before awaiting the seam, so the seam is never called when the flag is off.
         assert v2_mock.await_count == 0
         assert "## Targeted Gap-Fill (second pass)" in research
         assert "## Agentic Research Findings" not in research
@@ -607,9 +614,7 @@ class TestOrchestratorBothFlags:
             return_value="First-pass research prose long enough to pass the gap-fill min-chars gate. " * 4
         )
 
-        # None in sys.modules makes `from metaculus_bot.research.agentic_gap_fill
-        # import run_gap_fill_v2` raise ImportError — the exact failure a broken
-        # v2 module tree produces at the orchestrator's function-level import.
+        # None in sys.modules makes the stage's function-level import raise ImportError, as a broken v2 tree would.
         monkeypatch.setitem(sys.modules, "metaculus_bot.research.agentic_gap_fill", None)
 
         with (
@@ -707,7 +712,9 @@ class TestOrchestratorBothFlags:
         provider = AsyncMock(return_value="research prose")
         trace = {"transcript": [{"role": "system", "content": "x"}], "telemetry": {"steps": 2}}
 
-        async def _fake_v2(question, bundle, *, is_benchmarking, archive_sink=None, on_error=None):
+        async def _fake_v2(
+            question, bundle, *, is_benchmarking, archive_sink=None, ghost_context_sink=None, on_error=None
+        ):
             if archive_sink is not None:
                 archive_sink(trace)
             return "## Agentic Research Findings\n\nClaim: something."
@@ -746,7 +753,7 @@ class TestOrchestratorBothFlags:
 
     def test_persistence_writer_serializes_gap_fill_v2(self, tmp_path) -> None:
         """Writer round-trips the v2 trace and omits the key when absent."""
-        writer = ResearchPersistenceWriter(run_mode="tournament", tournament_id="t", run_id="r")
+        writer = ResearchPersistenceWriter(run_mode="tournament", platform="metaculus", tournament_id="t", run_id="r")
         trace = {"transcript": [{"role": "system", "content": "x"}], "telemetry": {"steps": 3}}
         writer.record(
             qid=1,
@@ -852,9 +859,10 @@ class TestGapFillV2CrashCounter:
         orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
         provider = AsyncMock(return_value="research prose")
 
-        async def _fake_v2(question, bundle, *, is_benchmarking, archive_sink=None, on_error=None):
-            # Mirror the loop's soft-fail: it swallows the crash, stamps
-            # telemetry.error, still archives the payload, and returns findings ("").
+        async def _fake_v2(
+            question, bundle, *, is_benchmarking, archive_sink=None, ghost_context_sink=None, on_error=None
+        ):
+            """Mirrors the loop's soft-fail: swallows the crash, stamps telemetry.error, archives the payload, returns ""."""
             if archive_sink is not None:
                 archive_sink(
                     {"transcript": [], "telemetry": {"steps": 0, "error": "APIConnectionError('boom')"}, "ghost": None}
@@ -904,7 +912,9 @@ class TestGapFillV2CrashCounter:
         orch = ResearchOrchestrator(default_llm=mock_llm, summarizer_llm=mock_llm, allow_research_fallback=False)
         provider = AsyncMock(return_value="research prose")
 
-        async def _fake_v2(question, bundle, *, is_benchmarking, archive_sink=None, on_error=None):
+        async def _fake_v2(
+            question, bundle, *, is_benchmarking, archive_sink=None, ghost_context_sink=None, on_error=None
+        ):
             if archive_sink is not None:
                 archive_sink({"transcript": [], "telemetry": {"steps": 0, "error": None}, "ghost": None})
             return ""  # nothing to research — a legitimate empty run, not a crash
@@ -927,9 +937,7 @@ class TestGapFillV2CrashCounter:
         redden CI (the class's 'a deadline hit must NOT [bump]' contract)."""
         monkeypatch.delenv("GAP_FILL_ENABLED", raising=False)
         monkeypatch.setenv("GAP_FILL_V2_ENABLED", "true")
-        # Tiny wall deadline so the outer wait_for fires fast — but kept above the
-        # _DEADLINE_SLOP_S (0.5s) epsilon so elapsed ≈ wall_deadline_s classifies as
-        # a real deadline rather than being swallowed by the slop allowance.
+        # A tiny wall deadline, kept above _DEADLINE_SLOP_S so the elapsed time still classifies as a real deadline.
         monkeypatch.setattr("metaculus_bot.research.agentic_gap_fill.GAP_FILL_V2_WALL_DEADLINE", 1.0)
 
         async def _sleeping_driver(_messages: Any, _tools: Any) -> Any:
@@ -955,8 +963,7 @@ class TestGapFillV2CrashCounter:
         via the orchestrator's post-gather archive-telemetry path."""
         monkeypatch.delenv("GAP_FILL_ENABLED", raising=False)
         monkeypatch.setenv("GAP_FILL_V2_ENABLED", "true")
-        # Default (large) wall deadline: the driver raises immediately, so elapsed is
-        # ~0, far below wall_deadline_s - slop, forcing the crash classification.
+        # Default wall deadline: the driver raises at once, so elapsed ~0 forces the crash classification.
 
         async def _timeout_driver(_messages: Any, _tools: Any) -> Any:
             raise TimeoutError("simulated connection-level timeout")

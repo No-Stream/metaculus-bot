@@ -3,6 +3,7 @@ from collections.abc import Iterator
 from datetime import datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import uuid4
 
 import pytest
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
@@ -14,10 +15,32 @@ from forecasting_tools import BinaryQuestion, GeneralLlm, MultipleChoiceQuestion
 # checkout is fine. See `_block_native_egress` for why the guard needs this class specifically.
 from playwright._impl._browser_type import BrowserType as PlaywrightBrowserType
 
+from metaculus_bot.publish_gate import reset_publish_skipped_closed
+from metaculus_bot.publish_hardening import reset_publish_attempt_failures
+from metaculus_bot.research import page_digest
+from metaculus_bot.research.degradation_views import reset_run_degradation_counters
+from metaculus_bot.research.fetch_ladder import run_cache
 from scripts import gha_artifacts
 
 _OPEN = datetime(2026, 1, 1)
 _RESOLVE = datetime(2026, 5, 1)
+
+
+@pytest.fixture(autouse=True)
+def _clear_fetch_ladder_run_cache() -> Iterator[None]:
+    """Give every test a fresh process-run cache while preserving reuse inside one test."""
+    run_cache.clear()
+    yield
+    run_cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def _stub_page_digest_provider(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise real digest fallback by default; digest tests override this provider boundary."""
+    if request.node.get_closest_marker("live") is not None:
+        return
+    client = MagicMock(invoke=AsyncMock(side_effect=TimeoutError("offline extractor double")))
+    monkeypatch.setattr(page_digest, "build_llm_with_openrouter_fallback", MagicMock(return_value=client))
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +271,9 @@ def _redirect_artifact_store(tmp_path_factory: pytest.TempPathFactory, monkeypat
     leave the omission unprotected. Tests that pass ``store_dir`` explicitly are
     unaffected.
     """
-    monkeypatch.setattr(gha_artifacts, "DEFAULT_STORE_DIR", str(tmp_path_factory.mktemp("gha_artifact_store")))
+    # Numbered mktemp scans every sibling on every test; let the store create a unique path only when used.
+    store_dir = tmp_path_factory.getbasetemp() / "gha_artifact_store" / uuid4().hex
+    monkeypatch.setattr(gha_artifacts, "DEFAULT_STORE_DIR", str(store_dir))
 
 
 # Shared failure fixtures
@@ -312,6 +337,9 @@ def make_mock_binary_question(qid: int = 1001) -> MagicMock:
     q.page_url = f"https://example.com/q/{qid}"
     q.open_time = _OPEN
     q.scheduled_resolution_time = _RESOLVE
+    # Real MetaculusQuestion objects always carry api_json; the prompts read
+    # api_json["question"] for the Mantic multi_resolution and grid clauses.
+    q.api_json = {"question": {}}
     return q
 
 
@@ -327,6 +355,9 @@ def make_mock_mc_question(qid: int = 1002, options: list[str] | None = None) -> 
     q.page_url = f"https://example.com/q/{qid}"
     q.open_time = _OPEN
     q.scheduled_resolution_time = _RESOLVE
+    # Real MetaculusQuestion objects always carry api_json; the prompts read
+    # api_json["question"] for the Mantic multi_resolution and grid clauses.
+    q.api_json = {"question": {}}
     return q
 
 
@@ -343,7 +374,7 @@ def make_mock_numeric_question(
     open_lower_bound: bool = False,
     open_upper_bound: bool = False,
     zero_point: float | None = None,
-    cdf_size: int | None = None,
+    cdf_size: int = 201,
     id_of_question: int = 42,
     page_url: str | None = None,
     question_text: str = "What will X be?",
@@ -383,6 +414,9 @@ def make_mock_numeric_question(
     q.cdf_size = cdf_size
     q.nominal_lower_bound = nominal_lower_bound
     q.nominal_upper_bound = nominal_upper_bound
+    # No platform-specific flags: the prompts read Mantic's ``multi_resolution`` / ``precision``
+    # off ``api_json["question"]``, and a MagicMock attribute chain is truthy.
+    q.api_json = {"question": {}}
     if with_open_resolve_times:
         q.open_time = datetime.now() - timedelta(days=30)
         q.scheduled_resolution_time = datetime.now() + timedelta(days=365)
@@ -437,6 +471,28 @@ def _clear_gemini_client_cache():
     gsp._cached_client_for_key.cache_clear()
     yield
     gsp._cached_client_for_key.cache_clear()
+
+
+def _zero_alertable_counters() -> None:
+    """Zero every module-global counter ``alertable_count`` sums, as run start does."""
+    reset_run_degradation_counters()
+    reset_publish_attempt_failures()
+    reset_publish_skipped_closed()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_alertable_counters() -> Iterator[None]:
+    """Give every test the fresh-run counters ``forecast_questions`` grants a real run.
+
+    The prediction-market, provider-health, publish-hardening and close-gate counters are
+    module state (each soft-fails with no handle back to the bot), so a degradation one test
+    records reddens a later test's fresh-bot ``alertable_count == 0`` whenever collection puts
+    the two in that order. Two files leaked that way:
+    ``tests/cli/test_cli_provider_degradation.py`` and ``tests/test_provider_flag_and_logging.py``.
+    """
+    _zero_alertable_counters()
+    yield
+    _zero_alertable_counters()
 
 
 @pytest.fixture
@@ -510,4 +566,7 @@ def mock_binary_question() -> MagicMock:
     question.id_of_question = 456
     question.open_time = datetime.now() - timedelta(days=30)
     question.scheduled_resolution_time = datetime.now() + timedelta(days=365)
+    # Real MetaculusQuestion objects always carry api_json; the prompts read
+    # api_json["question"] for the Mantic multi_resolution and grid clauses.
+    question.api_json = {"question": {}}
     return question

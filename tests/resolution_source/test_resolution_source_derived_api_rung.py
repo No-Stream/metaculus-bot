@@ -4,16 +4,14 @@ from __future__ import annotations
 
 import asyncio
 
-from metaculus_bot.research import rendered_fetch, resolution_presentation, resolution_source
+from metaculus_bot.research import rendered_fetch
+from metaculus_bot.research.fetch_ladder import guard, rungs
+from metaculus_bot.research.fetch_ladder.context import LadderContext
+from metaculus_bot.research.fetch_ladder.ladder import _fetch_one
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail
 from metaculus_bot.research.rendered_fetch import HarvestedJson, RenderedPage
 from metaculus_bot.research.resolution_fetch_result import ROUTE_CAVEATS
-from metaculus_bot.research.resolution_source import (
-    FetchContext,
-    _fetch_one,
-    _rung_counts,
-    resolution_source_provider,
-)
+from metaculus_bot.research.resolution_source import _rung_counts, resolution_source_provider
 from tests.resolution_source_fakes import (
     _FEED_URL,
     _JS_SHELL,
@@ -24,6 +22,7 @@ from tests.resolution_source_fakes import (
     _meta_refresh_stub,
     _mock_question,
     _prose_page,
+    capped_ctx,
 )
 
 
@@ -45,7 +44,7 @@ class TestDerivedApiRung:
         )
 
     async def test_the_harvested_feed_is_served_when_the_dom_is_still_empty(self, monkeypatch):
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(self._harvested(), []))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(self._harvested(), []))
         session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
 
         result = await _fetch_one(session, _URL, {})
@@ -64,7 +63,7 @@ class TestDerivedApiRung:
         """The whole point of remembering the endpoint: a host with several cited URLs pays for
         one Chromium launch, not one per URL."""
         calls: list[dict[str, object]] = []
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(self._harvested(), calls))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(self._harvested(), calls))
         second_url = "https://tracker.example.com/house"
         session = FakeSession(
             {
@@ -113,7 +112,7 @@ class TestDerivedApiRung:
             return harvested
 
         monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
-        monkeypatch.setattr(resolution_source, "render_page", _slow_render)
+        monkeypatch.setattr(rungs, "render_page", _slow_render)
         second_url = "https://tracker.example.com/house"
         session = FakeSession(
             {
@@ -122,7 +121,7 @@ class TestDerivedApiRung:
                 _FEED_URL: FakeResponse(200, body=self._FEED.encode(), content_type="application/json"),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
         question = _mock_question(resolution_criteria=f"Resolves per {_URL} and {second_url}")
 
         section = await resolution_source_provider(is_benchmarking=False)(question)
@@ -136,7 +135,7 @@ class TestDerivedApiRung:
 
     async def test_a_feed_that_fails_hands_the_url_on_to_the_browser(self, monkeypatch):
         calls: list[dict[str, object]] = []
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(self._harvested(), calls))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(self._harvested(), calls))
         second_url = "https://tracker.example.com/house"
         session = FakeSession(
             {
@@ -161,7 +160,7 @@ class TestDerivedApiRung:
         a "session expired" portal page was published as the page's data feed, under a lead
         saying it was the JSON the page loads its figures from."""
         calls: list[dict[str, object]] = []
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(self._harvested(), calls))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(self._harvested(), calls))
         second_url = "https://tracker.example.com/house"
         portal = _prose_page("Your session has expired. " * 30)
         session = FakeSession(
@@ -193,7 +192,7 @@ class TestDerivedApiRung:
         on the hop rather than on the rung that answered. The child context `_aux_ctx` builds is
         what keeps the page's own record to the rungs the page itself earned."""
         calls: list[dict[str, object]] = []
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(self._harvested(), calls))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(self._harvested(), calls))
         second_url = "https://tracker.example.com/house"
         login_url = "https://tracker.example.com/login"
         session = FakeSession(
@@ -224,7 +223,7 @@ class TestDerivedApiRung:
         assert second.route == "derived_api"
 
     async def test_the_derived_get_is_skipped_below_its_floor(self, monkeypatch):
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(self._harvested(), []))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(self._harvested(), []))
         second_url = "https://tracker.example.com/house"
         session = FakeSession(
             {
@@ -234,7 +233,7 @@ class TestDerivedApiRung:
         )
 
         await _fetch_one(session, _URL, {})
-        monkeypatch.setattr(FetchContext, "rung_budget_s", lambda self: 1.0)
+        monkeypatch.setattr(LadderContext, "rung_budget_s", lambda self: 1.0)
         second = await _fetch_one(session, second_url, {})
 
         assert second.status == "js_wall"
@@ -258,7 +257,7 @@ class TestDerivedApiRung:
             html=_JS_SHELL.decode(),
             json_responses=(HarvestedJson(url=_FEED_URL, body=b"a\x00" * 300),),
         )
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(mojibake, []))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(mojibake, []))
         session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
 
         result = await _fetch_one(session, _URL, {})
@@ -270,12 +269,11 @@ class TestDerivedApiRung:
         assert rendered_fetch.rendered_to_nothing(_URL, memo_scope="resolution_source") is True
 
     async def test_the_per_url_cap_binds_on_a_served_feed(self, monkeypatch):
-        monkeypatch.setattr(resolution_presentation, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", 400)
         big = '{"series":[' + ",".join(f'{{"v":{index}}}' for index in range(500)) + "]}"
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(self._harvested(body=big), []))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(self._harvested(body=big), []))
         session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
 
-        result = await _fetch_one(session, _URL, {})
+        result = await _fetch_one(session, _URL, {}, capped_ctx(400))
 
         assert result.status == "success"
         assert len(result.text) <= 400

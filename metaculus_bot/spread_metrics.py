@@ -19,16 +19,15 @@ from forecasting_tools import (
     PredictedOptionList,
 )
 from forecasting_tools.data_models.numeric_report import Percentile
-from forecasting_tools.data_models.questions import MetaculusQuestion
+from forecasting_tools.data_models.questions import DateQuestion, MetaculusQuestion
 
+from metaculus_bot.numeric.date_axis import numeric_view
 from metaculus_bot.numeric.percentile_set import EXPECTED_KEYS, PercentileSet, percentile_key
 from metaculus_bot.prob_math_utils import logit
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-# Percentile LABELS (not positions) at which numeric disagreement is measured:
-# the 10th, 50th, and 90th percentiles. Accessed by label so growing the standard
-# percentile set (e.g. 11 -> 13) cannot silently shift them.
+# Percentile LABELS, not positions, so growing the standard percentile set cannot silently shift them.
 _KEY_SPREAD_PERCENTILES: list[float] = [0.10, 0.50, 0.90]
 
 
@@ -46,23 +45,19 @@ def _has_standard_labels(model_pcts: list[Percentile]) -> bool:
     )
 
 
-def _key_percentile_values(model_pcts: list[Percentile]) -> tuple[float, float, float]:
+def _key_percentile_values(model_pcts: list[Percentile], question: NumericQuestion) -> tuple[float, float, float]:
     """Return the (P10, P50, P90) VALUES for one model's declared percentiles.
 
-    Continuous forecaster output declares the standard percentile set, so P10/P50/P90
-    resolve to exact label nodes via ``PercentileSet`` — byte-identical to the old strict
-    path.
-
-    Discrete numeric questions are different: ``build_numeric_distribution`` OVERWRITES a
-    model's ``declared_percentiles`` with a resampled CDF grid whose labels are CUMULATIVE
-    PROBABILITIES (0.0..1.0), not the standard set. For those, read the value at cumulative
-    probability 0.10/0.50/0.90 by treating each ``(value, percentile)`` point as an empirical
-    CDF and interpolating with ``np.interp`` (which requires the probability axis sorted
-    ascending).
-
-    A list that is neither the standard set nor a CDF grid spanning the key percentiles
-    (e.g. a truncated percentile list) cannot yield P10/P50/P90 without extrapolating
-    garbage, so it fails fast.
+    Continuous forecaster output declares the standard percentile set, so P10/P50/P90 resolve
+    to exact label nodes via ``PercentileSet``. A built distribution (``build_numeric_distribution``,
+    ``build_pmf_distribution``) instead carries the question's own ``cdf_size``-point CDF grid,
+    labelled by CUMULATIVE PROBABILITY, and is recognised by that length alone: an open bound
+    can legitimately hold heavy out-of-range mass (labels starting at 0.40, or the four labels
+    of a 3-bin Mantic grid ending at 0.30 with 70% above the range), so where the labels start
+    and end says nothing about whether the list is a grid. The grid is read as an empirical CDF
+    with ``np.interp``, which clamps at the ends: a key percentile beyond the labels returns the
+    displayed bound, the honest answer for mass beyond an open bound. Anything else (a truncated
+    percentile list) cannot yield P10/P50/P90 without extrapolating garbage, so it fails fast.
     """
     if _has_standard_labels(model_pcts):
         percentile_set = PercentileSet.from_percentiles(model_pcts)
@@ -74,26 +69,14 @@ def _key_percentile_values(model_pcts: list[Percentile]) -> tuple[float, float, 
 
     ordered = sorted(model_pcts, key=lambda p: p.percentile)
     labels = [p.percentile for p in ordered]
-    values = [p.value for p in ordered]
-    if not labels:
-        raise ValueError("numeric_percentile_spread: declared percentiles are empty; cannot compute spread")
-    # CDF grids from discrete resampling have many points (typically 50-201) with
-    # cumulative-probability labels. Open-bound questions can legitimately have
-    # heavy out-of-bound mass (e.g. labels[0]=0.40 means 40% mass below the
-    # displayed lower bound — the "Toy Story" scenario). np.interp clamps: if
-    # a key percentile (0.10) is below labels[0], it returns values[0] (the
-    # displayed bound), which is the honest answer.
-    # Only reject short non-grid lists that clearly can't interpolate key
-    # percentiles (< 5 points AND doesn't span P10-P90).
-    _MIN_GRID_POINTS = 5
-    is_plausible_grid = len(labels) >= _MIN_GRID_POINTS
-    spans_key_percentiles = labels[0] <= 0.10 and labels[-1] >= 0.90
-    if not is_plausible_grid and not spans_key_percentiles:
+    if len(labels) != question.cdf_size:
+        labels_range = f"[{labels[0]:.4f}, {labels[-1]:.4f}]" if labels else "[]"
         raise ValueError(
             "numeric_percentile_spread: declared percentiles are neither the standard percentiles "
-            f"nor a CDF grid spanning P10-P90; cannot read key percentiles from labels "
-            f"(len={len(labels)}, range=[{labels[0]:.4f}, {labels[-1]:.4f}])"
+            f"nor the question's {question.cdf_size}-point CDF grid; cannot read key percentiles from labels "
+            f"(len={len(labels)}, range={labels_range})"
         )
+    values = [p.value for p in ordered]
     p10, p50, p90 = np.interp(_KEY_SPREAD_PERCENTILES, labels, values)
     return float(p10), float(p50), float(p90)
 
@@ -159,29 +142,23 @@ def numeric_percentile_spread(
 ) -> float:
     """Compute the max normalized spread at key percentiles (10th, 50th, 90th).
 
-    For closed-bound questions, normalizes by the question range. For
-    open-ended questions, falls back to the ensemble interquartile range
-    (median of 90th percentiles minus median of 10th percentiles) as the
-    denominator.
+    Closed-bound questions normalize by the question range; open-ended ones fall back to the
+    ensemble interquartile range (median P90 minus median P10) as the denominator.
 
-    A non-positive denominator makes the ratio UNDEFINED — the reachable case is
-    an open-bound question whose models all interpolate to the same displayed
-    bound at P10 and P90 (heavy out-of-bound mass clamped by ``np.interp``). This
-    returns ``math.inf`` there, never ``0.0``: a failed measurement must not read
-    as an affirmative "the models agree" (which is exactly how
-    ``route_after_forecasts`` reads a spread of 0 — MEDIAN, skip stacking, marker
-    ``spread_below_threshold``). The caller reads ``inf`` as its own case rather than as a
-    huge spread: it routes to MEDIAN without spending a crux extraction, a targeted search
-    and a stacker call on no measurement, and stamps the skip reason ``spread_undefined`` so
-    the marker never claims agreement. The ``SPREAD_UNDEFINED`` WARN names the question.
+    A non-positive denominator makes the ratio UNDEFINED; the reachable case is an open-bound
+    question whose models all interpolate to the same displayed bound at P10 and P90 (heavy
+    out-of-bound mass clamped by ``np.interp``). This returns ``math.inf`` there, never ``0.0``:
+    a failed measurement must not read as "the models agree", which is how
+    ``route_after_forecasts`` reads a spread of 0 (MEDIAN, skip stacking, marker
+    ``spread_below_threshold``). The caller treats ``inf`` as its own case: MEDIAN without
+    spending a crux extraction, a targeted search and a stacker call on no measurement, skip
+    reason ``spread_undefined`` so the marker never claims agreement, and a ``SPREAD_UNDEFINED``
+    WARN naming the question.
     """
     if len(prediction_values) < 2:
         raise ValueError("numeric_percentile_spread requires at least 2 predictions")
 
-    # Read the (P10, P50, P90) VALUES per model by label. Continuous forecaster output
-    # uses the strict PercentileSet path; discrete-resampled CDF grids (cumulative-
-    # probability labels) are interpolated. Both resolve the same three percentiles.
-    key_values_by_model = [_key_percentile_values(model_pcts) for model_pcts in prediction_values]
+    key_values_by_model = [_key_percentile_values(model_pcts, question) for model_pcts in prediction_values]
     p10_values = [values[0] for values in key_values_by_model]
     p50_values = [values[1] for values in key_values_by_model]
     p90_values = [values[2] for values in key_values_by_model]
@@ -221,12 +198,16 @@ def numeric_percentile_spread(
 
 
 def compute_spread(question: MetaculusQuestion, prediction_values: list[Any]) -> float:
-    """Dispatch to the appropriate spread metric based on question type."""
+    """Dispatch to the appropriate spread metric based on question type.
+
+    A date question's members are numeric distributions on the epoch-seconds axis, so it takes
+    the numeric metric against its epoch view (the range denominator is then in seconds).
+    """
     if isinstance(question, BinaryQuestion):
         return binary_prob_range_spread(prediction_values)
     if isinstance(question, MultipleChoiceQuestion):
         return mc_max_option_spread(prediction_values)
-    if isinstance(question, NumericQuestion):
+    if isinstance(question, (NumericQuestion, DateQuestion)):
         percentile_lists = [pv.declared_percentiles for pv in prediction_values]
-        return numeric_percentile_spread(percentile_lists, question)
+        return numeric_percentile_spread(percentile_lists, numeric_view(question))
     raise ValueError(f"Unsupported question type for spread metrics: {type(question).__name__}")

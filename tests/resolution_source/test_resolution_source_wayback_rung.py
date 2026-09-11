@@ -7,16 +7,13 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from metaculus_bot.research import resolution_presentation, resolution_source
+from metaculus_bot.research.fetch_ladder import rungs
+from metaculus_bot.research.fetch_ladder.context import LadderContext, QuestionRungBudget
+from metaculus_bot.research.fetch_ladder.ladder import _fetch_one
+from metaculus_bot.research.fetch_ladder.rungs import _WAYBACK_TRIGGER_STATUSES
 from metaculus_bot.research.resolution_fetch_result import ROUTE_CAVEATS
 from metaculus_bot.research.resolution_presentation import format_resolution_sections
-from metaculus_bot.research.resolution_source import (
-    _WAYBACK_TRIGGER_STATUSES,
-    FetchContext,
-    QuestionRungBudget,
-    _fetch_one,
-    _rung_counts,
-)
+from metaculus_bot.research.resolution_source import _rung_counts
 from metaculus_bot.research.wayback import wayback_snapshot_url
 from tests.resolution_source_fakes import (
     _JS_SHELL,
@@ -30,6 +27,7 @@ from tests.resolution_source_fakes import (
     _prose_page,
     _snapshot_url,
     arm_paid_rung,
+    capped_ctx,
     paid_reader,
 )
 from tests.test_document_text import build_text_pdf
@@ -55,10 +53,10 @@ class TestWaybackRung:
         The module's constant OBJECT is restored rather than a copy, so the trigger population
         these tests assert on cannot drift from the one prod uses.
         """
-        monkeypatch.setattr(resolution_source, "_WAYBACK_TRIGGER_STATUSES", _WAYBACK_TRIGGER_STATUSES)
+        monkeypatch.setattr(rungs, "_WAYBACK_TRIGGER_STATUSES", _WAYBACK_TRIGGER_STATUSES)
 
-    def _ctx(self) -> FetchContext:
-        return FetchContext(now=self._NOW)
+    def _ctx(self) -> LadderContext:
+        return LadderContext(now=self._NOW)
 
     def _archive_page(self) -> bytes:
         return _prose_page(_RENDERED_PROSE)
@@ -116,7 +114,7 @@ class TestWaybackRung:
     async def test_a_js_wall_never_reaches_the_archive(self, monkeypatch):
         """The archive stores the unrendered shell: it rescued 0 of 8 archived walls while the
         browser rung rescued 6."""
-        monkeypatch.setattr(resolution_source, "render_page", _fake_render(None, []))
+        monkeypatch.setattr(rungs, "render_page", _fake_render(None, []))
         session = FakeSession({_URL: FakeResponse(200, body=_JS_SHELL, content_type="text/html")})
 
         result = await _fetch_one(session, _URL, {}, self._ctx())
@@ -150,7 +148,7 @@ class TestWaybackRung:
             extra={_ROBOTS_URL: FakeResponse(200, body=ROBOTS_ALLOW_ALL, content_type="text/plain")},
         )
 
-        result = await _fetch_one(session, _URL, {}, FetchContext(now=self._NOW, query="ask"))
+        result = await _fetch_one(session, _URL, {}, LadderContext(now=self._NOW, query="ask"))
 
         assert [call["url"] for call in calls] == [_URL]
         assert result.status == "success"
@@ -195,7 +193,11 @@ class TestWaybackRung:
 
     @pytest.mark.parametrize(
         "innermost",
-        ["https://www.metaculus.com/questions/45001/", "http://169.254.169.254/latest/meta-data/"],
+        [
+            "https://www.metaculus.com/questions/45001/",
+            "https://competitions.mantic.com/questions/650/",
+            "http://169.254.169.254/latest/meta-data/",
+        ],
     )
     async def test_a_nested_capture_is_unwrapped_to_its_innermost_url(self, innermost):
         """A capture OF a capture presents `web.archive.org` as its inner host, which clears both
@@ -258,7 +260,7 @@ class TestWaybackRung:
             }
         )
 
-        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.fetch_ladder.rungs"):
             result = await _fetch_one(session, _URL, {}, self._ctx())
 
         assert result.status == "blocked"
@@ -268,7 +270,7 @@ class TestWaybackRung:
         assert "no archived copy served for tracker.example.com" in caplog.text
 
     async def test_the_rung_is_skipped_below_its_floor(self, monkeypatch):
-        monkeypatch.setattr(FetchContext, "rung_budget_s", lambda self: 4.0)
+        monkeypatch.setattr(LadderContext, "rung_budget_s", lambda self: 4.0)
         session = FakeSession({_URL: FakeResponse(403, body=b"", content_type="text/html")})
 
         result = await _fetch_one(session, _URL, {}, self._ctx())
@@ -292,9 +294,9 @@ class TestWaybackRung:
 
         # Spelled out rather than looped: the cap is order-dependent, so which call is third is
         # the assertion.
-        first = await _fetch_one(session, urls[0], {}, FetchContext(now=self._NOW, shared=shared))
-        second = await _fetch_one(session, urls[1], {}, FetchContext(now=self._NOW, shared=shared))
-        third = await _fetch_one(session, urls[2], {}, FetchContext(now=self._NOW, shared=shared))
+        first = await _fetch_one(session, urls[0], {}, LadderContext(now=self._NOW, shared=shared))
+        second = await _fetch_one(session, urls[1], {}, LadderContext(now=self._NOW, shared=shared))
+        third = await _fetch_one(session, urls[2], {}, LadderContext(now=self._NOW, shared=shared))
         results = [first, second, third]
 
         assert [r.route for r in results] == ["wayback", "wayback", "direct"]
@@ -321,7 +323,7 @@ class TestWaybackRung:
             ),
         )
 
-        result = await _fetch_one(session, _URL, {}, FetchContext(now=self._NOW, query="hospitalizations reported"))
+        result = await _fetch_one(session, _URL, {}, LadderContext(now=self._NOW, query="hospitalizations reported"))
 
         assert result.status == "success"
         assert result.route == "wayback"
@@ -342,7 +344,7 @@ class TestWaybackRung:
             archived=FakeResponse(200, body=_JS_SHELL, content_type="text/html"),
         )
 
-        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.research.fetch_ladder.rungs"):
             result = await _fetch_one(session, _URL, {}, self._ctx())
 
         assert result.status == "blocked"
@@ -358,13 +360,12 @@ class TestWaybackRung:
         below the age-disclosure lead's own length, the earlier bare-lead return busted the
         per-URL bound `_budgeted_success_sections` relies on. The lead is now truncated to fit."""
         cap = 60
-        monkeypatch.setattr(resolution_presentation, "RESOLUTION_SOURCE_PER_URL_MAX_CHARS", cap)
         session = self._session(
             page=FakeResponse(403, body=b"denied", content_type="text/html"),
             captured=self._NOW - timedelta(days=3),
         )
 
-        result = await _fetch_one(session, _URL, {}, self._ctx())
+        result = await _fetch_one(session, _URL, {}, capped_ctx(cap, now=self._NOW))
 
         assert result.status == "success"
         assert result.route == "wayback"

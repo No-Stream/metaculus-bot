@@ -13,6 +13,7 @@ from forecasting_tools.data_models.numeric_report import Percentile
 
 from metaculus_bot.constants import NUM_MAX_STEP, NUM_MIN_PROB_STEP
 from metaculus_bot.numeric.pchip_cdf import (
+    _rebuild_with_min_steps,
     enforce_min_steps,
     enforce_strict_increasing,
     generate_pchip_cdf,
@@ -408,10 +409,10 @@ class TestGeneratePchipCdf:
     def test_boundary_labels_stay_silently_filtered(self):
         """0.0 / 100.0 KEYS are dropped by design, never raised on — values != keys.
 
-        ``_postprocess_ensemble_cdf``'s discrete branch feeds prob*100 labels that
-        legitimately include exactly 0.0 and 100.0 and relies on this filter
-        dropping them before the boundary points are re-added. The build with the
-        boundary labels present must be byte-identical to the build without them.
+        A caller that hands a whole CDF over as prob*100 labels legitimately includes
+        exactly 0.0 and 100.0; the filter drops them before the boundary points are
+        re-added from the bound semantics, so the build with the boundary labels
+        present must be byte-identical to the build without them.
         """
         base: dict[int | float, float] = {10.0: 1.0, 50.0: 5.0, 90.0: 9.0}
         with_boundaries: dict[int | float, float] = {0.0: 0.0, **base, 100.0: 10.0}
@@ -578,14 +579,21 @@ class TestGeneratePchipCdf:
 
 class TestAggressiveMinStepEnforcement:
     """Pin the LAST repair tier: the rebuild that fires when the min-step is still
-    violated after ``safe_cdf_bounds``.
+    violated after ``safe_cdf_bounds``, and the tolerance that keeps it off float noise.
 
     AGENTS.md records that this tier never fires on real forecasts (0 of 1182
-    archived numeric forecasts), and it is unreachable on the 201-point grid at the
-    production ``min_step``. It IS reachable on a coarse grid whose range is exactly
-    saturated by ``(num_points - 1) * min_step``, which is what these cases use. The
-    exact-value assertions exist so the tier can be restructured without silently
-    changing what it emits.
+    archived numeric forecasts). A grid whose range is EXACTLY saturated by
+    ``(num_points - 1) * min_step`` is the production shape of a forecast that puts
+    essentially all of its mass beyond an open bound (the in-range CDF is then the
+    bare min-step ramp), and the untoleranced trigger used to fire on that ramp's
+    float error: a step 1e-18 short tripped it, and the rebuild's untoleranced range
+    check then refused a range 1e-16 short and dropped the member (Mantic edge-case
+    review, 2026-09, rank 3). The trigger and the range check now share the
+    ``_MIN_STEP_TOLERANCE`` the post-check and final assertion always had, so the
+    saturated grid builds as-is and only a genuine shortfall reaches the raise. After
+    that change the tier is reachable through ``generate_pchip_cdf`` only as that
+    ValueError, so its success branch is pinned by direct call below; FUTURE.md holds
+    it as a dead-code cleanup candidate.
     """
 
     SIMPLE_PERCENTILES: ClassVar[dict[int | float, float]] = {10.0: 1.0, 50.0: 5.0, 90.0: 9.0}
@@ -603,7 +611,7 @@ class TestAggressiveMinStepEnforcement:
         97.5: 172.0,
     }
 
-    def test_saturated_coarse_grid_rebuilds_to_exactly_uniform(self):
+    def test_saturated_coarse_grid_builds_uniform_without_the_rebuild(self):
         cdf, aggressive_enforcement = generate_pchip_cdf(
             percentile_values=self.SIMPLE_PERCENTILES,
             open_upper_bound=False,
@@ -616,10 +624,11 @@ class TestAggressiveMinStepEnforcement:
             num_points=11,
         )
 
-        assert aggressive_enforcement is True
-        np.testing.assert_allclose(cdf, np.linspace(0.0, 1.0, 11), atol=1e-12)
+        assert aggressive_enforcement is False
+        np.testing.assert_allclose(cdf, np.linspace(0.0, 1.0, 11), atol=1e-10)
+        assert np.diff(cdf).min() >= 0.1 - 1e-10
 
-    def test_saturated_grid_rebuild_on_concentrated_declaration(self):
+    def test_saturated_grid_on_concentrated_declaration_builds_uniform_without_the_rebuild(self):
         cdf, aggressive_enforcement = generate_pchip_cdf(
             percentile_values=self.CONCENTRATED_PERCENTILES,
             open_upper_bound=False,
@@ -632,10 +641,12 @@ class TestAggressiveMinStepEnforcement:
             num_points=21,
         )
 
-        assert aggressive_enforcement is True
-        np.testing.assert_allclose(cdf, np.linspace(0.0, 1.0, 21), atol=1e-12)
+        assert aggressive_enforcement is False
+        np.testing.assert_allclose(cdf, np.linspace(0.0, 1.0, 21), atol=1e-10)
+        assert np.diff(cdf).min() >= 0.05 - 1e-10
 
-    def test_rebuild_emits_the_documented_warn_and_completion_lines(self, caplog):
+    def test_saturated_grid_emits_no_rebuild_warn(self, caplog):
+        """The float-epsilon shortfall of an exactly saturated ramp is not a repair event."""
         with caplog.at_level("INFO", logger="metaculus_bot.numeric.pchip_cdf"):
             generate_pchip_cdf(
                 percentile_values=self.SIMPLE_PERCENTILES,
@@ -652,7 +663,27 @@ class TestAggressiveMinStepEnforcement:
             )
 
         messages = [record.getMessage() for record in caplog.records]
-        assert any("PCHIP minimum step enforcement required for Q 4242" in m for m in messages)
+        assert not any("PCHIP minimum step enforcement required" in m for m in messages)
+        assert not any("PCHIP aggressive enforcement completed" in m for m in messages)
+
+    def test_the_rebuild_success_path_is_pinned_by_direct_call(self, caplog):
+        """Exact values, so the tier can be restructured without silently changing what it
+        emits: the shape-preserving allocation, the post-check and the completion line."""
+        with caplog.at_level("INFO", logger="metaculus_bot.numeric.pchip_cdf"):
+            out = _rebuild_with_min_steps(
+                np.array([0.0, 0.05, 0.5, 1.0]),
+                0.1,
+                open_lower_bound=False,
+                open_upper_bound=False,
+                question_id=4242,
+                question_url="https://ex/q/4242",
+            )
+
+        np.testing.assert_allclose(out, [0.0, 1 / 6, 0.5666666666666667, 1.0], rtol=0, atol=1e-15)
+        assert float(np.diff(out).min()) == pytest.approx(1 / 6)
+        assert out[0] == 0.0
+        assert out[-1] == 1.0
+        messages = [record.getMessage() for record in caplog.records]
         assert any("PCHIP aggressive enforcement completed for Q 4242" in m for m in messages)
 
     def test_range_too_small_for_min_steps_raises(self):

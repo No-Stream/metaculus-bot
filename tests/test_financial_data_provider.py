@@ -16,6 +16,7 @@ from metaculus_bot.constants import (
     FINANCIAL_VARIANCE_RATIO_LAG,
     FINANCIAL_YFINANCE_LOOKBACK_DAYS,
     MAX_FINANCIAL_IDENTIFIERS,
+    TS_ANCHOR_HTTP_TIMEOUT,
 )
 from metaculus_bot.research.financial_data import (
     _PERIOD_SLIP_GRACE_DAYS,
@@ -1609,7 +1610,7 @@ class TestBenchmarkingDateCeiling:
         mock_ticker.history.assert_called_once()
         _, kwargs = mock_ticker.history.call_args
         expected_start = (as_of - timedelta(days=FINANCIAL_YFINANCE_LOOKBACK_DAYS)).date()
-        assert kwargs == {"start": expected_start.isoformat()}
+        assert kwargs == {"start": expected_start.isoformat(), "timeout": TS_ANCHOR_HTTP_TIMEOUT}
         assert "P/E ratio" in result  # .info fundamentals rendered
 
     def test_fred_benchmarking_routes_through_ts_fetch_with_ceiling(self) -> None:
@@ -1862,6 +1863,7 @@ class TestBenchmarkingDateCeiling:
         expected_starts = {
             (t - timedelta(days=FINANCIAL_YFINANCE_LOOKBACK_DAYS)).date().isoformat() for t in (before, after)
         }
-        assert set(kwargs) == {"start"}
+        assert set(kwargs) == {"start", "timeout"}
         assert kwargs["start"] in expected_starts
+        assert kwargs["timeout"] == TS_ANCHOR_HTTP_TIMEOUT
         assert "### AAPL" in result

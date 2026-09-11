@@ -19,6 +19,7 @@ from forecasting_tools import (
 from forecasting_tools.data_models.data_organizer import PredictionTypes
 from forecasting_tools.data_models.forecast_report import ForecastReport, ResearchWithPredictions
 from forecasting_tools.data_models.questions import ConditionalQuestion, DateQuestion
+from forecasting_tools.helpers.metaculus_client import MetaculusClient
 
 from metaculus_bot.aggregation_pipeline import AggregationPipeline
 from metaculus_bot.aggregation_strategies import (
@@ -58,8 +59,16 @@ from metaculus_bot.drop_telemetry import (
     emit_drop_telemetry,
 )
 from metaculus_bot.extreme_call import format_extreme_call_markers
-from metaculus_bot.forecaster_runners import run_binary_forecast, run_mc_forecast, run_numeric_forecast
+from metaculus_bot.forecaster_runners import (
+    run_binary_forecast,
+    run_date_forecast,
+    run_mc_forecast,
+    run_numeric_forecast,
+)
 from metaculus_bot.llm_setup import prepare_llm_config
+from metaculus_bot.member_forecast import NUMERIC_COMBINE_METHOD_UNRECORDED, format_numeric_aggregate_marker
+from metaculus_bot.numeric.date_axis import numeric_qtype, numeric_view
+from metaculus_bot.numeric.out_of_range_floor import floor_published_tails
 from metaculus_bot.numeric.pchip_processing import log_pchip_summary, reset_pchip_stats
 from metaculus_bot.performance_analysis.parsing import extract_model_display_name_from_reasoning
 from metaculus_bot.publish_gate import (
@@ -68,6 +77,7 @@ from metaculus_bot.publish_gate import (
     reset_publish_skipped_closed,
 )
 from metaculus_bot.publish_hardening import publish_attempt_failures, reset_publish_attempt_failures
+from metaculus_bot.question_platform import question_platform
 from metaculus_bot.research.orchestrator import ResearchOrchestrator
 from metaculus_bot.research.providers import (
     ResearchCallable,
@@ -85,11 +95,43 @@ from metaculus_bot.utils.logging_utils import CompactLoggingForecastBot
 
 logger = logging.getLogger(__name__)
 
-# Sort sentinel for a question with no close time, so the tightest-close-first
-# ordering in forecast_questions never compares None against a datetime.
+# Sort sentinel for a missing close_time, so the tightest-close-first sort never compares None to a datetime.
 _CLOSE_TIME_MAX = datetime.max.replace(tzinfo=UTC)
 
 load_environment()
+
+
+def _forecast_history_is_readable(question: MetaculusQuestion) -> bool:
+    """True when the payload carries the ``my_forecasts`` field ``already_forecasted`` is derived from."""
+    question_json = question.api_json.get("question") or {}
+    return question_json.get("my_forecasts") is not None
+
+
+def _drop_questions_with_unreadable_forecast_history(questions: Sequence[MetaculusQuestion]) -> list[MetaculusQuestion]:
+    """The skip guard's fail-shut leg: a question whose ``my_forecasts`` field is unreadable is not eligible.
+
+    The framework derives ``already_forecasted`` inside a blanket except that answers False, so a
+    payload without the field (a list GET without ``with_cp=true``, an unauthenticated Mantic read,
+    an API change) would read as never forecast and re-publish every question on every hourly run.
+    One WARNING marker per dropped question keeps the drop visible in the telemetry archive.
+    """
+    readable: list[MetaculusQuestion] = []
+    for question in questions:
+        if _forecast_history_is_readable(question):
+            readable.append(question)
+            continue
+        logger.warning(
+            "SKIP_GUARD_UNREADABLE: question=%s post_id=%s platform=%s reason=my_forecasts_missing",
+            question.id_of_question,
+            question.id_of_post,
+            question_platform(question),
+        )
+    if len(readable) != len(questions):
+        logger.warning(
+            "Dropped %d question(s) with no readable my_forecasts field; the skip guard fails shut",
+            len(questions) - len(readable),
+        )
+    return readable
 
 
 class TemplateForecaster(CompactLoggingForecastBot):
@@ -114,10 +156,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
         stacking_spread_thresholds: dict[str, float] | None = None,
         min_forecasters_to_publish: int | None = None,
         research_sink: Any | None = None,
+        metaculus_client: MetaculusClient | None = None,
     ) -> None:
-        if not isinstance(aggregation_strategy, AggregationStrategy):
-            raise ValueError(f"aggregation_strategy must be an AggregationStrategy enum, got {aggregation_strategy}")
-
         setup = prepare_llm_config(
             llms=llms,
             aggregation_strategy=aggregation_strategy,
@@ -137,10 +177,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         self.is_benchmarking: bool = is_benchmarking
         self.allow_research_fallback: bool = allow_research_fallback
         self.research_cache: dict[int, str] | None = research_cache
-        # Resolve effective min-forecaster threshold. Defaults to the module
-        # constant for production; tests/benchmarks can override (e.g. tests
-        # typically use 2-model ensembles and would otherwise always fail the
-        # guard).
+        # Tests and harnesses override the prod constant; a 2-model ensemble would otherwise always fail the guard.
         self.min_forecasters_to_publish: int = (
             min_forecasters_to_publish if min_forecasters_to_publish is not None else MIN_FORECASTERS_TO_PUBLISH
         )
@@ -195,22 +232,13 @@ class TemplateForecaster(CompactLoggingForecastBot):
             folder_to_save_reports_to=folder_to_save_reports_to,
             skip_previously_forecasted_questions=skip_previously_forecasted_questions,
             llms=normalized_llms,  # type: ignore[arg-type]  # dict value type lacks None but parent expects Optional
-            # 0.2.92 added an upstream success-rate gate in
-            # _handle_errors_in__run_individual_question: it raises when
-            # len(predictions) < expected_total_predictions * required_successful_predictions.
-            # Upstream's expected_total_predictions equals the
-            # predictions_per_research_report that prepare_llm_config sets to the
-            # configured roster width. At the 0.5 default the gate would reject a
-            # single-survivor publish on any roster
-            # wider than two, contradicting MIN_FORECASTERS_TO_PUBLISH. Pin it to 0.0 so OUR
-            # min_forecasters_to_publish guard (above) stays the sole arbiter of
-            # whether a degraded ensemble still publishes.
+            # Off so our guard is the sole arbiter of a degraded publish; see docs/architecture.md "4. Min-forecasters guard".
             required_successful_predictions=0.0,
+            # None keeps the framework's default Metaculus client; mantic mode injects a ManticClient.
+            metaculus_client=metaculus_client,
         )
 
-        # Benchmark/backtest harnesses tag each bot instance with a display name
-        # (see benchmark/bot_factory.py, backtest.py). Declare it here so the
-        # attribute is statically known instead of needing scattered ignores.
+        # Declared so the harnesses' display-name tag is statically known; see docs/architecture.md "Harness seams".
         self.name: str = getattr(self, "name", type(self).__name__)
 
         # Now that super().__init__ has run, resolve the parser LLM.
@@ -235,22 +263,12 @@ class TemplateForecaster(CompactLoggingForecastBot):
         One bot instance == one run, so these are per-run totals rather than per-question.
         """
         self._forecasters_dropped_count: int = 0
-        # Per-model drop attribution (same lifecycle as the scalar above).
-        # _record_forecaster_drop is the single write path that keeps this list and the
-        # scalar in lockstep.
+        # _record_forecaster_drop is the single write path that keeps this list and the scalar above in lockstep.
         self._forecaster_drops: list[ForecasterDrop] = []
         self._questions_failed_to_publish: int = 0
-        # Questions whose close time was too near for the full pipeline's worst case,
-        # so the optional research stages were dropped (see time_budget.py). A
-        # fast-path publish is a degraded publish — the forecasters saw a thinner
-        # research bundle — and reddens CI for the same reason a thinned ensemble
-        # does: it is a symptom of upstream latency, which is the thing the operator
-        # wants paged. The question still publishes.
+        # A fast-path publish is a degraded publish and reddens CI; see docs/architecture.md "Run-level counters".
         self._time_budget_fast_path_count: int = 0
-        # qid -> forecasters that contributed to the published value, recorded by
-        # _research_and_make_predictions and drained by _create_unified_explanation
-        # for the FORECASTERS_USED marker. Needed because the stacked path returns a
-        # single aggregated prediction, so the published collection can't be counted.
+        # qid -> FORECASTERS_USED contributor count; a stacked publish collapses predictions to one, so count it here.
         self._contributing_forecasters: defaultdict[int, int] = defaultdict(int)
 
     @property
@@ -290,10 +308,8 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
         stacker_name = self._pipeline.stacker_llm.model if self._pipeline.stacker_llm else "<missing>"
         base_models = [m.model for m in self._forecaster_llms]
-        # Display truncation for one log line, not a computation over a sample.
-        short_list = (
-            base_models if len(base_models) <= 6 else [*base_models[:6], "..."]
-        )  # HARNESS-SCAN-EXEMPT-subsampling
+        shown_models = base_models[:6]  # HARNESS-SCAN-EXEMPT-subsampling: log-line display truncation, no computation
+        short_list = base_models if len(base_models) <= 6 else [*shown_models, "..."]
 
         if self.aggregation_strategy == AggregationStrategy.STACKING:
             logger.info(
@@ -319,17 +335,17 @@ class TemplateForecaster(CompactLoggingForecastBot):
         questions: Sequence[MetaculusQuestion],
         return_exceptions: bool = False,
     ) -> list[ForecastReport] | list[ForecastReport | BaseException]:
-        # Unsupported-type guard. 0.2.92's ApiFilter default and tournament fetch
-        # can now return ConditionalQuestion (a new type) alongside DateQuestion —
-        # neither of which this bot forecasts (_make_prediction has no runner for
-        # them). Drop them up front with a loud WARNING instead of letting them
-        # reach the fan-out and surface as per-question exceptions. This is the
-        # single chokepoint every entry path funnels through: both
-        # forecast_on_tournament and forecast_question call forecast_questions, so
-        # filtering here covers the tournament path and the test/URL path without a
-        # separate filter in cli.py. DiscreteQuestion subclasses NumericQuestion and
-        # is intentionally kept.
-        supported_types = (BinaryQuestion, MultipleChoiceQuestion, NumericQuestion)
+        """Filter, sort and cap the fetched questions, then hand the survivors to the framework fan-out.
+
+        The single chokepoint every entry path funnels through (forecast_on_tournament and
+        forecast_question both call it): the unsupported-type guard drops the ConditionalQuestion
+        the 0.2.92 tournament fetch can return, the skip guard fails shut on an unreadable
+        ``my_forecasts``, and the tightest-close-first sort decides who wins the shared research
+        semaphore and the per-run cap. DiscreteQuestion is a NumericQuestion and stays; DateQuestion
+        runs through the numeric pipeline on its epoch-seconds axis.
+        """
+        # A loud WARNING here beats a per-question exception in the fan-out (_make_prediction has no runner).
+        supported_types = (BinaryQuestion, MultipleChoiceQuestion, NumericQuestion, DateQuestion)
         supported_questions = [q for q in questions if isinstance(q, supported_types)]
         if len(supported_questions) != len(questions):
             dropped_type_names = sorted({type(q).__name__ for q in questions if not isinstance(q, supported_types)})
@@ -342,18 +358,13 @@ class TemplateForecaster(CompactLoggingForecastBot):
 
         # Apply skip filter first (mirrors base class behavior) so we cap unforecasted items
         if self.skip_previously_forecasted_questions:
+            questions = _drop_questions_with_unreadable_forecast_history(questions)
             unforecasted_questions = [q for q in questions if not q.already_forecasted]
             if len(questions) != len(unforecasted_questions):
                 logger.info(f"Skipping {len(questions) - len(unforecasted_questions)} previously forecasted questions")
             questions = unforecasted_questions
 
-        # Tightest close first. Questions all run under one asyncio.gather, so this
-        # is not a serialization order — it decides who wins the two contended
-        # resources: the shared max_concurrent_research semaphore (6 permits) and,
-        # below, the max_questions_per_run cap, which without this keeps whatever
-        # order the tournament fetch happened to return rather than the N questions
-        # closest to closing. Stable, so questions sharing a close time keep fetch
-        # order, and a missing close_time sorts LAST (no deadline, no urgency).
+        # Stable, so questions sharing a close time keep fetch order; a missing close_time sorts LAST (no urgency).
         questions = sorted(
             questions,
             key=lambda q: (
@@ -362,24 +373,26 @@ class TemplateForecaster(CompactLoggingForecastBot):
             ),
         )
 
-        # Enforce max questions per run safety cap
+        # A registered WARNING marker names the forfeited posts; an unharvestable forfeit is gone at the 90-day log expiry.
         if self.max_questions_per_run is not None and len(questions) > self.max_questions_per_run:
-            logger.info(
-                f"Limiting to the {self.max_questions_per_run} soonest-closing questions out of {len(questions)}"
+            dropped = list(questions)[self.max_questions_per_run :]
+            logger.warning(
+                "QUESTION_CAP_FORFEIT: platform=%s cap=%d total=%d dropped=%d posts=%s",
+                question_platform(dropped[0]),
+                self.max_questions_per_run,
+                len(questions),
+                len(dropped),
+                ",".join(str(q.id_of_post) for q in dropped),
             )
             questions = list(questions)[: self.max_questions_per_run]
 
-        # Log question processing info with progress
         if questions:
             bot_name = getattr(self, "name", "Bot")
             logger.info(f"📊 {bot_name}: Processing {len(questions)} questions...")
 
         reset_pchip_stats()
         self._research.reset_run_degradation_counters()
-        # Same per-run cadence as the module-scoped research counters above: the
-        # publish-hardening wrapper has no handle back to the bot, so its
-        # retry-exhaustion counter lives at module scope and is zeroed here. The
-        # close-time gate's counter is module-scoped for the same reason.
+        # The publish wrapper and the close gate have no handle back to the bot, so their counters are module-scoped.
         reset_publish_attempt_failures()
         reset_publish_skipped_closed()
 
@@ -390,18 +403,10 @@ class TemplateForecaster(CompactLoggingForecastBot):
         if self.aggregation_strategy == AggregationStrategy.CONDITIONAL_STACKING:
             logger.info(format_conditional_stacking_summary(self._degradation_snapshot()))
 
-        # Loud end-of-run degradation summary. Any non-zero counter here means
-        # something got dropped, the stacker fell back, or a research provider
-        # failed — all states where CI (cli.py) should exit non-zero so we get
-        # paged, but every publishable question has already been published.
+        # Any non-zero counter reddens CI via cli.py, after every publishable question has already published.
         logger.info(format_degradation_summary(self._degradation_snapshot()))
-        # Per-model attribution for the forecasters_dropped scalar above: which
-        # model failed, how often, and why (one grep on FORECASTER_DROPS), plus a
-        # WARNING when one model failed across multiple questions this run.
         self._emit_forecaster_drop_telemetry()
-        # The provider-degradation counterpart: which venue/signal degraded, on how
-        # many rows or questions, and what to do about it. Emitted even at zero, so
-        # "no provider degraded" is a recorded fact rather than an absent line.
+        # Emitted even at zero, so "no provider degraded" is a recorded fact rather than an absent line.
         self._research.log_provider_degradation_summary()
 
         return results
@@ -451,6 +456,14 @@ class TemplateForecaster(CompactLoggingForecastBot):
         self._research.gap_fill_v2_error_count = value
 
     @property
+    def _gap_fill_v1_error_count(self) -> int:
+        return self._research.gap_fill_v1_error_count
+
+    @_gap_fill_v1_error_count.setter
+    def _gap_fill_v1_error_count(self, value: int) -> None:
+        self._research.gap_fill_v1_error_count = value
+
+    @property
     def alertable_count(self) -> int:
         """Sum of counters whose non-zero value should page us (see degradation_counters)."""
         return alertable_total(self._degradation_snapshot())
@@ -471,6 +484,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             stacker_fallback_failed=aggregation_counters.stacker_fallback_failed_count,
             research_provider_failures=self._research_provider_failure_count,
             summarizer_failures=self._summarizer_failure_count,
+            gap_fill_v1_errors=self._gap_fill_v1_error_count,
             gap_fill_v2_errors=self._gap_fill_v2_error_count,
             prediction_market_degraded=self._prediction_market_degraded_count,
             prediction_market_source_losses=self._prediction_market_source_loss_count,
@@ -542,10 +556,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         treat it identically. Tests can patch this method directly to inject
         a synthetic prediction list without spinning up real tasks.
         """
-        # Attribution map: coros are built from self._forecaster_llms IN ORDER (see
-        # _research_and_make_predictions), so coro idx aligns with that list. This
-        # ordering contract is what lets per-model drop telemetry name the model a
-        # cancelled/raised task belonged to. "unknown" only if the lists desync.
+        # coros are built from self._forecaster_llms in order, so idx names the model; "unknown" only if they desync.
         tasks: list[asyncio.Task[Any]] = []
         task_model: dict[asyncio.Task[Any], str] = {}
         for idx, coro in enumerate(coros):
@@ -589,11 +600,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             else:
                 errors.append(f"{type(exc).__name__}: {exc}")
                 exceptions.append(exc)
-                # A forecaster that finished by raising is a dropped ensemble
-                # member and must count as degradation (so cli.py's alertable
-                # exit fires). Soft-deadline TimeoutErrors were already counted
-                # at their raise site in _forecaster_with_soft_deadline, so
-                # exclude them here to avoid double-counting.
+                # A raised forecaster is a drop; soft-deadline timeouts were already counted at their raise site.
                 if not isinstance(exc, asyncio.TimeoutError):
                     self._record_forecaster_drop(
                         model=task_model.get(task, "unknown"),
@@ -625,31 +632,19 @@ class TemplateForecaster(CompactLoggingForecastBot):
         self,
         question: MetaculusQuestion,
     ) -> ResearchWithPredictions[PredictionTypes]:
-        # Call the parent class's method if no specific forecaster LLMs are provided
+        """Research once and fan out over the forecaster roster; the framework's own path when no roster is set."""
         if not self._forecaster_llms:
             return await super()._research_and_make_predictions(question)
 
         assert question.id_of_question is not None, "id_of_question must not be None for stacking state-dict keying"
 
-        # Per-Q wall-clock cutoff: research, fan-out, aggregation, and publish all
-        # share the same budget, and it is the SMALLER of the static deadline and
-        # what this question's close time allows (see time_budget.py). Granted as
-        # early as possible so we don't overshoot from research-time alone.
+        # Granted before any spend so research alone cannot overshoot the shared per-question budget.
         time_budget = self._build_time_budget(question)
         logger.info(format_time_budget_marker(question, time_budget))
 
-        # Arithmetically unpublishable: not even an instant forecast leaves room for
-        # the prediction POST. Raising here skips the question with the same counter
-        # and the same outcome the close gate would produce at publish time, minus a
-        # full ensemble's worth of spend on a question Metaculus will refuse (the
-        # q45085 shape: fetched 22 seconds before its close, forecast at 3/3, then
-        # rejected 405). The message names the close time so the run log says WHY
-        # rather than reporting a mysterious zero-forecaster question.
+        # Unpublishable before any spend (the q45085 shape); see docs/architecture.md "0. Close-derived time budget".
         if time_budget.is_exhausted:
-            # SAME counter as the close gate at publish time: "latency cost us this
-            # question" has one home (publish_skipped_closed, already alertable),
-            # however early the loss was noticed. questions_failed_to_publish
-            # remains the min-forecasters floor's counter alone.
+            # The close gate's counter, not the min-forecasters floor's: latency losses have one home however early.
             record_publish_skipped_closed()
             msg = (
                 f"Q {question.id_of_question} has no viable time budget "
@@ -674,25 +669,13 @@ class TemplateForecaster(CompactLoggingForecastBot):
         notepad.total_research_reports_attempted += 1
         research = await self.run_research(question, time_budget=time_budget)
 
-        # Diagnostics seam: run_research returns forecaster-clean text (the
-        # provider-diagnostics block is withheld so it never reaches forecaster
-        # prompts, the stacker, or the gap-fill v2 driver brief). It must still
-        # reach the published comment, so it rides down to the router, which
-        # re-appends it to the comment-bound research_report strings only.
+        # Withheld from every prompt; the router re-appends it to the comment-bound research only.
         diagnostics_block = self._research.pop_provider_diagnostics(question.id_of_question)
 
-        # Pull the time-series-anchor chart image (if the chart flag rendered one
-        # this question) out of the provider's per-session cache so the base
-        # forecasters can attach it as a vision message. No-op unless
-        # TS_ANCHOR_CHART_ENABLED is on. The stacker path never receives chart_b64,
-        # so the image reaches base models only.
+        # The stacker never receives chart_b64, so the time-series chart reaches the base models only.
         chart_b64 = self._pull_research_chart(question.id_of_question)
 
-        # A stub, not the full corpus: the framework embeds summary_report under
-        # "### Research Summary" and research_report under "# RESEARCH", so
-        # setting both to `research` duplicated it and bloated the comment past
-        # the char limit. The "### Research Summary" heading is emitted
-        # regardless of body, so the trim anchor and parser markers survive.
+        # A stub: the framework renders both fields, so the full text here doubled the comment past its cap.
         summary_report = "_Full research in the RESEARCH section below._"
 
         qid_for_log = question.id_of_question
@@ -713,10 +696,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         if errors:
             logger.warning(f"Encountered errors while predicting: {errors}")
 
-        # Min-forecasters guard: below self.min_forecasters_to_publish, the
-        # ensemble is too degraded to publish. Increment counter for end-of-run
-        # alerting and raise so this question is skipped (but other batch
-        # questions and publication continue). See cli.py for exit-status wiring.
+        # Min-forecasters guard: raising skips this question alone; the counter reddens CI at the end of the run.
         n_valid = len(valid_predictions)
         if n_valid < self.min_forecasters_to_publish:
             self._questions_failed_to_publish += 1
@@ -729,38 +709,10 @@ class TemplateForecaster(CompactLoggingForecastBot):
                 self._reraise_exception_with_prepended_message(exception_group, msg)
             raise RuntimeError(msg)
 
-        # Contributor count for the FORECASTERS_USED marker, recorded HERE — the one
-        # point every branch below shares, so the stacked, single-forecaster, and
-        # base-combine paths agree on "forecasters that fed the published value" by
-        # construction. It cannot be recovered downstream: route finalization
-        # collapses `predictions` to a single aggregate, so counting the published
-        # collection reports 1 no matter how many forecasters contributed. Accumulated
-        # rather than assigned so research_reports_per_question > 1 keeps the count
-        # equal to the number of per-model summary bullets across all report sections.
+        # Accumulated, not assigned, so several research reports still match the per-model bullet count.
         self._contributing_forecasters[qid_for_log] += n_valid
 
-        # Positive survivor count, in the RUN LOG. Everything else that knows this
-        # number is either conditional or off-stdout: the "Only n/N forecasters
-        # succeeded" line fires only BELOW min_forecasters_to_publish (which the
-        # constant now permits to be low enough that zero survivors are needed to
-        # trip it), and the count above reaches the published Metaculus comment as
-        # FORECASTERS_USED, which is never logged. So a degraded publish exited zero
-        # and read identically to a healthy one — an operator checking "did every
-        # forecaster survive?" had to count EXTRACTION_RUNG lines and dedupe model
-        # slugs to infer it. Emitted unconditionally so the healthy case is stated
-        # rather than implied by the absence of a warning.
-        #
-        # models= is the deliberate symmetry with FORECASTER_DROPS's detail=: names on
-        # both sides let a reader diff survivors against drops from the log alone.
-        # Read off each prediction's own "Model: ..." prefix (stamped in
-        # _make_prediction) rather than self._forecaster_llms, because the roster
-        # lists CONFIGURED models and the survivors are a subset — reporting the
-        # roster here would relabel a degraded run as full.
-        #
-        # Derived once, positionally, and reused by the EXTREME_CALL block below: the two
-        # lines have to stay joinable on the model field, so reading the prefix twice would
-        # let a future change to one reading drift from the other. This list keeps the
-        # per-prediction None (rendered "unknown" there); the log line drops and sorts it.
+        # Read off each prediction's Model: prefix, not the roster, so a degraded run is never relabelled as full.
         survivor_names = [extract_model_display_name_from_reasoning(pred.reasoning) for pred in valid_predictions]
         survivor_models = sorted(filter(None, survivor_names))
         logger.info(
@@ -771,20 +723,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
             ",".join(survivor_models) if survivor_models else "unknown",
         )
 
-        # Per-member extreme-call telemetry, alongside the survivor count that supplies
-        # its denominator. Emitted HERE because this is the one point where the surviving
-        # predictions and their own model prefixes are both in hand and nothing has
-        # aggregated them yet — downstream, route_after_forecasts collapses the set to a
-        # published value and the per-member calls are only recoverable from parsed
-        # comments. Binary only, and no line for a member inside the band; see
-        # extreme_call.py for what the marker measures and why.
-        #
-        # The cast narrows PredictionTypes to the float a binary question's members carry
-        # by construction: this is the same isinstance predicate _make_prediction dispatches
-        # on, so the questions that reach here are exactly the ones routed to
-        # run_binary_forecast, which returns ReasonedPrediction[float] (a conditional or
-        # date question raises NotImplementedError there and never yields a prediction). An
-        # isinstance filter over the values would silently drop a member instead.
+        # Binary members are floats by runner dispatch, so the cast is exact; an isinstance filter could drop one silently.
         if isinstance(question, BinaryQuestion):
             for marker in format_extreme_call_markers(
                 qid_for_log,
@@ -837,11 +776,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         text = super()._format_forecaster_rationales(report_number, researched_predictions).lstrip()
         return format_forecaster_rationales_section(text, report_number)
 
-    # The PLR0917 suppression below is PERMANENT, not a TODO: this overrides
-    # ForecastBot._create_unified_explanation, which forecasting-tools calls POSITIONALLY
-    # (forecast_bot.py: "self._create_unified_explanation(question, valid_prediction_set,
-    # aggregated_prediction, final_cost, time_spent_in_minutes)"). Making any of these
-    # keyword-only would break the framework's own call.
+    # The PLR0917 noqa is permanent: forecasting-tools calls this override POSITIONALLY, so nothing can go keyword-only.
     def _create_unified_explanation(  # noqa: PLR0917  # signature is fixed by the ft base class, see comment above
         self,
         question: MetaculusQuestion,
@@ -860,24 +795,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         qid = question.id_of_question
         stacker_outcome = self._pipeline.outcomes.pop(qid, None) if qid is not None else None
         stacker_skip_reason = self._pipeline.skip_reasons.pop(qid, None) if qid is not None else None
-        # Ensemble-size disclosure: forecasters that CONTRIBUTED (== the number of
-        # per-model summary bullets) out of those CONFIGURED. Makes a degraded
-        # publish self-describing in the durable comment record, so residual
-        # analysis can tell a dropped model from a roster change (a missing bullet
-        # is otherwise ambiguous). Cause of any drop stays in run-log telemetry.
-        #
-        # The count comes from the fan-out (recorded per report in
-        # _research_and_make_predictions), NOT from the collections: on a stacked
-        # publish `predictions` holds the single aggregated prediction, so counting
-        # it would report 1/N on a healthy N-model run. The collection sum remains
-        # the fallback for callers that never ran our fan-out — the delegation to
-        # the parent implementation when no forecaster LLMs are configured.
-        #
-        # On that same delegated path the roster is empty, so the configured count
-        # falls back to predictions_per_research_report — the width the parent
-        # actually fans out over. llm_setup keeps the two equal whenever a roster IS
-        # set, so this only ever differs on delegation, and the parent asserts the
-        # value is > 0, so the denominator can never be 0.
+        # Fan-out count, not the collections' (a stacked publish holds one); docs/architecture.md "Ensemble-size disclosure".
         recorded_used = self._contributing_forecasters.pop(qid, None) if qid is not None else None
         n_used = (
             recorded_used
@@ -956,10 +874,10 @@ class TemplateForecaster(CompactLoggingForecastBot):
             forecast_function = lambda q, r, llm: self._run_forecast_on_multiple_choice(q, r, llm, chart_b64)  # noqa: E731
         elif isinstance(question, NumericQuestion):
             forecast_function = lambda q, r, llm: self._run_forecast_on_numeric(q, r, llm, chart_b64)  # noqa: E731
-        elif isinstance(question, (DateQuestion, ConditionalQuestion)):
-            # forecast_questions filters these out up front; this is the
-            # defense-in-depth backstop for any path that reaches _make_prediction
-            # directly with an unsupported type.
+        elif isinstance(question, DateQuestion):
+            forecast_function = lambda q, r, llm: self._run_forecast_on_date(q, r, llm, chart_b64)  # noqa: E731
+        elif isinstance(question, ConditionalQuestion):
+            # forecast_questions filters these out; this backstops a caller that reaches _make_prediction directly.
             raise NotImplementedError(f"{type(question).__name__} is not supported by this bot")
         else:
             raise ValueError(f"Unknown question type: {type(question)}")
@@ -968,10 +886,7 @@ class TemplateForecaster(CompactLoggingForecastBot):
         # Load-bearing: performance_analysis.parsing pulls per-model attribution from this "Model:" prefix.
         prediction.reasoning = f"Model: {actual_llm.model}\n\n{prediction.reasoning}"
 
-        # Probabilistic-tools activation: run deterministic math tools over
-        # the forecaster's structured JSON block (see tool_runner.py). The
-        # tool runner no-ops when PROBABILISTIC_TOOLS_ENABLED is off or no
-        # block was emitted; callers don't gate.
+        # No-ops when PROBABILISTIC_TOOLS_ENABLED is off (prod) or no block was emitted, so callers do not gate.
         computed_md = run_tools_for_forecaster(
             question=question,
             rationale=prediction.reasoning,
@@ -980,18 +895,9 @@ class TemplateForecaster(CompactLoggingForecastBot):
         if computed_md:
             prediction.reasoning = f"{prediction.reasoning}\n\n## Computed quantities\n{computed_md}"
 
-        # Extraction telemetry (EXTRACTION_RUNG lines) is emitted inside the
-        # value-extraction ladder (metaculus_bot/value_extraction.py), which the
-        # runners call — no per-prediction logging is needed here.
+        return prediction  # type: ignore[return-value]  # each branch narrows T; the framework carries the same ignore
 
-        # Each branch returns a specific ReasonedPrediction[T] but the signature
-        # requires ReasonedPrediction[PredictionTypes]; framework has the same pattern
-        return prediction  # type: ignore[return-value]
-
-    # The PLR0917 suppression below is PERMANENT, not a TODO: this overrides
-    # ForecastBot._aggregate_predictions, which forecasting-tools calls POSITIONALLY
-    # (forecast_bot.py: "await self._aggregate_predictions(all_predictions, question)"). The params
-    # past ``question`` are ours, but narrowing the first two would break the framework's call.
+    # The PLR0917 noqa is permanent: forecasting-tools calls the first two params POSITIONALLY; the rest are ours.
     async def _aggregate_predictions(  # noqa: PLR0917  # signature is fixed by the ft base class, see comment above
         self,
         predictions: list[PredictionTypes],
@@ -1002,15 +908,36 @@ class TemplateForecaster(CompactLoggingForecastBot):
     ) -> PredictionTypes:
         if self.aggregation_strategy in (AggregationStrategy.STACKING, AggregationStrategy.CONDITIONAL_STACKING):
             if reasoned_predictions is None and research is None:
-                return self._pipeline.base_combine(predictions, question)
-            return await self._pipeline.stack_predictions(
-                predictions,
-                question,
-                research=research,
-                reasoned_predictions=reasoned_predictions,
-                aggregated_tool_output=aggregated_tool_output,
+                aggregated = self._pipeline.base_combine(predictions, question)
+            else:
+                aggregated = await self._pipeline.stack_predictions(
+                    predictions,
+                    question,
+                    research=research,
+                    reasoned_predictions=reasoned_predictions,
+                    aggregated_tool_output=aggregated_tool_output,
+                )
+        else:
+            aggregated = self._pipeline.simple_combine(predictions, question)
+        # The one seam every aggregation path returns through, so the tail floor and marker see the published CDF.
+        if isinstance(aggregated, NumericDistribution):
+            floored = floor_published_tails(aggregated, question)
+            method = NUMERIC_COMBINE_METHOD_UNRECORDED
+            if question.id_of_question is not None:
+                method = self._pipeline.numeric_combine_methods.pop(question.id_of_question, method)
+            logger.info(
+                format_numeric_aggregate_marker(
+                    question_id=question.id_of_question,
+                    qtype=numeric_qtype(numeric_view(question)),
+                    cdf_size=floored.cdf_size,
+                    out_of_range=floored.published,
+                    out_of_range_raw=floored.raw,
+                    tail_floor=floored.floor,
+                    method=method,
+                )
             )
-        return self._pipeline.simple_combine(predictions, question)
+            return floored.distribution
+        return aggregated
 
     def _pull_research_chart(self, qid: int | None) -> str | None:
         """Pop the time-series-anchor chart image for this qid from the provider's
@@ -1050,3 +977,11 @@ class TemplateForecaster(CompactLoggingForecastBot):
         if qid is not None and discrete_vote is not None:
             self._pipeline.discrete_integer_votes[qid].append(discrete_vote)
         return prediction
+
+    async def _run_forecast_on_date(  # pyright: ignore[reportIncompatibleMethodOverride]  # extra params: ensemble fan-out passes a specific LLM + optional chart per call
+        self, question: DateQuestion, research: str, llm_to_use: GeneralLlm, chart_b64: str | None = None
+    ) -> ReasonedPrediction[NumericDistribution]:
+        """The date runner on the epoch-seconds axis; no discrete-integer vote, since snapping there is meaningless."""
+        return await run_date_forecast(
+            question, research, llm_to_use, self.get_llm("parser", "llm"), chart_b64=chart_b64
+        )

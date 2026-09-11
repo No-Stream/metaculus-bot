@@ -12,9 +12,11 @@ from forecasting_tools.data_models.questions import NumericQuestion
 
 from metaculus_bot.constants import NUM_MAX_STEP, NUM_MIN_PROB_STEP, NUM_RAMP_K_FACTOR
 from metaculus_bot.numeric.config import (
+    OPEN_TAIL_MIN_MASS,
     PCHIP_CDF_POINTS,
     grid_step_constraints,
 )
+from metaculus_bot.numeric.date_axis import EpochDateQuestion
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid, safe_cdf_bounds
 
 logger = logging.getLogger(__name__)
@@ -101,8 +103,8 @@ def generate_pchip_cdf_with_smoothing(
             zero_point=zero_point,
             min_step=NUM_MIN_PROB_STEP,
             num_points=PCHIP_CDF_POINTS,
-            question_id=getattr(question, "id_of_question", None),
-            question_url=getattr(question, "page_url", None),
+            question_id=question.id_of_question,
+            question_url=question.page_url,
             model_name=model_name,
         )
 
@@ -136,11 +138,11 @@ def _apply_ramp_smoothing(pchip_cdf: list[float], question: NumericQuestion, *, 
         if not question.open_lower_bound:
             smoothed[0] = 0.0
         else:
-            smoothed[0] = max(smoothed[0], 0.001)
+            smoothed[0] = max(smoothed[0], OPEN_TAIL_MIN_MASS)
         if not question.open_upper_bound:
             smoothed[-1] = 1.0
         else:
-            smoothed[-1] = min(smoothed[-1], 0.999)
+            smoothed[-1] = min(smoothed[-1], 1.0 - OPEN_TAIL_MIN_MASS)
 
         # Enforce max-step constraint post-smoothing
         smoothed = safe_cdf_bounds(
@@ -156,8 +158,8 @@ def _apply_ramp_smoothing(pchip_cdf: list[float], question: NumericQuestion, *, 
         min_delta_after = float(np.min(diffs_after)) if len(diffs_after) else 1.0
         logger.warning(
             "CDF ramp smoothing for Q %s | URL %s | min_prob_delta_before=%.8f | min_prob_delta_after=%.8f | k_factor=%.1f",
-            getattr(question, "id_of_question", None),
-            getattr(question, "page_url", None),
+            question.id_of_question,
+            question.page_url,
             min_delta_before,
             min_delta_after,
             NUM_RAMP_K_FACTOR,
@@ -181,7 +183,7 @@ def _validate_pchip_cdf(pchip_cdf: list[float], question: NumericQuestion) -> No
 
     min_step = np.min(np.diff(pchip_cdf))
     if min_step < NUM_MIN_PROB_STEP - 1e-10:
-        raise ValueError(f"PCHIP CDF violates minimum step requirement: {min_step:.8f} < 5e-5")
+        raise ValueError(f"PCHIP CDF violates minimum step requirement: {min_step:.8f} < {NUM_MIN_PROB_STEP:.8f}")
 
     max_step = np.max(np.diff(pchip_cdf))
     if max_step > NUM_MAX_STEP + 1e-6:
@@ -193,11 +195,11 @@ def _validate_pchip_cdf(pchip_cdf: list[float], question: NumericQuestion) -> No
     if not question.open_upper_bound and abs(pchip_cdf[-1] - 1.0) > 1e-6:
         raise ValueError(f"PCHIP CDF closed upper bound violation: {pchip_cdf[-1]} != 1.0")
 
-    if question.open_lower_bound and pchip_cdf[0] < 0.001:
-        raise ValueError(f"PCHIP CDF open lower bound violation: {pchip_cdf[0]} < 0.001")
+    if question.open_lower_bound and pchip_cdf[0] < OPEN_TAIL_MIN_MASS:
+        raise ValueError(f"PCHIP CDF open lower bound violation: {pchip_cdf[0]} < {OPEN_TAIL_MIN_MASS}")
 
-    if question.open_upper_bound and pchip_cdf[-1] > 0.999:
-        raise ValueError(f"PCHIP CDF open upper bound violation: {pchip_cdf[-1]} > 0.999")
+    if question.open_upper_bound and pchip_cdf[-1] > 1.0 - OPEN_TAIL_MIN_MASS:
+        raise ValueError(f"PCHIP CDF open upper bound violation: {pchip_cdf[-1]} > {1.0 - OPEN_TAIL_MIN_MASS}")
 
 
 def _log_pchip_success(pchip_cdf: list[float], question: NumericQuestion, smoothing_applied: bool) -> None:
@@ -207,7 +209,7 @@ def _log_pchip_success(pchip_cdf: list[float], question: NumericQuestion, smooth
 
     logger.info(
         "PCHIP OK for Q %s | points=%d | min_step=%.8f | max_step=%.8f | smoothing=%s | open_bounds=(%s,%s)",
-        getattr(question, "id_of_question", "N/A"),
+        question.id_of_question,
         len(pchip_cdf),
         min_step,
         max_step,
@@ -223,7 +225,12 @@ def create_pchip_numeric_distribution(
     question: NumericQuestion,
     zero_point: float | None,
 ) -> NumericDistribution:
-    """Create a custom NumericDistribution that uses PCHIP CDF."""
+    """Create a custom NumericDistribution that uses PCHIP CDF.
+
+    ``is_date`` is set from the question: on the epoch adapter of a date question it is what
+    makes forecasting-tools' ``make_readable_prediction`` render the published comment's values
+    as UTC dates instead of epoch floats. Nothing else reads it.
+    """
 
     class PchipNumericDistribution(NumericDistribution):
         def __init__(self, pchip_cdf_values, *args, **kwargs):
@@ -263,7 +270,8 @@ def create_pchip_numeric_distribution(
         upper_bound=question.upper_bound,
         lower_bound=question.lower_bound,
         zero_point=zero_point,
-        cdf_size=getattr(question, "cdf_size", None),
+        cdf_size=question.cdf_size,
+        is_date=isinstance(question, EpochDateQuestion),
         # Our CDF is already the final, min/max-step- and bound-enforced submission,
         # exposed via the get_cdf() override above. strict_validation=False stops the
         # 0.2.92 validators from (a) rejecting our beyond-open-bound percentile
@@ -285,11 +293,16 @@ def create_fallback_numeric_distribution(
 ) -> NumericDistribution:
     """Create fallback NumericDistribution when PCHIP fails.
 
-    Wraps forecasting-tools' native CDF builder (``get_cdf()``) but re-pins
-    open-bound endpoints through ``safe_cdf_bounds``. Metaculus rejects open-bound
-    CDFs with ``cdf[0] < 0.001`` / ``cdf[-1] > 0.999`` and caps the per-bin step,
-    so we enforce the legal range and max-step here rather than trust the raw
-    builder output.
+    Wraps forecasting-tools' native CDF builder (``get_cdf()``) but runs its output
+    through ``safe_cdf_bounds`` whatever the bound shape. Metaculus rejects open-bound
+    CDFs with ``cdf[0] < OPEN_TAIL_MIN_MASS`` / ``cdf[-1] > 1 - OPEN_TAIL_MIN_MASS`` and caps the per-bin step on
+    every question, so the legal range and the grid's step limits are enforced here
+    rather than trusting the raw builder output. The closed/closed case used to be
+    handed back raw: a tight declaration (normal, sd 0.6 on a [0, 100] grid) produced
+    a 0.297 bin against the server's 0.2 cap and an HTTP 400 on the lone-survivor
+    path, on the modal Mantic date shape. ``safe_cdf_bounds`` pins nothing on a
+    closed bound and ``enforce_min_steps`` caps at [0.0, 1.0], so the closed
+    endpoints survive it exactly.
 
     ``standardize_cdf=False`` keeps ``get_cdf()`` on the non-standardizing raw
     linear-interpolation path (the 0.2.54 behavior this fallback was written
@@ -317,9 +330,6 @@ def create_fallback_numeric_distribution(
             if cached_cdf is not None:
                 return cached_cdf
             base = super().get_cdf()
-            if not (self.open_lower_bound or self.open_upper_bound):
-                cached_cdf = base
-                return cached_cdf
             probs = np.array([p.percentile for p in base], dtype=float)
             # Scale the min/max-step constraints to the actual grid length. On a coarse
             # discrete grid (cdf_size < 201) the 201-grid defaults (max_step=0.2) would
@@ -352,7 +362,8 @@ def create_fallback_numeric_distribution(
         upper_bound=question.upper_bound,
         lower_bound=question.lower_bound,
         zero_point=zero_point,
-        cdf_size=getattr(question, "cdf_size", None),
+        cdf_size=question.cdf_size,
+        is_date=isinstance(question, EpochDateQuestion),
         # strict_validation=False: preserve the beyond-range declared percentiles
         # verbatim (no _check_too_far_from_bounds rejection, no
         # _check_and_update_repeating_values mutation). standardize_cdf=False: keep

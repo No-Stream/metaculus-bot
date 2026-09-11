@@ -15,7 +15,6 @@ from metaculus_bot.constants import (
     RESOLUTION_SOURCE_DATAWRAPPER_MAX_CHARTS,
     RESOLUTION_SOURCE_DATAWRAPPER_PER_DATASET_MAX_CHARS,
     RESOLUTION_SOURCE_MIN_SECTION_CHARS,
-    RESOLUTION_SOURCE_PER_URL_MAX_CHARS,
     RESOLUTION_SOURCE_TOTAL_MAX_CHARS,
 )
 from metaculus_bot.research.resolution_body_text import _truncate_csv_middle, _truncate_with_marker
@@ -41,7 +40,7 @@ def _unreadable_embed_disclosure(providers: list[str]) -> str:
     )
 
 
-def _page_text_with_leads(extracted: str, url: str, providers: list[str], chart_block: str = "") -> str:
+def _page_text_with_leads(extracted: str, url: str, providers: list[str], chart_block: str, *, cap: int | None) -> str:
     """Per-URL-capped page text, LED by the chart-data block and the embed disclosure.
 
     Both leads lead (exactly like the Tier-2 dataset lead) because every truncator
@@ -64,14 +63,17 @@ def _page_text_with_leads(extracted: str, url: str, providers: list[str], chart_
     bound the section budget relies on still holds — including in the pathological
     case where the leads alone exceed the cap (a test can tune the cap below the
     chart block's own).
+
+    ``cap`` is the caller's ``LadderPolicy.per_url_max_chars``, and None means uncapped: a
+    caller that windows its own text at presentation instead.
     """
     leads = [lead for lead in (chart_block, _unreadable_embed_disclosure(providers) if providers else "") if lead]
     if not leads:
-        return _truncate_with_marker(extracted, RESOLUTION_SOURCE_PER_URL_MAX_CHARS, url)
-    return _lead_then_capped_body("\n\n".join(leads), extracted, url)
+        return extracted if cap is None else _truncate_with_marker(extracted, cap, url)
+    return _lead_then_capped_body("\n\n".join(leads), extracted, url, cap=cap)
 
 
-def _lead_then_capped_body(lead: str, body: str, url: str) -> str:
+def _lead_then_capped_body(lead: str, body: str, url: str, *, cap: int | None) -> str:
     """A provenance lead, then as much of ``body`` as the per-URL cap leaves, inside the bound.
 
     The one arithmetic every rung that serves an artifact under a lead uses: the chart-data /
@@ -84,9 +86,12 @@ def _lead_then_capped_body(lead: str, body: str, url: str) -> str:
     (a bare lead there busts the bound the aggregate budget assumes). A blank body renders the
     lead alone for the same reason.
     """
-    body_cap = RESOLUTION_SOURCE_PER_URL_MAX_CHARS - len(lead) - 2
+    if cap is None:
+        # Uncapped: nothing here can trim the lead off, which is all the arithmetic protects.
+        return f"{lead}\n\n{body}" if body.strip() else lead
+    body_cap = cap - len(lead) - 2
     if body_cap <= 0 or not body.strip():
-        return _truncate_with_marker(lead, RESOLUTION_SOURCE_PER_URL_MAX_CHARS, url)
+        return _truncate_with_marker(lead, cap, url)
     return f"{lead}\n\n{_truncate_with_marker(body, body_cap, url)}"
 
 

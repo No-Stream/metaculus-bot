@@ -28,11 +28,13 @@ import copy
 import json
 import logging
 import time
-from collections.abc import Awaitable, Callable
-from typing import Any, Literal
+from collections.abc import Callable
+from typing import Any, Literal, get_args
 
 from pydantic import ValidationError
 
+from metaculus_bot.numeric.date_axis import format_epoch, to_epoch
+from metaculus_bot.question_types import QuestionType
 from metaculus_bot.research.agentic.artifact import detachment_lint, render_findings
 from metaculus_bot.research.agentic.dispatch import (
     _absorb_tool_results,
@@ -53,7 +55,7 @@ from metaculus_bot.research.agentic.gates import (
     _evaluate_conclude_gate,
     _FindingsValidation,
 )
-from metaculus_bot.research.agentic.llm import build_default_llm_call
+from metaculus_bot.research.agentic.llm import LlmCall, build_default_llm_call
 from metaculus_bot.research.agentic.loop_state import (
     _budget_line,
     _extract_tool_calls,
@@ -80,6 +82,7 @@ from metaculus_bot.research.agentic.tool_schemas import (
 )
 from metaculus_bot.research.agentic.types import (
     Finding,
+    GhostContext,
     GhostForecast,
     LoopConfig,
     LoopResult,
@@ -89,6 +92,7 @@ from metaculus_bot.research.agentic.types import (
 )
 from metaculus_bot.structured_output_schema import (
     BinaryStructured,
+    DateStructured,
     MultipleChoiceStructured,
     NumericStructured,
     extract_json_block,
@@ -97,9 +101,12 @@ from metaculus_bot.structured_output_schema import (
 
 logger = logging.getLogger(__name__)
 
-LlmCall = Callable[[list[dict[str, Any]], list[dict[str, Any]] | None], Awaitable[Any]]
-
 _NUDGE = "call conclude or use tools"
+
+# The two ghost markers; the v1 ghost's pair mirrors the plain ghost's shapes so one scorer reads both.
+_GHOST_MARKER = "GHOST_FORECAST"
+_GHOST_V1_MARKER = "GHOST_FORECAST_V1"
+_GHOST_TIMEOUT_S = 60.0
 
 
 def _validate_findings_payload(
@@ -134,10 +141,7 @@ def _validate_findings_payload(
             provenance_rejections += 1
             rejected.append(f"{label}[{index}] rejected: {provenance_reason}")
             continue
-        # WARN-ONLY quote spot-check: a miss is logged and counted but the
-        # finding is still accepted (read_document paraphrases, ellipsis joins).
-        # Deduped per run on (source_url, quote) so a finding re-listed in
-        # conclude's final_findings counts once, not once per submission.
+        # Warn-only and deduped per run: see docs/agentic_gap_fill.md "The findings gates".
         if not _quote_is_grounded(finding.quote, state.tool_content_normalized):
             warned_key = (finding.source_url, finding.quote)
             if warned_key not in state.warned_quote_keys:
@@ -173,8 +177,7 @@ def _summarize_dry_run(dry_run_forecast: dict[str, Any] | None) -> dict[str, Any
     marker line is then suppressed, same as the ghost path)."""
     if not isinstance(dry_run_forecast, dict):
         return None
-    # Wrap the dict as a fenced block so the tested _summarize_ghost path parses
-    # it identically to a real ghost — no second parsing code path.
+    # Fenced so the tested _summarize_ghost path parses it identically to a real ghost.
     raw_text = f"```json\n{json.dumps(dry_run_forecast, separators=(',', ':'))}\n```"
     _qtype, _summary, forecast = _summarize_ghost(raw_text)
     return forecast
@@ -189,12 +192,7 @@ async def _set_research_plan_tool(state: _LoopState, arguments: dict[str, Any], 
     whether v2's research moved its own view.
     """
     gaps, gap_issues = _coerce_planned_gaps(arguments.get("gaps"), max_gaps=config.max_gaps)
-    # A plan with zero valid gaps is rejected (F3a): storing it would flip W1's
-    # plan_gate_active off (opening external tools) while gates._evaluate_conclude_gate
-    # returns None on `not plan.gaps` — disabling the W2 gate entirely and letting
-    # a driver conclude with zero research. Leave research_plan untouched (None, or
-    # a prior valid plan) so the W1 gate stays armed and re-planning to empty can't
-    # clobber an existing plan; nudge the driver to register real gaps.
+    # Rejected, never stored, so the W1 and W2 gates stay armed: docs/agentic_gap_fill.md "The findings gates".
     if not gaps:
         notes = "; ".join(gap_issues) if gap_issues else "provide at least one ranked research gap"
         return ToolOutcome(
@@ -225,12 +223,7 @@ async def _set_research_plan_tool(state: _LoopState, arguments: dict[str, Any], 
     if forecast is not None:
         logger.info("%sGHOST_PRE_JSON: %s", state.log_prefix, json.dumps(forecast, separators=(",", ":")))
     elif raw_dry_run_forecast is not None:
-        # The driver DID supply a dry run but it failed schema validation (the
-        # observed case: flat declared percentiles, run 30718626314) or was not a
-        # dict. Without this line the GHOST_PRE_JSON suppression is silent, and the
-        # loss is non-random: it drops exactly the flattest pre-research views —
-        # the ones whose later sharpening would be the strongest "research moved
-        # me" signal — so the archived zero-move rate reads slightly high.
+        # Non-random loss, not just a suppressed line: see docs/agentic_gap_fill.md on the ghost forecast.
         logger.warning(
             "%sGHOST_PRE_JSON suppressed: dry_run_forecast did not parse into a structured forecast; "
             "this question's ghost pair will have no pre-research half",
@@ -280,14 +273,7 @@ async def _run_tool_handler(
 ) -> ToolOutcome:
     """Dispatch one tool call under its timeout, folding every failure into an outcome."""
     try:
-        # Instantiate the handler coroutine INSIDE the boundary. External-tool
-        # handlers have concrete signatures, and async-def binds kwargs eagerly:
-        # a missing/typo'd/extra key in the LLM-emitted `arguments` raises
-        # TypeError at bind time, before any await. Doing the bind here means
-        # that failure becomes a status="error" outcome (via the except below)
-        # instead of escaping the batch gather and aborting the whole pass —
-        # matching the unknown-tool path. Internal tools bind positionally and
-        # can't hit this.
+        # Bind inside the boundary: a bad argument becomes an error outcome, not a batch abort.
         if tool_call.name == "set_research_plan":
             handler = _set_research_plan_tool(state, arguments, config)
         elif tool_call.name == "record_findings":
@@ -385,7 +371,12 @@ async def _execute_tool_batch(
     )
 
 
-def _freeze_result(state: _LoopState, findings_markdown: str, ghost: GhostForecast | None) -> LoopResult:
+def _freeze_result(
+    state: _LoopState,
+    findings_markdown: str,
+    ghost: GhostForecast | None,
+    ghost_context: GhostContext | None = None,
+) -> LoopResult:
     state.telemetry.findings_count = len(state.findings)
     state.telemetry.pending_leads_count = len(state.pending_leads)
     state.telemetry.concluded_early = state.explicit_conclude and not state.telemetry.deadline_hit
@@ -395,12 +386,12 @@ def _freeze_result(state: _LoopState, findings_markdown: str, ghost: GhostForeca
         ghost=ghost,
         telemetry=state.telemetry,
         transcript=copy.deepcopy(state.messages),
+        ghost_context=ghost_context,
     )
 
 
 def _log_completion(state: _LoopState, log_prefix: str) -> None:
-    # Marker shape per plan §6: model + per-surface counters make the run_logs
-    # grep enough for the driver vibe-eval (no research-archive JSON needed).
+    """Emit this run's single GAP_FILL_V2 marker line (fields: docs/agentic_gap_fill.md "Telemetry")."""
     per_tool = state.telemetry.per_tool_counts
     searches = per_tool.get("search_news", 0) + per_tool.get("search_web", 0)
     logger.info(
@@ -432,14 +423,11 @@ def _log_completion(state: _LoopState, log_prefix: str) -> None:
     )
 
 
-_GHOST_QTYPES: tuple[Literal["binary", "multiple_choice", "numeric"], ...] = (
-    "binary",
-    "multiple_choice",
-    "numeric",
-)
+# Derived, not restated: a question type added to the shared Literal reaches the ghost parser too.
+_GHOST_QTYPES: tuple[QuestionType, ...] = get_args(QuestionType)
 
 
-def _declared_qtype(raw_text: str) -> Literal["binary", "multiple_choice", "numeric"] | None:
+def _declared_qtype(raw_text: str) -> QuestionType | None:
     """Peek the ghost block's self-declared ``question_type`` without parsing it.
 
     The ghost emits exactly one structured block that names its own
@@ -495,6 +483,12 @@ def _summarize_ghost(raw_text: str) -> tuple[str, str, dict[str, Any] | None]:
             median = declared.get(0.5)
             summary = "" if median is None else f"median={median}"
             return "numeric", summary, {"qtype": "numeric", "declared_percentiles": declared, "median": median}
+        if isinstance(block, DateStructured):
+            # Epoch seconds, the axis the date pipeline forecasts on, so the ghost scores like a published CDF.
+            declared = {float(pct): to_epoch(moment) for pct, moment in block.declared_percentiles.items()}
+            median = declared.get(0.5)
+            summary = "" if median is None else f"median={format_epoch(median, '')}"
+            return "date", summary, {"qtype": "date", "declared_percentiles": declared, "median": median}
     return "unknown", "", None
 
 
@@ -502,6 +496,7 @@ async def _run_ghost_phase(
     *,
     state: _LoopState,
     ghost_prompt: str,
+    tools_json: list[dict[str, Any]],
     llm_call: LlmCall,
     log_prefix: str,
 ) -> GhostForecast | None:
@@ -521,30 +516,61 @@ async def _run_ghost_phase(
     signal and must not gate a run — score it against resolution, not the panel.
     """
     state.messages.append({"role": "user", "content": ghost_prompt})
+    assistant_message = await _complete_ghost(state.messages, tools_json, llm_call, log_prefix, phase="Ghost phase")
+    if assistant_message is None:
+        return None
+    state.messages.append(assistant_message)
+    return _log_ghost(assistant_message, log_prefix, _GHOST_MARKER)
+
+
+async def _complete_ghost(
+    messages: list[dict[str, Any]],
+    tools_json: list[dict[str, Any]],
+    llm_call: LlmCall,
+    log_prefix: str,
+    *,
+    phase: str,
+) -> dict[str, Any] | None:
+    """One tool-forbidden ghost completion on the research turns' tool list, or None on timeout or failure."""
     try:
-        response = await asyncio.wait_for(llm_call(state.messages, None), timeout=60.0)
-        assistant_message = _parse_response_message(response)
-        state.messages.append(assistant_message)
+        # Same tool list as the last research turn, tools forbidden via tool_choice: the cached prefix keeps matching.
+        response = await asyncio.wait_for(llm_call(messages, tools_json, tool_choice="none"), timeout=_GHOST_TIMEOUT_S)
+        return _parse_response_message(response)
     except TimeoutError:
-        logger.warning("%sGhost phase timed out after 60s", log_prefix)
+        logger.warning("%s%s timed out after %.0fs", log_prefix, phase, _GHOST_TIMEOUT_S)
         return None
     except Exception as exc:  # noqa: BLE001  # HARNESS-SCAN-EXEMPT-broad-except  # telemetry-only phase: a failed ghost must never cost the run its banked findings
-        logger.warning("%sGhost phase failed: %s: %s", log_prefix, type(exc).__name__, exc)
+        logger.warning("%s%s failed: %s: %s", log_prefix, phase, type(exc).__name__, exc)
         return None
 
+
+def _log_ghost(assistant_message: dict[str, Any], log_prefix: str, marker: str) -> GhostForecast:
+    """Parse a ghost answer once and log its lossy summary line plus the additive full-fidelity JSON companion."""
     raw_text = assistant_message["content"]
     qtype, parsed_summary, forecast = _summarize_ghost(raw_text)
     ghost = GhostForecast(qtype=qtype, raw_text=raw_text, parsed_summary=parsed_summary)
-    logger.info("%sGHOST_FORECAST: qtype=%s summary=%s", log_prefix, ghost.qtype, ghost.parsed_summary)
-    # Additive full-fidelity companion marker: the legacy line above stays
-    # byte-identical (harvested archive + other tests depend on it); this one
-    # carries the complete, deterministically-parsable forecast so numeric
-    # ghosts (not just their median) are scoreable. qid is carried the same way
-    # as GHOST_FORECAST — via ``log_prefix`` — so the harvester derives it
-    # identically. Suppressed when no block parsed (nothing to serialize).
+    logger.info("%s%s: qtype=%s summary=%s", log_prefix, marker, ghost.qtype, ghost.parsed_summary)
     if forecast is not None:
-        logger.info("%sGHOST_FORECAST_JSON: %s", log_prefix, json.dumps(forecast, separators=(",", ":")))
+        logger.info("%s%s_JSON: %s", log_prefix, marker, json.dumps(forecast, separators=(",", ":")))
     return ghost
+
+
+async def run_ghost_v1(context: GhostContext, ghost_prompt: str, *, log_prefix: str = "") -> GhostForecast | None:
+    """The v1 ghost: the plain ghost's brief plus gap-fill v1's section, branched off the pre-ghost transcript.
+
+    Sends the loop's transcript up to, not including, the plain ghost's prompt, so the driver
+    answers without seeing its own first ghost, on the same tool list with ``tool_choice="none"``
+    so the cached prefix keeps matching. Telemetry only, never published, never raises; logs
+    ``GHOST_FORECAST_V1`` and ``GHOST_FORECAST_V1_JSON`` in the plain ghost's shapes. What the
+    pair measures: docs/agentic_gap_fill.md "The ghost forecast".
+    """
+    messages = [*context.messages, {"role": "user", "content": ghost_prompt}]
+    assistant_message = await _complete_ghost(
+        messages, context.tools_json, context.llm_call, log_prefix, phase="v1 ghost phase"
+    )
+    if assistant_message is None:
+        return None
+    return _log_ghost(assistant_message, log_prefix, _GHOST_V1_MARKER)
 
 
 async def _run_loop_body(
@@ -558,10 +584,11 @@ async def _run_loop_body(
     now: Callable[[], float],
 ) -> LoopResult:
     tools_by_name = {tool.name: tool for tool in tools}
+    offered_tools: list[dict[str, Any]] = []
 
     while not state.stop_loop and state.telemetry.steps < config.max_steps:
-        tools_json = _tool_schemas(tools, _must_conclude(state, config, now))
-        response = await llm_call(state.messages, tools_json)
+        offered_tools = _tool_schemas(tools, _must_conclude(state, config, now))
+        response = await llm_call(state.messages, offered_tools)
         assistant_message = _parse_response_message(response)
         state.messages.append(assistant_message)
         state.telemetry.steps += 1
@@ -581,20 +608,21 @@ async def _run_loop_body(
     state.telemetry.wall_s = now() - state.started_at_s
     findings_markdown = render_findings(state.findings, state.pending_leads)
     ghost: GhostForecast | None = None
+    ghost_context: GhostContext | None = None
     if ghost_prompt is not None and state.explicit_conclude:
-        ghost = await _run_ghost_phase(state=state, ghost_prompt=ghost_prompt, llm_call=llm_call, log_prefix=log_prefix)
+        # Captured before the ghost turn, so a second ghost branches off the same cached prefix without seeing the first.
+        ghost_context = GhostContext(
+            messages=copy.deepcopy(state.messages), tools_json=offered_tools, llm_call=llm_call
+        )
+        ghost = await _run_ghost_phase(
+            state=state, ghost_prompt=ghost_prompt, tools_json=offered_tools, llm_call=llm_call, log_prefix=log_prefix
+        )
 
     _log_completion(state, log_prefix)
-    return _freeze_result(state, findings_markdown, ghost)
+    return _freeze_result(state, findings_markdown, ghost, ghost_context if ghost is not None else None)
 
 
-# Slop allowance when deciding whether a TimeoutError out of the outer wait_for
-# is a genuine wall-deadline hit. On Python 3.11+ asyncio.TimeoutError IS builtin
-# TimeoutError, so a connection-level timeout raised inside the (unguarded)
-# driver call surfaces in the same except as a real wait_for deadline. We tell
-# them apart by elapsed wall time: a genuine deadline hit has elapsed ≈
-# wall_deadline_s, an inner timeout fires earlier. This epsilon absorbs
-# scheduling jitter in that comparison.
+# Jitter allowance for the deadline-versus-inner-timeout test below; see docs/agentic_gap_fill.md.
 _DEADLINE_SLOP_S = 0.5
 
 
@@ -632,11 +660,7 @@ async def run_agentic_loop(
         log_prefix=log_prefix,
     )
     state.telemetry.model = config.model
-    # Seed the provenance sets from the frozen brief: its embedded URLs
-    # (resolution-source snapshot, market snapshot, AskNews digests) are things
-    # the driver saw, so a NON-discrepancy finding may cite them. The system
-    # prompt is a fixed template that embeds no question URLs. A discrepancy
-    # finding may NOT lean on these — see gates._check_url_provenance.
+    # Briefing URLs ground non-discrepancy findings only: docs/agentic_gap_fill.md "The findings gates".
     state.briefing_urls = set(_iter_normalized_urls(user_brief))
 
     try:
@@ -655,29 +679,20 @@ async def run_agentic_loop(
     except asyncio.CancelledError:
         raise
     except TimeoutError as exc:
-        # asyncio.TimeoutError == builtin TimeoutError on 3.11+, so a bare
-        # connection-level timeout from inside the unguarded driver call lands
-        # here too — NOT just a genuine outer wait_for deadline. Classify by
-        # elapsed wall time: a real deadline hit has elapsed ≈ wall_deadline_s; an
-        # inner timeout fires earlier and is a crash, so it stamps error and
-        # bumps the orchestrator counter like any other soft-fail.
+        # Classify by elapsed wall time: an inner connection timeout lands in this except too.
         elapsed = now_fn() - state.started_at_s
         if elapsed >= config.wall_deadline_s - _DEADLINE_SLOP_S:
             state.telemetry.deadline_hit = True
         else:
             logger.exception("%sAgentic loop hit a non-deadline TimeoutError; soft-failing", log_prefix)
-            # Newline-sanitize: the GAP_FILL_V2 marker regex captures error= to
-            # end-of-line, so an embedded newline would truncate the harvest.
+            # Newline-sanitize: the marker regex captures error= to end-of-line.
             state.telemetry.error = repr(exc).replace("\n", " ")
         return _finalize_loop_exit(state, now_fn, log_prefix)
     except Exception as exc:  # HARNESS-SCAN-EXEMPT-broad-except  # sanctioned package boundary: mirror v1 soft-fail contract and never raise past the harness except on cancellation
         logger.exception("%sAgentic loop failed; soft-failing to banked findings if any", log_prefix)
-        # Stamp the crash so the completion marker (error=...) and the
-        # orchestrator's alertable counter can tell this apart from an idle
-        # "found nothing" run — a genuine deadline hit (above) sets deadline_hit
-        # instead and leaves error None. Newline-sanitize for the marker regex.
+        # error= is the only field separating a crash from an idle run; sanitize for the marker regex.
         state.telemetry.error = repr(exc).replace("\n", " ")
         return _finalize_loop_exit(state, now_fn, log_prefix)
 
 
-__all__ = ["LlmCall", "run_agentic_loop"]
+__all__ = ["LlmCall", "run_agentic_loop", "run_ghost_v1"]

@@ -28,6 +28,7 @@ from forecasting_tools.data_models.questions import NumericQuestion
 from pydantic import BaseModel
 
 from metaculus_bot.constants import DISCRETE_SNAP_MAX_INTEGERS, DISCRETE_SNAP_UNIFORM_MIX, NUM_MIN_PROB_STEP
+from metaculus_bot.numeric.config import grid_bin_width, grid_is_outcome_space
 from metaculus_bot.numeric.pchip_cdf import safe_cdf_bounds
 from metaculus_bot.numeric.pchip_processing import create_pchip_numeric_distribution
 
@@ -52,23 +53,29 @@ def majority_votes_discrete(votes: list[bool]) -> bool:
 
 
 def _snappable_integers(lower_bound: float, upper_bound: float) -> np.ndarray | None:
-    """Integers inside the bounds, or None when snapping should be skipped."""
-    integers = np.arange(math.ceil(lower_bound), math.floor(upper_bound) + 1)
-    if len(integers) > DISCRETE_SNAP_MAX_INTEGERS:
+    """Integers inside the bounds, or None when snapping should be skipped.
+
+    The count is checked arithmetically before the array exists: a wide range (post 40165
+    spans 6e10 integers, 480 GB as int64) must be rejected without being materialised.
+    """
+    first_integer = math.ceil(lower_bound)
+    last_integer = math.floor(upper_bound)
+    n_integers = last_integer - first_integer + 1
+    if n_integers > DISCRETE_SNAP_MAX_INTEGERS:
         logger.info(
             "Discrete snap skipped: %d integers > max %d | bounds=[%.1f, %.1f]",
-            len(integers),
+            n_integers,
             DISCRETE_SNAP_MAX_INTEGERS,
             lower_bound,
             upper_bound,
         )
         return None
 
-    if len(integers) == 0:
+    if n_integers <= 0:
         logger.warning("Discrete snap skipped: no integers in bounds [%.4f, %.4f]", lower_bound, upper_bound)
         return None
 
-    return integers
+    return np.arange(first_integer, last_integer + 1)
 
 
 def _integer_pmf(
@@ -115,8 +122,7 @@ def _step_cdf_from_pmf(
     mask = indices > 0
     step_cdf[mask] = tail_lower + cumulative_pmf[indices[mask] - 1]
 
-    # Pin cdf[0] for closed lower bound (step at k=lower_bound makes searchsorted
-    # assign mass to bucket 0, violating cdf[0]=0; pin pushes mass into bucket 1)
+    # A step at k == lower_bound lands mass in bucket 0, which a closed bound must keep at cdf[0] == 0
     if not open_lower_bound:
         step_cdf[0] = tail_lower
 
@@ -168,9 +174,7 @@ def snap_cdf_to_integers(
     uniform_cdf = np.linspace(p_smooth[0], p_smooth[-1], n_points)
     mixed_cdf = (1.0 - alpha) * step_cdf + alpha * uniform_cdf
 
-    # --- Step 4: Max-step redistribution + boundary pinning ---
-    # safe_cdf_bounds handles max-step, boundary constraints, and a final min-step re-enforcement;
-    # the uniform mixture above remains the primary min-step mechanism
+    # --- Step 4: Max-step redistribution + boundary pinning (re-enforces min-step after its own pass) ---
     enforced_cdf = safe_cdf_bounds(
         mixed_cdf,
         open_lower_bound,
@@ -206,8 +210,11 @@ def snap_distribution_to_integers(
 ) -> NumericDistribution | None:
     """Snap a NumericDistribution's CDF to integer boundaries.
 
-    Returns a new distribution with the snapped CDF, or None if snapping
-    should be skipped.
+    Returns a new distribution with the snapped CDF, or None if snapping should be skipped:
+    non-finite bounds, a natively discrete question (its grid IS its outcome space, so an
+    integer vote is wrong there; ``grid_is_outcome_space`` reads the type, not ``cdf_size``),
+    or a grid other than the 201-point one the snap's step limits belong to. Why no
+    grid-alignment guard is needed: ``docs/numeric_pipeline.md`` "Step 7".
     """
     if not (np.isfinite(question.lower_bound) and np.isfinite(question.upper_bound)):
         logger.warning(
@@ -215,8 +222,13 @@ def snap_distribution_to_integers(
         )
         return None
 
-    if question.cdf_size is not None and question.cdf_size != 201:
-        logger.info("Discrete snap skipped: question already labeled discrete (cdf_size=%d)", question.cdf_size)
+    if grid_is_outcome_space(question):
+        logger.info(
+            "Discrete snap skipped: the question's grid is already its outcome space | type=%s | cdf_size=%d | grid_step=%.6g",
+            type(question).__name__,
+            question.cdf_size,
+            grid_bin_width(question.lower_bound, question.upper_bound, question.cdf_size),
+        )
         return None
 
     if not hasattr(distribution, "_pchip_cdf_values"):

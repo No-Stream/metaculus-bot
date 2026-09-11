@@ -50,10 +50,9 @@ UNVERIFIED_ATTRIBUTION_MARKER = "unverified attribution"
 # Tier words naming a CLASS of source rather than an outlet, so there is nothing in the
 # grounding record to check them against. ``official`` (243), ``aggregator`` (54),
 # ``social`` (5), ``wire service`` (3), ``wire`` and ``wire services`` are the ones the
-# archived corpus actually contains — 307 of its 790 tier items; the rest are carried
-# over verbatim from the audit's own skip list (``gemini_search_audit/attribution_gap.py``)
-# so the shipped rule stays comparable to that 70-87% measurement, and so a future
-# ``[A: primary]`` is not read as an outlet named "primary".
+# archived corpus actually contains — 307 of its 790 tier items. The initial set came
+# from the audit's skip list; academic/peer-reviewed were added after the 2026-09-11
+# smoke. A class such as ``primary`` must not be read as a publisher name.
 _GENERIC_TIER_WORDS = frozenset(
     {
         "official",
@@ -70,6 +69,8 @@ _GENERIC_TIER_WORDS = frozenset(
         "news",
         "media",
         "expert",
+        "academic",
+        "peer-reviewed",
         "analyst",
         "unknown",
         "n/a",

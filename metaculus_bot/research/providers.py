@@ -80,23 +80,11 @@ _ASKNEWS_LAST_CALL_TS: float = 0.0
 def _get_asknews_rate_lock() -> asyncio.Lock:
     """Get-or-create the process-wide lock guarding the AskNews RPS gate.
 
-    Lazy purely for CONSISTENCY with ``get_asknews_semaphore`` below, which owns the
-    identical lifecycle two lines away. Both are process-wide asyncio primitives for
-    the same provider; having one built at import and the other lazily was a
-    difference with no reason behind it, and the import-time one is the shape that
-    can bind to a loop that later dies.
-
-    Honest scope: I could not construct a failing case against THIS gate.
-    ``asyncio.Lock`` binds to the running loop when it first creates a future, and a
-    lock left HELD at loop close does wedge later loops with "is bound to a different
-    event loop" — reproduced in isolation, where a cancelled holder left a waiter
-    queued. But driving the real ``_asknews_rate_gate`` the same way, a second
-    ``asyncio.run`` succeeds: the cancellation releases the lock before the loop
-    closes, so it rebinds cleanly. So this is a latent-shape cleanup, not a fix for an
-    observed failure, and it is deliberately not paired with a staleness check —
-    detecting a stale binding needs a private ``_get_loop`` probe that reads clean in
-    exactly the case that later fails, so the check would be reassuring rather than
-    effective.
+    Lazy purely for consistency with ``get_asknews_semaphore`` below, which owns the
+    identical lifecycle for the same provider; an import-time primitive is also the
+    shape that can bind to a loop that later dies. A latent-shape cleanup rather than
+    a fix for an observed failure, and deliberately unpaired with a staleness check:
+    see docs/research.md "AskNews dual-phase search".
     """
     global _ASKNEWS_RATE_LOCK  # noqa: PLW0603  # sole lazy-init of the process-wide AskNews lock; see docstring
     if _ASKNEWS_RATE_LOCK is None:
@@ -155,23 +143,22 @@ def is_asknews_subscription_error(exc: BaseException) -> bool:
 
 
 # Per-phase AskNews search parameters: (log label, SDK strategy, n_articles).
-# HOT is the latest-news sweep, HISTORICAL the deeper knowledge pull.
 _ASKNEWS_PHASES: dict[str, tuple[str, str, int]] = {
     "hot": ("HOT", "latest news", 6),
     "historical": ("HIST", "news knowledge", 10),
 }
 
-# Extra spacing before each phase, on top of the RPS gate: the vendor still
-# returns 429s at our nominal rate, so each phase eats a fixed wait first.
+# A fixed wait before each phase on top of the RPS gate, because the vendor 429s anyway.
 _ASKNEWS_PHASE_WAIT_SEC = 10.1
 
 
-# Retry predicate: only retry on known transient rate/concurrency errors.
-# Text-matched on purpose, unlike the LLM paths that read ``llm_status_code``:
-# the AskNews SDK raises its own ``asknews_sdk.errors`` classes carrying a
-# ``.code`` (429000 / 429001 / 403011) and never subclasses ``openai.APIError``,
-# so a status-based primitive reads None here and would disable this retry.
 def _is_asknews_retryable(err: Exception) -> bool:
+    """True iff err is one of AskNews's known-transient rate or concurrency errors.
+
+    Matched on the message rather than on a status code, unlike the LLM paths that read
+    ``llm_status_code``, because the AskNews SDK raises its own error classes and never
+    subclasses ``openai.APIError``: see docs/research.md "AskNews dual-phase search".
+    """
     msg = str(err).lower()
     return ("429" in msg) or ("rate limit" in msg) or ("concurrency limit" in msg)
 
@@ -216,7 +203,7 @@ async def _asknews_phase(
             articles = response.as_dicts
             record_raw_research(qid=qid, provider="asknews", phase=phase, payload=articles)
             return articles, attempt_used
-        except Exception as e:
+        except Exception as e:  # HARNESS-SCAN-EXEMPT-broad-except  # retry-then-reraise: non-retryable and exhausted ladder both re-raise below
             last_exc = e
             if not _is_asknews_retryable(e):
                 raise
@@ -233,11 +220,12 @@ def _asknews_provider() -> ResearchCallable:
     get_asknews_semaphore()
 
     async def _fetch(question: MetaculusQuestion) -> str:
-        # Hard wall-clock timeout around the full provider. AskNews's internal
-        # retry loop fails fast on non-retryable errors, but a genuine network
-        # hang (connect stall, DNS hang, server not closing the stream) is
-        # otherwise unbounded. This backstops that case so a stuck AskNews
-        # call can't hold the whole research phase hostage.
+        """Fetch AskNews research for one question under a hard wall-clock cap.
+
+        The inner retry ladder fails fast on non-retryable errors but leaves a genuine
+        network hang (connect stall, DNS hang, an unclosed stream) unbounded, so the cap
+        is what stops a stuck AskNews call holding the whole research phase hostage.
+        """
         return await asyncio.wait_for(
             _fetch_impl(question.question_text, qid=getattr(question, "id_of_question", None)),
             timeout=ASKNEWS_WALL_TIMEOUT,
@@ -249,7 +237,6 @@ def _asknews_provider() -> ResearchCallable:
         backoff = float(ASKNEWS_BACKOFF_SECS)
 
         async with _ASKNEWS_GLOBAL_SEMAPHORE:
-            # Use custom AskNews integration with proper rate limiting between API calls
             from asknews_sdk import (  # noqa: PLC0415  # late import: tests patch asknews_sdk.AsyncAskNewsSDK at source
                 AsyncAskNewsSDK,
             )
@@ -259,14 +246,15 @@ def _asknews_provider() -> ResearchCallable:
             if not client_id or not secret:
                 raise ValueError("ASKNEWS_CLIENT_ID and ASKNEWS_SECRET environment variables must be set")
 
-            logger.info(f"AskNews: Using custom integration, client_id={client_id[:8]}...")
+            logger.info(
+                f"AskNews: Using custom integration, client_id={client_id[:8]}..."  # HARNESS-SCAN-EXEMPT-subsampling: a log-line preview, not a data reduction
+            )
 
             async with AsyncAskNewsSDK(
                 client_id=client_id,
                 client_secret=secret,
                 scopes={"news"},
             ) as sdk:
-                # Hack: despite including rate limits in our asknews logic, we still get rate limits; manually massage addl waits to handle
                 logger.info(f"AskNews: Waiting {_ASKNEWS_PHASE_WAIT_SEC}s before hot news call...")
                 await asyncio.sleep(_ASKNEWS_PHASE_WAIT_SEC)
                 hot_articles, hot_attempt_used = await _asknews_phase(
@@ -274,7 +262,6 @@ def _asknews_provider() -> ResearchCallable:
                 )
                 assert hot_articles is not None
 
-                # Phase 2: HISTORICAL (news knowledge), reuse HOT results; do not re-call HOT on retries
                 logger.info(f"AskNews: Waiting {_ASKNEWS_PHASE_WAIT_SEC}s before historical news call...")
                 await asyncio.sleep(_ASKNEWS_PHASE_WAIT_SEC)
                 historical_articles, _ = await _asknews_phase(
@@ -328,18 +315,10 @@ def _format_asknews_dual_sections(
     """Format AskNews articles into two labeled sections: Historical Context and Recent Developments.
 
     Deduplicates within each list and cross-deduplicates (hot articles that duplicate historical
-    URLs are removed). Historical section comes first in the output.
-
-    Both phases empty returns ``""``, NOT a prose "no articles" sentence. The sentence
-    defeated every downstream empty guard: the orchestrator's ``has_output`` read chars>0
-    and reported ``ok``, the summarizer LLM (whose prompt has no no-data escape) was asked
-    to write a briefing from it, and the result rendered under the AskNews header as if it
-    were research. Gemini's grounded-chunk floor next door is the pattern — refuse.
-
-    Pure: the ASKNEWS_NO_ARTICLES WARN and the ``lost=articles:...`` registry token
-    belong to ``_asknews_provider``, which owns the qid — a formatter writing the
-    module-global provider-detail registry raced ``_degraded_to_raw_articles``' write
-    for the same key only by accident of ordering.
+    URLs are removed), historical section first. Both phases empty returns ``""``, never a prose
+    "no articles" sentence, and this stays pure: the WARN and the ``lost=articles:...`` token
+    belong to the caller that owns the qid. Both rules and their receipts:
+    docs/research.md "AskNews dual-phase search".
     """
     hist_deduped = _dedup_articles_by_url(historical_articles) if historical_articles else []
     hot_deduped = _dedup_articles_by_url(hot_articles) if hot_articles else []
@@ -387,10 +366,8 @@ async def _invoke_exa_research(
     if use_brackets_around_citations is not None:
         citation_kwargs["use_brackets_around_citations"] = use_brackets_around_citations
     searcher = SmartSearcher(
-        # temperature ignored when model is a preconfigured GeneralLlm; None
-        # keeps litellm from applying a sampling param on the fallback str path.
         model=default_llm,
-        temperature=None,
+        temperature=None,  # ignored on a preconfigured GeneralLlm; keeps litellm off the fallback str path
         num_searches_to_run=2,
         num_sites_per_search=10,
         **citation_kwargs,
@@ -428,10 +405,8 @@ async def _invoke_perplexity_research(
     metadata = llm_call_metadata("perplexity_research", plain_llm_key_alias(model_name))
     model_kwargs: dict[str, Any] = {
         "model": model_name,
-        # Pin provider-default sampling and leave the elapsed-gated wrapper below
-        # as the sole retry owner.
-        "temperature": None,
-        "allowed_tries": 1,
+        "temperature": None,  # provider-default sampling, pinned against a future GeneralLlm default flip
+        "allowed_tries": 1,  # the elapsed-gated wrapper below is the sole retry owner
         "metadata": metadata,
     }
     if api_key is not _OMITTED_API_KEY:
@@ -446,12 +421,12 @@ async def _invoke_perplexity_research(
 
 def _perplexity_provider(use_open_router: bool = False, is_benchmarking: bool = False) -> ResearchCallable:
     async def _fetch(question: MetaculusQuestion) -> str:
-        # Exclude prediction markets research when benchmarking to avoid data leakage.
-        # The same narrowed policy `web_research_prompt` carries, interpolated rather than
-        # restated: this provider is the PRIMARY whenever AskNews credentials are absent, so a
-        # second copy of the market-odds ask is a live policy that drifts (it carried the retired
-        # blanket "consider all relevant prediction markets" version after the first-pass prompt
-        # was narrowed to the venues the live snapshot does not cover).
+        """Run Perplexity research, dropping the market-odds ask when benchmarking (leakage).
+
+        The market-odds ask is interpolated from ``OUTSIDE_VENUE_MARKET_ODDS_POLICY`` rather than
+        restated, because a second copy drifted once: docs/research.md "Primary provider: a
+        priority ladder".
+        """
         prediction_markets_instruction = (
             "" if is_benchmarking else f"In addition to news, cover: {OUTSIDE_VENUE_MARKET_ODDS_POLICY}\n"
         )
@@ -473,24 +448,23 @@ def build_native_search_llm(
     *,
     reasoning_effort: str | None = None,
     verbosity: str | None = None,
+    search_context_size: str | None = None,
     role: str = "native_search",
 ) -> GeneralLlm:
     """Build a GeneralLlm configured for OpenAI native web search via OpenRouter.
 
-    Shared by the native search research provider, the targeted research module,
-    and the gap-fill resolver. ``role`` is the CREDIT_ROLE_SPEND line the completions
-    book under: the provider keeps the default, the other two callers pass their own
-    (``targeted_search`` / ``gap_fill_resolver``) so the three search spend lines stay
+    Shared by the native search research provider, the targeted research module, the gap-fill
+    resolver and the resolver probe (``scripts/probes/gap_fill_resolver_probe.py``). ``role`` is
+    the CREDIT_ROLE_SPEND line the completions book under, so the search spend lines stay
     separable in the run log.
 
-    Reasoning effort and verbosity come from the global NATIVE_SEARCH_REASONING_EFFORT
-    / NATIVE_SEARCH_VERBOSITY env at call time (so workflow overrides take effect
-    without re-importing), UNLESS the caller passes an explicit ``reasoning_effort``
-    / ``verbosity`` override — an explicit value always wins over the env read.
-    This lets callers like the gap-fill resolver pin their own model/effort
-    without perturbing the main native_search provider, which stays on the
-    env-driven LOW. An empty string (from either the override or the env)
-    disables passing the corresponding kwarg.
+    Reasoning effort and verbosity come from the NATIVE_SEARCH_REASONING_EFFORT /
+    NATIVE_SEARCH_VERBOSITY env at call time (so workflow overrides take effect without
+    re-importing) unless the caller passes an explicit override, which always wins; an empty
+    string from either source drops the kwarg. ``search_context_size`` overrides the
+    NATIVE_SEARCH_CONTEXT_SIZE constant the same way; there is no env read because production
+    runs one size. Key routing and the ``allowed_tries=1`` rationale: docs/research.md
+    "OpenAI native search".
     """
     base_model = model_slug or os.getenv(NATIVE_SEARCH_MODEL_ENV, NATIVE_SEARCH_DEFAULT_MODEL)
     model_with_search = f"openrouter/{base_model}"
@@ -498,23 +472,12 @@ def build_native_search_llm(
     kwargs: dict = {
         "model": model_with_search,
         "role": role,
-        # temperature=None: 0.2.92's GeneralLlm ctor already defaults temperature to
-        # None (it was a hard 0 pre-0.2.92), so this is now redundant-but-explicit —
-        # kept to pin provider-default sampling against a future default flip. reasoning
-        # models defer to provider defaults. top_p left unset.
-        "temperature": None,
+        "temperature": None,  # provider-default sampling, pinned against a future GeneralLlm default flip
         "max_tokens": NATIVE_SEARCH_MAX_TOKENS,
         "timeout": NATIVE_SEARCH_TIMEOUT,
-        # allowed_tries=1: a malformed-whitespace response from OpenRouter (the
-        # 2026-05-20 incident) won't be cured by retrying the same call, and
-        # the wall-clock guard at the caller (asyncio.wait_for in _fetch) is
-        # bounding the budget. With allowed_tries=1 the worst case is one
-        # NATIVE_SEARCH_WALL_TIMEOUT window instead of forecasting-tools'
-        # default ``allowed_tries`` multiplied by NATIVE_SEARCH_TIMEOUT (which
-        # resets per HTTP request).
-        "allowed_tries": 1,
+        "allowed_tries": 1,  # the caller's wall is the budget; a same-call retry only multiplies a drip (2026-05-20)
         "plugins": [{"id": "web", "max_results": NATIVE_SEARCH_MAX_RESULTS, "engine": "native"}],
-        "web_search_options": {"search_context_size": NATIVE_SEARCH_CONTEXT_SIZE},
+        "web_search_options": {"search_context_size": search_context_size or NATIVE_SEARCH_CONTEXT_SIZE},
     }
 
     effort = (
@@ -525,23 +488,12 @@ def build_native_search_llm(
     if effort:
         kwargs["reasoning"] = {"effort": effort}
 
-    # `verbosity` is a top-level OpenRouter / litellm parameter (see litellm
-    # `acompletion(... verbosity=...)` and OpenAI gpt-5 transformation). Earlier
-    # we tucked it inside `extra_body`; that worked because OpenRouter merges
-    # the body, but the canonical form matches the docs and survives any future
-    # extra_body validation. GeneralLlm passes unknown kwargs through to
-    # litellm by default (`pass_through_unknown_kwargs=True`).
+    # Top-level, not inside extra_body: the canonical litellm / OpenRouter form for gpt-5 verbosity.
     verbosity_value = (
         verbosity if verbosity is not None else os.getenv(NATIVE_SEARCH_VERBOSITY_ENV, NATIVE_SEARCH_VERBOSITY_DEFAULT)
     )
     if verbosity_value:
         kwargs["verbosity"] = verbosity_value
-
-    # Route through the donated-key wrapper. For openrouter/openai/* slugs this
-    # prefers the Metaculus-donated OAI_ANTH_OPENROUTER_KEY (OpenAI now enabled
-    # on it as of 2026-05-29) with automatic fallback to the personal
-    # OPENROUTER_API_KEY on credential/credit/guardrail errors. Non-donated
-    # providers (x-ai, etc.) get a plain GeneralLlm — same as before.
 
     return build_llm_with_openrouter_fallback(**kwargs)
 
@@ -560,18 +512,13 @@ def _native_search_provider(
         llm = build_native_search_llm(model_slug)
         prompt = web_research_prompt(
             question.question_text,
-            # The MC ballot (None on other types): a searching model can only query candidate
-            # names it has been shown (q44952 — zero retrieval on the eventual winner).
+            # The MC ballot (None on other types): a model can only search names it was shown (q44952).
             options=getattr(question, "options", None),
             is_benchmarking=is_benchmarking,
             citation_style="markdown",
         )
         logger.info(f"NativeSearch: Calling {llm.model} for research")
-        # Wall-clock backstop (now owned by invoke_with_transient_retry): see
-        # NATIVE_SEARCH_WALL_TIMEOUT in constants.py for the 2026-05-20 incident
-        # that motivated the hard cap. The transient-retry wrapper additionally
-        # recovers from instant aiohttp blips (litellm #14895) on this
-        # allowed_tries=1 LLM without ever retrying a slow stall (elapsed gate).
+        # The wrapper owns the wall cap and recovers instant aiohttp blips without retrying a stall.
         result = await invoke_with_transient_retry(
             lambda: llm.invoke(prompt), wall_timeout=NATIVE_SEARCH_WALL_TIMEOUT, label="native_search"
         )
@@ -581,8 +528,7 @@ def _native_search_provider(
             provider="native_search",
             payload=result,
         )
-        # Strip utm_source=openai from the forecaster-facing text; the raw log
-        # above keeps the untouched payload for archival fidelity.
+        # Only the forecaster-facing text is stripped; the raw log above keeps the untouched payload.
         return _strip_utm_source(result)
 
     return _fetch
@@ -712,10 +658,7 @@ def choose_provider_with_name(
 # ---------------------------------------------------------------------------
 
 
-# OpenAI native search tags every citation URL with `?utm_source=openai`; it is
-# pure tracking noise fanned into every forecaster prompt + the published comment.
-# Match the param wherever it sits in the query string, capturing the leading
-# separator and an optional trailing `&` so removal keeps the query well-formed.
+# Captures the leading separator and an optional trailing `&` so removal keeps the query well-formed.
 _UTM_SOURCE_OPENAI_RE = re.compile(r"([?&])utm_source=openai\b(&)?")
 
 
@@ -729,8 +672,7 @@ def _strip_utm_source(text: str) -> str:
     """
 
     def _repl(match: re.Match[str]) -> str:
-        # Keep the leading separator only when another param follows, so the
-        # query string stays well-formed (`?a&utm&b` -> `?a&b`, not `?ab`).
+        """Keep the leading separator only when another param follows (``?a&utm&b`` -> ``?a&b``)."""
         return match.group(1) if match.group(2) else ""
 
     return _UTM_SOURCE_OPENAI_RE.sub(_repl, text)
@@ -742,7 +684,7 @@ def _normalize_url_for_dedup(url: str) -> str:
     - Lowercase scheme and netloc
     - Drop fragment
     - Remove common tracking params (utm_*, gclid, fbclid, igshid, ref, mc_cid, mc_eid)
-    - Sort remaining query params
+    - Sort remaining query params, and strip a trailing slash inside a param value (b=2/ -> b=2)
     - Strip single trailing slash on path
     - Normalize mobile and AMP variants (m. subdomain, trailing /amp)
     """
@@ -752,31 +694,25 @@ def _normalize_url_for_dedup(url: str) -> str:
     scheme = (parts.scheme or "").lower()
     netloc = (parts.netloc or "").lower()
 
-    # Normalize mobile subdomain 'm.' to base domain when present
     if netloc.startswith("m."):
         netloc = netloc[2:]
 
-    # Normalize path: drop trailing '/amp' and single trailing slash
     path = parts.path or ""
     if path.endswith("/amp"):
         path = path[:-4]
     if path != "/" and path.endswith("/"):
         path = path[:-1]
 
-    # Normalize query: remove tracking keys; sort remaining
     drop_keys = {"gclid", "fbclid", "igshid", "ref", "mc_cid", "mc_eid"}
-    q = []
+    kept_params = []
     for k, raw_value in parse_qsl(parts.query, keep_blank_values=True):
         if k.startswith("utm_") or k in drop_keys:
             continue
-        # Normalize trivial trailing slashes in parameter values (e.g., b=2/ -> b=2)
         value = raw_value.rstrip("/") if isinstance(raw_value, str) and raw_value.endswith("/") else raw_value
-        q.append((k, value))
-    # Sort for canonical order
-    q.sort()
-    query = urlencode(q, doseq=True)
+        kept_params.append((k, value))
+    kept_params.sort()
+    query = urlencode(kept_params, doseq=True)
 
-    # Drop fragment
     fragment = ""
 
     return urlunsplit((scheme, netloc, path, query, fragment))

@@ -138,9 +138,8 @@ jobs:
           # Manual workflow_dispatch runs use this for end-to-end testing in prod
           # mode (is_benchmarking=False).
           PREDICTION_MARKETS_ENABLED: 'true'
-          # Tier-1 resolution-source fetcher: deterministically fetches URLs cited
-          # in the resolution criteria (plain HTTP + trafilatura), no LLM calls.
-          # test_bot only for now; prod workflows after eyeballing live output.
+          # Fetch URLs cited in the resolution criteria; long HTML uses the paid
+          # page-digest extractor, as in the production workflows.
           RESOLUTION_SOURCE_ENABLED: 'true'
           # The ladder's one PAID rung: when every free rung has failed to read a
           # cited page, Gemini's url_context reader is asked to read it, billed to

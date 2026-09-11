@@ -158,24 +158,26 @@ def detect_unit_mismatch(
     return False, ""
 
 
-def check_discrete_question_properties(question: NumericQuestion, cdf_points: int) -> tuple[bool, bool]:
-    """Check if a question is discrete and determine zero_point handling."""
-    cdf_size = getattr(question, "cdf_size", None)
-    is_discrete = cdf_size is not None and cdf_size != cdf_points
-    zero_point = getattr(question, "zero_point", None)
+def resolve_zero_point(question: NumericQuestion) -> float | None:
+    """The ``zero_point`` every CDF for this question is built with, per-model and ensemble alike.
 
-    force_zero_point_none = False
+    The question's own ``zero_point`` selects the geometric value axis the platform declares for
+    a log-scaled question, on ANY grid size: the server maps the submitted probabilities
+    positionally onto its bin edges, so a log-scaled question on a non-201 grid (the norm on
+    Mantic's fine grids, unreachable on Metaculus, whose log-scaled questions are always 201
+    points) needs the geometric axis exactly as a 201-point one does. Until 2026-09 a non-201
+    grid forced a linear axis here, publishing probabilities computed at linear positions
+    against geometric bins.
 
-    if is_discrete and zero_point is not None:
-        logger.debug(
-            f"Question {getattr(question, 'id_of_question', 'N/A')}: Forcing zero_point=None for discrete question"
-        )
-        force_zero_point_none = True
-    elif zero_point is not None and zero_point == question.lower_bound:
+    The one shape with no geometric axis is ``zero_point == lower_bound``: the axis ratio
+    ``(upper - zero_point) / (lower - zero_point)`` is a division by zero, so the CDF falls
+    back to a linear axis and says so.
+    """
+    zero_point = question.zero_point
+    if zero_point is not None and zero_point == question.lower_bound:
         logger.warning(
-            f"Question {getattr(question, 'id_of_question', 'N/A')}: zero_point ({zero_point}) is equal to lower_bound "
+            f"Question {question.id_of_question}: zero_point ({zero_point}) is equal to lower_bound "
             f"({question.lower_bound}). Forcing linear scale for CDF generation."
         )
-        force_zero_point_none = True
-
-    return is_discrete, force_zero_point_none
+        return None
+    return zero_point

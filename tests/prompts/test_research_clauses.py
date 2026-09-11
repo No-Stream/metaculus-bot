@@ -27,6 +27,7 @@ from metaculus_bot.prompts import (
     stacking_numeric_prompt,
     web_research_prompt,
 )
+from metaculus_bot.research.agentic.driver_prompt import build_system_prompt
 from metaculus_bot.research.section_format import PROVIDER_SECTION_HEADERS
 from tests.prompt_builders import (
     _RESEARCH_WITH_MARKETS,
@@ -36,6 +37,15 @@ from tests.prompt_builders import (
     _numeric_q,
     _summarizer_prompt,
 )
+
+
+class TestDriverSystemPromptSourceAttribution:
+    def test_cross_source_evidence_keeps_separate_quotes_and_links(self) -> None:
+        collapsed = " ".join(build_system_prompt("2026-09-11").split())
+        assert "verbatim quote from that source" in collapsed
+        assert "record a separate finding for each source so every excerpt keeps its own link" in collapsed
+        assert "State each source's evidence in its own claim and quote" in collapsed
+        assert "Put your comparison in claim" not in collapsed
 
 
 class TestGapFillAnalyzerPrompt:
@@ -54,8 +64,7 @@ class TestGapFillAnalyzerPrompt:
         lowered = result.lower()
         # The benchmarking marker must be present so downstream reviewers can grep for it.
         assert "benchmarking run" in lowered
-        # The carve-out must explicitly instruct the model to avoid prediction-market data.
-        # We verify both the "DO NOT" directive AND that it's attached to "prediction market".
+        # Both halves matter: the DO NOT directive and its attachment to "prediction market".
         assert "do not flag prediction-market" in lowered or "do not request searches for prediction markets" in lowered
         # Data-leakage framing must be present so the model understands *why*.
         assert "data leakage" in lowered
@@ -106,7 +115,31 @@ class TestGapFillAnalyzerPrompt:
 
 
 class TestGapFillSearchPrompt:
-    """Covers the benchmarking carve-out in the per-gap search prompt."""
+    """The benchmarking carve-out in the per-gap search prompt, and the criteria slot the resolver reads."""
+
+    # q44267 as the API served it: the title names the zone, the criteria pin the zone-entry SUBSET.
+    _Q44267_TITLE = (
+        "What will be the highest daily number of PLA aircraft tracked by Taiwan's Ministry of National "
+        "Defense in Taiwan's air-defense identification zone (ADIZ) in July-August 2026?"
+    )
+    _Q44267_CRITERIA = (
+        "This question resolves as the highest number of PLA aircraft accused by Taiwan's Ministry of "
+        "National Defense (MND) of having been detected in Taiwan's de facto ADIZ for any date after "
+        "June 30, 2026 and before September 1, 2026, as reported by the MND at its "
+        "[Regional Dynamic List ](https://www.mnd.gov.tw/news/plaactlist)portal.&#x20;"
+    )
+    _Q44267_FINE_PRINT = (
+        "This question's information (resolution criteria, fine print, background info, etc) is synced "
+        "with an [original identical question](https://www.metaculus.com/questions/44245) which opened on "
+        "2026-06-26 20:00:00. This question will resolve based on the resolution criteria and fine print "
+        "of the linked original question. However, if this question would resolve differently than the "
+        "original question, then this question will be annulled. Additionally, if the original question's "
+        "resolution could have been known before this question opened, then this question will be annulled."
+    )
+    _Q44267_GAP = (
+        "Clarify whether the question resolves on total PLA aircraft detected around Taiwan in each MND "
+        "daily report or only the subset that crossed the median line or entered ADIZ sectors"
+    )
 
     def test_benchmarking_true_includes_warning_and_bans_prediction_markets(self) -> None:
         """The per-gap search prompt also needs the benchmarking carve-out."""
@@ -114,6 +147,8 @@ class TestGapFillSearchPrompt:
             gap="What was the 2025 GDP?",
             search_query="US 2025 GDP BEA",
             question_text="Will GDP exceed 30T?",
+            resolution_criteria="rc",
+            fine_print="fp",
             is_benchmarking=True,
         )
 
@@ -130,6 +165,8 @@ class TestGapFillSearchPrompt:
             gap="What was the 2025 GDP?",
             search_query="US 2025 GDP BEA",
             question_text="Will GDP exceed 30T?",
+            resolution_criteria="rc",
+            fine_print="fp",
             is_benchmarking=False,
         )
 
@@ -145,12 +182,77 @@ class TestGapFillSearchPrompt:
             gap="Was the treaty signed?",
             search_query="treaty signing Sept 2026",
             question_text="Will the treaty be in force by 2027?",
+            resolution_criteria="rc",
+            fine_print="fp",
             is_benchmarking=False,
         )
 
         assert "Was the treaty signed?" in result
         assert "treaty signing Sept 2026" in result
         assert "Will the treaty be in force by 2027?" in result
+
+    def test_renders_the_resolution_criteria_and_fine_print_after_the_title(self) -> None:
+        """The resolver reads what the question resolves on, labelled so the criteria outrank the
+        title and any sister question it finds, and placed before the search instruction."""
+        result = gap_fill_search_prompt(
+            gap="Which of the two published figures resolves the question?",
+            search_query="official count definition",
+            question_text="Will the count exceed 40?",
+            resolution_criteria="Resolves YES if the official count exceeds 40.",
+            fine_print="Counts from the June revision are used.",
+        )
+
+        assert (
+            "Resolution criteria (what the question actually resolves on):\n"
+            "Resolves YES if the official count exceeds 40." in result
+        )
+        assert "Fine print:\nCounts from the June revision are used." in result
+        assert (
+            result.index("Will the count exceed 40?")
+            < result.index("Resolution criteria (what the question actually resolves on):")
+            < result.index("Fine print:")
+            < result.index("Search the web for CURRENT, AUTHORITATIVE evidence")
+        )
+
+    @pytest.mark.parametrize("fine_print", ["", "   ", None])
+    def test_omits_the_fine_print_line_when_there_is_none(self, fine_print: str | None) -> None:
+        result = gap_fill_search_prompt(
+            gap="g",
+            search_query="q",
+            question_text="Will X happen?",
+            resolution_criteria="Resolves YES if X.",
+            fine_print=fine_print,
+        )
+
+        assert "Fine print" not in result
+        assert "Resolution criteria (what the question actually resolves on):\nResolves YES if X." in result
+
+    def test_missing_criteria_render_the_analyzer_placeholder(self) -> None:
+        """Same ``(none provided)`` label as ``gap_fill_analyzer_prompt``, so a question with no criteria
+        reads the same in both gap-fill prompts."""
+        result = gap_fill_search_prompt(
+            gap="g", search_query="q", question_text="Will X happen?", resolution_criteria=None, fine_print=None
+        )
+
+        assert "Resolution criteria (what the question actually resolves on):\n(none provided)" in result
+
+    def test_q44267_criteria_put_the_adiz_subset_in_front_of_the_resolver(self) -> None:
+        """Regression pin on the 2026-09-09 round's worst miss (q44267, -95.66 spot peer): the resolver was
+        asked which of two figures in a Ministry of National Defense daily report resolved the question,
+        saw only the title, and ruled for the headline sortie count from a sister question's wording.
+        The criteria name the zone-entry subset; they now sit in the prompt."""
+        result = gap_fill_search_prompt(
+            gap=self._Q44267_GAP,
+            search_query="Taiwan MND PLA aircraft daily report ADIZ median line subset definition",
+            question_text=self._Q44267_TITLE,
+            resolution_criteria=self._Q44267_CRITERIA,
+            fine_print=self._Q44267_FINE_PRINT,
+        )
+
+        assert "detected in Taiwan's de facto ADIZ" in result
+        assert "Regional Dynamic List" in result
+        assert "Fine print:\nThis question's information" in result
+        assert result.index(self._Q44267_GAP) < result.index("detected in Taiwan's de facto ADIZ")
 
 
 class TestTsAnchorClause:
@@ -176,8 +278,7 @@ class TestTsAnchorClause:
     def test_clause_present_when_section_in_research(self) -> None:
         research = f"Some news.\n\n{TS_ANCHOR_SECTION_HEADER}\n**DGS10** — latest 4.20\n- band ..."
         result = numeric_prompt(_numeric_q(), research=research, lower_bound_message="lbm", upper_bound_message="ubm")
-        # Neutral description present: it points at the section and says what the band IS,
-        # including the independent-window caveat, without telling the model how to weigh it.
+        # Neutral: it points at the section and says what the band is, not how to weigh it.
         assert self._MARKER in result
         lowered = result.lower()
         assert "empirical distribution of the series' own past changes" in lowered
@@ -253,9 +354,7 @@ class TestWebResearchPromptPrimarySources:
     winning spring-AIB-2026 comments. Matches the primary-source hints
     already present in targeted_search_prompt and gap_fill_search_prompt."""
 
-    # Domain examples we expect to see called out somewhere in the block.
-    # We assert ≥3 of these 4 show up so the list can evolve without
-    # breaking the test on single-domain renames.
+    # At least 3 of the 4, so the prompt's domain list can evolve without a rename breaking this.
     _EXAMPLE_DOMAINS = (".gov", "sec.gov", "docs.", "who.int")
 
     def _assert_primary_sources_block_present(self, prompt: str) -> None:
@@ -382,35 +481,19 @@ class TestWebResearchPromptPrimarySources:
 
 
 class TestPredictionMarketFraming:
-    """The forecaster prompts must frame prediction markets as STRONG EVIDENCE
-    to weight heavily — not the old "not beholden" footnote — with a precise
-    conditional adjustment: anchor when the market's resolution criteria AND
-    date match the question, discount proportionally to any specific mismatch,
-    and extrapolate across a date-only mismatch.
+    """The market clause: its strong-evidence framing, its conditional adjustment, and its gate.
 
-    The PM clause must NOT carry a "you may deviate from a market" carve-out:
-    that sentence undercut the strong-evidence framing. The general principle
-    that a forecaster may supplement the research with its own training
-    knowledge is a SEPARATE, prompt-wide directive — not a market-specific one.
-
-    Gate: the whole clause renders ONLY when the research carries the rendered
-    ``## Prediction Market Snapshot`` section (``MARKET_SNAPSHOT_SECTION_HEADER``), the
-    same way the numeric prompt gates its TS-anchor clause. Prod-neutral: the header is
-    emitted whenever the provider rendered anything, including the deliberate-empty "no
-    relevant market" sentence, and it is absent only when the provider returned ``""``
-    (benchmarking, flag off, soft-fail) — exactly the prompts where the market policy
-    had nothing to bear on. That also makes the leakage story simpler than it was: a
-    benchmarking prompt no longer carries three paragraphs about markets it cannot see.
-    The mode-dependent leakage guard on the RESEARCH side still lives on
-    ``web_research_prompt`` (see ``test_market_ask_present_non_benchmarking_absent_benchmarking``).
-
-    Notation vs policy: the rendered table's own legend (``MARKET_SIGNAL_LEGEND``) defines the
-    relation tiers, the evidential order, RESOLVED, the ``↳`` rows and ``[remaining N]``; the
-    prompt keeps only the three READING rules the legend does not carry.
+    Anchor when the market's criteria AND resolution date match, discount proportionally to a named
+    mismatch, extrapolate across a date-only one, and never carry a "you may deviate from a market"
+    carve-out. The clause renders only when the research carries ``MARKET_SNAPSHOT_SECTION_HEADER``.
+    The notation-versus-policy split and every receipt are in docs/prompts.md "Test pins".
     """
 
     def _assert_strong_evidence_framing(self, prompt: str) -> None:
-        # Collapse whitespace so assertions don't depend on where clean_indents wraps lines.
+        """Assert the framing, the three reading rules, and the phrases that must be gone.
+
+        Whitespace is collapsed first so no check depends on where ``clean_indents`` wraps a line.
+        """
         lowered = " ".join(prompt.lower().split())
         assert "strong evidence" in lowered
         assert "weight them heavily" in lowered
@@ -422,26 +505,19 @@ class TestPredictionMarketFraming:
         assert "extrapolate" in lowered
         assert "constant-hazard" in lowered or "base-rate-over-time" in lowered
         assert "show the arithmetic" in lowered
-        # Reading rule 1: an other-cut market is the same quantity at another date/threshold/source,
-        # so it is something to extrapolate from, not to haircut.
+        # Rule 1: an other-cut market is the same quantity, so extrapolate rather than haircut.
         assert "`same_quantity_other_cut`" in lowered
         assert "extrapolate from it rather than discount it vaguely" in lowered
-        # Reading rule 2: which label wins when the two axes disagree. A tight relation on a THIN
-        # market is the shape that cost q45189: all three forecasters imported a thin single-strike
-        # price at full weight. The rule carries its reason (a thin price is noisy however tight its
-        # relation) and is directional — widen around the implied value rather than transplant it.
+        # Rule 2: liquidity governs when the relation and liquidity axes disagree (q45189).
         assert "the liquidity warning governs" in lowered
         assert "a thin price is noisy however tight its relation" in lowered
         assert "widen around its implied value rather than transplant its price" in lowered
-        # Reading rule 3: a family of `↳` rows is a distribution over the market's own question, so
-        # reading one bracket as an equality constraint on a tail is a category error — the other
-        # half of q45189 (all three cut the resolving bucket below their own prior that way).
+        # Rule 3: a ladder is a distribution, never an equality constraint on a tail (q45189).
         assert "is a distribution over that market's own question" in lowered
         assert "read the whole ladder" in lowered
         assert "never treat one outcome's price as an equality constraint" in lowered
         assert "cut the resolving bucket below the forecaster's own prior" in lowered
-        # NOTATION is the legend's job, stated beside the table; the prompt must not re-teach it.
-        # These are the phrases the pre-2026-09 clause carried that duplicated MARKET_SIGNAL_LEGEND.
+        # NOTATION is the legend's job; these are the phrases the pre-2026-09 clause duplicated.
         assert "weight each market/crowd signal by its stated liquidity/participation label" not in lowered
         assert "listed in order of evidential value" not in lowered
         assert "realized outcome rather than a forecast" not in lowered
@@ -450,9 +526,7 @@ class TestPredictionMarketFraming:
         assert "inside a counted group with its summed price" not in lowered
         # The old "not beholden" footnote must be gone.
         assert "not beholden" not in lowered
-        # The mis-scoped "you may deviate from a market" carve-out must NOT be present —
-        # it undercut the strong-evidence framing. The general expertise principle is
-        # asserted separately below.
+        # The mis-scoped "you may deviate from a market" carve-out undercut the framing.
         assert "deviate from a market" not in lowered
 
     def _assert_market_clause_absent(self, prompt: str) -> None:
@@ -584,8 +658,9 @@ class TestPresentTenseInstrumentGaps:
 
 
 class TestGapFillAnalyzerSlotDiscipline:
-    """The analyzer fills every slot whatever it is told: 55-77% of archived records sit at
-    the cap and only 8 of 308 returned one or two gaps, so the old "Most questions have 0-2
+    """The analyzer fills every slot whatever it is told: since 2026-07-17 it fills every slot
+    on about half of questions and lists three or more gaps on 96% (an earlier "55-77% at the
+    cap" figure matched no cap-aware reading of the archive), so the old "Most questions have 0-2
     real gaps; a few have 3-5" was behaviourally dead and "3-5" was stale against
     GAP_FILL_MAX_GAPS = 4. What earns its place is the discipline with its reason (each gap
     is a paid search) and the ordering contract the cap relies on (order is the ranking, no
@@ -713,8 +788,7 @@ class TestResearchPromptsCarryMcOptions:
 
     @pytest.mark.parametrize("options", [None, [], ()])
     def test_non_mc_questions_carry_no_options_line(self, options) -> None:
-        # Binary/numeric questions have no ballot; an empty "Options" header would invite
-        # the model to invent one.
+        """Binary and numeric questions have no ballot, and an empty "Options" header invites one."""
         assert "Options (in resolution order)" not in web_research_prompt("Will X happen?", options=options)
         assert "Options (in resolution order)" not in _summarizer_prompt(options=options)
 
@@ -727,7 +801,7 @@ class TestSourceTierTagging:
     provenance ladder has nothing left to weight."""
 
     def _assert_tier_tag_instruction(self, prompt: str) -> None:
-        # Collapse whitespace so assertions don't depend on where clean_indents wraps lines.
+        """Assert the shared source-tier instruction, whitespace collapsed so wrapping cannot matter."""
         collapsed = " ".join(prompt.split())
         assert "SOURCE TIER TAGS" in collapsed
         # Inline tag examples using the shared vocabulary.
@@ -790,8 +864,7 @@ class TestAskNewsSummarizerPrompt:
         summarizer's existing critical rules."""
         collapsed = " ".join(_summarizer_prompt().split())
         assert "Date every fact precisely" in collapsed
-        # First occurrence carries the full tag; repeats use the short tag (display
-        # compression only — the pre-window warning semantics must stay intact).
+        # Display compression only: the pre-window warning semantics must stay intact.
         assert "[PRE-WINDOW — occurred before question open, cannot itself satisfy the criteria]" in collapsed
         assert "FIRST time such a flag appears in the briefing, use the full tag" in collapsed
         assert 'for every subsequent occurrence use the short tag "[PRE-WINDOW]"' in collapsed
@@ -870,3 +943,68 @@ class TestAskNewsSummarizerPrompt:
         assert "organize by recency and relevance to the question" in collapsed
         # The old input-mirroring instruction it replaced must be gone.
         assert "Maintains the section structure" not in collapsed
+
+
+class TestGapFillAnalyzerGradeFields:
+    """The grade-based lean-out of gap-fill v1 (operator ruling, 2026-09-09). Three structured fields
+    beside each gap make the prompt's own discipline rules checkable by code: ``answerable_now`` for the
+    ANSWERABLE NOW rule (future-dated asks were 18% of gaps and a third of gap-one slots),
+    ``already_in_first_pass`` for its dated-reading carve-out (47% of the forced current-reading gaps
+    re-bought a reading the briefing held), and ``same_need_as`` for paraphrase repeats (one question in
+    three). ``research/targeted.py`` ``triage_gaps`` drops a failing gap before its resolver call; a
+    positional cap was rejected because it dropped the useful gap on 4 of 6 traced questions. Receipt:
+    scratch/cost_pass_2026-09-09/v1_gap_redundancy/REDUNDANCY.md."""
+
+    def _analyzer(self) -> str:
+        return gap_fill_analyzer_prompt(
+            "Will the tracker read above 50 on 2026-09-30?",
+            "Resolves YES if the tracker's published reading exceeds 50.",
+            "The tracker is updated weekly.",
+            "First pass: the tracker read 48 as of 2026-09-02.",
+            is_benchmarking=False,
+            max_gaps=4,
+        )
+
+    def test_schema_carries_the_three_grade_fields(self) -> None:
+        flat = _flat(self._analyzer())
+        schema_at = flat.index('{"gaps": [')
+        for field in ('"answerable_now":', '"already_in_first_pass":', '"same_need_as":'):
+            assert flat.index(field) > schema_at, field
+        # The three grades keep the analyzer's own ordering rule intact: still no rank fields.
+        assert "do not add rank fields or scores" in flat
+
+    def test_grade_rule_states_that_code_reads_the_grades_and_why(self) -> None:
+        flat = _flat(self._analyzer())
+        assert "grade every gap" in flat
+        assert "code reads them and drops a failing gap before its search is paid for" in flat
+
+    def test_answerable_now_needs_no_reference_date(self) -> None:
+        """The prompt carries no run date (only the bare year in gap type 8, which the ablation harness
+        rewrites), so the grade is defined by whether the observation exists yet, not by a date."""
+        flat = _flat(self._analyzer())
+        assert (
+            "answerable_now is false when the gap can only be answered by an observation not yet made "
+            "or a result not yet published" in flat
+        )
+
+    def test_already_in_first_pass_requires_the_dated_value(self) -> None:
+        flat = _flat(self._analyzer())
+        assert (
+            "already_in_first_pass is true when the first-pass research already states the value or fact with its date"
+            in flat
+        )
+
+    def test_same_need_as_is_a_one_based_position_of_an_earlier_gap_else_null(self) -> None:
+        flat = _flat(self._analyzer())
+        assert "same_need_as is the position (1 = the first gap) of an earlier gap in this list" in flat
+        assert "the same fact from the same source would answer, else null" in flat
+
+    def test_same_need_as_names_the_two_commonest_repeat_shapes(self) -> None:
+        """The archive's paraphrase pairs are the dashboard and its monthly summary, and official versus
+        preliminary results (45088, 44880); naming them is what makes the field fire on the real repeats."""
+        flat = _flat(self._analyzer())
+        assert "a dashboard and its monthly summary, or official and preliminary results, are one need" in flat
+
+    def test_grade_rule_sits_beside_the_schema_it_defines(self) -> None:
+        flat = _flat(self._analyzer())
+        assert flat.index("null results are search outcomes") < flat.index("grade every gap") < flat.index('{"gaps": [')

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
 from unittest.mock import AsyncMock
@@ -32,6 +33,8 @@ import aiohttp
 import pytest
 
 from metaculus_bot.research import resolution_datawrapper, resolution_source
+from metaculus_bot.research.fetch_ladder import guard
+from metaculus_bot.research.fetch_ladder import policy as ladder_policy
 from metaculus_bot.research.http_fetch import DatawrapperChartRef
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail
 from metaculus_bot.research.resolution_body_text import _truncate_csv_middle, _truncate_with_marker
@@ -233,7 +236,7 @@ class TestDatawrapperHop:
                 DATASET_URL: _csv_response(_csv_body(20), last_modified=_fresh_last_modified()),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         results = await fetch_resolution_sources([PAGE_URL])
 
@@ -265,7 +268,7 @@ class TestDatawrapperHop:
                 DATASET_URL: _csv_response(_csv_body(20), last_modified=_fresh_last_modified()),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         await fetch_resolution_sources([PAGE_URL])
 
@@ -283,7 +286,7 @@ class TestDatawrapperHop:
                 DATASET_URL: _csv_response(_csv_body(20), last_modified=_stale_last_modified()),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         results = await fetch_resolution_sources([PAGE_URL])
 
@@ -310,7 +313,7 @@ class TestDatawrapperHop:
                 DATASET_URL: _csv_response(_csv_body(20), last_modified=None),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         results = await fetch_resolution_sources([PAGE_URL])
         assert results[1].status == "stale_data"
@@ -324,7 +327,7 @@ class TestDatawrapperHop:
                 DATASET_URL: _csv_response(_csv_body(20), last_modified="not a date"),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         results = await fetch_resolution_sources([PAGE_URL])
         assert results[1].status == "stale_data"
@@ -341,7 +344,7 @@ class TestDatawrapperHop:
                 DATASET_URL: _csv_response(_csv_body(20), last_modified=tomorrow),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         results = await fetch_resolution_sources([PAGE_URL])
 
@@ -358,7 +361,7 @@ class TestDatawrapperHop:
                 DATASET_URL: _csv_response(_csv_body(20), last_modified=skewed),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         results = await fetch_resolution_sources([PAGE_URL])
 
@@ -373,7 +376,7 @@ class TestDatawrapperHop:
                 DATASET_URL: _csv_response(_csv_body(20), last_modified=recent),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         results = await fetch_resolution_sources([PAGE_URL])
         assert results[1].status == "success"
@@ -393,7 +396,7 @@ class TestDatawrapperHop:
                 DATASET_URL: _csv_response(_csv_body(20), last_modified=_fresh_last_modified()),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         results = await fetch_resolution_sources([PAGE_URL])
         assert [r.status for r in results] == ["js_wall", "success"]
@@ -410,7 +413,7 @@ class TestDatawrapperHop:
                 "https://static.dwcdn.net/data/": _csv_response(_csv_body(5), last_modified=_fresh_last_modified()),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         results = await fetch_resolution_sources([PAGE_URL])
 
@@ -433,7 +436,7 @@ class TestDatawrapperHop:
                 DATASET_URL: _csv_response(_csv_body(5), last_modified=_fresh_last_modified()),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         results = await fetch_resolution_sources([PAGE_URL, other_page])
 
@@ -449,7 +452,7 @@ class TestDatawrapperHop:
                 DATASET_URL: FakeResponse(404, body=b"", content_type="text/plain"),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         results = await fetch_resolution_sources([PAGE_URL])
         assert results[1].status == "not_found"
@@ -462,7 +465,7 @@ class TestDatawrapperHop:
                 DATASET_URL: aiohttp.ClientError("boom"),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         results = await fetch_resolution_sources([PAGE_URL])
         assert results[1].status == "error"
@@ -478,7 +481,7 @@ class TestDatawrapperHop:
                 DATASET_URL: _csv_response(_csv_body(500), last_modified=_fresh_last_modified()),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         results = await fetch_resolution_sources([PAGE_URL])
         dataset = results[1]
@@ -500,7 +503,7 @@ class TestDatawrapperHop:
             b"</p></article></body></html>"
         )
         session = FakeSession({PAGE_URL: FakeResponse(200, body=plain, content_type="text/html")})
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         results = await fetch_resolution_sources([PAGE_URL])
         assert len(results) == 1
@@ -522,7 +525,7 @@ class TestDatawrapperHop:
                 other_dataset: _csv_response(_csv_body(5), last_modified=_fresh_last_modified()),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         results = await fetch_resolution_sources([PAGE_URL, other_page])
 
@@ -546,6 +549,11 @@ class TestDatawrapperHop:
         before the outer wall) at test speed; the skip branch is tested separately."""
         monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
         monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_WALL_TIMEOUT", 0.4)
+        monkeypatch.setattr(
+            ladder_policy,
+            "RESOLUTION_SOURCE_POLICY",
+            replace(ladder_policy.RESOLUTION_SOURCE_POLICY, total_wall_s=0.4),
+        )
         monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_DATAWRAPPER_HOP_WALL_MARGIN_S", 0.3)
         monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_DATAWRAPPER_MIN_HOP_BUDGET_S", 0.0)
         events: list[str] = []
@@ -570,7 +578,7 @@ class TestDatawrapperHop:
                 DATASET_URL: _HangingResponse(200, body=b"", content_type="text/csv"),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         q = _mock_question(resolution_criteria=f"Resolves per the tracker at {PAGE_URL}.")
         out = await resolution_source_provider(is_benchmarking=False)(q)
@@ -589,13 +597,18 @@ class TestDatawrapperHop:
         attempt that cannot land and could push the provider past its wall."""
         monkeypatch.setenv("RESOLUTION_SOURCE_ENABLED", "true")
         monkeypatch.setattr(resolution_source, "RESOLUTION_SOURCE_WALL_TIMEOUT", 0.05)
+        monkeypatch.setattr(
+            ladder_policy,
+            "RESOLUTION_SOURCE_POLICY",
+            replace(ladder_policy.RESOLUTION_SOURCE_POLICY, total_wall_s=0.05),
+        )
         session = FakeSession(
             {
                 PAGE_URL: FakeResponse(200, body=_tracker_page_html(CHART_ID), content_type="text/html"),
                 DATASET_URL: _csv_response(_csv_body(5), last_modified=_fresh_last_modified()),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         with caplog.at_level(logging.WARNING):
             q = _mock_question(resolution_criteria=f"Resolves per the tracker at {PAGE_URL}.")
@@ -646,7 +659,7 @@ class TestDatawrapperHopFailureModes:
             del host, port, args, kwargs
             return [(0, 0, 0, "", ("127.0.0.1", 0))]
 
-        monkeypatch.setattr(resolution_source.socket, "getaddrinfo", _private_ainfo)
+        monkeypatch.setattr(guard.socket, "getaddrinfo", _private_ainfo)
         session = FakeSession({})  # no handlers: any request would raise
 
         result = await _fetch_datawrapper_dataset(session, self._chart(), PAGE_URL, {})
@@ -947,7 +960,7 @@ class TestEmbedShellPageStillHops:
                 DATASET_URL: _csv_response(_csv_body(20), last_modified=_fresh_last_modified()),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         results = await fetch_resolution_sources([PAGE_URL])
 
@@ -974,7 +987,7 @@ class TestEmbedShellPageStillHops:
                 DATASET_URL: _csv_response(_csv_body(20), last_modified=_fresh_last_modified()),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         results = await fetch_resolution_sources([PAGE_URL])
 
@@ -992,15 +1005,15 @@ class TestEmbedShellPageStillHops:
                 DATASET_URL: _csv_response(_csv_body(5), last_modified=_fresh_last_modified()),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
         q = _mock_question(resolution_criteria=f"Resolves per the tracker at {PAGE_URL}.")
 
         with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
             await resolution_source_provider(is_benchmarking=False)(q)
 
         assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
-            f"RESOLUTION_SOURCE_FETCH: question={q.id_of_question} url={PAGE_URL} status=ok http=200 embeds=none",
-            f"RESOLUTION_SOURCE_FETCH: question={q.id_of_question} url={DATASET_URL} status=ok http=200 embeds=none",
+            f"RESOLUTION_SOURCE_FETCH: question={q.id_of_question} url={PAGE_URL} status=ok http=200 embeds=none caller=resolution_source",
+            f"RESOLUTION_SOURCE_FETCH: question={q.id_of_question} url={DATASET_URL} status=ok http=200 embeds=none caller=resolution_source",
         ]
 
 
@@ -1013,7 +1026,7 @@ class TestProviderEndToEnd:
                 DATASET_URL: _csv_response(_csv_body(20), last_modified=_fresh_last_modified()),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         q = _mock_question(resolution_criteria=f"Resolves per the tracker at {PAGE_URL} — the CSV under the chart.")
         out = await resolution_source_provider(is_benchmarking=False)(q)
@@ -1042,7 +1055,7 @@ class TestProviderEndToEnd:
                 DATASET_URL: _csv_response(_csv_body(20), last_modified=_stale_last_modified()),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         q = _mock_question(resolution_criteria=f"Resolves per the tracker at {PAGE_URL}.")
         out = await resolution_source_provider(is_benchmarking=False)(q)
@@ -1063,7 +1076,7 @@ class TestProviderEndToEnd:
                 DATASET_URL: aiohttp.ClientError("boom"),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         q = _mock_question(resolution_criteria=f"Resolves per the tracker at {PAGE_URL}.")
         await resolution_source_provider(is_benchmarking=False)(q)
@@ -1085,16 +1098,16 @@ class TestProviderEndToEnd:
                 ),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
         q = _mock_question(resolution_criteria=f"Resolves per the tracker at {PAGE_URL}.")
 
         with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
             await resolution_source_provider(is_benchmarking=False)(q)
 
         assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
-            f"RESOLUTION_SOURCE_FETCH: question={q.id_of_question} url={PAGE_URL} status=ok http=200 embeds=none",
+            f"RESOLUTION_SOURCE_FETCH: question={q.id_of_question} url={PAGE_URL} status=ok http=200 embeds=none caller=resolution_source",
             f"RESOLUTION_SOURCE_FETCH: question={q.id_of_question} url={DATASET_URL} "
-            "status=blocked http=403 embeds=none failure_class=http_403 server=apache/2.4.62_(debian)",
+            "status=blocked http=403 embeds=none failure_class=http_403 server=apache/2.4.62_(debian) caller=resolution_source",
         ]
 
     async def test_a_hop_that_never_got_a_response_reports_its_transport_class(self, monkeypatch, caplog):
@@ -1107,16 +1120,16 @@ class TestProviderEndToEnd:
                 DATASET_URL: aiohttp.ClientError("boom"),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
         q = _mock_question(resolution_criteria=f"Resolves per the tracker at {PAGE_URL}.")
 
         with caplog.at_level(logging.INFO, logger="metaculus_bot.research.resolution_source"):
             await resolution_source_provider(is_benchmarking=False)(q)
 
         assert [m for m in caplog.messages if m.startswith("RESOLUTION_SOURCE_FETCH:")] == [
-            f"RESOLUTION_SOURCE_FETCH: question={q.id_of_question} url={PAGE_URL} status=ok http=200 embeds=none",
+            f"RESOLUTION_SOURCE_FETCH: question={q.id_of_question} url={PAGE_URL} status=ok http=200 embeds=none caller=resolution_source",
             f"RESOLUTION_SOURCE_FETCH: question={q.id_of_question} url={DATASET_URL} "
-            "status=error http=n/a embeds=none failure_class=connection exc=ClientError",
+            "status=error http=n/a embeds=none failure_class=connection exc=ClientError caller=resolution_source",
         ]
 
     async def test_datasets_cannot_evict_cited_page_text(self, monkeypatch):
@@ -1135,7 +1148,7 @@ class TestProviderEndToEnd:
                 ),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         results = await fetch_resolution_sources([PAGE_URL, other_page])
         out = format_resolution_sections(results, datetime.now(UTC))
@@ -1154,7 +1167,7 @@ class TestProviderEndToEnd:
                 DATASET_URL: _csv_response(_csv_body(20), last_modified=_fresh_last_modified()),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         q = _mock_question(resolution_criteria=f"Resolves per the tracker at {PAGE_URL}.")
         out = await resolution_source_provider(is_benchmarking=True)(q)
@@ -1177,7 +1190,7 @@ class TestUnreadableEmbedBesideADataset:
                 DATASET_URL: _csv_response(_csv_body(20), last_modified=_fresh_last_modified()),
             }
         )
-        monkeypatch.setattr(resolution_source, "_get_session", lambda: session)
+        monkeypatch.setattr(guard, "_get_session", lambda: session)
 
         results = await fetch_resolution_sources([PAGE_URL])
 

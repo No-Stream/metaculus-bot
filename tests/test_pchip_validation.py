@@ -74,6 +74,7 @@ class TestPchipValidation:
             upper_bound=upper,
             lower_bound=lower,
             zero_point=None,
+            cdf_size=201,
             id_of_question=123,
             question_text="Test numeric question",
             background_info="Test background",
@@ -81,6 +82,7 @@ class TestPchipValidation:
             fine_print="Test fine print",
             unit_of_measure="units",
             page_url="https://example.com/question/123",
+            api_json={"question": {}},
             open_time=_stub_open_time(),
             scheduled_resolution_time=_stub_resolve_time(),
         )

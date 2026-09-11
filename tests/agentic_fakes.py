@@ -123,7 +123,7 @@ def response(content: str = "", tool_calls: list[FakeToolCall] | None = None) ->
 class FakeLlm:
     """Scripted llm_call double; records every invocation.
 
-    ``calls`` entries are ``{"messages": ..., "tools": ...}`` dicts,
+    ``calls`` entries are ``{"messages": ..., "tools": ..., "tool_choice": ...}`` dicts,
     deep-copied at call time so append-only-transcript assertions compare
     genuine snapshots rather than aliased lists.
     """
@@ -132,8 +132,16 @@ class FakeLlm:
         self._responses = list(responses)
         self.calls: list[dict[str, Any]] = []
 
-    async def __call__(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None) -> Any:
-        self.calls.append({"messages": copy.deepcopy(messages), "tools": copy.deepcopy(tools)})
+    async def __call__(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        *,
+        tool_choice: str | None = None,
+    ) -> Any:
+        self.calls.append(
+            {"messages": copy.deepcopy(messages), "tools": copy.deepcopy(tools), "tool_choice": tool_choice}
+        )
         if not self._responses:
             raise AssertionError("FakeLlm ran out of scripted responses")
         response_or_exc = self._responses.pop(0)

@@ -44,7 +44,6 @@ from metaculus_bot.constants import (
     TIME_BUDGET_MIN_VIABLE_S,
     WALL_CLOCK_STACKING_MIN_BUDGET,
 )
-from metaculus_bot.publish_gate import reset_publish_skipped_closed
 from metaculus_bot.research.orchestrator import ResearchOrchestrator
 from metaculus_bot.research.provider_diagnostics import pop_provider_detail, record_provider_detail
 from metaculus_bot.research.provider_fanout import await_providers_within_deadline
@@ -61,17 +60,6 @@ from metaculus_bot.time_budget import (
 )
 from tests.conftest import gather_predictions_stub
 from tests.pipeline_test_helpers import make_e2e_bot, make_real_binary_question
-
-
-@pytest.fixture(autouse=True)
-def _isolate_publish_gate_counter():
-    """The pipeline tests here drive the REAL publish gate, whose skip counter is a module
-    global (prod resets it at run start). Without an after-each reset, a skip recorded in
-    this file leaks into any later-collected suite's fresh-bot ``alertable_count == 0``
-    assertion — observed as an order-dependent failure in test_degradation_counters."""
-    reset_publish_skipped_closed()
-    yield
-    reset_publish_skipped_closed()
 
 
 def _question(close_in: timedelta | None) -> BinaryQuestion:
@@ -608,6 +596,7 @@ class TestGapFillCutByTheResearchPhaseBudget:
         assert "x" * 2000 in research
         assert "Targeted Gap-Fill" not in research
         assert "Agentic Research Findings" not in research
+        assert orchestrator.gap_fill_v1_error_count == 0
         assert orchestrator.gap_fill_v2_error_count == 0
         # The cut IS alertable, once: both passes cut on one question dedupe to a
         # single research_budget_cut_count bump — the off-fast-path counter that
@@ -664,6 +653,8 @@ class TestTightestCloseFirstOrdering:
         question = MagicMock(spec=BinaryQuestion)
         question.already_forecasted = False
         question.id_of_question = qid
+        question.id_of_post = qid  # the QUESTION_CAP_FORFEIT marker names the posts it drops
+        question.page_url = f"https://www.metaculus.com/questions/{qid}/"  # and their platform
         question.close_time = datetime.now(UTC) + close_in if close_in is not None else None
         return question
 

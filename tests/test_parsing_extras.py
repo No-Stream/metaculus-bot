@@ -35,6 +35,7 @@ async def test_binary_parsing_clamps_extremes():
     # Minimal binary question
     q = MagicMock(spec=BinaryQuestion)
     q.page_url = "http://example.com"
+    q.api_json = {"question": {}}
     q.question_text = "?"
     q.background_info = ""
     q.resolution_criteria = ""
@@ -90,6 +91,7 @@ async def test_numeric_parsing_raises_on_wrong_count():
         lower_bound=0,
         upper_bound=100,
         page_url="http://ex/q",
+        api_json={"question": {}},
         zero_point=None,
         id_of_question=2,
         cdf_size=201,
@@ -178,6 +180,7 @@ async def test_parser_llm_used_for_structured_output():
     # Minimal binary question
     bq = MagicMock(spec=BinaryQuestion)
     bq.page_url = "url"
+    bq.api_json = {"question": {}}
     bq.question_text = "?"
     bq.background_info = ""
     bq.resolution_criteria = ""
@@ -196,6 +199,7 @@ async def test_parser_llm_used_for_structured_output():
     # Minimal multiple-choice question
     mcq = MagicMock(spec=MultipleChoiceQuestion)
     mcq.page_url = "url"
+    mcq.api_json = {"question": {}}
     mcq.question_text = "?"
     mcq.options = ["A", "B"]
     mcq.background_info = ""
@@ -221,6 +225,7 @@ async def test_parser_llm_used_for_structured_output():
         lower_bound=0,
         upper_bound=100,
         page_url="url",
+        api_json={"question": {}},
         zero_point=None,
         id_of_question=11,
         cdf_size=201,
@@ -253,6 +258,7 @@ async def test_mc_additional_instructions_include_options():
     )
     q = MagicMock(spec=MultipleChoiceQuestion)
     q.page_url = "url"
+    q.api_json = {"question": {}}
     q.question_text = "who?"
     q.options = ["Alpha", "Beta"]
     q.background_info = ""

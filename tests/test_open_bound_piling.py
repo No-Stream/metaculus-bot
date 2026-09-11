@@ -16,13 +16,13 @@ to the raw bounds, which false-fired on correct handlers (regression test at the
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import cast
+from typing import ClassVar, cast
 
 import numpy as np
 from forecasting_tools.data_models.numeric_report import NumericDistribution, Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
 
-from metaculus_bot.numeric.config import OPEN_BOUND_PILING_THRESHOLD
+from metaculus_bot.numeric.config import OPEN_BOUND_PILING_THRESHOLD, STANDARD_PERCENTILES, grid_step_constraints
 from metaculus_bot.numeric.diagnostics import log_open_bound_piling_diagnostics
 from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
 
@@ -55,9 +55,9 @@ def _declared(values: list[float]) -> list[Percentile]:
     return [Percentile(percentile=0.5, value=float(v)) for v in values]
 
 
-def _cdf_with_top_bin_mass(top_bin_mass: float) -> list[float]:
-    """Monotone CDF over ``_N`` points whose final step equals ``top_bin_mass``."""
-    body = np.linspace(0.0, 1.0 - top_bin_mass, _N - 1)
+def _cdf_with_top_bin_mass(top_bin_mass: float, n: int = _N) -> list[float]:
+    """Monotone CDF over ``n`` points whose final step equals ``top_bin_mass``."""
+    body = np.linspace(0.0, 1.0 - top_bin_mass, n - 1)
     return [*[float(v) for v in body], 1.0]
 
 
@@ -222,6 +222,111 @@ def test_observed_crammer_0126_fires_correct_handler_0073_does_not(caplog):
     assert not _piling_records(caplog)
 
 
+class TestThresholdScalesWithTheGridCap:
+    """The 0.10 calibration is against the 201-grid per-bin cap of 0.2.
+
+    On a finer grid the platform caps one bin lower (0.0889 at 451 points), and the max-step repair
+    clips a crammed terminal bin down to that cap, so a fixed 0.10 could never fire there. The trigger
+    is the calibrated fraction of THIS grid's cap; the 201-point and coarser grids keep 0.10 exactly.
+    """
+
+    _DECLARED_INSIDE: ClassVar[list[float]] = [10.0, 50.0, 95.0]
+
+    def test_451_bin_at_the_cap_fires(self, caplog):
+        cap_451 = grid_step_constraints(451)[1]
+        assert cap_451 < OPEN_BOUND_PILING_THRESHOLD, "the case is only interesting because the cap is under 0.10"
+        q = _make_question(open_upper=True, upper=100.0)
+
+        caplog.set_level("WARNING")
+        log_open_bound_piling_diagnostics(
+            _make_prediction(_cdf_with_top_bin_mass(cap_451, n=451)), q, "crammer", _declared(self._DECLARED_INSIDE)
+        )
+        records = _piling_records(caplog)
+        assert len(records) == 1
+        assert "bin_mass=0.089" in records[0]
+
+    def test_451_thin_tail_does_not_fire(self, caplog):
+        """0.02 is 22% of the 451 cap, the same fraction a 0.045 bin is of the 201 cap: a genuine tail."""
+        q = _make_question(open_upper=True, upper=100.0)
+
+        caplog.set_level("WARNING")
+        log_open_bound_piling_diagnostics(
+            _make_prediction(_cdf_with_top_bin_mass(0.02, n=451)), q, "good", _declared(self._DECLARED_INSIDE)
+        )
+        assert not _piling_records(caplog)
+
+    def test_coarse_grid_keeps_the_201_calibration(self, caplog):
+        """A 9-point grid's cap is 1.0; the trigger never loosens above 0.10, so 0.12 still fires."""
+        q = _make_question(open_upper=True, upper=100.0)
+
+        caplog.set_level("WARNING")
+        log_open_bound_piling_diagnostics(
+            _make_prediction(_cdf_with_top_bin_mass(0.12, n=9)), q, "crammer", _declared(self._DECLARED_INSIDE)
+        )
+        assert len(_piling_records(caplog)) == 1
+
+        caplog.clear()
+        log_open_bound_piling_diagnostics(
+            _make_prediction(_cdf_with_top_bin_mass(0.08, n=9)), q, "good", _declared(self._DECLARED_INSIDE)
+        )
+        assert not _piling_records(caplog)
+
+
+def _bitcoin_451_open_question() -> NumericQuestion:
+    """The live Mantic preseason bitcoin question: 450 bins over $54,950 to $99,950, both bounds open."""
+    return NumericQuestion(
+        id_of_question=650,
+        id_of_post=650,
+        page_url="https://competitions.mantic.com/questions/650",
+        question_text="Bitcoin price",
+        background_info="",
+        resolution_criteria="",
+        fine_print="",
+        published_time=None,
+        close_time=None,
+        lower_bound=54_950.0,
+        upper_bound=99_950.0,
+        open_lower_bound=True,
+        open_upper_bound=True,
+        unit_of_measure="USD",
+        zero_point=None,
+        cdf_size=451,
+    )
+
+
+def _run_real_pipeline_detector(question: NumericQuestion, values: list[float], caplog) -> list[str]:
+    """Drive values through the REAL pipeline (sanitize -> build) then the detector."""
+    pcts = [Percentile(percentile=p, value=v) for p, v in zip(STANDARD_PERCENTILES, values, strict=True)]
+    sanitized, zero_point = sanitize_percentiles(pcts, question)
+    prediction = build_numeric_distribution(sanitized, question, zero_point)
+
+    caplog.clear()
+    caplog.set_level("WARNING")
+    log_open_bound_piling_diagnostics(prediction, question, "test-model", sanitized)
+    return _piling_records(caplog)
+
+
+def test_fine_grid_crammer_fires_after_the_cap_clips_its_terminal_bin(caplog):
+    """P80..P99 crammed into the last $100 bin of the open ceiling: the repair clips that bin to the
+    451 cap (0.0889, under the fixed 0.10), and the scaled trigger still catches it."""
+    records = _run_real_pipeline_detector(
+        _bitcoin_451_open_question(),
+        [60_000, 62_000, 65_000, 70_000, 75_000, 85_000, 90_000, 95_000, 99_860, 99_880, 99_900, 99_920, 99_940],
+        caplog,
+    )
+    assert len(records) == 1
+    assert "bound=upper" in records[0]
+
+
+def test_fine_grid_correct_handler_places_mass_above_the_ceiling_and_does_not_fire(caplog):
+    records = _run_real_pipeline_detector(
+        _bitcoin_451_open_question(),
+        [60_000, 62_000, 65_000, 70_000, 75_000, 85_000, 90_000, 95_000, 99_500, 101_000, 105_000, 110_000, 120_000],
+        caplog,
+    )
+    assert not records
+
+
 # ---------------------------------------------------------------------------
 # Discrete-question regression: the detector must read the MODEL-DECLARED
 # percentiles, not prediction.declared_percentiles. On discrete questions
@@ -230,8 +335,6 @@ def test_observed_crammer_0126_fires_correct_handler_0073_does_not(caplog):
 # bound — reading it false-fired on models that correctly placed P99 above the
 # open ceiling (live repro on a Q38195-class question, 2026-07-11).
 # ---------------------------------------------------------------------------
-
-_STANDARD_PS = [0.01, 0.025, 0.05, 0.10, 0.20, 0.40, 0.50, 0.60, 0.80, 0.90, 0.95, 0.975, 0.99]
 
 
 def _discrete_open_upper_question() -> NumericQuestion:
@@ -256,16 +359,7 @@ def _discrete_open_upper_question() -> NumericQuestion:
 
 
 def _run_discrete_detector(values: list[float], caplog) -> list[str]:
-    """Drive values through the REAL pipeline (sanitize → build) then the detector."""
-    q = _discrete_open_upper_question()
-    pcts = [Percentile(percentile=p, value=v) for p, v in zip(_STANDARD_PS, values, strict=False)]
-    sanitized, zero_point = sanitize_percentiles(pcts, q)
-    prediction = build_numeric_distribution(sanitized, q, zero_point)
-
-    caplog.clear()
-    caplog.set_level("WARNING")
-    log_open_bound_piling_diagnostics(prediction, q, "test-model", sanitized)
-    return _piling_records(caplog)
+    return _run_real_pipeline_detector(_discrete_open_upper_question(), values, caplog)
 
 
 def test_discrete_correct_handler_with_mass_above_ceiling_no_fire(caplog):

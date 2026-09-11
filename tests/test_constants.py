@@ -6,24 +6,34 @@ future hyperparameter change is a single-point edit with a clear test to
 update and reason about.
 """
 
+import pytest
+
 from metaculus_bot.constants import (
     BINARY_PROB_MAX,
     BINARY_PROB_MIN,
     BINARY_STACKING_ENABLED_ENV,
+    DONATED_OPENROUTER_KEY_ENABLED_ENV,
     EXTREME_CALL_HIGH,
     EXTREME_CALL_LOW,
     GAP_FILL_V2_READER_MODEL,
     GEMINI_SEARCH_DEFAULT_MODEL,
+    MANTIC_API_BASE_URL,
+    MANTIC_BOT_USER_ID,
+    MANTIC_HOST,
+    MANTIC_SITE_URL,
     MC_PROB_MAX,
     MC_PROB_MIN,
     MC_STACKING_ENABLED_ENV,
+    METACULUS_HOST,
     NATIVE_SEARCH_DEFAULT_MODEL,
     NATIVE_SEARCH_REASONING_EFFORT_DEFAULT,
     NATIVE_SEARCH_TIMEOUT,
     NATIVE_SEARCH_VERBOSITY_DEFAULT,
     NUMERIC_STACKING_ENABLED_ENV,
+    QUESTION_PLATFORM_HOSTS,
     THIN_PUBLISH_BINARY_CEIL,
     THIN_PUBLISH_BINARY_FLOOR,
+    donated_openrouter_key_enabled,
     env_flag_enabled,
 )
 
@@ -117,8 +127,8 @@ class TestGeminiNativeSdkModelDefaults:
         assert GAP_FILL_V2_READER_MODEL == "gemini-3.8-flash"
 
     def test_both_native_surfaces_run_the_same_id(self):
-        # Trivially true while they match, which is the point: it fails the moment one
-        # surface is flipped to a model the other has not been verified on.
+        """Trivially true while they match, which is the point: it fails the moment one
+        surface is flipped to a model the other has not been verified on."""
         assert GEMINI_SEARCH_DEFAULT_MODEL == GAP_FILL_V2_READER_MODEL
 
 
@@ -184,6 +194,36 @@ class TestPerTypeStackingEnvVarNames:
         assert NUMERIC_STACKING_ENABLED_ENV == "NUMERIC_STACKING_ENABLED"
 
 
+class TestDonatedOpenRouterKeyMasterSwitch:
+    """Pin the master switch for the Metaculus-donated OpenRouter key.
+
+    Default ON keeps every Metaculus run unchanged; a Mantic run sets the env var false so
+    the donated key (Metaculus's money, for Metaculus tournaments) is never spent on another
+    platform. The env var NAME is a data contract with the Mantic workflow yaml and with
+    cli's fail-shut startup assertion, so it is pinned as a literal.
+    """
+
+    def test_env_var_name(self):
+        assert DONATED_OPENROUTER_KEY_ENABLED_ENV == "DONATED_OPENROUTER_KEY_ENABLED"
+
+    def test_unset_defaults_to_enabled(self, monkeypatch):
+        monkeypatch.delenv(DONATED_OPENROUTER_KEY_ENABLED_ENV, raising=False)
+        assert donated_openrouter_key_enabled() is True
+
+    def test_empty_string_is_unset(self, monkeypatch):
+        monkeypatch.setenv(DONATED_OPENROUTER_KEY_ENABLED_ENV, "")
+        assert donated_openrouter_key_enabled() is True
+
+    @pytest.mark.parametrize("raw", ["false", "0", "no", "FALSE"])
+    def test_false_y_values_disable(self, monkeypatch, raw):
+        monkeypatch.setenv(DONATED_OPENROUTER_KEY_ENABLED_ENV, raw)
+        assert donated_openrouter_key_enabled() is False
+
+    def test_explicit_true_enables(self, monkeypatch):
+        monkeypatch.setenv(DONATED_OPENROUTER_KEY_ENABLED_ENV, "true")
+        assert donated_openrouter_key_enabled() is True
+
+
 class TestThinPublishBinaryFloor:
     """The single-survivor publish floor is [0.05, 0.95], aliased to the EXTREME_CALL band.
 
@@ -199,12 +239,38 @@ class TestThinPublishBinaryFloor:
         assert THIN_PUBLISH_BINARY_CEIL == 0.95
 
     def test_floor_and_ceiling_alias_the_extreme_call_band(self):
-        # Trivially true while the alias holds, which is the point: paired with the two
-        # literal pins above, it fails the moment somebody re-hardcodes either edge.
+        """Trivially true while the alias holds, which is the point: paired with the two
+        literal pins above, it fails the moment somebody re-hardcodes either edge."""
         assert THIN_PUBLISH_BINARY_FLOOR == EXTREME_CALL_LOW
         assert THIN_PUBLISH_BINARY_CEIL == EXTREME_CALL_HIGH
 
     def test_floor_sits_strictly_inside_the_per_model_clamp(self):
-        # A 0.03 member call passes the per-model [0.02, 0.98] clamp untouched, which is
-        # why the floor is a new mechanism rather than a retune of BINARY_PROB_MIN/MAX.
+        """A 0.03 member call passes the per-model [0.02, 0.98] clamp untouched, which is
+        why the floor is a new mechanism rather than a retune of BINARY_PROB_MIN/MAX."""
         assert BINARY_PROB_MIN < THIN_PUBLISH_BINARY_FLOOR < THIN_PUBLISH_BINARY_CEIL < BINARY_PROB_MAX
+
+
+class TestQuestionPlatformHosts:
+    """Each platform host is spelled ONCE in constants.py; everything else derives from it.
+
+    Literal pins rather than derived ones, deliberately: the derivation is what a re-point (a
+    staging host, a domain change when Series 2 opens) relies on to move every consumer at once,
+    and these literals are what make a wrong derivation loud rather than split-brain.
+    """
+
+    def test_metaculus_host(self):
+        assert METACULUS_HOST == "metaculus.com"
+
+    def test_mantic_host_and_the_urls_derived_from_it(self):
+        assert MANTIC_HOST == "competitions.mantic.com"
+        assert MANTIC_SITE_URL == "https://competitions.mantic.com"
+        assert MANTIC_API_BASE_URL == "https://competitions.mantic.com/api"
+
+    def test_question_platform_hosts_names_both_platforms(self):
+        """The one list behind the publish-timeout scope, the self-reference refusal and the
+        gap-fill v2 driver text; an added platform lands here and nowhere else."""
+        assert QUESTION_PLATFORM_HOSTS == ("metaculus.com", "competitions.mantic.com")
+
+    def test_the_bots_own_mantic_account_id(self):
+        """``nostreambot-bot``, ``is_bot`` true, read off the public ``/api/users/81/`` on 2026-09-08."""
+        assert MANTIC_BOT_USER_ID == 81

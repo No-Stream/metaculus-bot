@@ -11,12 +11,7 @@ PROB_CLAMP_MIN: float = PROB_CLAMP_EPS
 PROB_CLAMP_MAX: float = 1.0 - PROB_CLAMP_EPS
 BOUNDARY_BASELINE: float = 0.05
 
-# Metaculus halves the peer and baseline score of a CONTINUOUS question. Its own
-# ``QUESTION_CONTINUOUS_TYPES`` is ``[numeric, date, discrete]`` (``questions/models.py``);
-# binary and multiple_choice are the un-halved family. The second name says UNHALVED rather
-# than DISCRETE because "discrete" is one of the platform's CONTINUOUS types: a
-# ``DISCRETE_QUESTION_TYPES`` holding binary and multiple_choice inverts the platform's own
-# vocabulary inside the module that exists to stop the halving being misapplied.
+# The platform's own halved family (``QUESTION_CONTINUOUS_TYPES``); "discrete" is CONTINUOUS there, hence UNHALVED, not DISCRETE, for the other name.
 CONTINUOUS_QUESTION_TYPES: frozenset[str] = frozenset({"numeric", "discrete", "date"})
 UNHALVED_QUESTION_TYPES: frozenset[str] = frozenset({"binary", "multiple_choice"})
 CONTINUOUS_PEER_DIVISOR: float = 2.0
@@ -28,6 +23,7 @@ __all__ = [
     "PROB_CLAMP_MAX",
     "PROB_CLAMP_MIN",
     "UNHALVED_QUESTION_TYPES",
+    "baseline_to_peer_factor",
     "binary_log_score",
     "brier_score",
     "clamp_prob",
@@ -151,33 +147,42 @@ def mc_log_score(predicted_probs: list[float], correct_option_index: int) -> flo
     return 100.0 * (math.log2(p_correct) / math.log2(k) + 1.0)
 
 
+def baseline_to_peer_factor(question_type: str, *, n_options: int | None = None) -> float:
+    """Multiply a difference of two baseline log scores by this to read it in spot-peer points.
+
+    The companion of :func:`spot_peer_delta` for callers holding scores rather than probabilities.
+    :func:`binary_log_score` and :func:`mc_log_score` are log-base-K, so their differences are in
+    ``log_K`` units and reach the platform's natural-log peer points times ``ln K``;
+    :func:`numeric_log_score` already returns the halved ``50 ln`` form, so a continuous difference is
+    a peer delta as it stands. Raises on an unrecognized type or a multiple-choice call without its
+    option count, for the same reason ``spot_peer_delta`` does.
+    """
+    if question_type in CONTINUOUS_QUESTION_TYPES:
+        return 1.0
+    if question_type == "binary":
+        return math.log(2.0)
+    if question_type == "multiple_choice":
+        if n_options is None or n_options < 2:
+            raise ValueError(f"a multiple-choice score delta needs its option count, got {n_options!r}")
+        return math.log(n_options)
+    raise ValueError(
+        f"unrecognized {question_type=}; expected one of {sorted(CONTINUOUS_QUESTION_TYPES | UNHALVED_QUESTION_TYPES)}"
+    )
+
+
 def spot_peer_delta(*, old_prob: float, new_prob: float, question_type: str) -> float:
     """Spot-peer points gained by moving OUR mass on the resolving outcome old -> new.
 
-    Metaculus's spot peer score is ``100 * (N/(N-1)) * ln(p/gmp)``, halved when the
-    question is one of :data:`CONTINUOUS_QUESTION_TYPES` (``scoring/score_math.py``
-    ``evaluate_forecasts_peer_spot_forecast``, read from source 2026-09-02). Because the
-    crowd's geometric mean includes us, that ``N/(N-1)`` factor is exactly what turns the
-    expression into ``100 * (ln p_us - mean_others ln p_i)``, so a counterfactual that
-    changes only OUR forecast moves the score by ``100 * ln(new/old)`` — halved for a
-    continuous question — with no crowd term left in it.
+    ``100 * ln(new/old)``, halved for a :data:`CONTINUOUS_QUESTION_TYPES` question: the platform's
+    spot peer is ``100 * (N/(N-1)) * ln(p/gmp)`` and the crowd mean includes us, so changing only our
+    forecast leaves no crowd term. The halving is the easiest thing in the codebase to apply twice
+    (:func:`numeric_log_score` already carries it) and the log-base-K baseline scores need ``ln K`` to
+    reach peer points (:func:`baseline_to_peer_factor`); both traps, their receipts and the platform
+    source are in docs/performance_analysis.md "Price a counterfactual with spot_peer_delta".
 
-    This function exists because that halving is the easiest thing in the codebase to
-    apply twice. :func:`numeric_log_score` ALREADY carries it (it returns ``50 * ln(...)``,
-    which is the platform's ``100 * ln(...) / 2``), so a difference of two
-    ``numeric_log_score`` values is already on the spot-peer scale and must NOT be doubled
-    to "convert" it. A 2026-08-31 round script doubled exactly that difference and priced
-    a q45065 near-miss counterfactual at up to +404 peer points when the true figure was
-    +202 (receipt: ``scratch/residual_2026-09-01/DOSSIER_SYNTHESIS.md`` section 7.2).
-
-    The mirror-image trap sits on the other two types: :func:`binary_log_score` and
-    :func:`mc_log_score` are log-base-K baseline scores, so their differences are in
-    ``log_K`` units and need multiplying by ``ln(K)`` (``ln 2`` for binary) to reach
-    peer points. ``tests/test_peer_delta_convention.py`` pins both directions.
-
-    Raises ``ValueError`` on a non-positive probability (a zero mass on the resolving
-    outcome is a caller-side pmf extraction bug, not a -inf score) or an unrecognized
-    question type (silently taking the un-halved branch is the bug this guards).
+    Raises ``ValueError`` on a non-positive probability (a zero mass on the resolving outcome is a
+    caller-side pmf extraction bug, not a -inf score) or an unrecognized question type (silently
+    taking the un-halved branch is the bug this guards).
     """
     if question_type in CONTINUOUS_QUESTION_TYPES:
         divisor = CONTINUOUS_PEER_DIVISOR

@@ -6,9 +6,12 @@ from unittest.mock import MagicMock
 import numpy as np
 from forecasting_tools.data_models.numeric_report import Percentile
 from forecasting_tools.data_models.questions import NumericQuestion
+from scipy.stats import norm
 
+from metaculus_bot.numeric.config import STANDARD_PERCENTILES
 from metaculus_bot.numeric.pipeline import build_numeric_distribution, sanitize_percentiles
 from metaculus_bot.numeric.validation import detect_unit_mismatch
+from tests.pipeline_test_helpers import assert_server_accepts_cdf
 
 
 def _build_question(**overrides) -> NumericQuestion:
@@ -247,3 +250,46 @@ def test_build_numeric_distribution_discrete_resamples_to_cdf_size():
 
     assert abs(probs[0] - 0.0) < 1e-9, f"Closed lower bound CDF should start at 0.0, got {probs[0]}"
     assert abs(probs[-1] - 1.0) < 1e-9, f"Closed upper bound CDF should end at 1.0, got {probs[-1]}"
+
+
+class TestFallbackDistributionOnClosedBounds:
+    """The fallback's ``get_cdf()`` used to hand forecasting-tools' raw builder output back
+    unchanged when BOTH bounds were closed, skipping the step enforcement the open-bound branch
+    ran. A tight declaration then carried a 0.297 bin against the server's 0.2 cap and the
+    lone-survivor path submitted it for an HTTP 400. Both bounds closed is the modal Mantic
+    date shape and common on Metaculus percentage questions."""
+
+    @staticmethod
+    def _tight_declaration() -> list[Percentile]:
+        return [Percentile(percentile=p, value=50.0 + 0.6 * norm.ppf(p)) for p in STANDARD_PERCENTILES]
+
+    def test_a_tight_closed_closed_declaration_meets_the_server_rules(self, monkeypatch):
+        question = _build_question(zero_point=None, open_lower_bound=False, open_upper_bound=False)
+        sanitized, zero_point = sanitize_percentiles(self._tight_declaration(), question)
+
+        def _pchip_fails(*_args, **_kwargs):
+            raise ValueError("forced PCHIP failure")
+
+        monkeypatch.setattr("metaculus_bot.numeric.pipeline.generate_pchip_cdf_with_smoothing", _pchip_fails)
+
+        prediction = build_numeric_distribution(sanitized, question, zero_point)
+
+        assert type(prediction).__name__ == "BoundSafeNumericDistribution"
+        heights = np.asarray([p.percentile for p in prediction.get_cdf()], dtype=float)
+        assert_server_accepts_cdf(heights, cdf_size=201, open_lower=False, open_upper=False)
+        assert heights[0] == 0.0
+        assert heights[-1] == 1.0
+
+    def test_the_open_bound_path_is_unchanged(self, monkeypatch):
+        question = _build_question(zero_point=None, open_lower_bound=True, open_upper_bound=True)
+        sanitized, zero_point = sanitize_percentiles(self._tight_declaration(), question)
+
+        def _pchip_fails(*_args, **_kwargs):
+            raise ValueError("forced PCHIP failure")
+
+        monkeypatch.setattr("metaculus_bot.numeric.pipeline.generate_pchip_cdf_with_smoothing", _pchip_fails)
+
+        prediction = build_numeric_distribution(sanitized, question, zero_point)
+
+        heights = np.asarray([p.percentile for p in prediction.get_cdf()], dtype=float)
+        assert_server_accepts_cdf(heights, cdf_size=201, open_lower=True, open_upper=True)

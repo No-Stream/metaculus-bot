@@ -1,61 +1,20 @@
-"""Offline full-pipeline e2e forecast test — the breaking-dependency tripwire.
+"""Offline full-pipeline e2e forecast test: the breaking-dependency tripwire.
 
-WHAT THIS DEFENDS AGAINST
-=========================
-The litellm 1.92 crash (``acompletion(tools=...)`` eagerly imports a proxy MCP
-handler needing ``fastapi``, which we don't install) fired only when the real
-call EXECUTED with ``tools=`` — a plain ``import litellm`` smoke test would NOT
-catch it, and the agentic gap-fill v2 loop (the only ``tools=`` caller) soft-
-failed to "" so nothing went red in CI. This test drives the REAL code paths of
-every external dependency on the forecast critical path — research, forecaster
-fan-out, aggregation, gap-fill v1 AND v2 — stubbing ONLY the outermost network
-boundary (the socket-opening client call). If a future dep upgrade breaks an
-import / transform / call-path anywhere in that stack, this test goes red.
+Binary, numeric and MC each run the whole ``forecast_questions`` pipeline offline, driving the
+REAL code paths of every external dependency on the forecast critical path (research, forecaster
+fan-out, aggregation, gap-fill v1 and v2) and stubbing ONLY the outermost network boundary, the
+socket-opening client call. That is what caught the litellm 1.92 ``tools=`` crash, which fired
+only when the real call executed and which the agentic v2 loop then soft-failed to "".
 
-DESIGN
-======
-* **LLM seam — a routing wrapper, not a global mock.** The pipeline makes many
-  heterogeneous LLM calls that each need a DIFFERENT valid canned response
-  (binary/numeric/MC forecaster blocks, summarizer prose, gap-fill v1 gap JSON,
-  native-search prose, the agentic v2 driver's tool calls, the parser salvage).
-  A single ``litellm.mock_response`` can't satisfy all of them. Instead we patch
-  the two ``acompletion`` chokepoints with a ROUTER that inspects the outgoing
-  ``model`` + ``messages`` (the system-prompt text identifies the call type),
-  selects the matching canned text, and forwards to the REAL
-  ``litellm.acompletion(**kwargs, mock_response=<routed>)``. Forwarding to real
-  litellm is load-bearing: it executes all real litellm import/transform/tools-
-  path code (catching the fastapi class of bug) while short-circuiting only the
-  network. The v2 driver path additionally uses ``mock_tool_calls`` so the loop
-  gets a real tool-call-shaped response.
+Two seams do the work. ``_install_llm_router`` patches both ``acompletion`` chokepoints with a
+router that reads the outgoing prompt, picks the matching canned response and forwards to real
+litellm with ``mock_response``, so all real litellm import/transform/tools-path code executes.
+``_install_provider_stubs`` replaces each provider's external client at its lowest boundary, with
+conftest's autouse network-egress guard as the backstop. ``_assert_pipeline_ran`` is where a run
+that quietly degraded gets caught.
 
-* **Provider seams — stub at the lowest client boundary.** Each research
-  provider's external client (AskNews SDK, google-genai Client, aiohttp session,
-  Exa client) is stubbed so OUR formatting/parsing code runs for real but no
-  socket opens. The autouse network-egress guard in conftest.py is the
-  belt-and-suspenders backstop: if a stub is missed, the test trips the guard
-  (a clear RuntimeError) rather than spending real money.
-
-PATHS FULLY EXERCISED (all three question types complete end to end)
-====================================================================
-Binary, numeric, and MC each run the full ``forecast_questions`` →
-``_research_and_make_predictions`` pipeline offline and produce a published-shape
-``ForecastReport``. Real code executed per question: the whole research fan-out
-(AskNews + summarizer, native search, Gemini grounded, financial-data classifier,
-prediction-market snapshot across 4 platforms, resolution-source fetch), gap-fill
-v1 (analyzer + parallel resolvers), gap-fill v2 (the agentic tool loop, driving
-REAL ``litellm.acompletion`` with ``tools=`` — the fastapi tripwire), the
-forecaster fan-out through the value-extraction ladder (rung=block), and CDF/MC
-post-processing + aggregation. Stacking is prod-disabled (the three
-``*_STACKING_ENABLED`` flags default off and are NOT set here), so the median/
-skipped aggregation path runs — the production-default path.
-
-Partially exercised: the stacker LLM itself (crux → targeted search → stacker)
-is not driven, because prod runs with stacking disabled; the conditional-stacking
-mechanism is covered by ``tests/test_conditional_stacking.py``. Rendered-fetch
-(headless Chromium) and read_document (Gemini url_context) inside the agentic loop
-only fire if the driver requests them; the scripted driver concludes without them,
-so those specific rungs are not covered here (they are unit-tested in
-``tests/test_agentic_tools.py``).
+Why each canned payload and stub is shaped the way it is, what ``_assert_pipeline_ran`` pins and
+the receipt behind each signal: ``docs/architecture.md`` "The offline end-to-end test".
 """
 
 from __future__ import annotations
@@ -88,26 +47,21 @@ from metaculus_bot.llm_configs import (
     STACKER_LLM,
     SUMMARIZER_LLM,
 )
-from metaculus_bot.research import gemini_search, prediction_market, resolution_source
+from metaculus_bot.research import gemini_search, prediction_market
 from metaculus_bot.research import providers as research_providers
 from metaculus_bot.research.agentic import llm as agentic_llm
+from metaculus_bot.research.fetch_ladder import guard
 
 _NOW = datetime.now(UTC)
 _OPEN = _NOW - timedelta(days=30)
 _RESOLVE = _NOW + timedelta(days=180)
 
-# A fetchable URL in resolution criteria exercises the resolution-source provider
-# (extract → fetch → trafilatura extract). example.com is RFC-2606 reserved; the
-# aiohttp session is stubbed so no socket opens and the SSRF-guard getaddrinfo is
-# patched to a public IP.
+# A fetchable URL in the resolution criteria is what exercises the resolution-source provider.
 _RESOLUTION_URL = "https://data.example.gov/unemployment-report"
 
 
 # ---------------------------------------------------------------------------
 # Canned forecaster / stacker blocks — parse at value_extraction rung 1 (block).
-# Kept byte-for-byte in sync with the STRUCTURED FORECAST schemas
-# (metaculus_bot/structured_output_schema.py) so extract_binary/mc/numeric all
-# land rung=block. Mirrors tests/pipeline_test_helpers.py's canned reasonings.
 # ---------------------------------------------------------------------------
 
 _CANNED_BINARY = """\
@@ -155,16 +109,12 @@ _CANNED_NATIVE_SEARCH_PROSE = (
     "[BLS](https://www.bls.gov/news.release/empsit.nr0.htm)."
 )
 
-# The prediction-market query author: `{"synonyms": [...], "framings": [...]}`. Anything else —
-# prose, or a shape `parse_query_author` rejects — makes the stage report a lost source, which
-# bumps the market provider's source-loss counter and fails `_assert_pipeline_ran`'s
-# `alertable_count == 0`.
+# The one shape `parse_query_author` accepts; anything else costs a source and reddens the suite.
 _CANNED_QUERY_AUTHOR = json.dumps(
     {"synonyms": ["jobless rate", "U-3", "household survey"], "framings": ["unemployment print", "jobs report rate"]}
 )
 
-# The prediction-market ranker's tiers, in value order. Only the first two earn the
-# strong-evidence preamble on the rendered snapshot.
+# The ranker's tiers in value order; only the first two earn the strong-evidence preamble.
 _RANKER_TIERS = ("same_quantity_same_date", "same_quantity_other_cut", "driver_or_consequence")
 
 
@@ -186,21 +136,23 @@ def _canned_ranking(prompt: str) -> str:
     return json.dumps(picks)
 
 
-# gap-fill v1 analyzer: a single-gap JSON payload (parse_gap_list).
+# gap-fill v1 analyzer: a single-gap JSON payload, graded to pass triage so the resolver path runs.
 _CANNED_GAP_ANALYZER = json.dumps(
-    {"gaps": [{"gap": "Latest BLS release date", "why_matters": "Anchors the level", "search_query": "BLS release"}]}
+    {
+        "gaps": [
+            {
+                "gap": "Latest BLS release date",
+                "why_matters": "Anchors the level",
+                "search_query": "BLS release",
+                "answerable_now": True,
+                "already_in_first_pass": False,
+                "same_need_as": None,
+            }
+        ]
+    }
 )
 
 # Providers that MUST report `ok` in the diagnostics block for these questions.
-# Verified empirically (all three question types, INFO logs) to be identical:
-# asknews/native_search/gemini_search/resolution_source all land `ok`, while
-# financial_data legitimately returns `empty` (non-financial question) — so it is
-# NOT asserted `ok`. prediction_market now renders rows off the stubbed off-topic
-# payloads, but it is left out of this set anyway: whether it renders is the canned
-# RANKING's call, not a statement about the provider's health, and pinning it here
-# would make the set assert a test fixture. A dep break that errors any required provider is
-# swallowed into status="errored" by the orchestrator, so this is the direct
-# catch for the non-litellm dependency class (google-genai / asknews / aiohttp).
 _REQUIRED_OK_PROVIDERS = frozenset({"asknews", "native_search", "gemini_search", "resolution_source"})
 
 
@@ -230,17 +182,17 @@ def _route_general_llm(kwargs: dict[str, Any]) -> str:
     Routes on prompt content. The base forecaster prompts embed a
     'STRUCTURED FORECAST' block schema and a per-type cue (percentiles / options
     line); the summarizer/native-search/gap-fill-analyzer calls carry their own
-    distinctive text. Order matters — most-specific first.
+    distinctive text. Order matters — most-specific first: the forecaster branch is checked
+    before the summarizer signal because the base MC and numeric prompts also contain
+    "Intelligence Briefing", and the prediction-market ranker before the generic branches because
+    its prompt carries a resolution-criteria header and no block, so it would otherwise fall
+    through to canned prose it cannot parse. Question type is read off the prompt too: percentiles
+    means numeric, an "Options (in resolution order):" line means MC, else binary.
     """
     text = _messages_text(kwargs)
     lower = text.lower()
 
-    # A forecaster (or stacker) call — the ONLY calls carrying the fenced
-    # STRUCTURED FORECAST block instruction. Checked FIRST because the base MC /
-    # numeric prompts also contain "Intelligence Briefing" (which would otherwise
-    # collide with the summarizer signal below). Pick the block by question type:
-    # the numeric prompt talks about percentiles; the MC prompt has an
-    # "Options (in resolution order):" line; else binary.
+    # Forecaster and stacker calls are the only ones carrying the fenced STRUCTURED FORECAST block.
     if "STRUCTURED FORECAST" in text:
         if "percentile" in lower:
             return _CANNED_NUMERIC
@@ -248,9 +200,7 @@ def _route_general_llm(kwargs: dict[str, Any]) -> str:
             return _CANNED_MC
         return _CANNED_BINARY
 
-    # Prediction-market ranker: the only call ranking candidates by evidential value. Checked
-    # before the generic branches because its prompt carries a resolution-criteria header and no
-    # block, so it would otherwise fall through to canned prose it cannot parse.
+    # The only call ranking candidates by evidential value.
     if "Rank the candidates by EVIDENTIAL VALUE" in text:
         return _canned_ranking(text)
 
@@ -266,32 +216,32 @@ def _route_general_llm(kwargs: dict[str, Any]) -> str:
     if "intelligence briefing" in lower or "<research>" in lower:
         return _CANNED_SUMMARY_PROSE
 
-    # Everything else — native / targeted web search, gap-fill resolver,
-    # perplexity fallback — carries a "research assistant" framing and no block.
+    # Native / targeted web search, the gap-fill resolver and the perplexity fallback: no block.
     return _CANNED_NATIVE_SEARCH_PROSE
 
 
 def _install_llm_router(monkeypatch: pytest.MonkeyPatch) -> None:
     """Patch BOTH acompletion chokepoints to route → real litellm + mock_response.
 
-    Chokepoint 1: ``forecasting_tools.ai_models.general_llm.acompletion`` — every
-    GeneralLlm call (forecasters, stacker, parser, summarizer, native search).
-    Chokepoint 2: ``metaculus_bot.research.agentic.llm.acompletion`` — the raw-
-    litellm agentic v2 driver (the ONLY ``tools=`` caller).
-
-    Both forward to the REAL ``litellm.acompletion`` with ``mock_response`` (and,
-    for the tools path, ``mock_tool_calls``) added — so all real litellm
+    Chokepoint 1: ``forecasting_tools.ai_models.general_llm.acompletion`` — every GeneralLlm call
+    (forecasters, stacker, parser, summarizer, native search). Chokepoint 2:
+    ``metaculus_bot.research.agentic.llm.acompletion`` — the raw-litellm agentic v2 driver (the
+    ONLY ``tools=`` caller). Both forward to the REAL ``litellm.acompletion`` with
+    ``mock_response`` (and, for the tools path, ``mock_tool_calls``) added, so all real litellm
     import/transform/tools-gated code executes while the network is short-circuited.
+
+    The agentic driver needs a tool-call-shaped response, and the scripted turns
+    (set_research_plan, then conclude) run its loop end to end without any external tool call
+    while still driving the real ``tools=`` path on every step. ``drop_params`` must be True for
+    the agentic wrapper's OpenRouter reasoning_effort handling: in prod a GeneralLlm invoke sets it
+    globally, so setting it here keeps the agentic path deterministic even if it runs first.
     """
     real_acompletion = litellm.acompletion
 
     async def general_llm_router(**kwargs: Any) -> Any:
         return await real_acompletion(**kwargs, mock_response=_route_general_llm(kwargs))
 
-    # Agentic driver: the loop needs a tool-call-shaped response. We script it to
-    # (1) set_research_plan on the first turn, then (2) conclude — enough to run
-    # the loop end to end without any external tool call, while still driving the
-    # real litellm ``tools=`` path (the fastapi tripwire) on every step.
+    # The scripted driver turns: set_research_plan first, then conclude.
     agentic_state = {"step": 0}
 
     async def agentic_router(**kwargs: Any) -> Any:
@@ -335,15 +285,11 @@ def _install_llm_router(monkeypatch: pytest.MonkeyPatch) -> None:
             return await real_acompletion(
                 **kwargs, mock_response="driving the agentic loop", mock_tool_calls=mock_tool_calls
             )
-        # The ghost phase calls with tools=None; return a plain block so
-        # _summarize_ghost parses it (telemetry only).
+        # The ghost phase calls with tools=None, and _summarize_ghost parses a plain block.
         return await real_acompletion(**kwargs, mock_response=_CANNED_BINARY)
 
     monkeypatch.setattr(ft_general_llm, "acompletion", general_llm_router)
     monkeypatch.setattr(agentic_llm, "acompletion", agentic_router)
-    # drop_params must be True for the agentic wrapper's OpenRouter reasoning_effort
-    # handling; a GeneralLlm invoke sets it globally in prod, but assert it here so
-    # the agentic path is deterministic even if it runs first.
     monkeypatch.setattr(litellm, "drop_params", True)
 
 
@@ -460,21 +406,7 @@ _RESOLUTION_HTML = (
 )
 
 
-# EVERY venue must return a POPULATED off-topic payload, and each must carry the liquidity
-# fields provider_health declares for it. Two reasons, both learned the hard way:
-#
-# - An EMPTY catalogue from a SUCCESSFUL fetch is a degradation in its own right (a dead response
-#   parser or a silently emptied index), and provider_health's catalogue_empty signal alerts on
-#   it by design — so an empty stub both trips that alert and skips the pool assembly this suite
-#   exists to exercise.
-# - A venue-complete payload set is what a healthy prod run actually looks like, so the pipeline
-#   under test is the one prod runs rather than a degraded corner of it.
-#
-# The liquidity fields are equally load-bearing: `market_field_contract` fires when a declared
-# field is absent from 100% of a venue's POOL rows — which is every row a populated payload
-# produces, whether or not the ranker keeps any of them — and every real open Kalshi market
-# carries volume_fp and open_interest_fp (1,504/1,504 measured), so a stub without them describes
-# a payload that does not exist.
+# Every venue returns a POPULATED off-topic payload with the liquidity fields provider_health wants.
 _OFF_TOPIC_KALSHI_EVENTS = json.dumps(
     {
         "events": [
@@ -567,8 +499,7 @@ _OFF_TOPIC_MANIFOLD_SEARCH = json.dumps(
         }
     ]
 ).encode()
-# The search listing carries no description, which is exactly why the enrichment fan-out exists;
-# the detail record is where the rules text comes from.
+# The search listing carries no description; the detail record is where the rules text comes from.
 _MANIFOLD_MARKET_DETAIL = json.dumps(
     {
         "id": "wc26brazil",
@@ -582,9 +513,9 @@ class _FakeHttpSession:
     """aiohttp.ClientSession stand-in for the prediction-market + resolution-source hosts.
 
     Every venue returns a populated OFF-TOPIC payload, because that is what "no relevant market"
-    actually looks like upstream (see the note above the payloads) — the ranker, not the
-    transport, is what decides a candidate does not bear on the question. The resolution-source
-    host returns an article-shaped HTML body so trafilatura runs.
+    actually looks like upstream (the FIXTURE RATIONALE section of the module docstring has the
+    receipts) — the ranker, not the transport, is what decides a candidate does not bear on the
+    question. The resolution-source host returns an article-shaped HTML body so trafilatura runs.
 
     Manifold's two endpoints are routed separately, and the ORDER matters: the detail path
     (`/v0/market/<id>`) is checked first, because a substring test for "manifold" alone would
@@ -620,10 +551,18 @@ class _FakeHttpSession:
 
 
 def _install_provider_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Stub every provider's external client at its socket-opening boundary."""
-    # AskNews SDK — both the two-phase provider and the agentic tools' search_news
-    # do a function-scoped `from asknews_sdk import AsyncAskNewsSDK`, so patching
-    # the module attribute covers both call sites.
+    """Stub every provider's external client at its socket-opening boundary.
+
+    Three patch sites are chosen rather than obvious. Both the two-phase AskNews provider and the
+    agentic tools' search_news do a function-scoped ``from asknews_sdk import AsyncAskNewsSDK``, so
+    patching the module attribute covers both call sites. The two-phase provider also sleeps 10.1s
+    twice before its calls, so ``asyncio.sleep`` is patched inside the providers module alone,
+    which keeps the test fast without touching the event loop anywhere else. For Gemini the patch
+    goes on ``build_gemini_client``, the public factory the provider calls, and NOT on
+    ``_cached_client_for_key``: that one is lru_cache-wrapped and conftest's autouse
+    ``_clear_gemini_client_cache`` fixture calls ``.cache_clear()`` on it at teardown, so replacing
+    it with a plain lambda would break teardown, while patching the caller leaves the cache intact.
+    """
     monkeypatch.setattr(asknews_sdk, "AsyncAskNewsSDK", _FakeAskNewsSDK)
 
     # Skip the AskNews provider's real rate-gate sleeps.
@@ -631,32 +570,25 @@ def _install_provider_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
         return None
 
     monkeypatch.setattr(research_providers, "_asknews_rate_gate", _noop_rate_gate)
-    # The two-phase AskNews provider sleeps 10.1s twice before its calls; patch
-    # asyncio.sleep inside the providers module to keep the test fast (it only
-    # affects that module's sleeps, not the event loop).
     real_sleep = research_providers.asyncio.sleep
 
     async def _fast_sleep(seconds: float) -> None:
-        # Collapse the provider's deliberate 10.1s throttle waits; keep 0-sleeps
-        # (checkpoints) real so scheduling semantics are unchanged.
+        """Collapse the provider's deliberate 10.1s throttle waits.
+
+        The await itself stays real (a 0-sleep), so scheduling semantics are unchanged.
+        """
         await real_sleep(0)
 
     monkeypatch.setattr(research_providers.asyncio, "sleep", _fast_sleep)
 
-    # Gemini grounded search — patch build_gemini_client (the public factory the
-    # provider calls). NOT _cached_client_for_key: that's an lru_cache-wrapped
-    # function conftest's autouse _clear_gemini_client_cache fixture calls
-    # .cache_clear() on at teardown, so replacing it with a plain lambda would
-    # break teardown. Patching the caller leaves the lru_cache intact.
     monkeypatch.setattr(gemini_search, "build_gemini_client", _fake_gemini_client)
 
     # Prediction-market + resolution-source aiohttp sessions.
     monkeypatch.setattr(prediction_market, "_get_session", _FakeHttpSession)
-    monkeypatch.setattr(resolution_source, "_get_session", _FakeHttpSession)
-    # resolution_source runs a getaddrinfo SSRF preflight on every URL; example.gov
-    # has no real DNS, so return a public IP (mirrors tests/resolution_source/conftest.py).
+    monkeypatch.setattr(guard, "_get_session", _FakeHttpSession)
+    # example.gov has no DNS for the SSRF preflight; mirrors tests/resolution_source/conftest.py.
     monkeypatch.setattr(
-        resolution_source.socket,
+        guard.socket,
         "getaddrinfo",
         lambda *a, **k: [(0, 0, 0, "", ("8.8.8.8", 0))],
     )
@@ -666,10 +598,15 @@ def _install_provider_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
 def _install_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Mirror the prod-workflow env: every provider ENABLED + dummy keys so gates pass.
 
-    Stacking flags are deliberately NOT set — prod runs with stacking disabled, so
+    Stacking flags are deliberately NOT left on — prod runs with stacking disabled, so
     the default-off median/skipped path is what we exercise. (conftest's autouse
-    fixture sets the *_STACKING_ENABLED flags on; we delete them here to reproduce
+    fixture sets the *_STACKING_ENABLED flags on; we set them false here to reproduce
     prod, which routes through the non-stacked aggregation.)
+
+    The keys are dummies, each opening one gate: the AskNews creds make AskNews the primary
+    provider (the prod case), GOOGLE_API_KEY opens gemini, FRED_API_KEY opens financial data, and
+    only the personal OpenRouter key is set — the donated one is deleted — so the fallback wrapper
+    stays single-key deterministic and the agentic router runs on one key.
     """
     for flag in (
         "NATIVE_SEARCH_ENABLED",
@@ -684,10 +621,6 @@ def _install_env(monkeypatch: pytest.MonkeyPatch) -> None:
     # Restore prod's stacking-disabled default (conftest autouse turns these on).
     for flag in ("BINARY_STACKING_ENABLED", "MC_STACKING_ENABLED", "NUMERIC_STACKING_ENABLED"):
         monkeypatch.setenv(flag, "false")
-    # Dummy API keys so provider-selection gates pass. AskNews creds make it the
-    # primary provider (prod case). GOOGLE_API_KEY for gemini + FRED_API_KEY for
-    # financial. Personal OpenRouter key only (donated deleted) so the fallback
-    # wrapper stays single-key deterministic and the agentic router is on one key.
     monkeypatch.setenv("ASKNEWS_CLIENT_ID", "dummy-client")
     monkeypatch.setenv("ASKNEWS_SECRET", "dummy-secret")
     monkeypatch.setenv("GOOGLE_API_KEY", "dummy-google")
@@ -849,25 +782,11 @@ class TestOfflineE2EForecast:
 
 
 def _assert_pipeline_ran(caplog: pytest.LogCaptureFixture, bot: TemplateForecaster, *, expect_qtype: str) -> None:
-    """Assert (via logs + the bot's degradation counters) that every real code
-    path executed offline WITHOUT any swallowed failure.
+    """Assert that every real code path executed offline WITHOUT any swallowed failure.
 
-    The load-bearing signals:
-    - alertable_count == 0: the sum of all degradation counters (forecasters
-      dropped, publish failures, stacker fallbacks, research-provider failures,
-      gap-fill v2 errors). The orchestrator SWALLOWS provider exceptions into
-      status="errored" + a counter bump rather than re-raising, so a broken
-      provider dep would otherwise pass silently — this is the tripwire for it.
-    - EXTRACTION_RUNG rung=block: the forecaster's canned block parsed at rung 1
-      (the value-extraction ladder ran for real over real model output).
-    - GAP_FILL_V2 ... error=None: the agentic v2 loop EXECUTED and did NOT crash —
-      this directly asserts the fastapi class of bug is absent (a dead-on-arrival
-      import error would stamp error=<repr> on every question).
-    - Provider diagnostics: the required providers returned 'ok' and NONE errored
-      (their real formatting code ran end to end).
+    Each signal it pins, and the receipt behind it, is in the module docstring's
+    "WHAT ``_assert_pipeline_ran`` PINS".
     """
-    # No swallowed degradation: a provider erroring, a forecaster being dropped,
-    # the stacker falling back, or gap-fill v2 crashing all bump this.
     assert bot.alertable_count == 0, (
         f"pipeline degraded — a provider errored, a forecaster was dropped, the stacker "
         f"fell back, or gap-fill v2 crashed: alertable_count={bot.alertable_count}"
@@ -888,12 +807,7 @@ def _assert_pipeline_ran(caplog: pytest.LogCaptureFixture, bot: TemplateForecast
     assert v2_lines, "no GAP_FILL_V2 marker — the agentic v2 loop never ran"
     clean_v2_lines = [m for m in v2_lines if "error=None" in m]
     assert clean_v2_lines, f"gap-fill v2 crashed (fastapi-class bug?): {v2_lines}"
-    # A crash-free marker (error=None) with tool_calls=0 would still pass the check
-    # above even though the driver never issued a tool call — i.e. a driver that
-    # stopped sending tools looks identical to a healthy run. Require >=1 tool call
-    # so "the v2 loop executed" means it actually drove the tools= path. The
-    # agentic_router scripts set_research_plan + conclude, so tool_calls is >=2 here.
-    # (?<!dup_) keeps the match off the sibling dup_tool_calls= field.
+    # tool_calls=0 with error=None reads like a healthy run, so require >=1; (?<!dup_) dodges dup_.
     tool_call_counts = [
         int(match.group(1)) for m in clean_v2_lines if (match := re.search(r"(?<!dup_)tool_calls=(\d+)", m))
     ]
@@ -902,11 +816,17 @@ def _assert_pipeline_ran(caplog: pytest.LogCaptureFixture, bot: TemplateForecast
         f"gap-fill v2 ran but issued no tool calls (tool_calls=0) — driver stopped sending tools: {clean_v2_lines}"
     )
 
-    # Provider diagnostics show the stubbed providers ran end to end. Each required
-    # provider must report `ok` (its real formatting code produced non-empty text),
-    # and NO provider may report `errored` — the direct catch for a swallowed
-    # provider-dep break (google-genai / asknews / aiohttp), which the orchestrator
-    # turns into status="errored" instead of re-raising.
+    # Gap-fill v1 graded its gap, kept it, and the resolved section reached the research bundle.
+    triage_lines = [m for m in messages if "GAP_FILL_V1_TRIAGE:" in m]
+    assert triage_lines, "no GAP_FILL_V1_TRIAGE marker — the gap-fill v1 analyzer/triage never ran"
+    assert any("listed=1 kept=1" in m for m in triage_lines), (
+        f"gap-fill v1 triage dropped the canned gap (expected listed=1 kept=1): {triage_lines}"
+    )
+    assert "### Gap 1: Latest BLS release date" in text, (
+        f"gap-fill v1 kept its gap but no resolved gap section reached the research bundle:\n{text}"
+    )
+
+    # The stubbed providers ran end to end: every required one `ok`, and none `errored`.
     assert "Provider diagnostics" in text, "no provider-diagnostics telemetry"
     for provider in _REQUIRED_OK_PROVIDERS:
         assert f"{provider}: ok" in text, (
@@ -914,20 +834,13 @@ def _assert_pipeline_ran(caplog: pytest.LogCaptureFixture, bot: TemplateForecast
         )
     assert ": errored" not in text, f"a research provider errored (swallowed by the orchestrator):\n{text}"
 
-    # Survivor count is stated POSITIVELY in the log. Before FORECASTERS_SURVIVED
-    # existed, the only line naming a survivor count was on the failure path and
-    # fired only below MIN_FORECASTERS_TO_PUBLISH — which is 1, so a 1-of-3 publish
-    # exited zero and read identically to a healthy 3-of-3. The count reached only
-    # the published Metaculus comment, never stdout, so an operator reading a run
-    # log had to count EXTRACTION_RUNG lines and dedupe model slugs to infer it.
+    # The survivor count is stated positively in the log, and names the surviving models.
     survived_lines = [m for m in messages if "FORECASTERS_SURVIVED:" in m]
     assert survived_lines, "no FORECASTERS_SURVIVED telemetry — the survivor count is not in the log"
     configured = len(bot._forecaster_llms)
     assert any(f"survived={configured}/{configured}" in m for m in survived_lines), (
         f"expected a full-ensemble survivor line (survived={configured}/{configured}); got: {survived_lines}"
     )
-    # The models= field must name the survivors, so a reader can diff them against
-    # FORECASTER_DROPS without cross-referencing the comment.
     assert any("models=" in m and m.split("models=")[1].strip() for m in survived_lines), (
         f"FORECASTERS_SURVIVED must name the surviving models: {survived_lines}"
     )

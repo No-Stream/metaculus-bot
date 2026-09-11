@@ -34,6 +34,7 @@ class DegradationSnapshot:
     stacker_fallback_failed: int
     research_provider_failures: int
     summarizer_failures: int
+    gap_fill_v1_errors: int
     gap_fill_v2_errors: int
     prediction_market_degraded: int
     prediction_market_source_losses: int
@@ -67,6 +68,7 @@ def alertable_total(snapshot: DegradationSnapshot) -> int:
         + snapshot.stacker_fallback_failed
         + snapshot.research_provider_failures
         + snapshot.summarizer_failures
+        + snapshot.gap_fill_v1_errors
         + snapshot.gap_fill_v2_errors
         + snapshot.prediction_market_degraded
         + snapshot.prediction_market_source_losses
@@ -82,41 +84,14 @@ def format_degradation_summary(snapshot: DegradationSnapshot) -> str:
     """The loud end-of-run degradation line.
 
     Any non-zero counter here means something got dropped, the stacker fell back,
-    or a research provider failed — all states where CI (``cli.py``) should exit
-    non-zero so we get paged, but every publishable question has already been
+    or a research provider failed: states where CI (``cli.py``) should exit
+    non-zero so we get paged, although every publishable question has already been
     published. Emitted unconditionally, so a clean run states its zeros rather
-    than implying them by an absent line.
-
-    The tail keys (``provider_degradation``, then ``publish_attempt_failures``,
-    then ``publish_skipped_closed``, then ``time_budget_fast_path``, then
-    ``research_budget_cuts``) stay LAST and in that order: the telemetry parser
-    wraps each in an optional trailing group so archived records that predate any
-    of them still harvest their other counters on a replace-by-run re-harvest.
-    Appending a key here without extending that regex breaks the whole line's
-    harvest, because the pattern is ``$``-anchored.
-
-    ``research_budget_cuts`` is the off-fast-path complement of
-    ``time_budget_fast_path``: a question whose window cleared the fast-path
-    threshold but whose research WINDOW still cut a provider or a gap-fill pass
-    (deduplicated per question, orchestrator-side). Without it that band's
-    degradation was invisible to the counter contract and the all-clear census.
-
-    The three publish-side counters mean three different things, which is why
-    they are three keys. ``questions_failed_to_publish`` counts questions the
-    min-forecasters floor kept from ATTEMPTING publication;
-    ``publish_attempt_failures`` counts attempted POSTs that exhausted the
-    publish-hardening retry budget (the q45085 405 shape the old counter could
-    not see); ``publish_skipped_closed`` counts questions whose publish the
-    close-time gate skipped before any POST, i.e. latency cost us the question.
-    The oldest key's name is misleading but stays — renaming it would silently
-    drop the field from every historical record the parser replays.
-
-    ``time_budget_fast_path`` is the fourth member of that family and the earliest
-    of them: it counts questions whose close time was too near for the full
-    pipeline's worst case, so the optional research stages were dropped to protect
-    the prediction POST. The three above fire once a publish has already failed or
-    been withheld; this one fires while the question is still savable, which is why
-    it is worth alerting on separately.
+    than implying them by an absent line. The telemetry parser reads it as generic
+    ``key=value`` pairs, so a counter appended here harvests with no regex change.
+    What each counter means, why the three publish-side counters are three keys,
+    and the history of the ``$``-anchored pattern: ``docs/telemetry_markers.md``
+    "DEGRADATION_COUNTERS".
     """
     return (
         f"Degradation counters: forecasters_dropped={snapshot.forecasters_dropped}, "
@@ -126,6 +101,7 @@ def format_degradation_summary(snapshot: DegradationSnapshot) -> str:
         f"stacker_fallback_failed={snapshot.stacker_fallback_failed}, "
         f"research_provider_failures={snapshot.research_provider_failures}, "
         f"summarizer_failures={snapshot.summarizer_failures}, "
+        f"gap_fill_v1_errors={snapshot.gap_fill_v1_errors}, "
         f"gap_fill_v2_errors={snapshot.gap_fill_v2_errors}, "
         f"prediction_market_degraded={snapshot.prediction_market_degraded}, "
         f"prediction_market_source_losses={snapshot.prediction_market_source_losses}, "

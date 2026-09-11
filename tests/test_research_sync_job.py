@@ -37,7 +37,7 @@ _PLIST_TEMPLATE = _SYNC_DIR / "com.metaculusbot.research-sync.plist.template"
 _REPO_ROOT_PLACEHOLDER = "__REPO_ROOT__"
 _WORKFLOW_DIR = _REPO_ROOT / ".github" / "workflows"
 
-# Every workflow that runs the bot: three scheduled prod tournaments plus the two
+# Every workflow that runs the bot: four scheduled prod tournaments plus the two
 # dispatch-only test workflows (test_bot / test_bot_basic both match *bot*).
 # .y*ml, not .yaml: the exact-set assertion below is what forces a NEW bot workflow to
 # satisfy this invariant, and a .yml-suffixed one would slip past it (claude.yml already
@@ -196,6 +196,7 @@ class TestBotWorkflowsArchiveTheirResearch:
         # invariant below or fail here. Silently escaping it is the failure mode that
         # cost us the three runs above.
         assert _BOT_WORKFLOWS == [
+            ".github/workflows/run_bot_on_mantic.yaml",
             ".github/workflows/run_bot_on_metaculus_cup.yaml",
             ".github/workflows/run_bot_on_minibench.yaml",
             ".github/workflows/run_bot_on_tournament.yaml",

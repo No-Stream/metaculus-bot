@@ -14,6 +14,7 @@ import numpy as np
 from scipy.interpolate import PchipInterpolator
 
 from metaculus_bot.constants import NUM_MAX_STEP, NUM_MIN_PROB_STEP
+from metaculus_bot.numeric.config import OPEN_TAIL_MIN_MASS
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,13 @@ _MASS_TOLERANCE: float = 1e-15
 # accumulated float drift. Deliberately far looser than _MASS_TOLERANCE (a ~200-ring walk
 # can drift a few times 1e-15) and far below the min-step, so nothing meaningful is lost.
 _UNPLACED_MASS_TOLERANCE: float = 1e-9
+# How far below ``min_step`` an adjacent step may sit before it counts as a violation. One
+# tolerance for the rebuild trigger, the rebuild's range check, its post-check and the final
+# assertion: when only the last two carried it, a 1e-18 step deficit tripped the trigger and
+# the range check then refused a range 1e-16 short, dropping a forecast that put almost all
+# of its mass beyond an open bound (Mantic edge-case review, 2026-09). The server rounds the
+# PMF to 9 decimals, so a deficit this small is invisible to it.
+_MIN_STEP_TOLERANCE: float = 1e-10
 
 
 @dataclass(frozen=True)
@@ -140,7 +148,7 @@ def safe_cdf_bounds(
 ) -> np.ndarray:
     """
     Ensure CDF respects Metaculus boundary constraints:
-    • For *open* bounds: cdf[0] ≥ 0.001, cdf[-1] ≤ 0.999
+    • For *open* bounds: cdf[0] ≥ ``OPEN_TAIL_MIN_MASS``, cdf[-1] ≤ ``1 - OPEN_TAIL_MIN_MASS``
     • No single step may exceed ``max_step``
     • Adjacent steps stay ≥ ``min_step`` (re-enforced after pin+cummax)
 
@@ -159,9 +167,9 @@ def safe_cdf_bounds(
 
     # Pin tails to legal open-bound limits
     if open_lower:
-        cdf[0] = max(cdf[0], 0.001)
+        cdf[0] = max(cdf[0], OPEN_TAIL_MIN_MASS)
     if open_upper:
-        cdf[-1] = min(cdf[-1], 0.999)
+        cdf[-1] = min(cdf[-1], 1.0 - OPEN_TAIL_MIN_MASS)
 
     # Enforce the maximum step rule
     pre_max_step = float(np.max(np.diff(cdf))) if cdf.size > 1 else 0.0
@@ -190,17 +198,15 @@ def safe_cdf_bounds(
 
     # Re-apply open bounds in case redistribution nudged them
     if open_lower:
-        cdf[0] = max(cdf[0], 0.001)
+        cdf[0] = max(cdf[0], OPEN_TAIL_MIN_MASS)
     if open_upper:
-        cdf[-1] = min(cdf[-1], 0.999)
+        cdf[-1] = min(cdf[-1], 1.0 - OPEN_TAIL_MIN_MASS)
 
     if cdf.size > 1:
         np.maximum.accumulate(cdf, out=cdf)
-        # Pinning cdf[0] up to 0.001 + cummax flattens any sub-0.001 prefix into
-        # 0-step bins, violating the server's min-step (the framework then
-        # drops the prediction on open-bound fallback questions). Re-enforce.
-        upper_cap = 0.999 if open_upper else 1.0
-        lower_cap = 0.001 if open_lower else 0.0
+        # Pinning cdf[0] up to the open-tail minimum + cummax flattens any prefix below it into 0-step bins.
+        upper_cap = 1.0 - OPEN_TAIL_MIN_MASS if open_upper else 1.0
+        lower_cap = OPEN_TAIL_MIN_MASS if open_lower else 0.0
         cdf = enforce_min_steps(cdf, min_step, upper_cap=upper_cap, lower_cap=lower_cap)
 
     return cdf
@@ -306,10 +312,11 @@ def _validate_pchip_bounds(
 def _clean_percentile_values(percentile_values: dict[int | float, float]) -> dict[float, float]:
     """Drop out-of-range percentile LABELS and reject unusable percentile VALUES.
 
-    The KEY filter is a genuine filter and must stay one: ``_postprocess_ensemble_cdf``'s
-    discrete branch deliberately passes labels of 0.0 and 100.0 (prob*100 over a 0..1
-    span) and relies on them being dropped here before the boundary points are re-added.
-    Raising on those would break every discrete question.
+    The KEY filter is a genuine filter and must stay one: a caller that hands a whole CDF
+    over as prob*100 labels legitimately includes exactly 0.0 and 100.0, and those are
+    dropped here because the boundary points are re-added below from the question's own
+    bound semantics. ``test_boundary_labels_stay_silently_filtered`` pins the build as
+    identical with and without them.
 
     A bad VALUE is the opposite case and raises. Silently skipping it built a
     12-of-13-point CDF while ``declared_percentiles`` still advertised 13 — a distribution
@@ -500,7 +507,8 @@ def _rebuild_with_min_steps(
     coarse grid whose available range is exactly saturated by the min-step.
 
     Raises:
-        ValueError: the CDF range cannot hold one ``min_step`` per bin.
+        ValueError: the CDF range cannot hold one ``min_step`` per bin (beyond
+            ``_MIN_STEP_TOLERANCE``; a float-epsilon shortfall rebuilds).
         RuntimeError: the rebuild itself failed to satisfy the min-step.
     """
     steps = np.diff(cdf_y)
@@ -525,7 +533,7 @@ def _rebuild_with_min_steps(
     available_range = end_val - start_val
     required_range = (len(cdf_y) - 1) * min_step
 
-    if required_range > available_range:
+    if required_range > available_range + _MIN_STEP_TOLERANCE:
         raise ValueError(
             f"Cannot satisfy minimum step requirement: need {required_range:.6f} "
             f"but only have {available_range:.6f} available in CDF range"
@@ -548,7 +556,7 @@ def _rebuild_with_min_steps(
         for i in range(1, len(new_cdf)):
             new_cdf[i] = new_cdf[i - 1] + (available_range / (len(new_cdf) - 1))
 
-    if np.any(np.diff(new_cdf) < min_step - 1e-10):
+    if np.any(np.diff(new_cdf) < min_step - _MIN_STEP_TOLERANCE):
         raise RuntimeError("Internal error: Step size enforcement failed")
 
     new_steps = np.diff(new_cdf)
@@ -571,8 +579,8 @@ def _assert_pchip_constraints(
     open_upper_bound: bool,
 ) -> None:
     """Fail loudly rather than submit a CDF the Metaculus validators would reject."""
-    if np.any(np.diff(cdf_y) < min_step - 1e-10):
-        problematic_indices = np.where(np.diff(cdf_y) < min_step - 1e-10)[0]
+    if np.any(np.diff(cdf_y) < min_step - _MIN_STEP_TOLERANCE):
+        problematic_indices = np.where(np.diff(cdf_y) < min_step - _MIN_STEP_TOLERANCE)[0]
         raise RuntimeError(
             f"Failed to enforce minimum step size at indices: {problematic_indices}, "
             f"values: {np.diff(cdf_y)[problematic_indices]}"
@@ -593,7 +601,7 @@ def generate_pchip_cdf(
     upper_bound: float,
     lower_bound: float,
     zero_point: float | None = None,
-    min_step: float = 5.0e-5,
+    min_step: float = NUM_MIN_PROB_STEP,
     max_step: float = NUM_MAX_STEP,
     num_points: int = 201,
     question_id: int | str | None = None,
@@ -660,7 +668,7 @@ def generate_pchip_cdf(
         model_name=model_name,
     )
 
-    aggressive_enforcement_used = bool(np.any(np.diff(cdf_y) < min_step))
+    aggressive_enforcement_used = bool(np.any(np.diff(cdf_y) < min_step - _MIN_STEP_TOLERANCE))
     if aggressive_enforcement_used:
         cdf_y = _rebuild_with_min_steps(
             cdf_y,

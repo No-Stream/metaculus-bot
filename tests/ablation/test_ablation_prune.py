@@ -10,7 +10,10 @@ All tests mock the subprocess primitive — no live ``claude -p`` invocations.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,7 +23,20 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from forecasting_tools import MetaculusQuestion
 
+from metaculus_bot.ablation import claude_cli, prune, qa_iterate
 from metaculus_bot.ablation.cache import AblationCache
+from metaculus_bot.ablation.claude_cli import _build_argv
+from metaculus_bot.ablation.prune import (
+    REDACTOR_SYSTEM_PROMPT,
+    _build_redactor_prompt,
+    _extract_inner_result,
+    _invoke_claude_redactor,
+    _parse_redactor_response,
+    _process_batch,
+    run_prune_for_qids,
+    verbatim_leak_check_passes,
+)
+from metaculus_bot.ablation.qa_iterate import VERIFIER_SYSTEM_PROMPT
 from metaculus_bot.backtest.scoring import GroundTruth
 
 # ---------------------------------------------------------------------------
@@ -48,9 +64,12 @@ def _make_ground_truth(
     *,
     question_type: str = "binary",
 ) -> GroundTruth:
-    # Type-aware verbatim detector branches on question_type so callers can
-    # exercise the binary {yes,no,true,false} skip, MC word-boundary check,
-    # and numeric strict-substring branches independently.
+    """Build a GroundTruth whose ``question_type`` selects the detector branch under test.
+
+    The type-aware verbatim detector branches on question_type, so callers can
+    exercise the binary {yes,no,true,false} skip, the MC word-boundary check and
+    the numeric strict-substring branch independently.
+    """
     resolution: object
     if question_type == "binary":
         resolution = True
@@ -93,8 +112,6 @@ async def test_run_prune_for_qids_cache_hit_short_circuits(
     cache: AblationCache,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from metaculus_bot.ablation.prune import run_prune_for_qids
-
     cache.write_pruned_research(
         qid=42,
         sanitized_blob="cached sanitized blob",
@@ -127,8 +144,6 @@ async def test_run_prune_for_qids_force_bypasses_cache(
     cache: AblationCache,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from metaculus_bot.ablation.prune import run_prune_for_qids
-
     cache.write_pruned_research(
         qid=42,
         sanitized_blob="OLD sanitized",
@@ -174,8 +189,6 @@ async def test_run_prune_for_qids_batches_correctly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """25 questions, batch_size=10 → 3 subprocess invocations (10, 10, 5)."""
-    from metaculus_bot.ablation.prune import run_prune_for_qids
-
     triples = []
     for qid in range(1000, 1025):
         triples.append((_make_question(qid), _make_ground_truth(qid, f"answer-{qid}"), f"raw blob {qid}"))
@@ -205,8 +218,6 @@ async def test_run_prune_for_qids_validates_sanitized_blob_excludes_ground_truth
     cache: AblationCache,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from metaculus_bot.ablation.prune import run_prune_for_qids
-
     triples = [
         (_make_question(1), _make_ground_truth(1, "17,237,442"), "raw blob 1"),
         (_make_question(2), _make_ground_truth(2, "PMI 53.6"), "raw blob 2"),
@@ -237,8 +248,6 @@ async def test_run_prune_for_qids_validates_qid_set_match(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    from metaculus_bot.ablation.prune import run_prune_for_qids
-
     triples = [
         (_make_question(1), _make_ground_truth(1), "raw blob 1"),
         (_make_question(2), _make_ground_truth(2), "raw blob 2"),
@@ -252,8 +261,6 @@ async def test_run_prune_for_qids_validates_qid_set_match(
         ]
     )
     _patch_subprocess(monkeypatch, [response])
-
-    import logging
 
     with caplog.at_level(logging.WARNING, logger="metaculus_bot.ablation.prune"):
         results = await run_prune_for_qids(triples, cache)
@@ -269,8 +276,6 @@ async def test_run_prune_for_qids_validates_empty_sanitized_blob_rejected(
     cache: AblationCache,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from metaculus_bot.ablation.prune import run_prune_for_qids
-
     triples = [
         (_make_question(1), _make_ground_truth(1), "raw blob 1"),
         (_make_question(2), _make_ground_truth(2), "raw blob 2"),
@@ -303,10 +308,6 @@ async def test_run_prune_for_qids_handles_subprocess_failure(
     failures: 1 failed batch (10 qids) + 10 failing per-qid retries +
     1 successful 5-qid batch.
     """
-    import subprocess
-
-    from metaculus_bot.ablation.prune import run_prune_for_qids
-
     triples = [(_make_question(qid), _make_ground_truth(qid), f"raw blob {qid}") for qid in range(1, 16)]
 
     failing_batch = subprocess.CalledProcessError(returncode=1, cmd=["claude"], stderr=b"oops")
@@ -327,20 +328,33 @@ async def test_run_prune_for_qids_handles_subprocess_failure(
 
 
 @pytest.mark.asyncio
+async def test_run_prune_for_qids_propagates_an_unexpected_redactor_error(
+    cache: AblationCache,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A subprocess failure or timeout is absorbed per batch; a bug class is not, so the stage stops on it."""
+    triples = [(_make_question(qid), _make_ground_truth(qid), f"raw blob {qid}") for qid in (1, 2)]
+    _patch_subprocess(monkeypatch, [KeyError("redactor bug")])
+
+    with pytest.raises(KeyError, match="redactor bug"):
+        await run_prune_for_qids(triples, cache, batch_size=10)
+
+    assert cache.read_pruned_research(1) is None
+    assert cache.read_pruned_research(2) is None
+
+
+@pytest.mark.asyncio
 async def test_run_prune_for_qids_handles_invalid_json(
     cache: AblationCache,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    from metaculus_bot.ablation.prune import run_prune_for_qids
-
+    """Unparseable stdout nulls the batch, and the per-qid recovery retries each qid once."""
     triples = [
         (_make_question(1), _make_ground_truth(1), "raw blob 1"),
         (_make_question(2), _make_ground_truth(2), "raw blob 2"),
     ]
-    _patch_subprocess(monkeypatch, ["this is definitely not valid JSON {{{{"])
-
-    import logging
+    _patch_subprocess(monkeypatch, ["this is definitely not valid JSON {{{{"] * 3)
 
     with caplog.at_level(logging.ERROR, logger="metaculus_bot.ablation.prune"):
         results = await run_prune_for_qids(triples, cache)
@@ -356,8 +370,6 @@ async def test_run_prune_for_qids_handles_invalid_json(
 
 
 def test_build_redactor_prompt_includes_question_fields() -> None:
-    from metaculus_bot.ablation.prune import _build_redactor_prompt
-
     triples = [
         (
             _make_question(123, text="Will the cat jump?"),
@@ -375,8 +387,6 @@ def test_build_redactor_prompt_includes_question_fields() -> None:
 
 
 def test_build_redactor_prompt_warns_redactor_about_ground_truth() -> None:
-    from metaculus_bot.ablation.prune import _build_redactor_prompt
-
     triples = [
         (
             _make_question(7),
@@ -392,8 +402,6 @@ def test_build_redactor_prompt_warns_redactor_about_ground_truth() -> None:
 
 
 def test_build_redactor_prompt_describes_json_schema() -> None:
-    from metaculus_bot.ablation.prune import _build_redactor_prompt
-
     triples = [(_make_question(7), _make_ground_truth(7), "blob")]
     prompt = _build_redactor_prompt(triples)
     assert "qid" in prompt
@@ -406,8 +414,6 @@ def test_redactor_system_prompt_warns_about_implication_leakage() -> None:
     "X PMI was unchanged from its March reading of 52.7%") leaks the answer
     even when no April value is named directly.
     """
-    from metaculus_bot.ablation.prune import REDACTOR_SYSTEM_PROMPT
-
     lower = REDACTOR_SYSTEM_PROMPT.lower()
     # At least one of the implication-leak terms should be present.
     implication_terms = ["implication", "anchor", "anchored", "bracket", "threshold framing"]
@@ -419,7 +425,6 @@ def test_redactor_system_prompt_warns_about_implication_leakage() -> None:
 
 def test_redactor_system_prompt_includes_example() -> None:
     """The prompt should ground its rules in a worked example."""
-    from metaculus_bot.ablation.prune import REDACTOR_SYSTEM_PROMPT
 
     upper = REDACTOR_SYSTEM_PROMPT.upper()
     assert "EXAMPLE" in upper, "REDACTOR_SYSTEM_PROMPT should contain a worked EXAMPLE"
@@ -429,8 +434,6 @@ def test_redactor_system_prompt_includes_second_example() -> None:
     """A second worked example is required to cover a real failure mode the
     first example didn't catch (subtler whole-sentence implication leak).
     """
-    from metaculus_bot.ablation.prune import REDACTOR_SYSTEM_PROMPT
-
     assert "EXAMPLE 2" in REDACTOR_SYSTEM_PROMPT, (
         "REDACTOR_SYSTEM_PROMPT must contain a second worked example marked 'EXAMPLE 2' "
         "to cover whole-sentence implication-leak failure modes that the first example doesn't capture."
@@ -440,12 +443,9 @@ def test_redactor_system_prompt_includes_second_example() -> None:
 def test_redactor_system_prompt_explains_anchored_value_failure_mode() -> None:
     """The prompt must explain WHY the redactor needs to redact ENTIRE comparative
     sentences, not just the leading clauses — the failure mode observed in qa_research_9.log.
+    A phrase like "ALGEBRAICALLY DETERMINES" (or an equivalent) must surface that principle.
     """
-    from metaculus_bot.ablation.prune import REDACTOR_SYSTEM_PROMPT
-
     upper = REDACTOR_SYSTEM_PROMPT.upper()
-    # A phrase like "ALGEBRAICALLY DETERMINES" or equivalent must surface the
-    # whole-sentence redaction principle.
     indicators = [
         "ALGEBRAICALLY DETERMINES",
         "WHOLE SENTENCE",
@@ -466,10 +466,17 @@ def test_redactor_system_prompt_explains_anchored_value_failure_mode() -> None:
 
 @pytest.mark.asyncio
 async def test_invoke_claude_redactor_uses_correct_flags(monkeypatch: pytest.MonkeyPatch) -> None:
-    import asyncio
+    """Pins the headless ``claude -p`` argv the redactor is driven with.
 
-    from metaculus_bot.ablation.prune import _invoke_claude_redactor
-
+    Deliberate omissions: no ``--bare`` (cargo-culted from a sibling harness's
+    known-good pattern) and no ``--allowedTools`` (fragile in non-interactive
+    mode). ``--output-format text`` because the redactor's reply is already the
+    JSON the prompt asks for, so no outer envelope is needed. Security posture
+    (2026-08-27): the prompt embeds web-derived text, so every tool is denied and
+    the permission mode stays at the headless default, leaving a prompt injection
+    nothing to steer. ``--settings`` force-disables the prompt-caching beta, which
+    the headless gateway rejects (diagnosed 2026-05-06).
+    """
     captured: dict = {}
 
     async def fake_create_subprocess_exec(*args, **kwargs):
@@ -501,22 +508,18 @@ async def test_invoke_claude_redactor_uses_correct_flags(monkeypatch: pytest.Mon
     assert "-p" in argv or "--print" in argv
     assert "--output-format" in argv
     output_idx = argv.index("--output-format")
-    # Plain text output — the redactor's response IS JSON because the prompt
-    # asks for it; we don't need an outer JSON envelope.
+    # The redactor's reply is already JSON, so no outer envelope is needed.
     assert argv[output_idx + 1] == "text"
     assert "--max-turns" in argv
     max_idx = argv.index("--max-turns")
     assert argv[max_idx + 1] == "1"
-    # Security posture (2026-08-27): the judge's prompt embeds web-derived text,
-    # so every tool is denied and permission mode stays at the headless default —
-    # a prompt injection must have nothing to steer.
+    # Every tool denied, no permission-mode override: an injection via the embedded web text has nothing to steer.
     assert "--permission-mode" not in argv
     assert "--disallowedTools" in argv
     tools_idx = argv.index("--disallowedTools")
     for tool in ("Bash", "Edit", "Write", "WebFetch", "Task"):
         assert tool in argv[tools_idx + 1]
-    # Force-disable prompt-caching beta (the headless gateway rejects it;
-    # diagnosed 2026-05-06).
+    # The headless gateway rejects the prompt-caching beta (diagnosed 2026-05-06).
     assert "--settings" in argv
     settings_idx = argv.index("--settings")
     settings_payload = argv[settings_idx + 1]
@@ -534,8 +537,6 @@ async def test_invoke_claude_redactor_uses_correct_flags(monkeypatch: pytest.Mon
 
 
 def test_parse_redactor_response_structured_blob() -> None:
-    from metaculus_bot.ablation.prune import _parse_redactor_response
-
     raw = _build_response(
         [
             (1, "sanitized 1", [{"original_excerpt": "ex", "reason": "states resolution"}]),
@@ -557,8 +558,6 @@ def test_parse_redactor_response_structured_blob() -> None:
 
 
 def test_parse_redactor_response_skips_qids_with_empty_sanitized_blob() -> None:
-    from metaculus_bot.ablation.prune import _parse_redactor_response
-
     raw = _build_response([(1, "", []), (2, "real content", [])])
     gts = {1: _make_ground_truth(1, "GT_1"), 2: _make_ground_truth(2, "GT_2")}
     parsed = _parse_redactor_response(raw, expected_qids=[1, 2], ground_truths=gts)
@@ -568,8 +567,6 @@ def test_parse_redactor_response_skips_qids_with_empty_sanitized_blob() -> None:
 
 
 def test_parse_redactor_response_rejects_qid_with_gt_in_blob() -> None:
-    from metaculus_bot.ablation.prune import _parse_redactor_response
-
     raw = _build_response(
         [
             (1, "Background. The total was 17,237,442 passengers.", []),
@@ -594,8 +591,6 @@ def test_parse_redactor_response_case_insensitive_gt_match() -> None:
     discriminative power). To exercise the case-insensitive substring branch
     we use a non-binary GT type.
     """
-    from metaculus_bot.ablation.prune import _parse_redactor_response
-
     raw = _build_response([(1, "the answer was Tuesday", [])])
     gts = {1: _make_ground_truth(1, "TUESDAY", question_type="multiple_choice")}
     parsed = _parse_redactor_response(raw, expected_qids=[1], ground_truths=gts)
@@ -604,13 +599,6 @@ def test_parse_redactor_response_case_insensitive_gt_match() -> None:
 
 # ---------------------------------------------------------------------------
 # Type-aware verbatim-leak detector
-#
-# Audit at backtests/ablation/audit_smoke_20260515.md:176-194 documents the
-# bug: the original substring-only check false-positives on binary "yes"/"no"
-# GTs (substring "no" appears 8x in "non-manufacturing") and on MC options
-# that share words with the question (e.g., "March 2026" appears in question
-# phrasing "Jan/Feb/Mar 2026"). 5 of 11 problematic qids in the smoke run
-# failed at this layer alone.
 # ---------------------------------------------------------------------------
 
 
@@ -623,6 +611,12 @@ class TestVerbatimLeakCheck:
       a standalone token sequence (not as ambient question phrasing).
     - numeric: substring check on normalized GT (numeric resolution strings
       are unique enough that any verbatim hit is a real leak).
+
+    Receipt: backtests/ablation/audit_smoke_20260515.md:176-194. The original
+    substring-only check false-positived on binary "yes"/"no" GTs ("no" appears
+    8x in "non-manufacturing") and on MC options that share words with the
+    question ("March 2026" inside the phrasing "Jan/Feb/Mar 2026"); 5 of 11
+    problematic qids in the smoke run failed at this layer alone.
     """
 
     def test_binary_no_gt_skips_substring_check_when_in_non_word(self) -> None:
@@ -630,8 +624,6 @@ class TestVerbatimLeakCheck:
         "non-manufacturing" → previously rejected by substring check.
         Should now PASS (skip).
         """
-        from metaculus_bot.ablation.prune import verbatim_leak_check_passes
-
         gt = _make_ground_truth(1, "no", question_type="binary")
         sanitized = "Background: the China non-manufacturing PMI methodology covers retail trade."
         passes, reason = verbatim_leak_check_passes(sanitized, gt, "binary")
@@ -639,8 +631,6 @@ class TestVerbatimLeakCheck:
         assert reason is None
 
     def test_binary_yes_gt_skips_substring_check(self) -> None:
-        from metaculus_bot.ablation.prune import verbatim_leak_check_passes
-
         gt = _make_ground_truth(1, "yes", question_type="binary")
         sanitized = "Background context — yesterday's report showed mixed signals."
         passes, reason = verbatim_leak_check_passes(sanitized, gt, "binary")
@@ -648,8 +638,6 @@ class TestVerbatimLeakCheck:
         assert reason is None
 
     def test_binary_true_gt_skips_substring_check(self) -> None:
-        from metaculus_bot.ablation.prune import verbatim_leak_check_passes
-
         gt = _make_ground_truth(1, "true", question_type="binary")
         sanitized = "Background. Truer statements about market structure are hard to find."
         passes, reason = verbatim_leak_check_passes(sanitized, gt, "binary")
@@ -657,8 +645,6 @@ class TestVerbatimLeakCheck:
         assert reason is None
 
     def test_binary_false_gt_skips_substring_check(self) -> None:
-        from metaculus_bot.ablation.prune import verbatim_leak_check_passes
-
         gt = _make_ground_truth(1, "false", question_type="binary")
         sanitized = "Background context with no resolution-relevant content."
         passes, reason = verbatim_leak_check_passes(sanitized, gt, "binary")
@@ -669,8 +655,6 @@ class TestVerbatimLeakCheck:
         """Rare binary GTs not in {yes,no,true,false} (e.g., "draw") fall
         through to the substring check.
         """
-        from metaculus_bot.ablation.prune import verbatim_leak_check_passes
-
         gt = _make_ground_truth(1, "draw", question_type="binary")
         sanitized = "Match notes: the result was a draw between the two teams."
         passes, reason = verbatim_leak_check_passes(sanitized, gt, "binary")
@@ -678,28 +662,22 @@ class TestVerbatimLeakCheck:
         assert reason is not None
 
     def test_mc_gt_word_boundary_passes_when_only_ambient_phrasing(self) -> None:
-        """MC GT "March 2026" appears as ambient question phrasing in
-        "comparing Jan 2026, Feb 2026, March 2026 revenues". With word-boundary
-        match the GT is present as a token sequence so a strict word-boundary
-        match still rejects. The audit recommends this — ambient mentions ARE
-        word-boundary matches; MC option-specific leakage is caught by the
-        downstream LLM screen + qa_iterate verifier. The narrower test is the
-        OPPOSITE: GT must NOT appear at word boundary.
-        """
-        from metaculus_bot.ablation.prune import verbatim_leak_check_passes
+        """An MC GT embedded inside a longer word ("Red" in "Reduction") is not a leak.
 
-        # Ambient: GT does NOT appear at word boundary, only embedded in another word.
-        # E.g., question option "ABC" appearing inside "ABCD".
+        The audit's word-boundary rule still rejects ambient question phrasing
+        such as "March 2026" in "comparing Jan 2026, Feb 2026, March 2026
+        revenues", because that IS a word-boundary match; option-specific
+        leakage there is left to the downstream LLM screen + qa_iterate
+        verifier. So the narrower property pinned here is the opposite one: a
+        GT that appears only as a substring of another word must pass.
+        """
         gt = _make_ground_truth(1, "Red", question_type="multiple_choice")
         sanitized = "Background context. The Reduction was significant."
-        # "Red" is a substring of "Reduction" but not a word-boundary match.
         passes, reason = verbatim_leak_check_passes(sanitized, gt, "multiple_choice")
         assert passes is True
         assert reason is None
 
     def test_mc_gt_word_boundary_rejects_when_standalone(self) -> None:
-        from metaculus_bot.ablation.prune import verbatim_leak_check_passes
-
         gt = _make_ground_truth(1, "Nikkei 225", question_type="multiple_choice")
         sanitized = "Background. The answer is Nikkei 225."
         passes, reason = verbatim_leak_check_passes(sanitized, gt, "multiple_choice")
@@ -707,8 +685,6 @@ class TestVerbatimLeakCheck:
         assert reason is not None
 
     def test_numeric_gt_substring_check_strict(self) -> None:
-        from metaculus_bot.ablation.prune import verbatim_leak_check_passes
-
         gt = _make_ground_truth(1, "66.246", question_type="numeric")
         sanitized = "Background context. The reported value was 66.246 percent."
         passes, reason = verbatim_leak_check_passes(sanitized, gt, "numeric")
@@ -716,8 +692,6 @@ class TestVerbatimLeakCheck:
         assert reason is not None
 
     def test_numeric_gt_not_in_sanitized_passes(self) -> None:
-        from metaculus_bot.ablation.prune import verbatim_leak_check_passes
-
         gt = _make_ground_truth(1, "66.246", question_type="numeric")
         sanitized = "Background. Pre-event guidance was 63-65 percent."
         passes, reason = verbatim_leak_check_passes(sanitized, gt, "numeric")
@@ -725,8 +699,6 @@ class TestVerbatimLeakCheck:
         assert reason is None
 
     def test_numeric_gt_negative_substring_check_strict(self) -> None:
-        from metaculus_bot.ablation.prune import verbatim_leak_check_passes
-
         gt = _make_ground_truth(1, "-87.9", question_type="numeric")
         sanitized = "Background. The advance trade balance was -87.9 billion."
         passes, reason = verbatim_leak_check_passes(sanitized, gt, "numeric")
@@ -734,8 +706,6 @@ class TestVerbatimLeakCheck:
         assert reason is not None
 
     def test_empty_gt_string_passes(self) -> None:
-        from metaculus_bot.ablation.prune import verbatim_leak_check_passes
-
         gt = _make_ground_truth(1, "", question_type="numeric")
         sanitized = "anything goes here"
         passes, reason = verbatim_leak_check_passes(sanitized, gt, "numeric")
@@ -755,8 +725,6 @@ def test_redactor_prompt_mentions_pre_event_guidance() -> None:
     context. The prompt must mention this concept so the redactor knows
     not to strip such pre-resolution context.
     """
-    from metaculus_bot.ablation.prune import REDACTOR_SYSTEM_PROMPT
-
     assert "guidance" in REDACTOR_SYSTEM_PROMPT.lower(), (
         "REDACTOR_SYSTEM_PROMPT must mention 'guidance' (pre-event analyst guidance) "
         "to instruct the redactor to preserve such ranges; see audit"
@@ -774,13 +742,9 @@ async def test_run_prune_for_qids_batch_size_is_parametrized(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``--prune-batch-size`` flows through to the batching loop."""
-    from metaculus_bot.ablation.prune import run_prune_for_qids
-
     triples = [
         (_make_question(qid), _make_ground_truth(qid, f"answer-{qid}"), f"raw {qid}") for qid in range(2000, 2007)
     ]
-
-    import asyncio
 
     batch_qids_seen: list[list[int]] = []
 
@@ -812,16 +776,9 @@ async def test_run_prune_for_qids_batch_failure_recovers_per_qid(
     With recovery, the per-qid retry catches transient failures while still
     bounding cost (each retry is its own subprocess invocation).
     """
-    import logging
-    import subprocess
-
-    from metaculus_bot.ablation.prune import run_prune_for_qids
-
     triples = [
         (_make_question(qid), _make_ground_truth(qid, f"answer-{qid}"), f"raw {qid}") for qid in range(3000, 3003)
     ]
-
-    import asyncio
 
     call_count = {"n": 0}
 
@@ -859,15 +816,9 @@ async def test_run_prune_for_qids_per_qid_recovery_partial_success(
     """If some per-qid recoveries succeed and others fail, only the failures
     end up as None. Bounds blast radius to specific qids.
     """
-    import subprocess
-
-    from metaculus_bot.ablation.prune import run_prune_for_qids
-
     triples = [
         (_make_question(qid), _make_ground_truth(qid, f"answer-{qid}"), f"raw {qid}") for qid in range(4000, 4003)
     ]
-
-    import asyncio
 
     async def flaky_invoke(prompt: str, **_kwargs: Any) -> str:
         await asyncio.sleep(0)
@@ -900,10 +851,6 @@ def test_extract_inner_result_warns_on_unparseable_stdout(caplog: pytest.LogCapt
     _parse_redactor_response) emit confusing errors about missing fields
     rather than the real envelope-shape failure.
     """
-    import logging
-
-    from metaculus_bot.ablation.prune import _extract_inner_result
-
     unparseable = "this is definitely not JSON {{{ }"
 
     with caplog.at_level(logging.WARNING, logger="metaculus_bot.ablation.prune"):
@@ -917,11 +864,6 @@ def test_extract_inner_result_warns_on_unparseable_stdout(caplog: pytest.LogCapt
 
 # ---------------------------------------------------------------------------
 # CRIT-1: subprocess kill on timeout
-#
-# At 50q x 3 iterations x 2 calls = 300 subprocess invocations. Each timeout
-# (DEFAULT_TIMEOUT_SECONDS=600) without proc.kill() leaks a child process,
-# holding 3 pipe FDs + a process slot until the OS reaps it. Subsequent
-# fork() calls compete with leaked children for FDs/process slots.
 # ---------------------------------------------------------------------------
 
 
@@ -935,13 +877,13 @@ async def test_invoke_claude_redactor_timeout_kills_subprocess(
     proc.kill() so the leaked child gets reaped, then re-raise so the
     caller's TimeoutError handling still fires.
 
+    Why it matters: 50 questions x 3 iterations x 2 calls is 300 subprocess
+    invocations, and each timeout (DEFAULT_TIMEOUT_SECONDS=600) without
+    proc.kill() leaks a child holding 3 pipe FDs and a process slot until the
+    OS reaps it, so later fork() calls compete with the leaked children.
+
     Mutation: remove proc.kill(); this test fails (kill_calls == 0).
     """
-    import asyncio
-    import logging
-
-    from metaculus_bot.ablation.prune import _invoke_claude_redactor
-
     kill_calls = {"n": 0}
     wait_calls = {"n": 0}
 
@@ -978,9 +920,7 @@ async def test_invoke_claude_redactor_timeout_kills_subprocess(
         caplog.at_level(logging.WARNING, logger="metaculus_bot.ablation.prune"),
         pytest.raises(asyncio.TimeoutError),
     ):
-        # timeout_seconds is typed as int; cast a tiny float through int(0)
-        # which still triggers wait_for's TimeoutError immediately because
-        # slow_communicate awaits 10 seconds.
+        # timeout_seconds=0 trips wait_for at once, since slow_communicate awaits 10 s.
         await _invoke_claude_redactor("any prompt", timeout_seconds=0)
 
     assert kill_calls["n"] == 1, f"proc.kill() should fire exactly once on timeout; got {kill_calls['n']}"
@@ -992,11 +932,6 @@ async def test_invoke_claude_redactor_timeout_kills_subprocess(
 
 # ---------------------------------------------------------------------------
 # MAJ-1: redactor batch prompt size guard with binary split
-#
-# 10 x 80 KB blobs near 800 KB ~ 200K tokens at the edge of Claude's input
-# context. Without a size guard, hot batches fail with subprocess.CalledProcessError
-# carrying input-too-long; with a guard, recursively split the batch in half
-# until each fits.
 # ---------------------------------------------------------------------------
 
 
@@ -1010,13 +945,12 @@ async def test_process_batch_splits_oversized_prompt(
     recursively split into 2 single-qid batches. Both qids land in the
     result dict (the mocked claude -p returns happy stubs) and a WARN log
     fires naming the split sizes.
+
+    Why the guard exists: 10 x 80 KB blobs near 800 KB is ~200K tokens, the
+    edge of Claude's input context. Without it a hot batch fails with a
+    subprocess.CalledProcessError carrying input-too-long; with it the batch
+    is halved recursively until each piece fits.
     """
-    import asyncio
-    import logging
-
-    from metaculus_bot.ablation import prune
-    from metaculus_bot.ablation.prune import _process_batch
-
     big_blob = "x" * 500_000  # 500 KB; 2 of these blow the ~720KB guard
     triples: list[tuple[MetaculusQuestion, GroundTruth, str]] = [
         (_make_question(qid), _make_ground_truth(qid, f"answer-{qid}"), big_blob) for qid in (5000, 5001)
@@ -1044,8 +978,7 @@ async def test_process_batch_splits_oversized_prompt(
     assert results[5000] is not None
     assert results[5001] is not None
 
-    # Recursive split should have produced 2 single-qid invocations
-    # (no successful 2-qid call because the original prompt was over the limit).
+    # No 2-qid call can have succeeded: the original prompt was over the limit.
     assert [5000] in invocations
     assert [5001] in invocations
     assert all(len(ids) == 1 for ids in invocations), (
@@ -1069,12 +1002,6 @@ async def test_process_batch_singleton_oversized_fails_loud(
     claude -p with an over-context prompt) and emit an ERROR log so the
     operator knows to truncate the blob upstream.
     """
-    import asyncio
-    import logging
-
-    from metaculus_bot.ablation import prune
-    from metaculus_bot.ablation.prune import _process_batch
-
     huge_blob = "y" * 1_000_000  # 1 MB; over the limit even alone
     triples: list[tuple[MetaculusQuestion, GroundTruth, str]] = [
         (_make_question(6000), _make_ground_truth(6000, "answer"), huge_blob)
@@ -1118,11 +1045,6 @@ async def test_process_batch_subprocess_failure_dumps_full_output(
     streams verbatim, and the ERROR log names the exit code, the dump path and
     the (truncated) stream text so the operator can find the artifact.
     """
-    import logging
-    import subprocess
-
-    from metaculus_bot.ablation.prune import _process_batch
-
     triples: list[tuple[MetaculusQuestion, GroundTruth, str]] = [
         (_make_question(7001), _make_ground_truth(7001), "raw blob 7001"),
         (_make_question(7002), _make_ground_truth(7002), "raw blob 7002"),
@@ -1168,11 +1090,6 @@ async def test_process_batch_failure_dump_write_error_degrades_gracefully(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """An unwritable dump path must not turn a batch failure into a crash."""
-    import logging
-    import subprocess
-
-    from metaculus_bot.ablation.prune import _process_batch
-
     triples: list[tuple[MetaculusQuestion, GroundTruth, str]] = [
         (_make_question(7100), _make_ground_truth(7100), "raw blob 7100")
     ]
@@ -1198,19 +1115,18 @@ async def test_process_batch_failure_dump_write_error_degrades_gracefully(
 
 # ---------------------------------------------------------------------------
 # F6: the headless `claude -p` driver is shared, not forked
-#
-# prune and qa_iterate used to carry byte-identical copies of the argv builder,
-# the timeout/orphan-reap block, and the stdout-envelope unwrapper. A knob added
-# to one copy never reached the other (qa_iterate's stage was pinned to the 600s
-# default for exactly that reason). These tests pin the single-source property so
-# a future edit re-forks loudly instead of silently.
 # ---------------------------------------------------------------------------
 
 
 def test_both_stages_share_one_claude_driver() -> None:
-    """prune and qa_iterate must resolve the driver to the SAME objects."""
-    from metaculus_bot.ablation import claude_cli, prune, qa_iterate
+    """prune and qa_iterate must resolve the driver to the SAME objects.
 
+    The two stages used to carry byte-identical copies of the argv builder, the
+    timeout/orphan-reap block and the stdout-envelope unwrapper, and a knob added
+    to one copy never reached the other (qa_iterate's stage stayed pinned to the
+    600s default for exactly that reason). Pinning identity makes a future
+    re-fork fail loudly instead of silently.
+    """
     shared = (
         "DEFAULT_CLAUDE_EXECUTABLE",
         "DEFAULT_TIMEOUT_SECONDS",
@@ -1226,10 +1142,6 @@ def test_both_stages_share_one_claude_driver() -> None:
 
 def test_prune_and_qa_iterate_argv_differ_only_in_system_prompt() -> None:
     """The two stages differ in system prompt alone — every other flag is shared."""
-    from metaculus_bot.ablation.claude_cli import _build_argv
-    from metaculus_bot.ablation.prune import REDACTOR_SYSTEM_PROMPT
-    from metaculus_bot.ablation.qa_iterate import VERIFIER_SYSTEM_PROMPT
-
     redactor_argv = _build_argv(REDACTOR_SYSTEM_PROMPT)
     verifier_argv = _build_argv(VERIFIER_SYSTEM_PROMPT)
 

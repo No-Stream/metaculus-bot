@@ -14,6 +14,8 @@ from metaculus_bot import constants
 from metaculus_bot.constants import (
     FALL_CUP_REMINDER_DATE,
     FALL_CUP_SLUG,
+    MANTIC_TOURNAMENT_END_DATE,
+    MANTIC_TOURNAMENT_ID,
     METACULUS_CUP_ID,
     TOURNAMENT_END_DATE,
     TOURNAMENT_HARD_STOP_WEEKS,
@@ -37,7 +39,7 @@ class TestTournamentDateCheck:
         with patch("metaculus_bot.constants.datetime") as mock_dt:
             mock_dt.strptime = datetime.strptime
             mock_dt.now.return_value = fake_now
-            check_tournament_dates()
+            assert check_tournament_dates() is False
 
         assert "ended" not in caplog.text.lower()
         assert "update" not in caplog.text.lower()
@@ -50,7 +52,7 @@ class TestTournamentDateCheck:
         with patch("metaculus_bot.constants.datetime") as mock_dt:
             mock_dt.strptime = datetime.strptime
             mock_dt.now.return_value = fake_now
-            check_tournament_dates()
+            assert check_tournament_dates() is True
 
         assert TOURNAMENT_ID in caplog.text
         assert "ended" in caplog.text.lower() or "update" in caplog.text.lower()
@@ -73,9 +75,94 @@ class TestTournamentDateCheck:
     def test_invalid_date_format_warns(self, caplog: pytest.LogCaptureFixture) -> None:
         """Invalid date format logs warning but doesn't crash."""
         with patch("metaculus_bot.constants.TOURNAMENT_END_DATE", "not-a-date"):
-            check_tournament_dates()
+            assert check_tournament_dates() is False
 
         assert "invalid" in caplog.text.lower()
+
+
+def _mantic_check_at(fake_now: datetime, caplog: pytest.LogCaptureFixture) -> bool:
+    with patch("metaculus_bot.constants.datetime") as mock_dt:
+        mock_dt.strptime = datetime.strptime
+        mock_dt.now.return_value = fake_now
+        with caplog.at_level(logging.INFO, logger="metaculus_bot.constants"):
+            return check_tournament_dates(tournament_id=MANTIC_TOURNAMENT_ID, end_date_str=MANTIC_TOURNAMENT_END_DATE)
+
+
+class TestManticTournamentDates:
+    """check_tournament_dates on the Mantic kwargs, against the REAL function.
+
+    ``--mode mantic`` passes ``MANTIC_TOURNAMENT_ID`` / ``MANTIC_TOURNAMENT_END_DATE`` (cli.py),
+    and ``tests/cli/test_cli_season_guards.py`` pins that call against a MagicMock, so nothing
+    else proves the callee honors the kwargs. The negative assertions are the point: the Mantic
+    and Metaculus end dates differ, so a dropped substitution in the function body either fires
+    nothing at all or names the Metaculus id and date, and both fail here.
+
+    The verdict is asserted on every case because it is the whole mechanism of the stale-slug
+    red exit (``cli._check_tournament_dates`` -> ``sys.exit(1)``): with the warning kept and the
+    ``return True`` dropped, every Mantic cron after the close would stay green for a fortnight.
+    """
+
+    def test_no_warning_before_the_mantic_end_date(self, caplog: pytest.LogCaptureFixture) -> None:
+        end_date = datetime.strptime(MANTIC_TOURNAMENT_END_DATE, "%Y-%m-%d")
+
+        assert _mantic_check_at(end_date - timedelta(days=30), caplog) is False
+
+        assert "ended" not in caplog.text.lower()
+        assert "update" not in caplog.text.lower()
+
+    def test_the_end_date_itself_is_still_open(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The constant names the LAST open day: Preseason 2 closes at 12:00 UTC on it, so a run in
+        those final open hours forecasts and publishes normally and must not redden the run."""
+        end_date = datetime.strptime(MANTIC_TOURNAMENT_END_DATE, "%Y-%m-%d")
+
+        assert _mantic_check_at(end_date + timedelta(hours=11, minutes=25), caplog) is False
+
+        assert "ended" not in caplog.text.lower()
+
+    def test_stale_from_the_first_utc_minute_of_the_day_after(self, caplog: pytest.LogCaptureFixture) -> None:
+        end_date = datetime.strptime(MANTIC_TOURNAMENT_END_DATE, "%Y-%m-%d")
+
+        assert _mantic_check_at(end_date + timedelta(days=1, minutes=5), caplog) is True
+
+        assert "ended" in caplog.text.lower()
+        assert MANTIC_TOURNAMENT_ID in caplog.text
+
+    def test_warning_after_the_mantic_end_date_names_the_mantic_tournament(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        end_date = datetime.strptime(MANTIC_TOURNAMENT_END_DATE, "%Y-%m-%d")
+        # Past the Mantic close, months before the Metaculus one.
+        assert _mantic_check_at(end_date + timedelta(days=7), caplog) is True
+
+        assert "ended" in caplog.text.lower()
+        assert MANTIC_TOURNAMENT_ID in caplog.text
+        assert MANTIC_TOURNAMENT_END_DATE in caplog.text
+        assert TOURNAMENT_ID not in caplog.text, "the warning must name the Mantic id, not the Metaculus default"
+        assert TOURNAMENT_END_DATE not in caplog.text, "the warning must name the Mantic date, not the Metaculus one"
+
+    def test_error_after_the_mantic_hard_stop_names_the_mantic_tournament(self) -> None:
+        end_date = datetime.strptime(MANTIC_TOURNAMENT_END_DATE, "%Y-%m-%d")
+        hard_stop = end_date + timedelta(weeks=TOURNAMENT_HARD_STOP_WEEKS)
+        fake_now = hard_stop + timedelta(days=1)
+
+        with patch("metaculus_bot.constants.datetime") as mock_dt:
+            mock_dt.strptime = datetime.strptime
+            mock_dt.now.return_value = fake_now
+            with pytest.raises(TournamentExpiredError) as exc_info:
+                check_tournament_dates(tournament_id=MANTIC_TOURNAMENT_ID, end_date_str=MANTIC_TOURNAMENT_END_DATE)
+
+        message = str(exc_info.value)
+        assert MANTIC_TOURNAMENT_ID in message
+        assert MANTIC_TOURNAMENT_END_DATE in message
+        assert TOURNAMENT_ID not in message, "the error must name the Mantic id, not the Metaculus default"
+        assert TOURNAMENT_END_DATE not in message, "the error must name the Mantic date, not the Metaculus one"
+
+    def test_invalid_end_date_format_warns_naming_the_mantic_tournament(self, caplog: pytest.LogCaptureFixture) -> None:
+        assert check_tournament_dates(tournament_id=MANTIC_TOURNAMENT_ID, end_date_str="not-a-date") is False
+
+        assert "invalid" in caplog.text.lower()
+        assert MANTIC_TOURNAMENT_ID in caplog.text
+        assert TOURNAMENT_ID not in caplog.text, "the warning must name the Mantic id, not the Metaculus default"
 
 
 class TestTournamentConfigFreshness:
@@ -211,10 +298,9 @@ class TestFallCupStaysConfigured:
     """
 
     def test_the_reminder_is_discharged(self) -> None:
-        # Reads the REAL clock on purpose, exactly like test_tournament_not_expired above —
-        # do NOT "fix" it as flaky by mocking the date. Deliberately asserts the DUE verdict
-        # rather than the flag, so re-arming for a future season stays green until that
-        # season's reminder date actually arrives.
+        """Reads the REAL clock on purpose, exactly like test_tournament_not_expired above; do NOT
+        "fix" it as flaky by mocking the date. Deliberately asserts the DUE verdict rather than the
+        flag, so re-arming for a future season stays green until that season's reminder date arrives."""
         assert not fall_cup_reminder_due(), (
             f"\n\n"
             f"{'=' * 70}\n"
@@ -235,9 +321,8 @@ class TestFallCupStaysConfigured:
         )
 
     def test_the_cup_id_is_a_dated_season_slug(self) -> None:
-        # The undated slug is the specific failure this whole block exists for: Metaculus
-        # answers HTTP 400 for it, so a cup run under it finds no questions and forfeits the
-        # season silently.
+        """The undated slug is the specific failure this whole block exists for: Metaculus answers
+        HTTP 400 for it, so a cup run under it finds no questions and forfeits the season silently."""
         assert METACULUS_CUP_ID != "metaculus-cup"
         assert METACULUS_CUP_ID == FALL_CUP_SLUG, "FALL_CUP_SLUG must stay an alias of the configured cup"
         assert METACULUS_CUP_ID == "metaculus-cup-fall-2026", (

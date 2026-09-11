@@ -118,6 +118,9 @@ jobs:
           NATIVE_SEARCH_ENABLED: 'true'
           FINANCIAL_DATA_ENABLED: 'true'
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          # SEC EDGAR fair-access contact: the User-Agent the EDGAR client sends. Unset, the
+          # client declines and the fetch ladder falls through to the ordinary page fetch.
+          SEC_EDGAR_CONTACT_EMAIL: ${{ secrets.SEC_EDGAR_CONTACT_EMAIL }}
           # Gemini grounded search (Google AI Studio SDK) adds a 3rd distinct source.
           # GOOGLE_API_KEY is the operator's personal Google AI Studio key (stored
           # in CI as secrets.GEMINI_API_KEY). The grounded-search side has no
@@ -151,7 +154,7 @@ jobs:
           # is_benchmarking=False in the prod path (this workflow), so the
           # provider's own benchmarking guard doesn't suppress it here.
           PREDICTION_MARKETS_ENABLED: 'true'
-          # Tier-1 resolution-source fetcher (plain HTTP + trafilatura, no LLM calls).
+          # Cited-source fetcher; long HTML uses the paid page-digest extractor.
           # Validated via live test_bot run 2026-07-10.
           RESOLUTION_SOURCE_ENABLED: 'true'
           # The ladder's one PAID rung: when every free rung has failed to read a

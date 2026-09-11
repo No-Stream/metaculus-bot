@@ -109,9 +109,9 @@ FORECASTER_LLMS: list[GeneralLlm] = [
     #
     # OpenAI flagship (5.6 series). 2026-07-20: effort xhigh -> high. The
     # reasoning-effort audit (scratch/reasoning_effort_audit_2026-07-20/) found
-    # default->high clearly worth it but high->xhigh UNMEASURED; sol is ~70% of
-    # forecaster reasoning spend, so we stop paying the unmeasured premium on the
-    # dominant-cost slot. opus-4.8 keeps xhigh below as the remaining premium bet
+    # default->high clearly worth it but high->xhigh UNMEASURED, so we stop paying
+    # the unmeasured premium here (the three slots measure within 12% of each other,
+    # $0.24 to $0.27 a question, 2026-09-09). opus-4.8 keeps xhigh below as the remaining premium bet
     # (FUTURE.md "Price the high->xhigh reasoning-effort premium"). (2026-07-15
     # had bumped this high -> xhigh.) Live-verified: OpenRouter's effort enum is
     # max|xhigh|high|medium|low|minimal|none and this model accepts high (bogus

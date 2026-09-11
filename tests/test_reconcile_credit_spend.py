@@ -20,12 +20,14 @@ from scripts import reconcile_credit_spend as rcs
 from scripts.reconcile_credit_spend import RunSpend, aggregate_roles, reconcile, role_spend_by_run
 
 
-def _snapshot(run_id: str, phase: str, usage: float | None, *, ts: str, key: str = "personal") -> dict:
+def _snapshot(
+    run_id: str, phase: str, usage: float | None, *, ts: str, key: str = "personal", workflow: str = "tournament"
+) -> dict:
     """One credit_balance archive record."""
     return {
         "marker": "credit_balance",
         "run_id": run_id,
-        "workflow": "tournament",
+        "workflow": workflow,
         "run_date": f"{ts}Z",
         "line_ts": ts,
         "key": key,
@@ -35,17 +37,17 @@ def _snapshot(run_id: str, phase: str, usage: float | None, *, ts: str, key: str
     }
 
 
-def _run(run_id: str, start_usage: float, end_usage: float, *, hour: int) -> list[dict]:
+def _run(run_id: str, start_usage: float, end_usage: float, *, hour: int, key: str = "personal") -> list[dict]:
     return [
-        _snapshot(run_id, "start", start_usage, ts=f"2026-07-25T{hour:02d}:00:00"),
-        _snapshot(run_id, "end", end_usage, ts=f"2026-07-25T{hour:02d}:10:00"),
+        _snapshot(run_id, "start", start_usage, ts=f"2026-07-25T{hour:02d}:00:00", key=key),
+        _snapshot(run_id, "end", end_usage, ts=f"2026-07-25T{hour:02d}:10:00", key=key),
     ]
 
 
 class TestSettledSpendRecovery:
     def test_lagged_spend_is_recovered_from_the_next_run(self) -> None:
-        # Run A reports 0.00 within-run (usage flat across it) but the next run's
-        # start shows usage 0.30 higher — that 0.30 is A's real spend, booked late.
+        """Run A reports 0.00 within-run (usage flat across it) but the next run's start shows
+        usage 0.30 higher: that 0.30 is A's real spend, booked late."""
         records = _run("A", 100.00, 100.00, hour=1) + _run("B", 100.30, 100.30, hour=2)
         rows = reconcile(records, "personal")
 
@@ -56,7 +58,7 @@ class TestSettledSpendRecovery:
         assert run_a.lagged_usd == pytest.approx(0.30)
 
     def test_partially_settled_run_keeps_both_halves(self) -> None:
-        # Some spend lands inside the run, the rest after. Both must be accounted.
+        """Some spend lands inside the run, the rest after. Both must be accounted."""
         records = _run("A", 100.00, 100.10, hour=1) + _run("B", 100.35, 100.35, hour=2)
         rows = reconcile(records, "personal")
         assert rows[0].within_run_usd == pytest.approx(0.10)
@@ -64,8 +66,8 @@ class TestSettledSpendRecovery:
         assert rows[0].lagged_usd == pytest.approx(0.25)
 
     def test_final_run_is_reported_unsettled_not_guessed(self) -> None:
-        # No successor means no observation after the settlement window. Reporting a
-        # number here would be fabricating one, so settled stays None.
+        """No successor means no observation after the settlement window. Reporting a number
+        here would be fabricating one, so settled stays None."""
         records = _run("A", 100.00, 100.00, hour=1) + _run("B", 100.30, 100.30, hour=2)
         rows = reconcile(records, "personal")
         final = rows[-1]
@@ -91,8 +93,8 @@ class TestSettledSpendRecovery:
             assert row.settled_usd == pytest.approx((row.within_run_usd or 0.0) + (row.lagged_usd or 0.0))
 
     def test_runs_are_ordered_by_snapshot_time_not_dict_order(self) -> None:
-        # Successor identification depends on ordering, and archive files are not
-        # guaranteed chronological (concurrent workflow dispatches interleave).
+        """Successor identification depends on ordering, and archive files are not guaranteed
+        chronological (concurrent workflow dispatches interleave)."""
         late = _run("LATE", 100.30, 100.30, hour=5)
         early = _run("EARLY", 100.00, 100.00, hour=1)
         rows = reconcile(late + early, "personal")
@@ -110,21 +112,56 @@ class TestSettledSpendRecovery:
         rows = reconcile(records, "personal")
         assert [row.run_id for row in rows] == ["A", "B"]
 
-    def test_missing_usage_yields_none_rather_than_a_wrong_number(self) -> None:
-        # A fetch failure records usage=None. Treating it as 0 would invent spend.
-        records = _run("A", 100.00, 100.00, hour=1)
-        records[0]["usage"] = None
-        records += _run("B", 100.30, 100.30, hour=2)
+    def test_missing_end_usage_yields_none_within_run_but_keeps_the_run_in_the_chain(self) -> None:
+        """An end-snapshot fetch failure records usage=None. Treating it as 0 would invent spend,
+        so within-run is None. The start usage is still a real observation of the key's balance,
+        so the run stays paired: its own spend settles against its successor, and its start
+        settles its predecessor."""
+        records = (
+            _run("A", 100.00, 100.00, hour=1) + _run("B", 100.30, 100.30, hour=2) + _run("C", 100.50, 100.50, hour=3)
+        )
+        records[3]["usage"] = None  # B's end snapshot
         rows = reconcile(records, "personal")
-        assert rows[0].within_run_usd is None
-        assert rows[0].settled_usd is None
+        assert [row.run_id for row in rows] == ["A", "B", "C"]
+        assert rows[0].settled_usd == pytest.approx(0.30)
+        assert rows[1].within_run_usd is None
+        assert rows[1].settled_usd == pytest.approx(0.20)
+        assert rows[1].lagged_usd is None
+
+    def test_a_usage_less_start_snapshot_leaves_the_run_unpaired_and_its_predecessor_settled(self) -> None:
+        """A Mantic run never probes the donated key and logs ``CREDIT_BALANCE: key=donated
+        phase=start skipped (donated routing disabled)``, which the archive parses into a start
+        record with usage=None. That is not an observation of the key's booked balance, so the
+        run must neither break its predecessor's settlement chain nor add an all-None row of its
+        own: it spent nothing on the key, so the NEXT run's start is the predecessor's settlement
+        observation. Before the fix the predecessor read None and a spurious MANTIC row appeared.
+        """
+        records = [
+            *_run("A", 100.00, 100.00, hour=1, key="donated"),
+            _snapshot("MANTIC", "start", None, ts="2026-07-25T02:00:00", key="donated", workflow="mantic"),
+            _snapshot("MANTIC", "end", None, ts="2026-07-25T02:10:00", key="donated", workflow="mantic"),
+            *_run("B", 100.30, 100.40, hour=3, key="donated"),
+            *_run("C", 100.60, 100.60, hour=4, key="donated"),
+        ]
+        rows = reconcile(records, "donated")
+        assert [row.run_id for row in rows] == ["A", "B", "C"]
+        assert rows[0].settled_usd == pytest.approx(0.30)
+        assert rows[1].settled_usd == pytest.approx(0.30)
 
 
 def _role_row(
-    run_id: str, role: str, key: str, *, usd: float | None, calls: int, costed_calls: int | None = None
+    run_id: str,
+    role: str,
+    key: str,
+    *,
+    usd: float | None,
+    calls: int,
+    costed_calls: int | None = None,
+    charged_usd: float | None = None,
 ) -> dict:
-    """One credit_role_spend archive record (the harvested CREDIT_ROLE_SPEND line)."""
-    return {
+    """One credit_role_spend archive record (the harvested CREDIT_ROLE_SPEND line). Without
+    ``charged_usd`` it is the pre-2026-09-09 shape, whose only dollar total is ``usd``."""
+    row = {
         "marker": "credit_role_spend",
         "run_id": run_id,
         "role": role,
@@ -134,6 +171,9 @@ def _role_row(
         "costed_calls": calls if costed_calls is None else costed_calls,
         "byok_usd": None if usd is None else 0.0,
     }
+    if charged_usd is not None:
+        row["charged_usd"] = charged_usd
+    return row
 
 
 class TestRoleLedgerReconciliation:
@@ -149,14 +189,31 @@ class TestRoleLedgerReconciliation:
             _role_row("B", "forecaster:google", "personal", usd=0.30, calls=1),
         ]
         by_run = role_spend_by_run(records, "personal")
-        assert by_run["A"].usd == pytest.approx(0.2512)
+        assert by_run["A"].charged_usd == pytest.approx(0.2512)
         assert (by_run["A"].rows, by_run["A"].costed_rows) == (2, 2)
-        assert by_run["B"].usd == pytest.approx(0.30)
+        assert by_run["B"].charged_usd == pytest.approx(0.30)
+
+    def test_charged_usd_is_preferred_and_usd_is_the_fallback_for_older_rows(self) -> None:
+        """Rows since 2026-09-09 carry ``charged_usd``, the money actually charged; ``usd`` double
+        counts a non-BYOK row that echoed the upstream cost (the personal-key Google slot read
+        1.1433 against 0.5716 charged on run 33907102246). Older rows have only ``usd``, and a
+        re-harvested older row carries ``charged_usd=None``, which must not shadow ``usd``."""
+        records = [
+            _role_row("NEW", "forecaster:google", "personal", usd=1.1433, calls=4, charged_usd=0.5716),
+            _role_row("OLD", "forecaster:google", "personal", usd=1.1433, calls=4),
+            {**_role_row("REHARVESTED", "forecaster:google", "personal", usd=0.2787, calls=1), "charged_usd": None},
+        ]
+        by_run = role_spend_by_run(records, "personal")
+        assert by_run["NEW"].charged_usd == pytest.approx(0.5716)
+        assert by_run["OLD"].charged_usd == pytest.approx(1.1433)
+        assert by_run["REHARVESTED"].charged_usd == pytest.approx(0.2787)
+        (total,) = aggregate_roles(records)
+        assert total.charged_usd == pytest.approx(0.5716 + 1.1433 + 0.2787)
 
     def test_run_with_only_uncosted_rows_reports_none_not_zero(self) -> None:
         records = [_role_row("A", "perplexity_research", "personal", usd=None, calls=2, costed_calls=0)]
         run_a = role_spend_by_run(records, "personal")["A"]
-        assert run_a.usd is None
+        assert run_a.charged_usd is None
         assert (run_a.rows, run_a.costed_rows) == (1, 0)
 
     def test_aggregate_orders_by_usd_with_uncosted_last_and_respects_the_run_filter(self) -> None:
@@ -173,9 +230,9 @@ class TestRoleLedgerReconciliation:
             ("parser", "donated"),
             ("untagged", "unknown"),
         ]
-        assert totals[0].usd == pytest.approx(0.75)
+        assert totals[0].charged_usd == pytest.approx(0.75)
         assert (totals[0].calls, totals[0].costed_calls) == (2, 2)
-        assert totals[2].usd is None
+        assert totals[2].charged_usd is None
 
     def test_aggregate_without_a_filter_covers_every_run(self) -> None:
         records = [
@@ -183,7 +240,7 @@ class TestRoleLedgerReconciliation:
             _role_row("B", "parser", "donated", usd=0.02, calls=1),
         ]
         (total,) = aggregate_roles(records)
-        assert total.usd == pytest.approx(0.03)
+        assert total.charged_usd == pytest.approx(0.03)
         assert total.calls == 2
 
 
