@@ -499,8 +499,10 @@ outlet's copy), only the provenance claim, which is why the marker says
 
 Generic tier words that name a CLASS rather than an outlet are skipped before
 matching (`official` alone is 243 of the corpus's 790 tier items, and the skip
-list is carried over from the audit's own so the shipped rate stays comparable to
-its measurement). Matching is then biased hard toward KEEPING, because a false
+list starts from the audit's own). This includes `academic` and `peer-reviewed`:
+the single-question smoke on 2026-09-11 otherwise counted all 23 occurrences of
+`[B: academic / peer-reviewed]` as unsupported publisher names. Matching is then biased
+hard toward KEEPING, because a false
 strip discards real provenance while a false keep merely leaves one tag standing.
 Any one of six rules credits a name: it concatenates into the domain
 (`Golf Channel` / golfchannel.com); all of its identity tokens appear in the

@@ -409,6 +409,10 @@ may cite them. The system prompt is a fixed template that embeds no question
 URLs, so nothing is seeded from it. A discrepancy finding may not lean on a
 briefing URL at all: see `gates._check_url_provenance`.
 
+Each finding has one source URL. The driver is instructed to record evidence from
+different sources as separate findings, keeping each source's evidence in its own
+`claim` and `quote`, so every excerpt retains its own link.
+
 The quote spot-check in `_validate_findings_payload` is warn-only. A quote that
 is not found verbatim in the run's tool contents is logged and counted in
 `quote_mismatch_warnings`, but the finding is still banked, because

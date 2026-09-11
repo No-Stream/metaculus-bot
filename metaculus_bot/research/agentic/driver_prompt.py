@@ -194,8 +194,10 @@ Most questions need little; a few need a lot. Spend accordingly.
   sake of it.
 
 RULES FOR FINDINGS (strictly enforced; violating findings are rejected):
-  - Each finding: one factual claim + source URL + verbatim quote + the
-    source's date + how you retrieved it.
+  - Each finding: one factual claim + source URL + verbatim quote from that
+    source + the source's date + how you retrieved it. For comparisons across
+    sources, record a separate finding for each source so every excerpt keeps
+    its own link. State each source's evidence in its own claim and quote.
   - DISCREPANCY findings (highest-value output): if a check shows the
     briefing states something the source does not support — a wrong number,
     a misread clause, a misattributed or hallucinated fact, a stale figure

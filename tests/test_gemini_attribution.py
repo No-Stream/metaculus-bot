@@ -172,6 +172,21 @@ class TestTheLooseningRulesStayBounded:
 
 
 class TestWhatTheCheckLeavesAlone:
+    def test_academic_categories_are_not_publisher_attributions(self) -> None:
+        for category in ("academic", "peer-reviewed", "academic / peer-reviewed"):
+            text = f"The paper models the age distribution [B: {category}]."
+            result = rewrite_unsupported_attributions(text, ["demographic-research.org"])
+            assert result.text == text
+            assert (result.tagged, result.unsupported, result.groups_rewritten) == (0, 0, 0)
+
+    def test_academic_category_does_not_exempt_an_unbacked_publisher(self) -> None:
+        text = "The paper models lifespan [B: academic / peer-reviewed]. The report agrees [B: Reuters]."
+        result = rewrite_unsupported_attributions(text, ["demographic-research.org"])
+        assert result.text == (
+            "The paper models lifespan [B: academic / peer-reviewed]. The report agrees [unverified attribution]."
+        )
+        assert (result.tagged, result.unsupported, result.groups_rewritten) == (1, 1, 1)
+
     def test_generic_tier_words(self) -> None:
         # ``official`` / ``aggregator`` name a class of source, not an outlet, so there is
         # nothing in the grounding record to check them against. 307 of the corpus's 790

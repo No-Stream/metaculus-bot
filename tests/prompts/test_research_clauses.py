@@ -27,6 +27,7 @@ from metaculus_bot.prompts import (
     stacking_numeric_prompt,
     web_research_prompt,
 )
+from metaculus_bot.research.agentic.driver_prompt import build_system_prompt
 from metaculus_bot.research.section_format import PROVIDER_SECTION_HEADERS
 from tests.prompt_builders import (
     _RESEARCH_WITH_MARKETS,
@@ -36,6 +37,15 @@ from tests.prompt_builders import (
     _numeric_q,
     _summarizer_prompt,
 )
+
+
+class TestDriverSystemPromptSourceAttribution:
+    def test_cross_source_evidence_keeps_separate_quotes_and_links(self) -> None:
+        collapsed = " ".join(build_system_prompt("2026-09-11").split())
+        assert "verbatim quote from that source" in collapsed
+        assert "record a separate finding for each source so every excerpt keeps its own link" in collapsed
+        assert "State each source's evidence in its own claim and quote" in collapsed
+        assert "Put your comparison in claim" not in collapsed
 
 
 class TestGapFillAnalyzerPrompt:
