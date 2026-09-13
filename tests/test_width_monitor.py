@@ -864,6 +864,19 @@ class TestParseExcludeQids:
         for name in EXCLUSION_COHORTS:
             assert name in help_text
 
+    def test_a_dataset_has_to_be_named(self, capsys):
+        """``--cached`` used to default to ``scratch/coherence_2026-07-15/perf_all_tagged.json``.
+
+        A fresh clone has no ``scratch/`` at all, and on the operator's machine that round
+        directory still resolves months after it was superseded, so a bare invocation silently
+        reported a stale dataset as the current one.
+        """
+        with pytest.raises(SystemExit) as exit_info:
+            main([])
+
+        assert exit_info.value.code == 2
+        assert "--cached" in capsys.readouterr().err
+
 
 class TestDegradedRunCohorts:
     """The dry-donated-key incident cohorts (2026-07-26 .. 07-28), now tracked constants.

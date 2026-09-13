@@ -417,9 +417,12 @@ check_credits:
 # PAID, PERSONAL KEY ONLY (ask-first gate, see AGENTS.md): the paired section-strip bench forecasts
 # every resolved gap-fill pair four ways (full bundle, minus v1, minus v2, minus both) with one cheap
 # model on OPENROUTER_API_KEY and scores the arms against the resolutions. Nothing publishes and no
-# research runs; the estimate at the default 3 replicates is about $1.25. A bare `make strip_bench`
-# prints the plan and refuses; ARGS="--dry-run" is the free view; ARGS="--i-accept-spend" runs it
-# under --max-spend-usd (default 10); ARGS="--rescore <run dir>" rebuilds results offline.
+# research runs; the estimate at the default 3 replicates is about $1.25. Every mode except
+# --rescore needs --pairs and --perf-json, which name the round directory being benched (they used
+# to default to a fixed round and silently went stale). So the plan-and-refuse call is
+# ARGS="--pairs <pairs.jsonl> --perf-json <perf_all_tagged.json>", the same plus ARGS="--dry-run"
+# is the free view, plus ARGS="--i-accept-spend" runs it under --max-spend-usd (default 10), and
+# ARGS="--rescore <run dir>" rebuilds results offline from a finished run.
 strip_bench:
 	uv run python -m scripts.probes.section_strip_bench $(ARGS)
 

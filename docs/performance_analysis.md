@@ -40,6 +40,25 @@ list endpoint under `with_cp=true` so each page already carries the token's own
 nothing, so it is **not subject to the repo's cost gate** (unlike `make backtest_*` and
 live runs).
 
+**`--output` is required for a live pull and saves on the `--cached` path too.** It has no
+default: it used to be `scratch/performance_data.json`, which is gitignored and absent in a
+fresh clone, and once the cached path started saving, a default would have made a read-only
+report clobber an unrelated pull. Omitting `--output` under `--cached` is the read-only report.
+Passing it under `--cached --prior` is how the rescore tags reach disk; `save_dataset` used to
+sit inside the live-pull branch, so that combination tagged records in memory and wrote
+nothing, and nine rounds carried a `diff_prior.py` to work around it.
+
+**One page's network blip no longer abandons the sweep.** `_api_get` retries HTTP 429 and the
+transient network failures (`requests.exceptions.Timeout`, which covers read and connect
+timeouts, and `ConnectionError`) out of ONE shared budget of `MAX_RETRIES` attempts, with
+`RETRY_BACKOFF_SECS * attempt` between them. Sharing the budget is what keeps the change safe
+in a path whose overrun costs forecasts: the worst case per page is unchanged from the 429-only
+retry it replaced, `MAX_RETRIES` reads at `REQUEST_TIMEOUT_SECS` plus the backoffs, 105 s at
+the values in `collector.py`. Nothing else is caught, so a genuine failure still crashes with
+its own traceback rather than arriving as a slow success, and an exhausted 429 raises an error
+naming the rate limit instead of reporting the whole rate-limited run as one unlucky request.
+A sustained outage still fails the pull; re-running it is free.
+
 **Pass `--prior <previous round's dataset>` on every round pull.** Metaculus
 re-resolves questions IN PLACE without moving any timestamp we store. It edited q44798
 (Halo: Campaign Evolved Metascore) from 80 to 82 with `resolution_set_time` left at a

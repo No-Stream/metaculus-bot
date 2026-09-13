@@ -984,6 +984,19 @@ class TestCli:
         path.write_text(json.dumps(records))
         return str(path)
 
+    def test_a_dataset_has_to_be_named(self, capsys):
+        """``--cached`` used to default to ``scratch/residual_2026-09-01/perf_all_tagged.json``.
+
+        A fresh clone has no ``scratch/`` at all, and on the operator's machine that round
+        directory still resolves after it is superseded, so a bare invocation silently swept a
+        stale dataset and reported it as the current round.
+        """
+        with pytest.raises(SystemExit) as exit_info:
+            main([])
+
+        assert exit_info.value.code == 2
+        assert "--cached" in capsys.readouterr().err
+
     def test_writes_json_and_markdown(self, tmp_path, capsys):
         path = self._write(tmp_path, self._dataset())
         out_json = str(tmp_path / "sweep.json")

@@ -627,8 +627,13 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Era-bucketed numeric width / calibration monitor (read-only)")
     parser.add_argument(
         "--cached",
-        default="scratch/coherence_2026-07-15/perf_all_tagged.json",
-        help="Path to a cached performance dataset JSON (list of records). Default: %(default)s",
+        default=None,
+        help=(
+            "Path to a cached performance dataset JSON (list of records), normally the current "
+            "round's perf_all_tagged.json. Required unless --tournament is given: a default "
+            "naming one round keeps resolving after that round is superseded, so the monitor "
+            "would silently read a stale dataset."
+        ),
     )
     parser.add_argument(
         "--tournament",
@@ -666,8 +671,10 @@ def main(argv: list[str] | None = None) -> None:
         # Confirm the host is the real Metaculus before the token-sending pull.
         verify_metaculus_api_identity()
         data = build_performance_dataset(tournament=args.tournament)
-    else:
+    elif args.cached is not None:
         data = load_dataset(args.cached)
+    else:
+        parser.error("pass --cached <dataset> or --tournament <slug>: there is no dataset to read otherwise")
 
     metrics = compute_all_eras(data, exclude_qids=exclude_qids)
     if exclude_qids:

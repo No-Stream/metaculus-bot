@@ -29,8 +29,6 @@ from scripts.probes.section_strip_bench.run import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_PAIRS = REPO_ROOT / "scratch" / "cost_pass_2026-09-09" / "v1_vs_v2" / "pairs.jsonl"
-DEFAULT_PERF_JSON = REPO_ROOT / "scratch" / "residual_2026-09-09" / "perf_all_tagged.json"
 DEFAULT_ARCHIVE_DIR = REPO_ROOT / "backtests" / "research_archive" / "latest"
 DEFAULT_OUT_ROOT = REPO_ROOT / "scratch" / "probes"
 
@@ -102,13 +100,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--concurrency", type=_positive_int, default=DEFAULT_CONCURRENCY)
     parser.add_argument("--bootstrap-seed", type=_non_negative_int, default=0)
-    parser.add_argument("--pairs", type=Path, default=DEFAULT_PAIRS)
-    parser.add_argument("--perf-json", type=Path, default=DEFAULT_PERF_JSON)
+    # Not defaulted: a dated round directory keeps resolving once superseded (see _require_dataset).
+    parser.add_argument("--pairs", type=Path, default=None, help="The gap-fill pairs JSONL the bench forecasts.")
+    parser.add_argument(
+        "--perf-json", type=Path, default=None, help="The round's perf_all_tagged.json, for the resolutions."
+    )
     parser.add_argument("--archive-dir", type=Path, default=DEFAULT_ARCHIVE_DIR)
     parser.add_argument("--out-root", type=Path, default=DEFAULT_OUT_ROOT, help="Run dirs are created under this.")
     args = parser.parse_args(argv)
     if FULL_ARM not in args.arms:
         parser.error(f"--arms must include {FULL_ARM!r}: the deltas are full minus arm")
+    # Scoped to the modes that load questions; --rescore rebuilds from a run dir and reads neither.
+    if args.rescore is None:
+        missing = [flag for flag, value in (("--pairs", args.pairs), ("--perf-json", args.perf_json)) if value is None]
+        if missing:
+            parser.error(f"{' and '.join(missing)} must be passed: they live in the round directory being benched")
     return args
 
 

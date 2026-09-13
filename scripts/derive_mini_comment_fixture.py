@@ -311,8 +311,9 @@ def main() -> None:
 
     if not args.source.exists():
         raise SystemExit(
-            f"source pull not found at {args.source}; run the performance-analysis collector first "
-            "(see AGENTS.md 'Residual / performance analysis')"
+            f"source pull not found at {args.source} (gitignored, so a fresh clone has none). Either pass "
+            "--source <an existing pull>, or make one with 'uv run python -m metaculus_bot.performance_analysis "
+            f"--tournament <slug> --output {args.source}'."
         )
 
     with args.source.open() as handle:
