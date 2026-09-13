@@ -273,7 +273,7 @@ class TestPerformanceCliInvokesPreflight:
         ):
             manager.attach_mock(verify, "verify")
             manager.attach_mock(build, "build")
-            perf_cli.main([])
+            perf_cli.main(["--output", "unused.json"])
 
         verify.assert_called_once()
         call_names = [name for name, _, _ in manager.mock_calls]
@@ -292,5 +292,5 @@ class TestPerformanceCliInvokesPreflight:
             patch.object(perf_cli, "generate_report", return_value=""),
             pytest.raises(ApiIdentityError),
         ):
-            perf_cli.main([])
+            perf_cli.main(["--output", "unused.json"])
         build.assert_not_called()

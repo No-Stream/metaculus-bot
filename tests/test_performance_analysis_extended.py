@@ -13,6 +13,7 @@ from typing import ClassVar, cast
 
 import numpy as np
 import pytest
+import requests
 
 from metaculus_bot import performance_analysis
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
@@ -472,6 +473,119 @@ class TestAnonymousModelKey:
         """A real model name is never anonymous, and neither are the near-misses: display names
         that merely start the same way as the positional format, and a bullet-shaped string."""
         assert not is_anonymous_model_key(key)
+
+
+# ---------------------------------------------------------------------------
+# collector — the retry that keeps one timeout from abandoning a whole sweep
+# ---------------------------------------------------------------------------
+
+
+class _FakeResponse:
+    def __init__(self, status_code: int, payload: dict | None = None) -> None:
+        self.status_code = status_code
+        self._payload = payload if payload is not None else {}
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise requests.exceptions.HTTPError(f"HTTP {self.status_code}")
+
+    def json(self) -> dict:
+        return self._payload
+
+
+class TestApiGetRetry:
+    """``_api_get`` retries a transient network failure, and its wall clock stays bounded.
+
+    A read timeout used to propagate on its first occurrence, so one slow page abandoned a
+    whole tournament sweep and wrote nothing after several minutes of paging. Nine residual
+    rounds worked around it with a pasted ``resilient_pull.py``. The retry budget is SHARED
+    with the 429 budget on purpose: the worst-case wall clock is then identical to the
+    429-only retry this replaces, which is what makes the change strictly safer in a path
+    whose overrun costs forecasts.
+    """
+
+    def _install(self, monkeypatch, outcomes: list[object]) -> tuple[list[float], list[dict]]:
+        """Serve ``outcomes`` (a response or an exception instance) in order; record every sleep."""
+        sleeps: list[float] = []
+        calls: list[dict] = []
+        remaining = list(outcomes)
+
+        def fake_get(url: str, headers: dict | None = None, params: dict | None = None, timeout: float | None = None):
+            calls.append({"url": url, "headers": dict(headers or {}), "timeout": timeout})
+            outcome = remaining.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        def fake_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        monkeypatch.setattr(collector.requests, "get", fake_get)
+        monkeypatch.setattr(collector.time, "sleep", fake_sleep)
+        return sleeps, calls
+
+    def test_a_read_timeout_is_retried_and_the_next_attempt_wins(self, monkeypatch):
+        sleeps, calls = self._install(
+            monkeypatch,
+            [requests.exceptions.ReadTimeout("slow page"), _FakeResponse(200, {"results": [{"id": 7}]})],
+        )
+
+        assert collector._api_get("/posts/", "token") == {"results": [{"id": 7}]}
+        assert len(calls) == 2
+        assert sleeps == [collector.RETRY_BACKOFF_SECS]
+
+    def test_a_connection_error_is_retried_too(self, monkeypatch):
+        self._install(
+            monkeypatch, [requests.exceptions.ConnectionError("reset by peer"), _FakeResponse(200, {"results": []})]
+        )
+
+        assert collector._api_get("/comments/", "token") == {"results": []}
+
+    def test_exhausted_transient_retries_raise_the_underlying_requests_error(self, monkeypatch):
+        timeout = requests.exceptions.ReadTimeout("still slow")
+        sleeps, calls = self._install(monkeypatch, [timeout] * collector.MAX_RETRIES)
+
+        with pytest.raises(requests.exceptions.ReadTimeout):
+            collector._api_get("/posts/", "token")
+
+        # Every attempt is spent, and the last one does not sleep before giving up.
+        assert len(calls) == collector.MAX_RETRIES
+        assert len(sleeps) == collector.MAX_RETRIES - 1
+
+    def test_the_transient_and_429_budgets_are_shared_so_the_attempt_ceiling_is_unchanged(self, monkeypatch):
+        outcomes: list[object] = [requests.exceptions.ReadTimeout("slow"), _FakeResponse(429), _FakeResponse(429)]
+        assert len(outcomes) == collector.MAX_RETRIES, "this pin assumes the three-attempt budget"
+        sleeps, calls = self._install(monkeypatch, outcomes)
+
+        with pytest.raises(requests.exceptions.RequestException):
+            collector._api_get("/posts/", "token")
+
+        assert len(calls) == collector.MAX_RETRIES
+        # Worst-case wall clock: MAX_RETRIES reads at the request timeout, plus these backoffs.
+        assert sleeps == [collector.RETRY_BACKOFF_SECS, collector.RETRY_BACKOFF_SECS * 2]
+
+    def test_an_exhausted_429_names_the_rate_limit_rather_than_reporting_one_unlucky_request(self, monkeypatch):
+        self._install(monkeypatch, [_FakeResponse(429)] * collector.MAX_RETRIES)
+
+        with pytest.raises(requests.exceptions.HTTPError, match="429 rate limit"):
+            collector._api_get("/posts/", "token")
+
+    def test_a_server_error_is_not_retried(self, monkeypatch):
+        _sleeps, calls = self._install(monkeypatch, [_FakeResponse(500)])
+
+        with pytest.raises(requests.exceptions.HTTPError):
+            collector._api_get("/posts/", "token")
+
+        assert len(calls) == 1
+
+    def test_every_attempt_carries_the_bounded_request_timeout(self, monkeypatch):
+        _sleeps, calls = self._install(
+            monkeypatch, [requests.exceptions.ReadTimeout("slow"), _FakeResponse(200, {"results": []})]
+        )
+
+        collector._api_get("/posts/", "token")
+
+        assert [call["timeout"] for call in calls] == [collector.REQUEST_TIMEOUT_SECS] * 2
 
 
 # ---------------------------------------------------------------------------

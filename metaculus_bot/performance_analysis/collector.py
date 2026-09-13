@@ -43,7 +43,11 @@ DEFAULT_TOURNAMENT = "spring-aib-2026"
 FETCH_DELAY_SECS: float = 0.5
 MAX_RETRIES: int = 3
 RETRY_BACKOFF_SECS: float = 5.0
+REQUEST_TIMEOUT_SECS: float = 30.0
 PAGE_SIZE: int = 100
+
+# Retried; anything else propagates (docs/performance_analysis.md "The round pull").
+_TRANSIENT_NETWORK_ERRORS = (requests.exceptions.Timeout, requests.exceptions.ConnectionError)
 
 
 # ---------------------------------------------------------------------------
@@ -56,18 +60,39 @@ def _make_headers(token: str) -> dict[str, str]:
 
 
 def _api_get(path: str, token: str, params: dict | None = None) -> dict:
+    """GET one page, retrying a 429 or a transient network failure within one shared budget.
+
+    Both causes draw on the same ``MAX_RETRIES`` attempts, so the worst-case wall clock is
+    unchanged from the 429-only retry this replaced: ``MAX_RETRIES`` reads at
+    ``REQUEST_TIMEOUT_SECS`` plus the backoffs between them. Exhaustion raises rather than
+    returning a partial page, because a sweep that reports a slow success is worse than one
+    that stops. Receipts: docs/performance_analysis.md "The round pull".
+    """
     url = f"{BASE_URL}{path}"
     headers = _make_headers(token)
     for attempt in range(MAX_RETRIES):
-        resp = requests.get(url, headers=headers, params=params, timeout=30)
-        if resp.status_code == 429 and attempt < MAX_RETRIES - 1:
-            wait = RETRY_BACKOFF_SECS * (attempt + 1)
+        last_attempt = attempt == MAX_RETRIES - 1
+        wait = RETRY_BACKOFF_SECS * (attempt + 1)
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT_SECS)
+        except _TRANSIENT_NETWORK_ERRORS as exc:
+            if last_attempt:
+                raise
+            logger.warning(
+                f"{type(exc).__name__} on {path}, retrying in {wait}s (attempt {attempt + 1}/{MAX_RETRIES}): {exc}"
+            )
+            time.sleep(wait)
+            continue
+        if resp.status_code == 429:
+            if last_attempt:
+                break
             logger.warning(f"Rate limited (429), retrying in {wait}s (attempt {attempt + 1}/{MAX_RETRIES})...")
             time.sleep(wait)
             continue
         resp.raise_for_status()
         return resp.json()
-    raise RuntimeError("Exhausted retries on rate-limited request")
+    # Reached only by an exhausted 429, which raise_for_status reported as one unlucky request.
+    raise requests.exceptions.HTTPError(f"429 rate limit on {path}: retries exhausted after {MAX_RETRIES} attempts")
 
 
 # ---------------------------------------------------------------------------
