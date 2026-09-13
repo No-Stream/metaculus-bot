@@ -63,11 +63,7 @@ def _score_stats(values: list[float]) -> dict:
     }
 
 
-# The one registry for the four platform-score metrics: summary key, accessor, report
-# label, in report order. platform_score_summary, the section's emptiness gate and its
-# render loop all iterate this, so adding a metric in one place reaches all three
-# (previously a `fields` dict here and a `_PLATFORM_SCORE_ROWS` 730 lines apart could
-# drift, silently dropping a metric from the report). ``coverage`` is handled separately.
+# The one registry the summary, its emptiness gate and its render loop all iterate, in report order.
 _PLATFORM_SCORE_METRICS: tuple[tuple[str, Callable[[dict], float | None], str], ...] = (
     ("spot_peer", spot_peer_score, "spot peer (PRIMARY, the leaderboard metric)"),
     ("peer", peer_score, "peer (coverage-scaled, secondary)"),
@@ -98,35 +94,13 @@ def platform_score_summary(data: list[dict]) -> dict:
 def per_model_cohort(data: list[dict], *, cut: str) -> list[tuple[dict, dict]]:
     """Return ``(record, per_model_forecasts)`` pairs valid for a per-model cut.
 
-    ``per_model_forecasts`` is only a per-MODEL record on questions the bot
-    published as an aggregate of individually-attributed base forecasts. Two
-    kinds of entry break that, and both are dropped here:
-
-    * **Stacker-fired records.** When the stacker LLM produced the published
-      value, the bot writes ONE summary bullet holding the stacker's aggregate.
-      Bucketing it under whatever key that bullet carries makes a per-model
-      score that is really a stacker-vs-base-model mixture. Detection is
-      ``detect_stacker_fired(record) == "confirmed_stacker"`` — the verdict
-      backed by an explicit flag, marker, or body signature. ``likely_stacker``
-      is deliberately NOT excluded: it is a spread-plus-delta heuristic that
-      fires on any high-spread question whose published value sits far from the
-      median, which is exactly what a MEAN-era aggregate looks like, so
-      honoring it would drop the high-disagreement records these cuts exist to
-      measure.
-    * **Anonymous attribution keys.** ``Forecaster N`` keys are positional
-      fallbacks, assigned when neither an explicit roster nor a ``Model:`` line
-      identified the forecaster (``parsing.anonymous_model_key``). Pooled across
-      questions, one positional bucket spans different models — and on
-      stacking-era comments it is the stacker's own aggregate, which is how 50
-      such forecasts reached the 2026-04 per-model cuts as if they were two
-      extra ensemble members.
-
-    Both exclusion counts are logged at INFO under the ``PER_MODEL_COHORT``
-    marker, keyed by ``cut``, so a shrunken cohort is visible in the run log
-    rather than passing for full coverage.
-
-    Records are returned even when every key was dropped; callers already handle
-    an empty per-model dict (they need <2 parseable values to mean "no spread").
+    Drops confirmed-stacker records and anonymous ``Forecaster N`` keys, both of which turn
+    a per-model score into a stacker-vs-base-model mixture, and logs each exclusion count at
+    INFO under ``PER_MODEL_COHORT`` so a shrunken cohort cannot pass for full coverage. Why
+    ``likely_stacker`` deliberately does not exclude, and the 50-forecast incident behind the
+    anonymous-key rule: ``docs/performance_analysis.md`` "Per-model cuts run on a filtered
+    cohort". Records are returned even when every key was dropped, since callers already read
+    an empty per-model dict as "no spread".
     """
     cohort: list[tuple[dict, dict]] = []
     excluded_stacked_records = 0
@@ -256,24 +230,11 @@ OUT_OF_RANGE_MARKER_SIDES: Mapping[str, str] = {"below_lower_bound": "low", "abo
 class PitReading:
     """One record's PIT reading: a point value, or an INTERVAL of possible values.
 
-    Metaculus reports a resolution past the displayed range as the string
-    ``above_upper_bound`` / ``below_lower_bound``, so the resolution VALUE is unknown and
-    ``F(resolution)`` is only pinned to a SET: ``[cdf[-1], 1]`` above the ceiling,
-    ``[0, cdf[0]]`` below the floor. On an open bound that set can be wide, because our own
-    CDF is free to put real mass out there — q44842 published 13% of its mass above the
-    displayed ceiling, resolved ``above_upper_bound``, and won spot peer +24.4, while the old
-    convention (PIT := 1.0) scored it a high-side band miss.
-
-    Two conventions ride on this type, and they differ deliberately:
-
-    * COVERAGE counts an interval as covered when it INTERSECTS the band — a band miss only
-      when the WHOLE interval lies outside it.
-    * POINT statistics (mean, std, histogram) EXCLUDE intervals and disclose how many were
-      excluded. Imputing a midpoint would manufacture a reading nobody measured.
-
-    An interval whose endpoints coincide (a closed bound, or an open one carrying no
-    out-of-range mass) IS a point reading: ``is_interval`` is False and ``point`` answers the
-    same value the old convention forced, so nothing changes on those records.
+    A resolution past the displayed range arrives as a string, so its ``F(resolution)`` is
+    pinned only to a set. Coverage counts an interval as covered when it intersects the band;
+    point statistics exclude intervals and disclose the count. Both conventions, the q44842
+    receipt and the coinciding-endpoint case: ``docs/performance_analysis.md`` "An
+    out-of-range resolution gives a SET-valued PIT reading".
     """
 
     low: float
@@ -372,11 +333,7 @@ def numeric_pit_analysis(data: list[dict]) -> dict:
             readings.append(out_of_range)
         elif isinstance(resolution, (int, float)) and not isinstance(resolution, bool):
             if upper_bound - lower_bound <= 0:
-                # No range, no interpolated PIT — the record is dropped rather than
-                # contributing the 0.5 that used to come back from _interpolate_pit, which
-                # is the single most favorable value available (inside BOTH coverage bands).
-                # Scoped to the interpolated branch: an out-of-range resolution's interval is
-                # a real reading that never touched the range.
+                # No range, no interpolated PIT: a 0.5 default sits inside BOTH coverage bands.
                 continue
             readings.append(
                 PitReading.from_point(
@@ -427,30 +384,13 @@ def declared_percentile_pit(
 ) -> float | None:
     """PIT from the MEDIAN of the ensemble members' declared percentile curves.
 
-    The declared ``(percentile, value)`` pairs are the models' raw output and are NOT
-    clipped to the question's displayed range, so a resolution beyond the CDF grid
-    still gets a real quantile: interpolate each member's own value -> percentile
-    curve at the resolution (clamping to the curve's endpoint percentiles beyond its
-    ends) and take the median across members — the same median-of-members the
-    published aggregate is built from, read in percentile space where the bound is
-    not a wall. Returns None when no member curve is usable.
-
-    Anonymous ``Forecaster N`` keys are EXCLUDED, matching ``max_step_clamp_screen``
-    next door and ``per_model_cohort``: on a stacker-fired record that positional
-    bucket holds the stacker's AGGREGATE, so pooling it into a median-of-members
-    counts the aggregate as an extra member and pulls the median toward itself. The
-    two sets don't intersect in today's archive, so this is a latent fix — but the
-    two sibling consumers of this field already filter, and one that didn't was how
-    the 50-forecast mixture got in.
-
-    Sparse curves are NOT excluded here, deliberately — no ``MIN_SCOREABLE_ANCHORS``
-    gate, unlike the ranking/clamp-screen consumers. Their ~96-log-point artifact
-    comes from PCHIP-rebuilding a sparse curve onto a full CDF grid and log-scoring
-    it; this path only linearly interpolates the declared pairs in percentile space
-    for a single quantile, where a 3-anchor curve is coarse but not a fabricated
-    distribution, and its member PIT is then medianed against its siblings' rather
-    than scored on its own. Gating here would also delete the uniformly-sparse-era
-    records (fall-2025 comments declare 8-percentile sets) whose PITs are valid.
+    The declared pairs are raw model output and are never clipped to the displayed range, so
+    a resolution beyond the CDF grid still gets a real quantile: interpolate each member's
+    own value-to-percentile curve at the resolution, clamping to its endpoint percentiles
+    beyond its ends, then take the median across members. None when no curve is usable.
+    Anonymous keys are excluded here as in the two sibling consumers, and sparse curves
+    deliberately are NOT: ``docs/performance_analysis.md`` "Per-model cuts run on a filtered
+    cohort" carries both rules and why the anchor floor does not apply.
     """
     curves = {
         model: pairs for model, pairs in (per_model_percentiles or {}).items() if not is_anonymous_model_key(str(model))
@@ -462,8 +402,7 @@ def declared_percentile_pit(
 def _single_curve_pit(percentile_pairs: Sequence[Sequence[float]], resolution: float) -> float | None:
     """Interpolate one member's declared (percentile 0-100, value) curve at ``resolution``."""
     if len(percentile_pairs) < 2:
-        # A single recovered pair interpolates to a constant PIT at every resolution
-        # (trimmed comments can lose most of a member's declared lines) — unusable.
+        # A single recovered pair interpolates to a constant PIT at every resolution.
         return None
     try:
         pcts = np.array([float(p[0]) / 100.0 for p in percentile_pairs], dtype=float)
@@ -474,8 +413,7 @@ def _single_curve_pit(percentile_pairs: Sequence[Sequence[float]], resolution: f
     order = np.argsort(vals, kind="stable")
     vals, pcts = vals[order], pcts[order]
     if np.any(np.diff(pcts) < 0):
-        # Percentiles that DECREASE as values increase after the value sort mean the
-        # member declared a non-monotonic set; interpolating it inverts the curve.
+        # Percentiles falling as values rise means a non-monotonic set: interpolation inverts it.
         return None
     if not np.all(np.diff(vals) > 0):
         # Duplicate declared values (e.g. a flat tail): jitter into strict monotonicity.
@@ -549,32 +487,12 @@ def _member_bin_masses(record: dict, bin_low: float, bin_high: float) -> dict[st
 def max_step_clamp_screen(record: dict, *, member_margin: float = _CLAMP_MEMBER_MARGIN) -> dict:
     """Did a per-bin max-step cap, not the forecasters, decide the published mass at the truth?
 
-    On a coarse discrete grid the pre-``9f1175c`` flat 0.2 cap can hold the realized
-    bin far below what every member asked for (q43913: published 0.200 where members'
-    own curves wanted 0.575-0.823 — spot peer -41.20, coverage-scaled peer
-    -38.67). That is a pipeline defect
-    masquerading as a forecast error, and it manufactures apparent dissent: each
-    member keeps its concentrated mass while the published curve does not.
-
-    The cap is ERA-CORRECT, gated on the submit timestamp: the flat 0.2 before the
-    grid-scaled cap reached main (``GRID_SCALED_MAX_STEP_MERGED_AT``), the record's
-    own ``grid_step_constraints(len(cdf))`` max after. Without the gate every
-    post-fix coarse-grid discrete that legitimately holds a 0.2 bin false-positives.
-    A missing/unparseable timestamp is treated as pre-fix — the undated records in
-    the archive all predate the fix.
-
-    Suspected requires ALL of: the realized bin CAP-BOUND — within ``_CLAMP_CAP_ATOL``
-    of the era-correct cap, or at least ``_CLAMP_CAP_NEAR_FRAC`` of it, since the
-    min-step / ramp / snap machinery shaves a saturated bin ~1% under the cap — at
-    least two attributed member curves, and the LEAST concentrated member wanting at
-    least ``member_margin`` more mass on that bin — "every member" is the point; a
-    clamp overrides the whole ensemble, unlike a median.
-
-    The cap is the PLATFORM's per-bin rule (``0.2 * 200 / N``), so a cap-bound
-    realized bin is not automatically our defect. Pre-``d4ee57f`` records additionally
-    carry the slack-proportional smear; post-``d4ee57f`` the excess is packed into the
-    adjacent bins, and a cap-bound bin means only that the platform constraint set the
-    published mass at the truth.
+    The cap is era-correct, gated on the submit timestamp against
+    ``GRID_SCALED_MAX_STEP_MERGED_AT``, and a record is suspected only when the realized bin
+    is cap-bound, at least two attributed member curves exist, and the least concentrated of
+    them wants ``member_margin`` more mass there. The three criteria, the q43913 receipt and
+    why a cap-bound bin is not automatically our defect:
+    ``docs/performance_analysis.md`` "What ``max_step_clamp_screen`` looks for".
     """
     out: dict = {"applicable": record.get("type") in ("numeric", "discrete"), "suspected": False}
     if not out["applicable"]:
@@ -644,11 +562,7 @@ def _interpolate_pit(
     via :func:`build_cdf_value_grid` using ``zero_point``.
     """
     if upper_bound - lower_bound <= 0:
-        # A zero-width question has no PIT, so this raises rather than answering. The old
-        # ``return 0.5`` was the single most favorable value available — it falls inside BOTH
-        # coverage bands, so a degenerate record silently improved every calibration
-        # statistic it entered. Callers screen the range before calling (see
-        # ``numeric_pit_analysis``); reaching here means one didn't.
+        # Raise rather than answer 0.5, which sits inside both bands and flatters every stat.
         raise ValueError(f"degenerate question range [{lower_bound}, {upper_bound}] has no PIT")
 
     if value_grid is not None and len(value_grid) == len(cdf_values):
@@ -709,12 +623,7 @@ def mc_summary(data: list[dict]) -> dict:
             if correct_idx < len(forecast_values):
                 prob_on_correct.append(forecast_values[correct_idx])
             else:
-                # A forecast vector shorter than the option list cannot say what probability
-                # we put on the winner. The old ``else 0.0`` recorded that as "we gave the
-                # correct option zero" — the worst possible value — dragging
-                # mean_prob_correct down on a PARSE gap rather than on a forecast. The
-                # mc_log_score gate upstream makes this unreachable today; if it ever isn't,
-                # the record leaves this one statistic instead of poisoning it.
+                # A short vector cannot say what we put on the winner, and 0.0 scores a parse gap.
                 logger.warning(
                     f"MC forecast vector shorter than its option list: post_id={r.get('post_id')} "
                     f"options={len(options)} values={len(forecast_values)}; dropped from mean_prob_correct"
@@ -803,21 +712,12 @@ def stacking_effectiveness(
 ) -> dict:
     """Bucket binary questions by whether their spread would have triggered stacking.
 
-    On each question, compute the binary spread across per-model forecasts using
-    ``spread_fn`` (default: probability range, matching the production trigger).
-    If that spread is strictly greater than ``threshold``, count it as triggered
-    (comparison uses ``>``, matching the production trigger in main.py).
-    Returns triggered/skipped counts and mean Brier per bucket.
-
-    Note: this does NOT tell us whether the stored ensemble prediction was
-    actually produced via stacking or base aggregation. We can't distinguish
-    those from stored data alone; this is a counterfactual cohort cut showing
-    how the trigger metric correlates with outcome difficulty.
-
-    Restricted to the per-model cohort (see ``per_model_cohort``), so the spread
-    is always measured across named base models. Records whose spread can't be
-    computed (fewer than two parseable per-model values) land in ``skipped``, as
-    they always have.
+    Spread comes from ``spread_fn`` (probability range by default) and beats ``threshold``
+    strictly, matching the production trigger; returns triggered and skipped counts with mean
+    Brier per bucket, over the ``per_model_cohort`` so the spread is always across named base
+    models. This is a COUNTERFACTUAL cut and says nothing about whether a stored prediction
+    was actually stacked: ``docs/performance_analysis.md`` "What ``max_step_clamp_screen``
+    looks for" closes with the reason.
     """
     binary = [r for r in data if r["type"] == "binary" and isinstance(r["resolution_parsed"], bool)]
 

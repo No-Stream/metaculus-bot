@@ -265,6 +265,35 @@ The companion `gfv2_confidence` grades a False `gfv2_present` the way
 | `ambiguous_trimmed_no_payload` | a trimmed comment record; the section may have been trimmed away |
 | `absent_no_payload` | an untrimmed record from a writer that cannot carry the payload |
 
+Four more rules the tagger in `performance_analysis/research_tags.py` runs on, none of
+them obvious from the code:
+
+- **Header greps are depth-agnostic** (`^#{1,4}`). An artifact record heads its sections
+  at `## `, while a comment-backfill record re-heads everything one level deeper, so an
+  exact-depth grep would read every backfilled record as untreated.
+- **The section flag is the treatment marker, and `gfv2_loop_ran` is deliberately a
+  different fact.** The v2 driver banks a transcript on the record even when it soft-fails
+  and contributes no section to the bundle, so payload presence overstates treatment.
+- **`anchor_confidence` grades a False anchor read** against the trim-immune
+  `## Provider Diagnostics` block: `header` when the header itself was found,
+  `diag_ok_header_missing` when the provider ran and produced a section the text no longer
+  carries (trimming ate it, so treatment is genuinely unclear), `diag_confirms_absent`
+  when the diagnostics line says `empty` / `errored` / `skipped` / `timeout`, and
+  `ambiguous_trimmed_no_diag` on a trimmed record with no diagnostics line at all, since
+  trimming keeps the header and the tail and can eat a leading section.
+- **A question with no archive record gets None on every tag, never False.** Absence of
+  evidence is not an untreated record.
+
+The payload-era boundary that decides carryability is `B4E9DF0_MERGED_AT`
+(2026-07-21T17:07:37Z), aliased in `research_tags.py` as `_GFV2_PAYLOAD_ERA_START`: schema
+v2 landed 2026-06-28 in `1655c43`, three weeks before the `gap_fill_v2` write reached
+`main`, so a schema-v2 artifact from that window is a can't-carry record too rather than a
+confident False. A present payload proves a run whatever the writer class; only an ABSENT
+one depends on carryability, and a null payload counts as absent, because a
+key-present-but-empty read as a run is the collapse the original `bool()` made. A
+`log_backfill` record never tags at all: it is post-id-keyed and identified only by
+`page_url`, so on an id collision the URL check cannot rule out a foreign question.
+
 Separately, `metadata.nr_forecasters` (the Metaculus CROWD size) reads **0 in all 2196
 records pulled before 2026-08-25**, because the collector read it off the question
 dict, where it does not exist; it lives on the POST. Nothing rewrites the archive, so
@@ -1074,6 +1103,39 @@ rather than of code, but nothing may claim the CIs were widened unless
 `EraWidthMetrics.ci_clustered` says they were, which is what the `n_eff` cell's
 `(widened)` / `(=n)` marker reports. An earlier version of this reasoning asserted that
 about 62% of records share a post; no archived dataset supports that figure.
+
+### What `max_step_clamp_screen` looks for, and why its cap is era-dependent
+
+The screen answers one question: did a per-bin max-step cap, rather than the forecasters,
+decide the published mass at the truth? On a coarse discrete grid the pre-`9f1175c` flat 0.2
+cap can hold the realized bin far below what every member asked for. q43913 published 0.200
+where the members' own curves wanted 0.575 to 0.823, worth spot peer −41.20 and
+coverage-scaled peer −38.67. That is a pipeline defect posing as a forecast error, and it
+manufactures apparent dissent: each member keeps its concentrated mass while the published
+curve does not.
+
+The cap is looked up per record against the submit timestamp: the flat 0.2 before
+`GRID_SCALED_MAX_STEP_MERGED_AT`, the record's own `grid_step_constraints(len(cdf))` maximum
+after it. Without that gate every post-fix coarse-grid discrete that legitimately holds a
+0.2 bin false-positives. A missing or unparseable timestamp reads as pre-fix, since every
+undated record in the archive predates the fix.
+
+A record is *suspected* only when all three hold: the realized bin is cap-bound (within
+`_CLAMP_CAP_ATOL` of the era-correct cap, or at least `_CLAMP_CAP_NEAR_FRAC` of it, because
+the min-step, ramp and discrete-snap machinery shaves a saturated bin about 1% under the
+cap), at least two attributed member curves exist, and the LEAST concentrated member wants
+at least `member_margin` more mass on that bin. "Every member" is the point: a clamp
+overrides the whole ensemble, unlike a median. A cap-bound bin is not automatically our
+defect, because the cap is the platform's own per-bin rule (`0.2 * 200 / N`); pre-`d4ee57f`
+records additionally carry the slack-proportional smear, while post-`d4ee57f` the excess is
+packed into adjacent bins.
+
+`stacking_effectiveness` in the same module is a COUNTERFACTUAL cohort cut, not a record of
+what the pipeline did. It buckets binary questions by whether their measured spread would
+have tripped the production stacking trigger (strictly greater than the threshold, matching
+production) and reports mean Brier per bucket. Stored data cannot say whether a given
+prediction was actually stacked, so the cut shows how the trigger metric correlates with
+outcome difficulty and nothing more.
 
 ## A starved outer tail is a different defect from the max-step smear, and it is systematic
 
