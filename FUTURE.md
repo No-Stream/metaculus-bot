@@ -2555,13 +2555,18 @@ them OUT of feature work, land as their own PRs.
   `tests/prompts/test_pmf_prompt.py::TestPercentileFillIsTodaysText`, so it is safe to do blind;
   it is not done here per this section's standing rule.
 
-  **`tests/test_performance_analysis_extended.py` measured 2026-09-09: 1,910 lines**, over the
-  ceiling and listed nowhere until now (found by the smell hook while the private-comment fix added
-  one class to it). Two independent groups share only the module's four record/post builders: the
-  analysis cuts (`mc_summary`, `no_bias_check`, the PIT and percentile classes, `per_model_cohort`)
-  and the collector (fetch, build, rescore, report), so the split is mechanical the next time
-  anything touches the file; not done inside a one-function fix, and not while sibling branches are
-  merging into this one.
+  **`tests/test_performance_analysis_extended.py` is SPLIT** (2026-09-12, at 2,024 lines; first
+  measured 2026-09-09 at 1,910, over the ceiling and listed nowhere until then, found by the smell
+  hook while the private-comment fix added the `_api_get` retry class to it). It had grown well past
+  the two groups this entry predicted, so the split went by concern rather than in two: the analysis
+  cuts are `tests/test_performance_analysis_cuts.py` (319), the collector's retry, its two pulls and
+  `_process_post` are `test_performance_analysis_collector.py` (450), the PIT reading and its
+  declared-percentile fallback are `test_performance_analysis_pit.py` (469), the max-step clamp
+  screen is `test_performance_analysis_clamp_screen.py` (278), score healing plus the
+  `build_performance_dataset` wiring are `test_performance_analysis_dataset.py` (287), and
+  `generate_report` is `test_performance_analysis_report.py` (113), with the three record/post
+  builders, the fake response and the pre-fix PIT reference in
+  `tests/performance_analysis_fakes.py` (137). Same 144 tests, none rewritten.
 - **Dedupe the peg anchor when two tickers share one (added 2026-09-01, forge R15).** The bundle's
   peg-anchor block is decided per ticker inside `_fetch_yfinance_data`
   (`research/financial_data.py`), so a question naming two pegged crosses that share an anchor

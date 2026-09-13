@@ -5,9 +5,9 @@ make a number trustworthy, and the receipts behind each one. It covers the round
 and the `--prior` rescoring diff, what the archives hold and which of their fields are
 historically unreadable, era bucketing and the merge-to-main dating rule, the standing
 exclusion cohorts, the scoring conventions (spot peer, and `spot_peer_delta` for
-counterfactuals), the clip-threshold sweep, per-model forecast recovery, the PIT
-convention for out-of-range resolutions, starved outer tails, and question-supply /
-forfeit accounting.
+counterfactuals), the clip-threshold sweep, per-model forecast recovery, how to read the
+width monitor's era table, the PIT convention for out-of-range resolutions, starved outer
+tails, and question-supply / forfeit accounting.
 
 Two sibling documents own the other halves, and this doc cross-links rather than
 restates them. `docs/operations.md` § "Performance analysis and the width monitor" is
@@ -872,6 +872,24 @@ when a pull introduces a genuinely new shape. The derivation only admits a recor
 miniature parses IDENTICALLY to its full-size source, and the shape-coverage test fails
 loudly if the set ever narrows.
 
+The redaction keeps only what the parsers key on. The comments are real published
+Metaculus text, so everything carrying no parser signal is elided: research prose,
+per-model rationale prose, third-party news headlines, and the question title. What
+survives is the structural skeleton, meaning section headers, `*Forecaster N*` bullets,
+`Model:` lines, percentile, probability and multiple-choice option value lines, and fenced
+JSON blocks verbatim. `parse_per_model_reasoning_text` is public but deliberately outside
+the faithfulness filter, because the redaction exists to elide rationale prose, which is
+exactly what that parser returns, so it necessarily diverges on every record. Its key set
+still survives the shrink; only the bodies go.
+
+`scripts/derive_mini_comment_fixture.py --emit-expectations` re-renders the test suite's
+`_EXPECTED_PARSES_BY_POST` table from the checked-in fixture, so it needs no local pull.
+The values come from running the real parsers over the fixture, which makes the table a
+characterization of current behaviour rather than an independent specification. That is
+the point, since hand-transcribing a dozen nested dicts is how a typo becomes an
+"expected" value, and it is also the risk: regenerating after a parser change will happily
+bless the change. Read the emitted diff and confirm each moved value is intended.
+
 ## An out-of-range resolution gives a SET-valued PIT reading, not a forced 1.0 / 0.0
 
 Metaculus reports a resolution past the displayed range as the bare string
@@ -904,6 +922,103 @@ Two API notes for any round script:
 - `EraWidthMetrics.pit_std` / `mean_pit` are `float | None` behind a
   `point_metrics_underpowered` gate and render as `n/a`, so JSON consumers must expect
   nulls.
+
+## Reading the width monitor's era table
+
+`width_monitor.py` reports how wide the bot's published numeric distributions are and
+whether that width is calibrated, split by config era, every column read off the published
+201-point CDF. It exists because the bot has oscillated between too wide and too narrow
+across the two width-relevant merges:
+
+- until **2026-05-18** the pipeline intentionally widened tails (`k_tail=1.25` in the
+  tail-widening pass);
+- on **2026-05-18** widening was turned off (`k_tail=1.0`, identity) after a calibration
+  study found the widened tails too fat;
+- on **2026-07-21** the july15 bundle landed, whose width-relevant piece is the
+  time-series-anchor prompt clause. It pushes "sharpen, don't widen", because published
+  low-tail coverage was about 0.03 against a 0.10 target, badly too wide, so the forward
+  risk flips toward over-sharpening and this monitor is what closes the loop on that
+  transition. The same merge dropped the forecaster roster from six models to the
+  latest-per-vendor triple and lowered `MIN_FORECASTERS_TO_PUBLISH`, so a width shift
+  across that boundary cannot be attributed to the anchor alone.
+
+Nothing finer earns a bucket, per the era-bucketing rule above: a pipeline-behaviour change
+starts an era, a git hash does not. Both boundaries are aliased in `width_monitor.py` from
+the `*_MERGED_AT` constants in `analysis.py`, as `WIDENING_FLIP` and `TS_ANCHOR_ENABLE`, so
+that this table and the clip sweep's binary-clamp regime can never disagree. The dating
+rule and the command that re-derives a boundary are in "Era boundaries are merge-to-main
+timestamps, never authoring dates" above; the two spellings are in "Vocabulary that
+collides" below.
+
+### What each column means
+
+- **central-80% coverage** (`cov80`) is the fraction of PIT in [0.10, 0.90], calibrated at
+  0.80, and **central-50% coverage** (`cov50`) the fraction in [0.25, 0.75], calibrated at
+  0.50. Both carry Beta-Binomial / Jeffreys-prior 95% CIs.
+- **cov@10 / cov@50 / cov@90** are P(PIT <= 0.10), P(PIT <= 0.50) and P(PIT <= 0.90),
+  calibrated at 0.10, 0.50 and 0.90. The outer two read low- and high-tail coverage; the
+  middle one reads directional bias, how often the resolution landed below our median.
+- **PIT std** is calibrated against the Uniform(0,1) standard deviation, 1/sqrt(12) or
+  about 0.289. Smaller means the PITs are piled in the center, so the distributions are too
+  WIDE; larger means piled at the extremes, so they are too NARROW.
+- **median relative band width** is the median over questions of (P90 - P10) / |P50| read
+  off the published CDF. It is the raw sharpness metric and depends on no resolution, so it
+  answers "how wide are we in absolute terms" while the coverage columns answer "is that
+  width calibrated".
+- **band_miss** is the out-of-band rate, P(PIT < 0.10) + P(PIT > 0.90), which is exactly
+  1 - raw cov80 and so carries nothing on its own. The lo/hi split is the point: it
+  separates a band that is too TIGHT, both tails elevated, from one of roughly the right
+  width that is MIS-CENTERED, with the misses piled in one tail. `cov80` cannot express
+  that distinction, and the two call for opposite corrections. A set-valued reading misses
+  a tail only when the WHOLE interval lies outside it, which keeps the identity
+  band_miss == 1 - cov80 exact, since an interval that fails to intersect [0.10, 0.90] lies
+  entirely on one side of it.
+
+PIT itself is F_bot(resolution) on the canonical Metaculus value grid
+(`build_cdf_value_grid`), and the two out-of-range cases differ by what the platform told
+us. A string marker (`below_lower_bound` / `above_upper_bound`) gives no value, so the
+reading is the interval our own published tail mass pins F to, and every coverage column
+counts it on band intersection while PIT std and mean PIT exclude it. A numeric resolution
+beyond the grid keeps a point PIT, scored off the members' declared-percentile curves
+rather than the grid clamp. Both conventions are in "An out-of-range resolution gives a
+SET-valued PIT reading, not a forced 1.0 / 0.0" above. The method mirrors
+`scratch/calibration_audit_2026-07-16/mc_numeric_calibration.py`.
+
+### Rows below ten PIT readings render their point metrics as `n/a`
+
+`MIN_N_FOR_POINT_METRICS` is 10. Below that many readings a row's point metrics (cov@10,
+cov@50, cov@90, PIT std, mean PIT and band_miss) are not estimates: their resolution is
+1/n, coarser than the finest calibrated target they are compared against, cov@10 at 0.10,
+so the value can only land on a grid whose spacing exceeds the quantity being measured. At
+n=1 PIT std is exactly 0.0, which reads as "maximally too wide" while carrying no
+information. Those cells render `n/a` in the markdown; the JSON keeps the raw values
+alongside an `underpowered` flag, since a script can decide for itself but a reader cannot
+un-see a number. `cov80` and `cov50` are exempt, because their CIs widen honestly at small
+n, which is exactly the disclosure the point metrics lack. `pit_std` and `mean_pit` run on
+the point-only denominator, so a row can clear the floor on readings and still fall under
+it on point values; `point_metrics_underpowered` is that second gate.
+
+### The clustered CI is real machinery and currently inert
+
+The `cov80` and `cov50` CIs are computed at `n_eff`, the count of distinct `post_id`
+values, rather than at the raw question count, so that a post carrying several correlated
+sub-questions cannot narrow the CI as though they were independent: the collector expands a
+`group_of_questions` post into one record per sub-question, and those share a series, a
+window and a resolution source. Clustering is on `post_id` alone, the one grouping key
+already on every record, and a record with no `post_id` counts as its own family through a
+unique positional sentinel, so it is never merged with another such record. The point
+estimate is untouched, still cov_k / n; only the CI width reflects `n_eff`, via
+`jeffreys_ci(round(cov_k * n_eff / n), n_eff)`.
+
+**The correction is inert on every dataset measured so far, and the table says so per
+row.** Measured 2026-08-25 across all archived pulls (residual_2026-06-15 through
+residual_2026-08-24, plus coherence_2026-07-15): every post carried exactly one resolved
+record, so `n_eff == n` everywhere and the rendered CI is the naive one. The mechanism
+stays because a group post resolving into the tournament is a matter of question supply
+rather than of code, but nothing may claim the CIs were widened unless
+`EraWidthMetrics.ci_clustered` says they were, which is what the `n_eff` cell's
+`(widened)` / `(=n)` marker reports. An earlier version of this reasoning asserted that
+about 62% of records share a post; no archived dataset supports that figure.
 
 ## A starved outer tail is a different defect from the max-step smear, and it is systematic
 
