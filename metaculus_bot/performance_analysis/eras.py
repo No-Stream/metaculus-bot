@@ -80,8 +80,11 @@ FINE_SUBERA_TABLE: SuberaTable = (
     # A new sub-era is one appended row: ("cost_pass", <merge-to-main committer timestamp>).
 )
 
-ERAS: tuple[str, ...] = ("pre_flip", "post_flip", "triple_era", "no_ts")
+PRE_FLIP = "pre_flip"
+POST_FLIP = "post_flip"
+TRIPLE_ERA = "triple_era"
 NO_TS = "no_ts"
+ERAS: tuple[str, ...] = (PRE_FLIP, POST_FLIP, TRIPLE_ERA, NO_TS)
 TRIPLE_SUBERAS: tuple[str, ...] = tuple(name for name, _ in TRIPLE_SUBERA_TABLE)
 FINE_SUBERAS: tuple[str, ...] = tuple(name for name, _ in FINE_SUBERA_TABLE)
 # Sub-eras whose questions were forecast at or after the time-budget merge; empty as of 2026-08-26.
@@ -96,10 +99,10 @@ def era_of(record: dict) -> str:
     if dt is None:
         return NO_TS
     if dt >= B4E9DF0_MERGED_AT:
-        return "triple_era"
+        return TRIPLE_ERA
     if dt >= WIDENING_FLIP_MERGED_AT:
-        return "post_flip"
-    return "pre_flip"
+        return POST_FLIP
+    return PRE_FLIP
 
 
 def _subera_of(record: dict, table: SuberaTable) -> str | None:

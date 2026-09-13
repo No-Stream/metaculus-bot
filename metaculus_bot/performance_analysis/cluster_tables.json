@@ -1,0 +1,488 @@
+{
+  "round_notes": {
+    "label": "2026-09-09",
+    "prior_round": "scratch/residual_2026-09-01",
+    "caveats": [
+      "Clusters are named from titles, resolution values and resolve dates, not from a full resolution-criteria read of each question.",
+      "Cluster ids are assigned over the UNION cohort, but collapse is computed within the cohort being measured, so a cluster split across eras (brent_spot_aug2026, anthropic_release_and_access_2026, mideast_shipping_disruption_2026, metaculus_cup_summer_2026_standings, aug2026_rates_and_risk) collapses less inside a single-era arm.",
+      "The degraded_run, partial_degraded and known_bug records are cluster members and are excluded from the strict cohorts, so the strict effective n already reflects that.",
+      "Weak clusters are a judgment call. us_2026_cycle_top_donors is the weakest of them: one database read on one date, but the two parties' top donors are separate people with separate motives, and the pair resolved in opposite directions.",
+      "This file labels 113 of the dataset's 905 records. The summer post_flip arm as a whole (184 records) is NOT clustered, so any test comparing a collapsed triple arm against an uncollapsed post_flip arm is still generous to the triple arm."
+    ],
+    "siblings_note": "Quote the strong-only number as primary and the strong-and-weak number as the conservative bound. Unlike the prior round, strong clusters DO reach into this new wave, so the new wave's effective n is genuinely below its record count."
+  },
+  "clusters": {
+    "cyclosporiasis_2026_season": {
+      "strength": "strong",
+      "basis": "Carried and now five members: five readings of the 2026 cyclosporiasis season. US case count (44842, +26.0 spot), 44 or more states reporting (44873, +36.1, gemini-only degraded), any deaths (44874, -105.3, gemini-only degraded), NEW Michigan hospitalizations under 300 (44856, +34.0, 2-of-3 partial degraded) and NEW global hospitalizations (44951, +100.6, the round's biggest single win). One outbreak trajectory drives all five, so the round's largest August miss and its largest win are the same draw seen twice.",
+      "question_ids": [
+        44842,
+        44873,
+        44874,
+        44856,
+        44951
+      ]
+    },
+    "fl_primary_2026_08_18": {
+      "strength": "strong",
+      "basis": "Carried from 2026-08-24. The 2026 Florida primary on 2026-08-18: FL-06 Republican ballot (45189), the Democratic Chief Financial Officer binary (45084) and the DeSantis endorsement binary (44870, degraded_run). 44381, the statewide Republican gubernatorial ballot, is post_flip and outside the cohort: named, not counted.",
+      "question_ids": [
+        45189,
+        45084,
+        44870
+      ]
+    },
+    "us_natl_polling_aug14": {
+      "strength": "strong",
+      "basis": "Carried from 2026-08-24. One US national-polling snapshot dated 2026-08-14/15: Trump approval (44841, partial_degraded), the Democratic generic-ballot lead (44855) and the share opposing the Iran War (44858). One national mood moves all three together. 44807 (does the generic-ballot lead fail to reach 7.0, read on a different date) is deliberately not a member; see rejected_links.",
+      "question_ids": [
+        44841,
+        44855,
+        44858
+      ]
+    },
+    "metaculus_cup_summer_2026_standings": {
+      "strength": "strong",
+      "basis": "NEW. Three reads of ONE final leaderboard, the Summer 2026 Metaculus Cup: will a bot beat all humans (44209, -8.9 spot), will a bot finish top five (44956, +28.3) and will the Community beat Dylan Matthews (43918, +20.7). The first two are near-mechanically nested, since beating every human implies a top-five finish. 45173 (a human at number one on the MarketPulse leaderboard) is a different tournament and stays a singleton.",
+      "question_ids": [
+        44209,
+        44956,
+        43918
+      ]
+    },
+    "uk_labour_leadership_2026": {
+      "strength": "strong",
+      "basis": "NEW. One UK Labour leadership-challenge outcome through August 2026: will Keir Starmer cease to be Prime Minister before September (43664, +62.9 spot) and will Wes Streeting formally submit nominations to trigger a contest (43666, +13.6). A successful challenge resolves both, so they are one draw. 44911, the Labour 7-poll moving average on 08-31 (+81.5, the party's standing rather than its leadership), is a rejected link.",
+      "question_ids": [
+        43664,
+        43666
+      ]
+    },
+    "ebola_drc_2026": {
+      "strength": "strong",
+      "basis": "NEW. One 2026 Democratic Republic of the Congo Ebola outbreak, read on two instruments: the count of laboratory-confirmed Bundibugyo cases the World Health Organization reports (43667, -36.0 spot, the wave's fourth-worst miss) and whether the WHO reports spread to a seventh Congolese province (45365, +24.3). Outbreak size and geographic spread are the same epidemic curve, so the miss and the win are not independent.",
+      "question_ids": [
+        43667,
+        45365
+      ]
+    },
+    "us_aug2026_jobs_report": {
+      "strength": "strong",
+      "basis": "NEW. One release, the US Bureau of Labor Statistics Employment Situation for August 2026 (published 2026-09-04): nonfarm jobs added (45401, +62.1 spot) and the seasonally adjusted U-3 unemployment rate (44943, +6.3). One survey pair sets both numbers. 45199 (people affected by tech layoffs per the TrueUp tracker) reads a different instrument and is rejected.",
+      "question_ids": [
+        45401,
+        44943
+      ]
+    },
+    "atlantic_hurricane_season_2026": {
+      "strength": "strong",
+      "basis": "NEW. One Atlantic hurricane season through August 2026: whether a hurricane made landfall in the continental United States before September (43744, -11.5 spot) and how many major hurricanes of Category 3 or higher occurred (44055, +47.3). A quiet season suppresses both counts, so the pair is one draw of seasonal activity.",
+      "question_ids": [
+        43744,
+        44055
+      ]
+    },
+    "brent_spot_aug2026": {
+      "strength": "strong",
+      "basis": "NEW, split out of the carried aug2026_asset_prices cluster. Two thresholds on ONE Brent crude price path in the same window: Brent futures closing below 100 dollars on 08-17 (45080, +10.4 spot) and Brent spot reaching 130 dollars before September (43665, +4.3). One price series resolves both. Kept strong even though the members straddle the post_flip / triple boundary, which means it collapses less inside a single-era arm.",
+      "question_ids": [
+        45080,
+        43665
+      ]
+    },
+    "nuri_rocket_schedule_2026": {
+      "strength": "strong",
+      "basis": "NEW. One South Korean launch-schedule decision: whether a specific date for the fifth Nuri launch was announced (45244, -9.1 spot) and whether the officially targeted launch month became something other than October 2026 (45245, +18.9). One announcement resolves both.",
+      "question_ids": [
+        45244,
+        45245
+      ]
+    },
+    "aug2026_rates_and_risk": {
+      "strength": "weak",
+      "basis": "Carried from 2026-08-24 and re-based after the energy questions were split out. One month of August 2026 rates and risk appetite across instruments: the Treasury futures NOB spread on 08-14 (44868) and again on 08-31 (45086, NEW), the 30-year Treasury yield holding at or above 5 percent all month (45167, NEW), the highest intraday VIX (45172, NEW, -32.4 spot, the wave's sixth-worst miss), the S&P 500 change over the last week of August (45362) and the Ethereum August high (44882). Stays WEAK: different asset classes, and the two NOB reads are the same instrument on different dates, which the prior rounds treat as separate draws. Out-of-cohort former members, named only: 44008 (SpaceX share price), 43748 (30-year mortgage rate), 44773 (Brent 08-28) and 44797 (USD/SZL).",
+      "question_ids": [
+        44868,
+        45086,
+        45167,
+        45172,
+        45362,
+        44882
+      ]
+    },
+    "aug2026_retail_fuel": {
+      "strength": "weak",
+      "basis": "NEW. Two retail fuel prices in the same month: the average lower-Atlantic US diesel price on 08-31 (45193, +4.3 spot) and whether US gasoline prices set a new all-time high (44957, +18.4). Both ride the crude path that brent_spot_aug2026 prices, but through their own refining and retail margins, so WEAK rather than folded into the Brent pair.",
+      "question_ids": [
+        45193,
+        44957
+      ]
+    },
+    "aug2026_heat_records": {
+      "strength": "weak",
+      "basis": "NEW. One Northern Hemisphere August 2026 heat regime on three scales: Death Valley reaching 125 degrees Fahrenheit (44954, +76.7 spot), August being the warmest on record per Copernicus (45162, +21.8) and which US state was hottest on 08-31 (45191, -6.5). A hot month lifts all three, but a local daily extreme and a global monthly anomaly are far apart, so WEAK. 45200 (a Swiss cantonal open-fire ban) is a policy act and is rejected.",
+      "question_ids": [
+        44954,
+        45162,
+        45191
+      ]
+    },
+    "frontier_lab_ipo_2026": {
+      "strength": "weak",
+      "basis": "NEW. One artificial-intelligence financing regime: whether OpenAI filed an S-1 initial registration statement with the Securities and Exchange Commission before September (43893, +25.0 spot) and whether Anthropic did (44620, +41.9). Two independent boards, one market window, so WEAK.",
+      "question_ids": [
+        43893,
+        44620
+      ]
+    },
+    "anthropic_release_and_access_2026": {
+      "strength": "weak",
+      "basis": "Renamed from anthropic_frontier_release_cycle and re-based. One Anthropic release and deployment cadence: whether an Anthropic model held number one on the Chatbot Text Arena leaderboard at the end of August (44871, +17.5 spot, degraded_run) and the access status of Claude Fable and Mythos on 09-01 (44207, NEW, +20.0). 43638 (Claude Mythos released before September), which anchored the prior round's version, is post_flip and no longer new, so it is outside this cohort and named only.",
+      "question_ids": [
+        44871,
+        44207
+      ]
+    },
+    "mideast_shipping_disruption_2026": {
+      "strength": "weak",
+      "basis": "Renamed from hormuz_closure_2026 and re-based. One Middle East maritime-disruption regime read on two straits: the Strait of Hormuz Monitor showing Closed on 08-31 (44804, +14.0 spot) and Bab el-Mandeb transit calls being cut by half or more on 08-31 (44955, NEW, +0.8). Same conflict, different chokepoints and different operators' routing decisions, so WEAK. 44049 (Hormuz traffic returning to normal in June), the prior version's other member, is post_flip and out of cohort.",
+      "question_ids": [
+        44804,
+        44955
+      ]
+    },
+    "starlink_country_rollout_2026": {
+      "strength": "weak",
+      "basis": "NEW. One company's rollout cadence read on two markets: whether Starlink's website showed South Africa as available before September (43758, +28.1 spot) and whether it showed India (43759, +26.8). One corporate launch calendar and one website, but two independent national regulators, so WEAK. Same shape as the carried Anthropic release cluster.",
+      "question_ids": [
+        43758,
+        43759
+      ]
+    },
+    "ocha_appeal_funding_sep2026": {
+      "strength": "weak",
+      "basis": "NEW. Two humanitarian appeals read off ONE instrument on one date, the UN Office for the Coordination of Humanitarian Affairs Financial Tracking Service: the percentage of the 2026 Lebanon Flash Appeal funded (45195, +16.1 spot) and of the 2026 Escalation of Hostilities in the Occupied Palestinian Territory appeal (45196, +58.7). One donor environment and one tracker, two separate appeals, so WEAK.",
+      "question_ids": [
+        45195,
+        45196
+      ]
+    },
+    "us_2026_cycle_top_donors": {
+      "strength": "weak",
+      "basis": "NEW. One dated campaign-finance database read on 09-01, two parties: the largest Republican donor of the 2026 cycle (45187, -46.9 spot, the wave's fifth-worst miss) and the largest Democratic donor (45188, +16.6). Same instrument and date, but which individual tops each list is a separate fact, so WEAK.",
+      "question_ids": [
+        45187,
+        45188
+      ]
+    },
+    "russia_ukraine_diplomacy_aug2026": {
+      "strength": "weak",
+      "basis": "NEW. One Russia-Ukraine diplomatic track through August 2026: a Zelenskyy-Putin in-person meeting before September (43939, +7.0 spot), a Trump-Putin phone call during August (44703, +12.8) and Ukraine announcing a presidential election before September (44053, +8.8), which in practice requires a settlement. One negotiation trajectory, three different events, so WEAK.",
+      "question_ids": [
+        43939,
+        44703,
+        44053
+      ]
+    }
+  },
+  "retired_clusters": {
+    "iceland_eu_referendum_2026_08": {
+      "strength": "strong",
+      "members": [
+        44208,
+        43894
+      ],
+      "note": "One Icelandic EU referendum; both post_flip, resolved 2026-08-30, dossiered 08-31."
+    },
+    "senate_polling_aug31": {
+      "strength": "weak",
+      "members": [
+        44554,
+        44555,
+        44556
+      ],
+      "note": "Nebraska, Maine and Texas Senate polling leads on 08-31; all post_flip."
+    },
+    "aug2026_asset_prices": {
+      "strength": "weak",
+      "members": [
+        44868,
+        45080,
+        44882,
+        45362,
+        44008,
+        43748
+      ],
+      "note": "SPLIT this round rather than retired for lack of members: the Brent pair became the strong brent_spot_aug2026 cluster, retail fuel became aug2026_retail_fuel, and the remainder is aug2026_rates_and_risk. 44008 and 43748 left the cohort."
+    }
+  },
+  "template_families": {
+    "poll_lead_or_average_on_date": {
+      "basis": "'What will the lead or the polling average read on <date>', resolved off an aggregator.",
+      "question_ids": [
+        44554,
+        44555,
+        44556,
+        44807,
+        44855,
+        44841,
+        44858,
+        44911
+      ]
+    },
+    "published_series_level": {
+      "basis": "'What will <official published series> read on <date>': the pipeline path is fetch the series and extrapolate (time-series anchor, financial data, resolution-source fetcher).",
+      "question_ids": [
+        44944,
+        45218,
+        45114,
+        44950,
+        44621,
+        43828,
+        45065,
+        44868,
+        45086,
+        44842,
+        43949,
+        43950,
+        45362,
+        45363,
+        44943,
+        45401,
+        45190,
+        45193,
+        45172,
+        45195,
+        45196,
+        44869,
+        44225,
+        44267,
+        43667,
+        45088,
+        44879
+      ]
+    },
+    "live_tracker_or_leaderboard_snapshot": {
+      "basis": "'Who or what tops <leaderboard>' and 'what does <live tracker> show on <date>': resolves off a live web page.",
+      "question_ids": [
+        44219,
+        44871,
+        45173,
+        44872,
+        44798,
+        44800,
+        44840,
+        45188,
+        45191,
+        44804,
+        44209,
+        44956,
+        43918,
+        45187,
+        44881,
+        45199,
+        44857,
+        44207,
+        43758,
+        43759
+      ]
+    },
+    "asset_or_commodity_price_level": {
+      "basis": "A market level, change or threshold on a date.",
+      "question_ids": [
+        44773,
+        44797,
+        45080,
+        44882,
+        44868,
+        45086,
+        44265,
+        45362,
+        43665,
+        45193,
+        44957,
+        45167,
+        45172
+      ]
+    },
+    "election_result_ballot": {
+      "basis": "Who wins, or what the vote share or seat count is, in a scheduled election or referendum.",
+      "question_ids": [
+        43895,
+        44839,
+        45174,
+        45189,
+        43894,
+        44208,
+        45084,
+        45215,
+        44053
+      ]
+    },
+    "event_or_announcement_by_date": {
+      "basis": "'Will <discrete event, official announcement, visit or launch> happen before <date>'.",
+      "question_ids": [
+        44708,
+        45163,
+        45244,
+        45245,
+        44870,
+        44874,
+        44873,
+        43837,
+        43601,
+        44424,
+        43749,
+        44557,
+        43834,
+        44387,
+        44152,
+        45217,
+        43638,
+        43893,
+        44620,
+        43664,
+        43666,
+        43939,
+        44703,
+        45094,
+        45202,
+        45365,
+        45395,
+        45186,
+        44416,
+        44455,
+        44407,
+        44772,
+        43742,
+        44263,
+        44408,
+        44710,
+        44220,
+        43914,
+        43640,
+        43830,
+        43744,
+        44221,
+        43599,
+        43525,
+        44054,
+        45201,
+        45200,
+        45162,
+        44954,
+        44955,
+        45245
+      ]
+    },
+    "count_in_period": {
+      "basis": "'How many <events> in <period>', counted off a live list.",
+      "question_ids": [
+        44561,
+        44564,
+        44558,
+        44878,
+        44055,
+        44951,
+        44856
+      ]
+    }
+  },
+  "rejected_links": [
+    {
+      "qids": [
+        44911,
+        43664,
+        43666
+      ],
+      "reason": "The UK Labour 7-poll moving average on 08-31 (44911, +81.5 spot) reads the party's standing, while the leadership pair reads whether Starmer survived. A challenge would move the polls, but the polls did not resolve the challenge, and folding a weak member into a strong cluster would misstate the cluster's strength. Template family only."
+    },
+    {
+      "qids": [
+        44807,
+        44855
+      ],
+      "reason": "Both read the Democratic generic-ballot lead, on different dates (08-31 versus 08-14). 44855 sits in the same-day strong cluster us_natl_polling_aug14, and a different date is a different draw of the instrument. Carried rejection."
+    },
+    {
+      "qids": [
+        45199,
+        45401,
+        44943
+      ],
+      "reason": "Tech-layoff headcount from the TrueUp tracker (45199, +81.8 spot) is a private web tracker of announcements, not the Bureau of Labor Statistics survey pair that resolves the jobs-report cluster. Same subject, different instrument and different universe."
+    },
+    {
+      "qids": [
+        44619,
+        45195
+      ],
+      "reason": "Both are Lebanon in the same window, but the Lebanese Armed Forces deploying to two pilot zones (44619, -48.9 spot, the wave's third-worst miss) is a security milestone and the Flash Appeal funding percentage is a donor-behaviour read. No shared resolving driver."
+    },
+    {
+      "qids": [
+        45200,
+        44954,
+        45162
+      ],
+      "reason": "The Swiss Canton of Valais open-fire ban (45200, +22.2 spot) is a cantonal legal act with its own thresholds and review dates. European fire danger correlates with the August heat regime, but a policy decision is not a temperature reading."
+    },
+    {
+      "qids": [
+        44872,
+        44840,
+        44877
+      ],
+      "reason": "Three Ocearch shark-tracker reads (a Contender ping by 08-14, sharks tracked on 08-31, Percy's location on 09-01). Different quantities off one live tracker are a METHOD correlation, template family live_tracker_or_leaderboard_snapshot, not one world state. Carried rejection; 44877 is still unresolved."
+    },
+    {
+      "qids": [
+        45094,
+        43893,
+        44620
+      ],
+      "reason": "A funding round for Lovable, DeepSeek or Perplexity (45094, -47.9 spot, the wave's fourth-worst miss) is private late-stage financing for second-tier labs; the IPO pair is a public-markets filing decision by the two leaders. Different capital markets."
+    },
+    {
+      "qids": [
+        45202,
+        44207,
+        44871
+      ],
+      "reason": "Grok 4.7 appearing on SpaceXAI release notes (45202, +12.5 spot) is a different vendor's release cadence from Anthropic's, so it stays a singleton rather than joining anthropic_release_and_access_2026."
+    },
+    {
+      "qids": [
+        45173,
+        44209,
+        44956,
+        43918
+      ],
+      "reason": "A human at number one on the MarketPulse leaderboard on 08-25 (45173, +34.9 spot) is a different tournament with a different field and a different date from the Summer 2026 Metaculus Cup standings."
+    },
+    {
+      "qids": [
+        44267,
+        45163,
+        45186
+      ],
+      "reason": "Peak daily People's Liberation Army aircraft tracked by Taiwan (44267, -95.7 spot, the wave's worst miss), International Stabilization Force deployment into Gaza (45163) and a US strike on JNIM in Mali (45186) are three unrelated theatres. Grouping them as geopolitics would be a category cluster, which the rule forbids."
+    }
+  ],
+  "pending_additions": [
+    {
+      "question_id": 44876,
+      "post_id": 44727,
+      "joins_cluster": "single, pairs with the out-of-cohort 44800 (same AI-hallucination-cases database)",
+      "title": "How many cases will Damien Charlotin's AI Hallucination Cases database record for the second half of August 2026?",
+      "note": "degraded_run (1-of-3). Still unresolved."
+    },
+    {
+      "question_id": 44877,
+      "post_id": 44728,
+      "joins_cluster": "template family live_tracker_or_leaderboard_snapshot (Ocearch, with 44872 and 44840)",
+      "title": "Where will be the great white shark Percy on September 1, 2026?",
+      "note": "degraded_run (1-of-3). Still unresolved; the last open member of the dry-key cohort pair."
+    }
+  ]
+}
