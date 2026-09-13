@@ -351,11 +351,66 @@ no width or score shift across it can be attributed to any one of them. Treating
 dates as separable slices a period of constant prod config and reads noise as a config
 effect. When a doc gives an authoring date, say so, and put the landing date next to it.
 
-The boundary constants live in `performance_analysis/analysis.py`:
-`WIDENING_FLIP_MERGED_AT` (`0e85e1b`, 2026-05-18T17:21:19Z), `FT_0292_MERGED_AT`
-(`325b1b0`, 2026-07-24T19:16:26Z) and `B4E9DF0_MERGED_AT` (2026-07-21T17:07:37Z). See
-"Vocabulary that collides" at the end for the width monitor's aliases of the same
-instants.
+### One home: `performance_analysis/eras.py`
+
+Every boundary instant and every per-record era tag lives in `performance_analysis/eras.py`,
+and nothing else in the tree declares one. Import from there rather than retyping an
+instant: the era map had been retyped by hand into each round's own copy for five rounds,
+and one of those copies carried an authoring date for four months without a single test
+noticing. Where a module wants its own name for a boundary it aliases the object, as
+`width_monitor.py` does with `WIDENING_FLIP` and `TS_ANCHOR_ENABLE` and `research_tags.py`
+does with `_GFV2_PAYLOAD_ERA_START`. See "Vocabulary that collides" at the end for those
+aliases.
+
+| Constant | Merge | Committer instant (UTC) | What landed |
+|---|---|---|---|
+| `WIDENING_FLIP_MERGED_AT` | `0e85e1b` | 2026-05-18T17:21:19Z | numeric `k_tail` 1.25 to 1.0, `SPAN_FLOOR_GAMMA` 1.0 to 0.0, binary clamp 0.01/0.99 to 0.02/0.98 |
+| `B4E9DF0_MERGED_AT` | `b4e9df0` (PR #55) | 2026-07-21T17:07:37Z | the july15 bundle: 3-member roster, gap-fill v2, TS anchor, `MIN_FORECASTERS_TO_PUBLISH` 3 to 1 |
+| `FT_0292_MERGED_AT` | `325b1b0` (PR #57) | 2026-07-24T19:16:26Z | forecasting-tools 0.2.92, MC option clamp 0.005/0.995 to 0.01/0.99 |
+| `JULY25_MERGED_AT` | `73e4782` (PR #58) | 2026-07-26T04:38:40Z | the zero-output retry carve-out |
+| `DRY_KEY_FIX_MERGED_AT` | `c3c91cb` (PR #59) | 2026-07-28T03:07:53Z | a drained donated key falls back to the personal key |
+| `RANKED_MARKET_MERGED_AT` | `bfd5df2` (PR #61) | 2026-08-06T01:28:49Z | ranked prediction-market retrieval |
+| `TIME_BUDGET_MERGED_AT` | `951f8e4` (PR #64) | 2026-08-26T17:23:30Z | the close-derived time budget |
+| `LINTERS_MERGED_AT` | `eded193` (PR #65) | 2026-08-28T03:54:03Z | the lint campaign, which is provenance only and opens no sub-era |
+| `FALL_CONFIG_MERGED_AT` | `8d5a082` (PR #66) | 2026-09-05T01:59:24Z | the next-season bundle: prompt de-bloat, the shared fetch ladder |
+| `IMPERSONATE_RUNG_MERGED_AT` | `a9cbe03` (PR #67) | 2026-09-05T15:31:40Z | the TLS-impersonation fetch rung |
+| `FALL_TARGET_MERGED_AT` | `660fd35` (PR #68) | 2026-09-07T05:52:20Z | the fall tournament target |
+
+`GRID_SCALED_MAX_STEP_MERGED_AT` is an alias of `B4E9DF0_MERGED_AT`, because `9f1175c`
+(grid-scaled max-step for discrete CDF resampling) rode that same merge.
+
+**The widening flip is the worked example of the rule.** `b8d730f` authored it on
+2026-05-12 and is not on `main`'s first-parent history at all: it reached `main` only inside
+`0e85e1b`, six days later. Every round's era map until 2026-09-12 carried
+`datetime(2026, 5, 12)`, the authoring date truncated to midnight. Nothing published moved,
+because zero resolved records fall in the six-day window, which is exactly why it survived:
+the defect was latent, and a backfill recovering May 12-18 records would have activated it.
+
+**The tags.** Five pure functions in the same module read `bot_comment_created_at` (the
+submission time, because a question was forecast under whichever config was live when the
+bot published its comment) and return the fields a round's tagging pass writes:
+
+| Field | Function | Values | Read by |
+|---|---|---|---|
+| `config_era` | `era_of` | `pre_flip`, `post_flip`, `triple_era`, `no_ts` | `era_gap` (its default `ERA_FIELD`), the clip sweep's era windows |
+| `triple_subera` | `triple_subera_of` | `triple_pre_market`, `triple_ranked_market`, `triple_time_budget`, `triple_fall_config` | the coarse pooling, where every fall merge is one bucket |
+| `triple_subera_fine` | `triple_subera_fine_of` | `pre_ft_unfreeze`, `ft_0292`, `july25`, `post_dry_key_fix`, `ranked_markets`, `time_budget`, `fall_config` | `era_gap --era-field triple_subera_fine`, which is how the fall read selects its arms |
+| `ft_unfreeze_side` | `ft_unfreeze_side_of` | `pre_ft_0292`, `ft_0292` | the MC-clamp cuts |
+| `post_linters_merge` | `post_linters_merge_of` | `True` / `False` | provenance only |
+
+Every sub-era function returns `None` outside the triple era. These strings are a data
+contract: a renamed value breaks a standing instrument silently, so add a value rather than
+re-spelling one. A new sub-era is one appended row in `FINE_SUBERA_TABLE` (and a coarse row
+only if it deserves its own pooled bucket), which is why the three September merges share
+`triple_fall_config`: they landed inside three days, and separable rows would slice a period
+of near-constant config.
+
+`tests/test_performance_analysis_eras.py` pins each instant against `git log -1 --format=%cI`
+on its merge sha and asserts that sha is on `main`'s first-parent history, so an assertion
+cannot pass by feeding a constant back to itself. It also walks the package and fails on any
+module that redeclares an instant rather than aliasing the object; that scan found a twelfth
+copy the day it was written. Those assertions need the git objects, so CI's test job checks
+out with `fetch-depth: 0` and the tests skip themselves on a shallow clone.
 
 ## The known-pipeline-bug cohort
 
@@ -644,7 +699,7 @@ counted and bounded, never estimated:
 **The in-force clamp is looked up per record** from `bot_comment_created_at` against
 `WIDENING_FLIP_MERGED_AT` (binary, `0e85e1b`, 2026-05-18T17:21:19Z) and
 `FT_0292_MERGED_AT` (MC, `325b1b0`, 2026-07-24T19:16:26Z), both merge-to-main committer
-dates, living beside `B4E9DF0_MERGED_AT` in `analysis.py`, and `width_monitor.WIDENING_FLIP`
+dates, living beside `B4E9DF0_MERGED_AT` in `eras.py`, and `width_monitor.WIDENING_FLIP`
 aliases the first.
 
 **Each window carries an insurance view**: the break-even clipped-side rate, a Jeffreys
@@ -944,7 +999,7 @@ across the two width-relevant merges:
 
 Nothing finer earns a bucket, per the era-bucketing rule above: a pipeline-behaviour change
 starts an era, a git hash does not. Both boundaries are aliased in `width_monitor.py` from
-the `*_MERGED_AT` constants in `analysis.py`, as `WIDENING_FLIP` and `TS_ANCHOR_ENABLE`, so
+the `*_MERGED_AT` constants in `eras.py`, as `WIDENING_FLIP` and `TS_ANCHOR_ENABLE`, so
 that this table and the clip sweep's binary-clamp regime can never disagree. The dating
 rule and the command that re-derives a boundary are in "Era boundaries are merge-to-main
 timestamps, never authoring dates" above; the two spellings are in "Vocabulary that
@@ -1110,7 +1165,7 @@ Keeping them straight is the same discipline the era rule asks for.
 
 **Era-boundary constants have two vocabularies for one instant.** The width monitor
 names its boundaries `WIDENING_FLIP` and `TS_ANCHOR_ENABLE`; both are aliases defined in
-`width_monitor.py` of `analysis.py`'s `WIDENING_FLIP_MERGED_AT` and
+`width_monitor.py` of `eras.py`'s `WIDENING_FLIP_MERGED_AT` and
 `B4E9DF0_MERGED_AT`. So the width monitor's `TS_ANCHOR_ENABLE` and the clip sweep's
 `B4E9DF0_MERGED_AT` are the same 2026-07-21T17:07:37Z instant under two names. Prefer
 the `*_MERGED_AT` names in new code, and never introduce a third spelling.

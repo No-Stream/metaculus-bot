@@ -32,8 +32,6 @@ import numpy as np
 
 from metaculus_bot.api_preflight import verify_metaculus_api_identity
 from metaculus_bot.performance_analysis.analysis import (
-    B4E9DF0_MERGED_AT,
-    WIDENING_FLIP_MERGED_AT,
     PitReading,
     jeffreys_ci,
     out_of_range_pit_reading,
@@ -47,6 +45,7 @@ from metaculus_bot.performance_analysis.cohorts import (
     parse_exclude_qids,
 )
 from metaculus_bot.performance_analysis.collector import build_performance_dataset, load_dataset
+from metaculus_bot.performance_analysis.eras import B4E9DF0_MERGED_AT, WIDENING_FLIP_MERGED_AT
 from metaculus_bot.performance_analysis.markdown import markdown_table
 from metaculus_bot.performance_analysis.outer_tail import render_starved_outer_tails, scan_outer_tails
 from metaculus_bot.performance_analysis.scaling import NUMERIC_TYPES, cdf_and_grid
@@ -75,7 +74,7 @@ class Era:
         return (self.start is None or dt >= self.start) and (self.end is None or dt < self.end)
 
 
-# Aliases of analysis.py's merge timestamps: docs/performance_analysis.md "Reading the width monitor's era table"
+# Aliases of eras.py's merge timestamps: docs/performance_analysis.md "Reading the width monitor's era table"
 WIDENING_FLIP = WIDENING_FLIP_MERGED_AT
 TS_ANCHOR_ENABLE = B4E9DF0_MERGED_AT
 

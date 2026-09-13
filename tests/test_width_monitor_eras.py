@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from metaculus_bot.performance_analysis.analysis import B4E9DF0_MERGED_AT, GRID_SCALED_MAX_STEP_MERGED_AT
+from metaculus_bot.performance_analysis.eras import B4E9DF0_MERGED_AT, GRID_SCALED_MAX_STEP_MERGED_AT
 from metaculus_bot.performance_analysis.width_monitor import (
     TS_ANCHOR_ENABLE,
     WIDENING_FLIP,

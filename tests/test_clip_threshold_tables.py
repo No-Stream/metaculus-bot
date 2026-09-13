@@ -13,7 +13,7 @@ import pytest
 from scipy.stats import beta
 
 from metaculus_bot.constants import THIN_PUBLISH_BINARY_FLOOR
-from metaculus_bot.performance_analysis.analysis import B4E9DF0_MERGED_AT, jeffreys_ci
+from metaculus_bot.performance_analysis.analysis import jeffreys_ci
 from metaculus_bot.performance_analysis.clip_threshold_report import render_report
 from metaculus_bot.performance_analysis.clip_threshold_selection import binomial_cdf
 from metaculus_bot.performance_analysis.clip_threshold_sweep import BOOTSTRAP_CL, build_clip_records, sweep_row
@@ -30,6 +30,7 @@ from metaculus_bot.performance_analysis.clip_threshold_windows import (
     WINDOW_CURRENT_CLAMP,
     WINDOW_ERA_PRE_FLIP,
 )
+from metaculus_bot.performance_analysis.eras import B4E9DF0_MERGED_AT
 from tests.clip_threshold_fakes import (
     AFTER_FT_0292,
     AFTER_WIDENING,

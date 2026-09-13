@@ -52,7 +52,7 @@ from metaculus_bot.bootstrap import bootstrap_means
 from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN, MC_PROB_MAX, MC_PROB_MIN
 from metaculus_bot.mc_processing import FLOOR_FEASIBILITY_ATOL, clamp_and_renormalize_probs
 from metaculus_bot.numeric.utils import aggregate_binary_mean
-from metaculus_bot.performance_analysis.analysis import FT_0292_MERGED_AT, WIDENING_FLIP_MERGED_AT
+from metaculus_bot.performance_analysis.eras import FT_0292_MERGED_AT, WIDENING_FLIP_MERGED_AT
 from metaculus_bot.performance_analysis.parsing import _parse_probability
 from metaculus_bot.performance_analysis.platform_scores import spot_peer_score
 from metaculus_bot.performance_analysis.stacker_detection import base_or_per_model_forecasts, detect_stacker_fired

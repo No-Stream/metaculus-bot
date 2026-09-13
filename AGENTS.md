@@ -206,6 +206,7 @@ Inside `metaculus_bot/`:
 | OpenRouter key fallback and retries | `fallback_openrouter.py`, `llm_retry.py`, `llm_setup.py` |
 | Residual / calibration analysis | `performance_analysis/`, `calibration/` |
 | Era gap with horizon matching and the two-sided roster watch | `performance_analysis/era_gap.py` |
+| Config-era boundaries (merge-to-main instants) and the per-record era tags, one home | `performance_analysis/eras.py` |
 | Backtest, ablation, benchmark harnesses | `backtest/`, `ablation/`, `benchmark/`, `ensemble_analysis/` |
 | Probability math, dormant in prod | `probabilistic_tools/`, `tool_runner.py` |
 

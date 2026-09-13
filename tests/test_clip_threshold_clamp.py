@@ -12,8 +12,8 @@ import pytest
 
 from metaculus_bot.constants import MC_PROB_MAX, MC_PROB_MIN
 from metaculus_bot.mc_processing import clamp_and_renormalize_probs
-from metaculus_bot.performance_analysis.analysis import FT_0292_MERGED_AT, WIDENING_FLIP_MERGED_AT
 from metaculus_bot.performance_analysis.clip_threshold_sweep import in_force_bounds
+from metaculus_bot.performance_analysis.eras import FT_0292_MERGED_AT, WIDENING_FLIP_MERGED_AT
 from metaculus_bot.performance_analysis.width_monitor import WIDENING_FLIP
 from tests.clip_threshold_fakes import AFTER_WIDENING, AS_OF, BEFORE_WIDENING, one_binary
 

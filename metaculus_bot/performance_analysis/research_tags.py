@@ -47,6 +47,7 @@ import re
 from datetime import UTC, datetime
 from pathlib import Path
 
+from metaculus_bot.performance_analysis.eras import B4E9DF0_MERGED_AT
 from metaculus_bot.performance_analysis.id_mapping import QuestionIds
 
 logger = logging.getLogger(__name__)
@@ -76,15 +77,11 @@ _ABSENT_TAGS: dict[str, None] = {
     "research_source_class": None,
 }
 
-# The one writer class whose records can carry the ``gap_fill_v2`` payload: the
-# schema-v2 live-capture writer (``research/persistence.py``), which writes the key
-# only when the v2 loop actually ran. Comment-backfill and schema-v1 records never
-# carry it regardless, so their silence is not evidence — and neither is a schema-v2
-# artifact's from before the payload write landed on main (b4e9df0), since the schema
-# number predates the key by ~3 weeks (see the module docstring's ternary note).
+# The one writer class whose records can carry the ``gap_fill_v2`` payload (module docstring).
 _GFV2_PAYLOAD_SCHEMA_VERSION = 2
 _GFV2_PAYLOAD_SOURCE = "artifact"
-_GFV2_PAYLOAD_ERA_START = datetime(2026, 7, 21, 17, 7, 37, tzinfo=UTC)
+# The payload write reached main in b4e9df0, three weeks after schema v2: an alias, never a copy.
+_GFV2_PAYLOAD_ERA_START = B4E9DF0_MERGED_AT
 
 
 def _writer_can_carry_gfv2_payload(record: dict) -> bool:

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from metaculus_bot.performance_analysis.analysis import B4E9DF0_MERGED_AT, WIDENING_FLIP_MERGED_AT
 from metaculus_bot.performance_analysis.clip_threshold_sweep import BINARY_FLOOR_GRID, ClipRecord, build_clip_records
 from metaculus_bot.performance_analysis.clip_threshold_tables import nesting_rows, regime_span
 from metaculus_bot.performance_analysis.clip_threshold_windows import (
@@ -19,6 +18,7 @@ from metaculus_bot.performance_analysis.clip_threshold_windows import (
     nested_windows,
     window_labels,
 )
+from metaculus_bot.performance_analysis.eras import B4E9DF0_MERGED_AT, WIDENING_FLIP_MERGED_AT
 from tests.clip_threshold_fakes import AFTER_FT_0292, AFTER_WIDENING, AS_OF, BEFORE_WIDENING, binary_record
 
 

@@ -4,13 +4,13 @@ import logging
 import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
 
 import numpy as np
 from scipy.stats import beta, spearmanr
 
 from metaculus_bot.numeric.config import MAX_CDF_PROB_STEP, grid_step_constraints
 from metaculus_bot.numeric.pchip_cdf import build_cdf_value_grid
+from metaculus_bot.performance_analysis.eras import GRID_SCALED_MAX_STEP_MERGED_AT
 from metaculus_bot.performance_analysis.parsing import (
     MIN_SCOREABLE_ANCHORS,
     _parse_probability,
@@ -502,29 +502,10 @@ def jeffreys_ci(k: int, n: int, cl: float = 0.95) -> tuple[float, float, float]:
     return mean, lo, hi
 
 
-# ``b4e9df0`` — the merge that landed the july15 bundle on main. THE single source of
-# truth for this era boundary across the package: width_monitor's ``TS_ANCHOR_ENABLE``
-# aliases it, and every screen gated on the bundle's contents keys on it. Era
-# boundaries are merge-to-main COMMITTER timestamps, never authoring dates.
-B4E9DF0_MERGED_AT = datetime(2026, 7, 21, 17, 7, 37, tzinfo=UTC)
-
-# 0e85e1b: numeric k_tail 1.25 -> 1.0 AND the binary clamp [0.01, 0.99] -> [0.02, 0.98].
-WIDENING_FLIP_MERGED_AT = datetime(2026, 5, 18, 17, 21, 19, tzinfo=UTC)
-# 325b1b0 (ft 0.2.54 -> 0.2.92): the MC option clamp [0.005, 0.995] -> [0.01, 0.99].
-FT_0292_MERGED_AT = datetime(2026, 7, 24, 19, 16, 26, tzinfo=UTC)
-
-# ``9f1175c`` (grid-scaled max-step for discrete CDF resampling) rode that merge.
-# Before this instant a flat 0.2 per-bin cap applied at EVERY grid size; after it,
-# coarse discrete grids get the relaxed ``grid_step_constraints`` cap.
-GRID_SCALED_MAX_STEP_MERGED_AT = B4E9DF0_MERGED_AT
-
-# A published bin counts as sitting at the cap within this tolerance, and the members
-# must want at least this much MORE mass there for the record to be clamp-suspected.
+# Cap tolerance and the extra member mass a record needs to be clamp-suspected.
 _CLAMP_CAP_ATOL = 1e-6
 _CLAMP_MEMBER_MARGIN = 0.10
-# The min-step / ramp / discrete-snap machinery shaves the top step ~1% below the cap
-# (q45065: 0.1977991526 against 0.2, 98.9%), so exact equality structurally misses every
-# post-snap instance; a bin at >= this fraction of the cap is treated as cap-bound too.
+# Post-snap steps land ~1% under the cap, so exact equality misses them: docs/performance_analysis.md.
 _CLAMP_CAP_NEAR_FRAC = 0.90
 
 
