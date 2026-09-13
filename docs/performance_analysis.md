@@ -1335,3 +1335,130 @@ date; its tell was that the record's own comment named the retired `grok-4.5` /
 `gpt-5.5` / `opus-4.6` roster, dropped by the same merge that landed the anchor. That is
 fixed. The row is absent *today* because empty eras are omitted and no post-july15
 numeric has resolved. Neither statement is stale; read them in that order.
+
+## The round dataset builder
+
+Every round produces one `perf_all_tagged.json`, the dataset every downstream lane reads. The
+rules for building it are the same round to round and live in two tracked modules:
+`performance_analysis/round_dataset.py` (load, dedup, heal, tag, cohort) and
+`performance_analysis/round_outputs.py` (the four output files and the console report).
+Everything that names one particular round lives in a `RoundSpec` the round's own script
+constructs, so a new round is a spec and two calls rather than another copy of the script. The
+script had been copy-pasted forward ten times before this extraction, once per round, and each
+copy diverged; one of them carried a wrong era boundary for four months.
+
+### The round script
+
+```python
+SPEC = RoundSpec(
+    round_dir=THIS_DIR,
+    label="2026-09-16",
+    prior_dir=THIS_DIR.parent / "residual_2026-09-09",
+    prior_label="2026-09-09",
+    telemetry_dir=REPO / "backtests" / "telemetry_archive",
+    weighted_slug="summer-futureeval-2026",
+    required_slugs=("summer-futureeval-2026",),
+    optional_slugs=("metaculus-cup-fall-2026", "minibench"),
+    reused_slugs=("spring-aib-2026", "fall-aib-2025", "summer-futureeval-2026"),
+)
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+write_round_outputs(build_round_dataset(SPEC))
+```
+
+Filenames inside the round directory are conventional, so the spec names slugs rather than
+paths: `perf_<slug>.json` for each pulled tournament, `question_weights.json` for the
+leaderboard weights, `platform_rescored.json` for the pull's own re-resolution diff, and the
+four outputs. A required slug whose file is missing logs a WARNING and contributes nothing; an
+optional slug whose file is missing is silent, which is how a probed-but-empty successor
+tournament is meant to behave. `label` and `prior_label` are the provenance strings a record
+carries (`fresh_2026-09-16`, `reused_2026-09-09_tagged`), so they are the round's own name and
+not a path.
+
+### What the spine does, in order
+
+1. Loads the prior round's tagged file once, and reads three things off it: the baselines this
+   round does not re-pull, the cross-round rescore provenance, and the "was this already here,
+   was it already scored" snapshot behind `is_new_since_prior` and `newly_scored`.
+2. Loads each fresh pull, strips every tag field it owns off a reused record, and dedups on
+   `(question_id, post_id)` preferring the fresh record. A reused record of the weighted slug
+   that survives dedup means the fresh pull lost a question, and that is logged as a warning.
+3. Carries `rescored_fields` and `platform_rescored` forward BY KEY rather than on the reused
+   record itself. A fresh record wins dedup over its reused twin, so a carry on the record would
+   be thrown away and "Metaculus re-resolved this once" would become indistinguishable from
+   "never rescored".
+4. Heals the stored scores through `collector.rescore_records` and records the per-field deltas.
+   A fresh record changing here is a red flag, because the pull was scored by the current
+   collector; a reused record changing is the expected healing of a stale stored value.
+5. Stamps the era tags from `eras.py` and the leaderboard `question_weight`, which is set only on
+   the weighted slug's records and is `None` everywhere else.
+6. Pins the degraded cohort by joining the telemetry archive's `forecaster_drops` markers to that
+   run's per-question markers, then unions the result with `cohorts.py`'s canonical set, so a gap
+   in the archive cannot silently un-tag a known-degraded question.
+7. Flags novelty and the exclusion cohorts, then tags Metaculus-side score movement and
+   cross-checks the local ternary against the pull-side diff's distribution.
+
+### Two invariants
+
+**Field insertion order is part of the output.** `perf_all_tagged.json` is compared byte for byte
+between rounds, and Python preserves dict insertion order into JSON, so the tagging steps assign
+in a fixed order: provenance, then carried provenance, then healing, then era tags and weight,
+then novelty and cohorts, then the platform-rescore fields. Reordering the steps rewrites the
+file without changing a single value.
+
+**The tag vocabulary is a contract.** `era_gap.py` selects its arms with
+`--era-field triple_subera_fine`, and `clip_threshold.py` slices on the `pre_flip` / `post_flip`
+vocabulary. A renamed tag value breaks a standing instrument silently, which is why the tag
+functions live in `eras.py` and are imported rather than rewritten.
+
+### The reproduction receipt
+
+The spine was extracted from `scratch/residual_2026-09-09/bucket_by_era.py`, the tenth copy.
+Running the tracked code over that round's own inputs reproduces `perf_all_tagged.json` (905
+records, 88 MB), `new_since_prior.json` (78 records) and `degraded_cohort.json` byte for byte,
+and reproduces every block of `counts_by_era.json` except two. `generated` is a wall-clock stamp.
+`boundaries_utc.flip` now reads the corrected merge instant 2026-05-18T17:21:19Z instead of the
+2026-05-12 authoring date every scratch copy carried; no record was submitted inside that
+six-day window, so no record's era, tag or score moves with it.
+
+### Bot-side healing versus platform re-resolution: four field families, two owners
+
+A round carries two independent "this number changed" stories and they must never share a name.
+
+`rescored_fields` (with `rescored_fields_this_round` and `rescored_fields_prior_rounds`) is OURS:
+the bot-side score fields `collector.rescore_records` recomputed from the record's own stored
+inputs. Those scores are pure functions of inputs the record already carries, so a change means
+our scorer changed, not the platform.
+
+`platform_rescored` (with `platform_rescored_this_round`, `platform_rescored_prior_rounds` and
+`platform_rescored_pull_tag`) is METACULUS's, detected by `rescore_diff.diff_platform_rescores`.
+It exists because Metaculus can change a resolution after the fact without moving any timestamp
+we store. On 2026-08-31 it resolved q44798 (post 44645, "Halo: Campaign Evolved Metascore") at
+80, the PS5 hero card on Metacritic, and then within 26 hours edited it to 82, the Xbox card the
+resolution criteria actually name. `resolution_set_time` still read 2026-08-31T21:38:45Z
+afterwards, which PRECEDES the pull that read 80, so nothing timestamp-shaped could have flagged
+the edit. That record's spot peer went from +5.41 to -5.42 between two consecutive rounds, and
+every table the earlier round published about it was silently stale. The only reliable detector
+is a value-level diff of the pull against its predecessor: `resolution_raw` and
+`resolution_parsed` verbatim, plus every key of `metaculus_scores` on either side, so a field
+Metaculus adds later is diffed with no edit to the code.
+
+`rescore_diff`'s own tag is deliberately three-state, because "compared, nothing moved" and
+"never compared" are different facts and the second is what a run with no `--prior` produces.
+`None` means no prior record existed for that `(question_id, post_id)`, `False` means compared
+and unchanged, `True` means at least one field moved. On a `True` record only,
+`platform_rescored_fields` names the fields, `prior_resolution` carries the prior
+`resolution_raw` (equal to the current one on a score-only re-score, which is how a reader tells
+the two cases apart) and `prior_metaculus_scores` carries the prior score block. Those two prior
+snapshots are attached to moved records only: on an unchanged record the current values ARE the
+prior ones, and copying them everywhere would double the dataset's size to say nothing. The old
+`resolution_parsed` value is not recoverable from the tag, so `render_rescore_summary` reports it
+as `None` rather than guessing; `resolution_raw` moves with it in every real case and that row
+carries the values. A summary over records where nothing was compared says exactly that and
+claims nothing about staleness, because a dataset that never went through the diff and a prior
+pull with no overlapping key produce identical tags.
+
+`RESCORE_ATOL` is 1e-6, shared by `rescore_diff` and `collector.rescore_records` so both sides of
+a round comparison use one threshold. The platform's scores round-trip through JSON exactly and
+our scorer reproduces them to about 1e-14, while the gaps this exists to catch are whole points:
+the known-stale q44798 gaps start at 0.6.
