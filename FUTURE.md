@@ -2498,7 +2498,7 @@ them OUT of feature work, land as their own PRs.
   are now three separate authenticated Metaculus GET helpers with the same `Authorization: Token`
   header shape and offset/limit paging: `performance_analysis/collector.py`'s private `_api_get`
   (three 429 retries, then a bare `RuntimeError`), `scripts/backfill_research_from_comments.py`'s own
-  copy, and `scripts/supply_probe.py`'s `_get_json` (a larger rate-limit budget, and it raises
+  copy, and `scripts/supply_probe.py`'s `get_json` (a larger rate-limit budget, and it raises
   `requests` exceptions rather than `RuntimeError` because its caller soft-fails per slug). The probe
   deliberately did NOT import collector's private helper (the contract does not fit and promoting it
   would have edited a shared file mid-fan-out), so the consolidation is this follow-up: one public
@@ -3766,3 +3766,28 @@ Exa prompt contains joined words (`giveyou`, `generatea`, `newswould`); its stan
 does not. Correcting those prompt bytes belongs in a deliberate behavior change, separate from
 the ownership refactor. The Perplexity factory's omitted key and orchestrator's explicit key
 remain distinct too; any future credential-policy change must address both callers.
+
+## Round-script promotion decisions (2026-09-12)
+
+Three per-round scratch scripts were audited for promotion into `scripts/`. Two shipped as
+tracked CLIs, `scripts/verify_pull.py` and `scripts/probe_slugs.py`; `docs/operations.md`
+"Auditing a round pull, and probing the season slugs" is the runbook for both.
+
+**`check_cup_comments.py` was NOT promoted, and should not be.** Four copies existed
+(2026-08-02, 08-24, 08-31, 09-01), three byte-identical. It asked whether the bot's Metaculus
+Cup comments landed by listing `/api/comments/?post=<id>&author=<bot>` once, plain. That
+listing is blind to private comments, and the cup is exactly the tournament whose comments
+stay private until Metaculus flips them public weekly, so a cup comment the bot really did
+post reads as absent. The receipt is in `docs/performance_analysis.md`: on 2026-09-09 the
+plain author listing returned 1,054 public summer comments and none of the six private
+2026-09-07 comments, which is why both tracked comment readers page the listing twice (plain,
+then `is_private=true`) and merge by comment id. Promoting the script as written would have
+shipped a false-alarm generator whose loudest output, "no bot output on the cup; skipping the
+cup pull is correct", is the wrong call.
+
+Its question is already answered better. `make supply_probe --slugs metaculus-cup-fall-2026`
+classifies every closed or resolved question off `my_forecasts`, which is what the scoring pull
+itself drops on and which comment privacy cannot hide, and prints a warning when nothing on a
+slug carries a bot forecast. Reach for that instead. Reviving a comment-side check needs a real
+question the forecast-side read cannot answer (a forecast that published with no comment), and
+it must page both listings.

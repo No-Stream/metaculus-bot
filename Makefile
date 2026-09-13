@@ -1,4 +1,4 @@
-.PHONY: install lock test test_verbose all lint lint_imports deps format typecheck typecheck_ty cov audit run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research sync_telemetry sync_raw_research sync_all resync_from_store backfill_research download_research download_run_logs download_raw_research backfill_comments score_ghosts close_margin_watch supply_probe supply_probe_mantic cost_report dispatch_watch cronjob_dispatch_setup backtest_with_cache run_mantic run_mantic_one strip_bench probe_resolver replay_ladder artifacts_link artifacts_check artifacts_migrate
+.PHONY: install lock test test_verbose all lint lint_imports deps format typecheck typecheck_ty cov audit run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research sync_telemetry sync_raw_research sync_all resync_from_store backfill_research download_research download_run_logs download_raw_research backfill_comments score_ghosts close_margin_watch supply_probe supply_probe_mantic probe_slugs verify_pull cost_report dispatch_watch cronjob_dispatch_setup backtest_with_cache run_mantic run_mantic_one strip_bench probe_resolver replay_ladder artifacts_link artifacts_check artifacts_migrate
 
 # Stream logs live from recipes; avoid per-target buffering
 MAKEFLAGS += --output-sync=none
@@ -326,6 +326,24 @@ supply_probe:
 # miss-rate-per-UTC-release-hour table that answers the cron-cadence question.
 supply_probe_mantic:
 	uv run python scripts/supply_probe.py --platform mantic $(ARGS)
+
+# Which season slugs exist, which the repo's constants point at, and which are stale: one project
+# GET per candidate (the configured slugs plus the generated season-successor spellings). Read-only
+# + free (Metaculus project metadata only; no LLM, no research, no publish). The project object is
+# the authoritative existence check because the tournaments LIST omits an `unlisted` project, which
+# is what a new season is before its first question. Post counts are supply_probe's job.
+# ARGS="--seasons-ahead 2", ARGS="--slugs <a> <b>" for extras, ARGS="--output <path>".
+probe_slugs:
+	uv run python scripts/probe_slugs.py $(ARGS)
+
+# Coverage audit of a completed residual-round pull, FULLY OFFLINE (no network at all): which
+# resolved posts produced no record and why, resolved group members with no record, the diff versus
+# the prior round, whether every overlapping platform score reproduces, and whether the pull still
+# parses per-model forecasts out of the bot's comments. Recordless posts a prior round already
+# classified are derived from that round's own checkpoint, so nothing is hardcoded per round.
+# Needs ARGS="--records <path>"; add --prior-records for checks 3-5 and --output for the new cohort.
+verify_pull:
+	uv run python scripts/verify_pull.py $(ARGS)
 
 # Cost per question off the telemetry archive (read-only + free; run sync_telemetry first): per
 # run (questions, charged $, $/question), per role ($/question, prompt and output tokens per

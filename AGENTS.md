@@ -112,8 +112,10 @@ Free and safe. Run freely:
   `sync_telemetry`, `sync_raw_research`, `download_*`, `backfill_*`), the `performance_analysis`
   package, `make score_ghosts`, `make close_margin_watch`, `make ablation_score`,
   `make supply_probe`, `make supply_probe_mantic` (public Mantic reads; `MANTIC_TOKEN` optional),
-  `make benchmark_display`. These hit only the Metaculus API, Mantic's public API and GitHub
-  artifacts.
+  `make probe_slugs`, `make benchmark_display`. These hit only the Metaculus API, Mantic's public
+  API and GitHub artifacts.
+- `make verify_pull`: fully offline. It audits a completed residual-round pull against its own
+  checkpoint, so it makes no network call at all.
 - `make dispatch_watch` (one `gh run list`, tabulated per bot workflow and UTC day into scheduled
   versus dispatched runs) and the bare `make cronjob_dispatch_setup` dry run: read-only views of
   trigger delivery and of the cron-job.org jobs.
