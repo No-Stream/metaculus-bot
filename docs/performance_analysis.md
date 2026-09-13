@@ -690,6 +690,70 @@ Run before the first `fall_config` question resolves (on 2026-09-09 six were for
 closed) it exits with `era arm 'fall_config' has no scoreable records; nothing to compare yet` plus
 the field's value counts, and prints no report.
 
+## Building a round's cluster structure
+
+**The clustering rule is code; which questions share a driver is curated data.** Entry point
+`metaculus_bot/performance_analysis/cluster_structure.py`, read-only and offline, writing the file
+the section above consumes:
+
+```bash
+uv run python -m metaculus_bot.performance_analysis.cluster_structure \
+    --dataset <round>/dim_category_slim.json --output-json <round>/cluster_structure.json \
+    [--tables metaculus_bot/performance_analysis/cluster_tables.json]
+```
+
+Several questions in any wave are one real-world event or one dated statistical release seen from
+different angles, so a record count overstates the evidence: on the 2026-09-09 round the wave's
+largest August miss and its largest win were both readings of one cyclosporiasis outbreak. Each
+question id gets exactly one cluster, at one of three strengths. **`strong`** means one driver
+mechanically resolves every member (one Florida primary, one Employment Situation release, one
+Metaculus Cup leaderboard), so the cluster collapses to one observation. **`weak`** means a shared
+regime, so residuals correlate but the draws are separate, and it collapses only as a sensitivity;
+report the strong-only effective n as primary and the strong-and-weak number as the conservative
+bound. **`single`** means no sibling in the cohort, and every unclustered record becomes its own
+`single_<qid>` cluster so nothing is silently unlabelled. The same resolution-set DATE, the same
+CATEGORY and the same question TEMPLATE are none of them cluster bases: Metaculus writes
+resolutions in calendar batches on unrelated quantities, which the emitted
+`resolution_set_date_histogram` shows so nobody has to take it on faith, and the template families
+(one question shape resolved off one kind of instrument) are reported for method correlation and
+never collapsed.
+
+**The curated tables are a tracked asset, `cluster_tables.json` beside the module.** They hold
+which questions cluster, at what strength, with the basis text for each, plus the clusters retired
+for id continuity, the template families, the links considered and rejected, the forecast-but-
+unresolved questions that join on resolution, and the round's own caveats. That is a human's
+per-round judgement rather than a rule, it grows every round, and it is edited in the JSON, never
+promoted into Python. **Every id in it is a QUESTION id.** Post and question ids share one integer
+namespace and the 2026-09-09 tables prove the collision is live: they carry question ids 44873 and
+44874, which are also minibench POST ids, so a table matched against post ids admits unrelated
+questions (`cohorts.py` carries the same warning for the exclusion cohorts). The asset needs its
+own negation in `.gitignore`, because the blanket `*.json` ignore matches at any depth;
+`tests/test_performance_analysis_cluster_structure.py` asserts `git ls-files` really carries it, so
+the "exists locally, absent on a fresh clone" trap cannot come back.
+
+**Three guards fail shut rather than mislabelling a round.** A cluster naming a question outside
+the measured cohort raises: out-of-cohort siblings belong in the basis prose, named and not
+counted, because a cluster that quietly reaches outside the cohort would collapse draws the round
+never measured. A question claimed by two clusters raises. A retired cluster that still owns an
+assigned member raises, which is how a cluster retired too early is caught; a retired id whose
+members live on under new ids is the SPLIT case and is fine, as when `aug2026_asset_prices` became
+the strong `brent_spot_aug2026` plus `aug2026_retail_fuel` plus `aug2026_rates_and_risk`.
+
+**Cluster ids are assigned over the union cohort, but collapse is computed inside whichever slice
+is being measured**, so a cluster straddling two eras collapses less inside a single-era arm. The
+seven reported slices are the wave new since the prior round (all of it, and its post-flip and
+triple-era halves), the whole triple era, and that era `clean` (degraded-run and known-bug records
+dropped), `strict` (partial-degraded dropped too) and strict-and-new-only. Each slice name carries
+its own record count, so `triple_strict_63` reads itself. The degraded and bug records are cluster
+members and are dropped by the slice, so the strict effective n already reflects them.
+
+**The rule reproduces the round it was extracted from.** Run over
+`scratch/residual_2026-09-09/dim_category_slim.json` with the tracked tables it rebuilds that
+round's `cluster_structure.json` field for field, all fourteen top-level keys including
+`qid_to_cluster`, the per-cluster member blocks, `effective_n` and the prose, differing only in the
+`source` path. `era_gap --clusters` on the rebuilt file prints a byte-identical report, watch row
+included (+5.56 [-5.56, +16.41]).
+
 ## The clip-threshold sweep
 
 **The clip floors are priced by a standing sweep, and a looser clip is censored, never
