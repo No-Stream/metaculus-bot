@@ -292,7 +292,7 @@ class TestManticPaging:
             results = pages[index] if index < len(pages) else []
             return {"results": results, "next": f"{url}?offset={(index + 1) * supply_probe.PAGE_SIZE}", "count": None}
 
-        monkeypatch.setattr(supply_probe, "_get_json", _fake_get)
+        monkeypatch.setattr(supply_probe, "get_json", _fake_get)
         monkeypatch.setattr(supply_probe.time, "sleep", lambda _s: None)
         return seen
 
@@ -359,7 +359,7 @@ class TestGetJsonWithoutAToken:
 
         monkeypatch.setattr(supply_probe.requests, "get", _fake_get)
 
-        supply_probe._get_json({"limit": 1}, None, url=MANTIC_PROBE.posts_url)
+        supply_probe.get_json({"limit": 1}, None, url=MANTIC_PROBE.posts_url)
 
         assert calls == [{"url": MANTIC_PROBE.posts_url, "headers": {}}]
 

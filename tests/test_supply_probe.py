@@ -339,7 +339,7 @@ class TestResolveBotForecasts:
                 raise requests.HTTPError(f"429 rate limit on {post_id}")
             return details_by_post_id[post_id]
 
-        monkeypatch.setattr(supply_probe, "_get_json", _fake_get)
+        monkeypatch.setattr(supply_probe, "get_json", _fake_get)
         monkeypatch.setattr(supply_probe.time, "sleep", sleeps.append)
         return seen, sleeps
 
@@ -529,9 +529,9 @@ class TestRenderReport:
 
 
 class TestRateLimitRetry:
-    """``_get_json``'s 429 handling, driven over a fake ``requests.get``.
+    """``get_json``'s 429 handling, driven over a fake ``requests.get``.
 
-    Every other test in this file monkeypatches ``_get_json`` away, so nothing exercised the
+    Every other test in this file monkeypatches ``get_json`` away, so nothing exercised the
     retry itself — and this is the one path the probe was built around: the posts endpoint
     rate-limits hard right after a full performance pull, and an unretried 429 turns a live
     slug into an error row that reads exactly like a dead one.
@@ -555,7 +555,7 @@ class TestRateLimitRetry:
         payload = {"results": [_post(801, _question(81))]}
         calls, sleeps = self._install_responses(monkeypatch, [429, 200], payload=payload)
 
-        data = supply_probe._get_json({"tournaments": "slug", "statuses": "closed"}, "token")
+        data = supply_probe.get_json({"tournaments": "slug", "statuses": "closed"}, "token")
 
         assert data == payload
         assert len(calls) == 2, "the rate-limited attempt must be retried, not surfaced"
@@ -570,7 +570,7 @@ class TestRateLimitRetry:
         calls, sleeps = self._install_responses(monkeypatch, [429] * supply_probe.MAX_RETRIES)
 
         with pytest.raises(requests.RequestException):
-            supply_probe._get_json({"tournaments": "slug", "statuses": "closed"}, "token")
+            supply_probe.get_json({"tournaments": "slug", "statuses": "closed"}, "token")
 
         assert len(calls) == supply_probe.MAX_RETRIES
         assert sleeps == [
@@ -583,7 +583,7 @@ class TestRateLimitRetry:
         self._install_responses(monkeypatch, [429] * supply_probe.MAX_RETRIES)
 
         with pytest.raises(requests.RequestException) as excinfo:
-            supply_probe._get_json({"tournaments": "slug", "statuses": "closed"}, "token")
+            supply_probe.get_json({"tournaments": "slug", "statuses": "closed"}, "token")
 
         assert "429" in str(excinfo.value)
         assert "retries exhausted" in str(excinfo.value), (
@@ -597,7 +597,7 @@ class TestRateLimitRetry:
         calls, _sleeps = self._install_responses(monkeypatch, [200], payload={"id": 920})
         detail_url = f"{POSTS_URL}920/"
 
-        data = supply_probe._get_json({}, "token", url=detail_url)
+        data = supply_probe.get_json({}, "token", url=detail_url)
 
         assert data == {"id": 920}
         assert [call["url"] for call in calls] == [detail_url]
@@ -608,7 +608,7 @@ class TestRateLimitRetry:
         calls, sleeps = self._install_responses(monkeypatch, [404])
 
         with pytest.raises(requests.HTTPError):
-            supply_probe._get_json({"tournaments": "metaculus-cup", "statuses": "closed"}, "token")
+            supply_probe.get_json({"tournaments": "metaculus-cup", "statuses": "closed"}, "token")
 
         assert len(calls) == 1
         assert sleeps == []
@@ -643,7 +643,7 @@ class TestFetchPaging:
             pages = pages_by_status.get(status, [])
             return {"results": pages[index] if index < len(pages) else []}
 
-        monkeypatch.setattr(supply_probe, "_get_json", _fake_get)
+        monkeypatch.setattr(supply_probe, "get_json", _fake_get)
         monkeypatch.setattr(supply_probe.time, "sleep", lambda _s: None)
         return seen
 
@@ -675,7 +675,7 @@ class TestFetchPaging:
             offset = params["offset"]
             return {"results": [_post(3000 + offset, _question(3000 + offset))] * supply_probe.PAGE_SIZE}
 
-        monkeypatch.setattr(supply_probe, "_get_json", _always_full)
+        monkeypatch.setattr(supply_probe, "get_json", _always_full)
         monkeypatch.setattr(supply_probe.time, "sleep", lambda _s: None)
 
         by_status = fetch_posts_by_status("slug", ("closed",), "token")
