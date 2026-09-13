@@ -759,6 +759,91 @@ row that moves no record renders `identity` rather than a CI.
   q44874, whose shape the thin publish floor prices at **+51.08 over the 4 genuine k=1
   publishes with zero cost to the other three**.
 
+### The sweep model
+
+`clip_threshold_sweep.py` holds the model and the math; rendering lives in
+`clip_threshold_report`, so the dependency runs one way, CLI to report to sweep. Four facts
+about its representation carry the rest of the module.
+
+**Both question types live in one vector shape.** `ClipRecord.published` is the outcome-space
+probability vector, `(p_no, p_yes)` for binary and the option vector for MC, which is what lets
+the counterfactual, the replay and the censoring rules stay single-branch. The clamp semantics
+still differ: binary clamps `p_yes` and takes the complement, MC clamps every option and
+renormalises, and `apply_bounds` is the one place that branches on it. For the same reason
+`clampable_indices` is `p_yes` alone on binary. `p_no` is its complement, so a floor on `p_yes`
+is the same constraint as a ceiling on `p_no`, and counting both would report a publish sitting
+at the ceiling as floor-censored.
+
+**Tightening intersects with the clamp in force before it computes anything.** A candidate at
+least as tight as the one that was live is fully determined by the published value, whether or
+not that value was itself clamped, so `clip_delta` takes that intersection rather than pricing
+the candidate on its own.
+
+**The member censoring rule reads median POSITIONS, and that is what makes it exact.** A member
+above the floor in a non-median position cannot move the median however low its raw value was,
+which is why `member_censored` checks the positions the median actually reads rather than
+counting any member at the floor. Under a mean aggregator every member moves the publish, so
+every position counts. For MC the rule runs per option, against the members in THAT option's
+median slot; it deliberately does not count a member floored on option j while sitting in
+option k's median slot with a non-floored value. Renormalisation does couple the two, but the
+round's refutation pass rejected "any member component at the floor" as overstating the bound,
+and the coupled move is bounded by the floored mass a looser clip releases anyway.
+
+**A floor can be infeasible on a ballot.** An MC floor `c` cannot be DELIVERED where a ballot
+has more than `1 / c` options (eleven options each at least 0.10 already exceed 1), and the live
+clamp then returns its sub-floor fallback. Such records are priced like any other but counted in
+`infeasible_n`, so a cell labelled "floor 0.10" says on how many ballots that floor was not the
+floor actually applied. `floor_infeasible` mirrors the degenerate test in
+`clamp_and_renormalize_probs`; binary has one free value and is always feasible.
+
+### Sweep constants and tolerances
+
+These live in `clip_threshold_sweep.py` rather than in `constants.py` because they are analysis
+parameters and nothing in the live pipeline reads them.
+
+- **`BINARY_FLOOR_GRID` / `MC_FLOOR_GRID`** hold the candidate FLOORS, each implying the ceiling
+  `1 - c`, and are module constants so that a round can widen the grid without touching logic.
+  Every candidate must satisfy `0 < c < 0.5` for the clamp to be a clamp, which a module-level assert enforces: at `c >= 0.5` the bounds invert (`lo > hi`) and
+  `apply_bounds` collapses every publish to `1 - c`.
+- **`MC_UNSHIPPABLE_NOTE`.** forecasting-tools 0.2.92's `PredictedOptionList` validator clamps
+  every option into [0.01, 0.99] on construction, so an MC floor below `MC_PROB_MIN` is not
+  shippable today whatever this sweep says about it. Those rows are labelled (the `shippable`
+  field) and reported rather than dropped.
+- **`BINARY_CENSOR_ATOL` = 1e-9, `MC_CENSOR_ATOL` = 0.0015.** A record sits AT its in-force
+  bound within this tolerance. Binary publishes are a median rounded to 3 dp, so a clamped one
+  hits the floor exactly; MC options pass through a renormalisation that leaves 0.0101 or 0.011
+  where 0.01 was clamped, and the MC tolerance is coarse enough to catch that drift and nothing
+  wider.
+- **`DELTA_ATOL` = 1e-9.** A record counts as MOVED when its spot-peer delta clears this. Binary
+  deltas are exactly 0 when nothing moves, but MC vectors are renormalised, so an unaffected MC
+  record's delta is float noise of order 1e-14 points. The same threshold guards the row's
+  driver: `sweep_row` names a `top1_question_id` only on a row that moved something, because an
+  MC row whose candidate is looser than the in-force clamp still carries about 1e-13 of
+  renormalisation noise, and a share computed over that noise reads as a real concentration
+  (0.07) and names a question the candidate never touched, on a row whose own `n_affected` is 0.
+- **`REPLAY_DISAGREE_ATOL` = 0.005.** The published-vector counterfactual and the per-model
+  replay count as disagreeing when the resolving mass differs by more than half a point of
+  probability, the resolution at which a disagreement could plausibly have changed a published
+  forecast. The same tolerance decides whether a replayed aggregate REPRODUCES the published
+  vector, which is how `detect_aggregator` tells median from mean.
+- **`ARGMAX_TIE_ATOL`**, equal to `DELTA_ATOL`, is how close two candidates must be in spot-peer
+  points to tie for the argmax. Ties are the norm rather than an edge case: every candidate at
+  or below a window's in-force floor scores exactly 0 when no publish in that window was
+  clamped, so the winner is usually a plateau. That is why `argmax_rows` returns the whole tied
+  set and `argmax_row` takes its smallest `c`, the least interventionist winner.
+- **`_CLAMP_HISTORY`** holds the clamp in force, oldest regime first, as `(start_or_None, lo,
+  hi)` rows. Every row is a LITERAL so that moving `BINARY_PROB_MIN` or `MC_PROB_MIN` cannot
+  retroactively reprice the records published under the retired clamp; the two asserts beside it
+  fail loudly and force an APPEND of a new regime rather than an edit to the last row. Binary
+  [0.01, 0.99] predates the earliest archived record, which is why its first row has no start.
+  An undatable record (`moment=None`) gets the WIDEST historical clamp, because a censoring
+  claim needs to know which floor was live and the assumption that claims the least is the
+  loosest one.
+- **`LOW_PRICE_BINS` / `HIGH_PRICE_BINS`** are extreme-bin edges, `(label, lower, upper,
+  p_midpoint)`. Low bins are half-open as `(lower, upper]` and high bins as `[lower, upper)`.
+  The implied rate of the COUNTED event is the midpoint for a low bin and its complement for a
+  high one, because a high bin counts NO resolutions.
+
 ## Receipts behind the survivor-conditional markers
 
 `FORECASTERS_SURVIVED`, `EXTREME_CALL` and `THIN_PUBLISH_FLOOR` are described as mechanisms
