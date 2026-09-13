@@ -1,9 +1,11 @@
 ###  Specific to Project ###
 
 # Local benchmark / backtest / analysis outputs. Per-operator state, never committed.
-/benchmarks/
-/backtests/
-/research_outputs/
+# No trailing slash, same reason as `.claude` below: these are SYMLINKS to the private artifacts
+# repo (scripts/artifacts_link.sh), git sees a symlink as a file, and a `dir/` rule would miss it.
+/benchmarks
+/backtests
+/research_outputs
 # jscpd output dir (report/jscpd-report.json is ~2.7MB)
 /report/
 sandbox.py
@@ -14,12 +16,14 @@ REFERENCE_COPY_OF_*
 # Bot run logs. Every run_bot_on_*.yaml does `mkdir -p run_logs` and tees stdout into it
 # (.github/workflows/run_bot_on_tournament.yaml:57-58); a local `make run` writes there too.
 # Run logs embed full research bundles and forecaster rationales -> never commit on a public fork.
-/run_logs/
+/run_logs
 *.log
 
 # Scratch, plans, audits, handoffs -- local research state, never committed.
 # `scratch*/` covers both scratch/ and scratch_docs_and_planning/ in one rule.
 scratch*/
+# The `scratch` symlink itself, which `scratch*/` cannot match (see the /backtests note above).
+/scratch
 notes/
 handoff-*.md
 HANDOFF*.md
