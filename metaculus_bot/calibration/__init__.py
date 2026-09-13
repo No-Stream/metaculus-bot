@@ -12,7 +12,7 @@ spring-aib-2026). The math, fit CLI, and integration hook are kept in
 place so the analysis can be re-run cheaply when more data accumulates.
 
 Numeric (CDF) recalibration is out of scope for this iteration and tracked
-in ``scratch_docs_and_planning/FUTURE.md``.
+in ``FUTURE.md``.
 
 References:
 - Upstream: Metaculus notebook "Improving Forecaster Performance via

@@ -1,0 +1,170 @@
+﻿Series 2
+This document outlines the changes being introduced in the second iteration of Mantic’s disagreement seeking forecasting tournament. The provisional kick-off date for Series 2 is September 2nd. We are planning to run a mini tournament to test out the ideas ahead of the full scale tournament, see Section 8 for details on that.
+
+
+Question-writer specific changes are presented first (Section 1, Section 2, Section 3). The sections are ordered to avoid forward references and not in order of interestingness or importance. The most interesting changes are those in Section 5, which introduces a method for adapting questions to the available precision of resolution at resolution time, and Section 7, which introduces a new kind of forecasting question situation.
+
+
+Apply to write questions in Series 2 here and to forecast here.
+1. Iterating on the disagreement score
+We’re introducing a new disagreement score. The new score is the mean pairwise Jensen-Shannon Divergence (JSD) over all pairs of forecasts, scaled up to match existing scores.
+Maths
+Specifically, for a question with  mutually exclusive collectively exhaustive outcomes and  forecasts written
+,
+i.e.  is the probability that forecast  assigns to outcome . The Shannon entropy of such a forecast, in bits, is
+                 (with convention )
+For a pair of forecasts  define their midpoint mixture  by
+,
+and their Jensen-Shannon divergence by
+
+The new disagreement score is
+.
+(The 100 is introduced to scale up so the range is [0,100] rather than [0,1].)
+Properties of this score
+Desirable properties
+1. Zero when all forecasts are identical, positive otherwise, and bounded from above. With the rescale, the range runs [0, 100] where 100 is attained if and only if every pair of forecasts have disjoint support i.e. they only put mass where the other does not.
+2. Finite in the presence of zero probabilities and the score does not diverge when low probabilities are assigned to bins.
+3. Not dominated by tail behaviour.
+4. Invariant to the number of bins when the bin width is greater than the forecast sharpness, i.e. when the bins are wide enough to not be destroying much information about the forecasts. So if the forecast sharpness is ~1 then changing from 10 to 100 to 10,000 bins changes the score by much less than 1%.
+5. The score does not depend, in expectation, on the number of forecasts submitted. ( is a U-statistic for a population functional that does not depend on .)
+6. Comparable across question formats.
+7. More interpretable as we can state the disagreement between each pair of forecasters and how much that is contributing to the score.
+Things that are missing
+   8. Ordinality: the score treats the bins as unordered, but on quantitative questions the bins are ordered and we may have the sense that distributions that are closer together on the number line should be scored as disagreeing less. This score does not account for this.
+   9. Outlier robustness: we have not made adjustments to specifically downweight or exclude outliers. (Though this score is more robust than the previous score.)
+2. Question-writer leaderboard and prizes
+The Series 1 question-writers’ leaderboard is ranked by the sum of disagreement over each user’s submitted questions. Summing scores may discourage exploring new question-writing strategies in favour of exploiting proven strategies that reliably score well, as every question counts towards the overall score. In Series 2 we will switch to top-k scoring to better incentivise searching for new strategies for producing ever higher levels of disagreement. We will also introduce two smaller prizes to be awarded separately based on disagreement achieved for categorical (binary and multiple choice) and quantitative (numerical, discrete, and date) questions.
+Rewarding high variance strategies
+As a very simple toy model, consider two strategies that payout as follows
+   * Strategy 1 (S1) pays out with distribution 
+   * Strategy 2 (S2) pays out with distribution 
+And four games that are played as follows
+      * Game 1: sample once from each and compare
+      * Game 2: sample twenty times from each and compare sums
+      * Game 3: sample twice and compare the larger of the two samples
+      * Game 4: sample twenty times and compare the sums of the five largest samples in each
+In Game 1, S1 wins about two thirds of the time (62.4%). In Game 2, S1 loses less than a tenth of the time (92.1%). But in Game 3, S2 gains a slight edge (51%) and in Game 4 the gap opens up with S2 winning 92.5% of the time.
+Multiple prize pools for different k’s: top-1, top-5, top-10
+We are planning to have separate prize pools for the top-1, top-5, and top-10 disagreement scores, i.e. a prize for the question-writer that produced the question with the single greatest disagreement, a prize for the question-writer with the greatest disagreement across five questions combined, etc.
+
+
+One reason for doing this is to maintain motivation for the question-writer that scores a very strong top-5 score early in the competition that they do not expect to improve on with later questions for whatever reason. Having a top-10 pool gives them a reason to keep submitting questions.
+Separate prizes for categorical and quantitative questions
+In addition to the overall leaderboard prizes, we are planning to award smaller prize pools based on disagreement achieved over categorical and quantitative questions separately. We are interested in probing model disagreement in both of these formats but it is difficult to balance the scoring between them and awarding prizes separately more simply targets what we want.
+3. Relaxing the question topic constraint
+The question topic constraint will be relaxed for the next series. The current implementation takes a combined whitelist and blacklist approach to filtering questions: each question is tagged with topics and those topics must include at least one from the whitelist and may not include any from the blacklist. We plan to both widen the range of topics on the whitelist and make the topics on the blacklist more specific so as to avoid rejecting appropriate questions by association.
+
+
+For example, ‘sports’ appears on the blacklist and is intended to prevent questions about the results of specific sports fixtures from being asked. However, there are many questions that would be legitimately interesting and happen to have a sports component e.g. a question about the economic impact of the FIFA World Cup. Making blacklist topics more specific, like ‘the result of a specific sports fixture,’ will help to avoid this problem.
+4. Using baseline points rather than peer score
+Metaculus introduced the peer score, which takes into account the relative difficulty of a question by comparing forecasters to their peers, as a way to ‘recognize [the] abilities and contributions’ of ‘forecasters [that] make deeply researched predictions on relatively few questions… across [Metaculus].’ The baseline score does not adjust for question difficulty in this way and instead compares directly to a uniform prediction, where matching the uniform prediction, the baseline, scores 0, a perfect prediction scores 100, and worse-than-chance predictions score negatively.
+
+
+Metaculus prioritises the peer score over the baseline score because, among human forecasters, it is possible to exploit the baseline score if you are willing to simply submit forecasts that agree with the community prediction for a large number of questions. Given that hobbyist human forecasters have limited bandwidth for forecasting, it makes sense that you want to focus your scoring on rewarding beating peers and not raw forecast volume.
+
+
+However, AI forecasting systems are not bandwidth constrained and there is no community prediction available during the period when questions are open for forecasting. So these reasons do not hold up for an AI forecasting competition. Furthermore, we have recruited a ‘best-of-the-best’ group of AI systems for these tournaments and this means that even the top systems have an expected peer score per question around zero, and on questions where they are uncertain is negative. This means that it is often rational to skip forecasting a question under peer scoring. We want the systems to be incentivized to forecast every question, and switching to the baseline score does this.
+Avoiding penalising missing questions too heavily
+Whilst we want to encourage answering all questions, we want to avoid turning the competition into a pure test of robustness. To reduce the impact of missing questions we are planning to introduce three safety nets: top-k scoring, fallback scoring, and excluding questions with very low participation.
+Top-k
+The forecaster leaderboard will be the sum of your top 95% forecasts by baseline points. This means missing a handful of questions will not change your score.
+Fallback
+The baseline score has the natural fallback that returning a uniform distribution and not submitting a forecast receive the same score (0). The problem is that some questions might be easy, and so missing these would represent a big loss. To account for this, rather than receiving zero points on the questions that you miss, you will instead receive the 25th percentile score. This means missing a genuinely easy question won’t cost you the tournament, but also means you are unlikely to win by skipping everything.
+Low participation exclusion
+If a question receives fewer than two forecasts, i.e. one or none, then it will be excluded from the leaderboard score. The assumption is that very low participation is an indicator of a wider outage.
+A small modification
+The Metaculus baseline score for categorical questions over  categories is
+
+i.e. one hundred times the logarithm in base  (the number of categories) of the probability assigned to the outcome plus one. A uniform distribution assigning  to each outcome scores zero as 
+.
+For numerical questions the score is similar but with a scaling factor that was set empirically to have the average score for numerical and categorical questions match for human forecasters. We are going to use the same, unadjusted score for all question types for the sake of consistency.
+5. Adapting to the precision of resolution
+Sometimes we can only resolve questions to limited precision and this can distort forecasts. We can adapt how questions are defined and resolved to fix this.
+What’s the story?
+Forecasting questions are generally better able to discriminate between the quality of different forecasts when the outcome space is more granular. Aggregating sets of outcomes together is lossy: you can’t tell from the forecast which of the aggregated outcomes the forecaster thinks is more or less likely. Consider the question
+
+
+        Will the Prime Minister resign within the next year?
+
+
+If one forecaster thinks they are almost certainly resigning this week and another thinks they are likely to stay in post for a few months before resigning, then their forecasts for this question will be the same even though they actually fundamentally disagree about what is going to happen. It would be better to ask them when they think the Prime Minister will resign, which in practice looks like getting many forecasts for the price of one: will they resign today? tomorrow? in 2 days? etc. Their disagreement will be surfaced by this change in format.
+  
+
+However, there is usually a limit to how finely we can actually resolve a question. Perhaps the series we want to forecast is only released weekly, or perhaps reports of an event are only given to hourly or daily precision. In this case, it is rational when making a forecast to predict the precision of the resolution and to modify your forecast in anticipation of the resolution being rounded in some way. This mixes a second forecast in with the forecast we actually care about, and so distorts the forecasts.
+  
+
+It is rational to forecast both the result and how the result will be resolved.
+
+
+We can correct for this problem by committing to resolving questions to the precision of the resolution that is available, which means forecasters do not expect to gain by mixing in a second forecast to account for the realised precision.
+How will this be implemented?
+Setting bin widths
+Quantitative forecasts are submitted as probabilities assigned to bins where the bin width is the precision we intend to resolve to. If we want to have the option to resolve to a lower precision later, we should choose the bins in a way that makes them easy to aggregate.
+
+
+For example, a date question asks users to make predictions over intervals of time. Under the old system (adopted from Metaculus), these intervals would be a fixed fraction of however much time there was between the upper and lower bound e.g. the question On what day will the #1 song on Spotify’s Global Weekly Top Songs chart next exceed 45 million streams? from Series 1 had a bin width of 8 hours 50 minutes and 6 seconds.
+
+
+Question-writers will be given the option to set the expected precision of resolution when posing the question subject to the constraint that the total number of bins does not exceed 2,000 and date questions will have a minimum bin width of 1 day. A default selection will be suggested depending on the question type. For date questions the options will be days, weeks, and months, with the default being days. For numerical questions the default will be a power of 10 that produces between 100 and 1,000 bins (tie-breaking in favour of 1,000 bins when relevant).
+
+
+Continuing with the example question above, the default would have been to use a bin width of 1-day. As the question is asking about a weekly statistic, the question-writer should opt to use a precision of weeks, but if they fail to do so we can later aggregate the days into weeks. Here are some further examples to illustrate:
+      * What will the NVDA share price be on 1st September in USD?
+      * Lower bound $150, upper bound $300: range is $150, default to bin width of $1 to produce 150 bins. The question writer could choose to instead use bins of width 0.1 as this produces 1,500 bins which is less than the limit of 2,000.
+      * What week will see the greatest number of influenza hospitalisations in Q4 2026?
+      * Lower bound 1st October 2026, upper bound 31st December 2026: the range is 92 days, defaults to a bin width of 1-day to produce 92 bins
+      * Question-writer selects instead to use weeks as the unit as they know this is the precision of resolution for the question
+      * If the question-writer had failed to select weeks, we would have been able to aggregate the default choice of days up to weekly periods exactly
+      * What will company X yearly revenue be in their Q3 report?
+      * Lower bound $2B, upper bound $12B: range is $10B, default to a bin width of $10M to produce 1,000 bins.
+      * At resolution time, the company only reports to nearest $100M (e.g. $7.7B). We aggregate the bins up to $100M and resolve as though there were always 100 bins.
+Scoring
+Once we have adapted a question to the precision appropriate to resolution by aggregating bins, we can score it as though it always had that precision. For example, we may have a question about the turnout in an election that we believe we will be able to resolve to 2 decimal places, but at resolution time we find the results are only reported to 1 decimal place. Having started with bins of width 0.01 we can aggregate the probability mass from every ten bins up to bins of width 0.1 and score using as though we had always known the precision of the report.
+  
+
+Post-aggregation there is no difference between the forecast that accounted for uncertainty about how the question would be resolved and the forecast that didn’t.
+
+
+Specifically, going from a question originally defined with  bins of width  and converting to width  with  and  bins, the original scoring would be
+
+And the new scoring would be
+
+With  summing over all of the smaller bins that end up in the larger bin that contains the resolution.
+6. Fusing numerical and discrete question types
+Numerical and Discrete question types will be merged into a single Quantitative question type. Question-writers will define the outcome space for these questions by setting upper and lower bounds, defining whether the upper and lower bounds are open or closed, and, optionally, providing a step size. If a step size is not provided, then a step size will be chosen that is a power of 10 (...100, 10, 1, 0.1, 0.01… etc.) based on the range width to produce between 100 and 1,000 bins. User defined step sizes will be required to produce at most 2,000 bins.
+What problem is this solving?
+The Numerical question type uses a default of 200 bins. This often results in bins that are not well aligned with the possible outcomes of the question, e.g. having bins that contain no outcomes or having some bins with more outcomes than others, or that cannot be straightforwardly aggregated into bins that are well aligned with the possible outcomes without losing too much precision.
+
+
+If the question-writer knows what the possible outcomes are, as in the case of a discrete question, they can set the step size to reflect that and we can avoid these problems. If they don’t, or the outcome space is continuous, then setting the bins to powers of 10 means we can easily aggregate them later to reflect the precision that we are able to resolve the question to. For example, consider a question about voter turnout in an election measured in percentage points. If we set the bins to be steps of 0.01 percentage points and then later we are only able to find reports to 0.1 percentage points, we can easily aggregate groups of 10 bins to match the precision of resolution. If the bins were instead of size 0.031 then we’d have to aggregate up to bins of size 3.1 percentage points to achieve equal sized bins that contain equal numbers of outcomes.
+7. Forecasting distributions of values; or, One forecast, many resolutions
+When forecasting competitively it may be rational to submit forecasts that are more extreme than our beliefs given a utility function that is non-linear in our overall score or final leaderboard position. Forecasting distributions of values, or, more functionally, making one forecast against which we will score many resolutions, reduces the expected reward for this behaviour and so encourages forecasters to more honestly report their beliefs about the target variable.
+A toy example
+To illustrate the problem, consider playing the following games with a small group:
+      1. We each write down our forecast for the outcome of a dice roll, the dice is rolled and our forecasts are scored using the log score, and then we rank the players according to their scores.
+      2. The same as game 1, but we roll the dice 100 times and your forecast is scored against the outcome of each roll and your overall score is the mean.
+If you value coming first more highly than the other positions, then, even if you believe the dice is fair and each outcome is equally likely, it would be rational for you to report a distribution that is not uniform because this increases your expected chances of winning even if your expected score decreases. However, the degree to which you should diverge from your belief changes a lot between the two games.
+
+
+In the first game, if you’re playing against a single naïvely honest player that reports ⅙ for each outcome, then you can win ⅚ of the time by reporting something like 0.18 for outcomes one through five and 0.10 for a six. But over 100 rolls, this strategy loses 80% of the time and the most you should deviate against a uniform player is about ±1% or 0.0016, and so the 100 roll game incentivises greater honesty in our submitted forecasts.
+Forecast format
+The format for these forecasts will be the same as for regular, single resolution questions. The only change is that the forecast will be scored against more than one resolution.
+Scoring multiple resolutions
+The baseline score for a forecast over  outcomes resolving to the -th outcome is
+
+Where  is the probability assigned to the -th outcome. We can generalise this to multiple resolutions with  the count of resolutions for the -th outcome
+
+i.e. take the weighted average of the scores by resolution.
+Example questions
+
+
+Single resolution question
+	Possible multi-resolution form
+	What will SPCX close at on October 1?
+	What will the close prices of SPCX be from October 1 through December 1?
+	Which age group will have the highest influenza infection rates in Q4?
+	What will the distribution of influenza infection rates by age group be in Q4?
+	How many passengers will the TSA process between September 1 and October 1 in total?
+	How many passengers will the TSA process each day from September 1 to October 1?
+	8. Series 1.5
+We’re going to run a mini tournament lasting two weeks to test out all the new ideas and provide an opportunity to iron out any kinks that come up. The tournament will start at the close of Series 1 on August 12th and run to August 26th.

@@ -1,0 +1,347 @@
+﻿Tournament details
+Details on the rules and structures of the new forecasting tournament being run by Mantic.
+Table of contents
+Tournament details
+Table of contents
+General
+Hosting
+Key dates
+Public access
+Failed questions
+Practice period
+Question resolution
+For question-writers
+Signing-up
+Usernames
+Scoring
+Leaderboard
+Latency
+Examples
+Annulment
+Prizes
+Question budget and timeline
+Question formats
+Binary
+Multiple choice
+Discrete
+Numeric
+Date
+Question parameters
+Question constraints
+(1) Clarity
+Misspecified and malformed questions
+Ambiguous resolution criteria
+(2) Topicality
+(3) Discrimination
+(4) Distinctness
+Question scheduling
+Background information about AI forecasting systems
+For AI forecasters
+Signing-up
+API documentation
+Developing during the tournament
+Scoring
+Prizes
+Subsidies
+Question scheduling
+Appendix A: Disagreement Score Analysis on Metaculus Fall AIB
+
+
+General
+Hosting
+The tournament will be hosted at competitions.mantic.com and is based on the open-source Metaculus website. The site will go live on Monday 20th April.
+Key dates
+* The site will be published and allow sign-ups from Monday 20th April
+* It will be possible to submit test/practice questions on Monday 20th and Tuesday 21st April
+* The first questions counting in the tournament will be released on Wednesday 22nd April
+* The tournament will run for 16 weeks to Wednesday 12th August
+* The latest resolution date for questions will be Wednesday 12th August
+* All questions will be resolved and prizes disbursed by Wednesday 9th September
+Public access
+The site will be publicly accessible to view questions, forecasts, and the leaderboards for both question-writers and forecasters. However, participation in the tournament, both as a forecaster and as a question-writer, is by application and acceptance only.
+Failed questions
+If for any reason a question does not receive at least two forecasts, we will exclude the question from the competition
+Practice period
+From when the site goes live on Monday 20th April until the start of the tournament on Wednesday 22nd April, it will be possible for question-writers to submit test questions. These questions will also be open for the forecasters to test their systems against.
+Question resolution
+Questions will be resolved automatically by an LLM system with the option to appeal resolutions.
+For question-writers
+Signing-up
+The tournament site will go live on Monday 20th April at the latest. Question-writers that have applied and been accepted will be able to sign-up using the email they submitted in their application.
+Usernames
+We would like to encourage question-writers to use their real names but this is not a rule and pseudonyms are acceptable.
+Scoring
+Questions are scored based on how much the forecasters disagree, with a minimum score of 0 (all the forecasters produced the same forecast) and 500 (the forecasters disagreed entirely). Roughly speaking, we measure the disagreement by considering how varied we expect the scores to be for the forecasters once the question has been resolved. Full details are presented at this link.
+
+
+An empirical analysis of the disagreement scoring metric was performed on the Metaculus Fall AIB benchmark, with results reported in Appendix A.
+Leaderboard
+There will be a publicly accessible leaderboard ranked by total points scored with columns for username, number of questions written, average score, total score, and the proportion of points won.
+Latency
+Questions can be scored as soon as the forecasters have submitted their forecasts. This means you may only have to wait an hour or so after a question goes live to get feedback on your questions and see your prize winnings increase!
+
+
+Note: questions will be scheduled for release no earlier than 1 hour after they are submitted.
+Examples
+For a binary question with two forecasters, the submitted question gets the maximum score if one of the forecasters says 100% and the other says 0%. (Practically, there is a limit on how confident the forecasters are allowed to be so the actual maximum is given by one forecaster saying 99.9% and the other saying 0.1%.) The minimum score is achieved by the forecasters giving the same forecasts e.g. both say 76%.
+
+
+For multiple choice questions, we have the same thing but they can disagree in as many ways as there are combinations of outcomes and to reach the minimum score they would have to agree across all outcomes.
+
+
+For numerical questions, the maximum score is achieved by the forecasters giving distributions with no overlap, and the minimum is achieved when the distributions are identical. Date questions are scored the same way as numerical questions.
+Annulment
+If a question is annulled its score will be set to 0. There are three situations where questions are expected to annulled
+1. The question turned out to have a faulty premise or include misinformation
+2. The resolution criteria are later found to be ambiguous for whatever world state we end up in
+3. The question had already resolved by the time it was asked
+If your question is annulled you will have the option to appeal the decision.
+Prizes
+The $25,000 USD prize pool will be distributed in proportion to the total number of points each participant scores across all of their questions. There will be at most 500 questions asked and so the average payment per question will be $50, and the exchange rate from points to USD will be at least $1 per 10pts. Here is an example leaderboard to illustrate:
+
+
+Question-writer
+	Total points
+	Fraction of total
+	Prize
+	A
+	5,000
+	50%
+	$12,500
+	B
+	3,000
+	30%
+	$7,500
+	C
+	2,000
+	20%
+	$5,000
+	Question budget and timeline
+On a schedule, writers will be allocated a budget of questions. Initially, everyone will receive 5 questions to submit within the first four weeks of the tournament. Every two weeks a top-up will be granted until a total of 500 questions have been submitted. Questions that have not been submitted within their allotted period will be returned to the general pool to avoid problems with absentee writers reducing the total number of questions that are asked during the tournament.
+
+
+Grant date
+	Expiry date
+	Allotment / questions
+	April 22nd
+	May 20th
+	5
+	May 6th
+	June 3rd
+	5
+	May 20th
+	June 17th
+	Redistribution
+	June 3rd
+	July 1st
+	Redistribution
+	…
+	
+
+If everyone that has been accepted dutifully writes and submits their questions, then each question-writer will be allotted 10 questions and there will be no redistribution required. If half the group fails to submit their questions, then that question budget will be redistributed to the active participants at the later grant dates and so the active writers will end up with 20 questions each.
+Question formats
+There are five Metaculus-style question formats: binary, multiple choice, discrete, numeric, and date.
+Binary
+Simple yes-no questions like Will another U.S. cabinet member leave office before May 2026?
+Multiple choice
+Categorical questions like Which Bloc will form the 2026 Danish Government?
+Discrete
+Questions about variables that take a finite or countably infinite number of values, often counts, ranks, or measurements with limited precision. Contrast this with multiple choice questions, which also have a finite but not fixed number of outcomes, by the outcomes of discrete questions being ordered.
+* Count: How many new national emergencies will Donald J. Trump declare under the National Emergencies Act in 2026?
+* Rank: Where will Wishbone Deluxe debut on the Billboard 200?
+* Limited precision: What will be Donald Trump's approval rating on April 14, 2026?
+
+
+Note: if the number of discrete values that could be taken exceeds a thousand, it would usually be better to use the numeric format instead.
+Numeric
+Questions about variables that are real-valued e.g. physical properties like mass, length, weight. Also used for questions about variables that are approximately continuously-valued at the scale of the questions e.g. the box office earnings for a film in dollars.
+* Approximately continuous: How many people worldwide will have completed vaccination with the M72 tuberculosis vaccine before 2040?
+* Genuinely continuous: After a (weak) AGI is created, how many months will it be before the first superintelligent AI is created?
+Date
+Numeric questions about dates like When will the first weakly general AI system be devised, tested, and publicly announced?
+Question parameters
+All times will be treated as being in Coordinated Universal Time (UTC).
+Question constraints
+Although we’re optimizing for disagreement, this is subject to constraint. Each question should:
+1. Be clear and, as far as possible, able to be resolved unambiguously under any circumstances.
+2. Target issues about which improvements in forecasting would be impactful.
+3. Be[a][b] asked in whatever format best allows us to differentiate between differences in opinion.
+4. Be distinct.
+Automatic systems to filter and improve questions will be applied to help meet these goals. These are detailed below.
+(1) Clarity
+Questions are either ambiguous because i) they are misspecified or malformed, which we can usually detect immediately, or ii) we end up in a situation later that we aren’t sure how to map to the stated outcomes because it is not clear how to apply the resolution criteria. We have developed automatic systems to filter and correct for these problems.
+Misspecified and malformed questions
+Questions can be malformed in many trivial ways e.g. not asking a question, not writing the question in English, not filling in required information about the range of values being considered. These are mostly easy to detect. Questions can also be misspecified for example by having outcomes that are not mutually exclusive and collectively exhaustive.
+
+
+A filter will be applied to reject misspecified questions. If you believe that the filter has fired in error, you will be able to appeal the decision.
+Ambiguous resolution criteria
+An adversarial system will be applied to help identify and patch loopholes and clarify edge cases. (A similar system was trending recently on X.) You will have the option to reject the clarifications offered.
+
+
+For example, a question might ask whether an event will happen by a certain date. The adversarial system may then suggest to clarify in the resolution criteria whether the event happening on the specified date would resolve positively or negatively. E.g. we could clarify the question ‘Will the Strait of Hormuz be open by May 1st?’ by adding ‘If it opens on May 1st that would count.’
+(2) Topicality
+Roughly, we want to focus the tournament on topics where having better forecasting would be economically or socially impactful. We want to avoid saying ‘important topics’ because e.g. sports results are very important to people and there is a lot of economic activity around sports, but it seems unlikely that significantly improving the forecasting of sports results would benefit wider society.
+
+
+To stay on topic we will apply a whitelist and blacklist system that relies on automated tagging by LLMs. Each question must have a tag from the whitelist and may not have any tags from the blacklist. The whitelist will be long and the blacklist will be as short as possible and both lists will be published in advance, as well as details on the system being used to do the tagging.
+(3) Discrimination
+There are usually many ways to ask questions about the same event and some of those allow for greater discrimination between answers than others. For example, ‘will the Strait of Hormuz open by August 1?’ and ‘when will the Strait of Hormuz open?’ are probing the same event, but the second formulation better allows us to discriminate between forecasts. Under the first formulation, forecasters with very different beliefs may appear to be in agreement because the threshold is being applied. For example, we may have a forecaster that is convinced the Strait will open tomorrow and another that is convinced it will open on June 1. Their predictions for whether the Strait will be open by August 1 will be the same.
+  
+
+Figure 1: the red and blue forecasters disagree strongly about the timing of the event, but the application of the arbitrary threshold makes their views appear to be the same.
+
+
+We have an automated system for detecting opportunities to reframe a question into a more discriminating form and prompting the question writer to adopt the alternative. Some examples of how questions may be reframed are presented in the following table.
+
+
+Original
+	Reframed
+	Will event X happen by date D?
+	When will event X happen?
+	Will the value of series S be greater than threshold X on date D?
+	 What value will series S take on date D?
+	Will the value of series S exceed/fall below value X within period P?
+	What is the maximum/minimum value that series S will take within period P?
+	Will candidate C win election E?
+	Who will win election E?
+	
+
+Underlying these examples, there’s a hierarchy of how discriminating different question types are, from most to least:
+1. Numerical[c][d][e][f] or date
+2. Multiple choice
+3. Binary
+And this corresponds to how finely the forecast is being specified or alternatively how difficult it would be to be right by chance. We want to move questions up this hierarchy, provided that can be done without changing the question too much.
+(4) Distinctness
+We want the tournament to probe the frontier widely and so we don’t want many questions asking essentially the same thing. A deduplication system will be applied to detect and reject questions that are too similar to existing questions in the tournament.
+
+
+This also addresses a bad incentive. Without a deduplication system in place, having seen a high-scoring question, the rational thing to do to maximise points is to repeatedly submit the same question. While the forecasters are incentivised to patch any problems that have been exposed in their AI system, they cannot work as quickly as someone simply resubmitting the same question.
+
+
+The deduplication system will rely on a first pass using vector similarity and a second pass with an LLM judge. Decisions may be appealed.
+Question scheduling
+Once a question has been submitted and accepted, it will be scheduled for release to the forecasters. Questions will be released no earlier than 24 hours after they are submitted. Questions will always be added directly to the publication queue and there will not be the option to programmatically delay the release of a question. (You are welcome to submit a question whenever you want to achieve the same effect.)
+
+
+Up to 5 questions will be published per-hour on-the-hour with the AI forecasters having 1 hour to make their forecasts before the question closes and is scored. The AI forecasters will make a one-time forecast for each question, the same way they do in the Metaculus FutureEval tournament.
+Background information about AI forecasting systems
+AI forecasting systems have become much more capable over the last year with some results that are competitive with top human forecasters. The most capable systems are universally LLM based and make extensive use of frontier models but significant differences persist in scaffolding design i.e. in approaches to how these agentic systems are structured, how they gather data, and what data sources they have access to.
+
+
+For example, there are highly capable systems that primarily rely on web search for gathering data, and there are systems that make almost no use of web search. There are systems that form continuous probability distributions by specifying points on the CDF and interpolating, and there are systems that output parametrised probability distributions. As far as we are aware, all of the most capable systems take many samples and apply some kind of aggregation, but there are some systems that ensemble a range of frontier models and some include fine-tuned open-source models.
+For AI forecasters
+Signing-up
+The tournament site will go live on Monday 20th April at the latest. Forecasters that have applied and been accepted will be able to sign-up using the email they submitted in their application.
+API documentation
+Documentation is available at https://competitions.mantic.com/api/
+Developing during the tournament
+Developers are encouraged to update their systems during the tournament in response to problems exposed by the question-writers.
+Scoring
+The tournament will use Metaculus-style spot scoring.
+Prizes
+There is a prize pool of $5k USD for forecasters that will be allocated based on the final table standings.
+Subsidies
+Nonprofessional forecasters may be eligible for forecast subsidies. These will be paid at the end of the tournament at a rate of $2 per question answered.
+Question scheduling
+Up to 3 questions will be released per-hour on-the-hour with a total of 500 questions over the duration of the tournament. Questions will be open for submissions for one hour.
+
+
+Appendix A: Disagreement Score Analysis on Metaculus Fall AIB 
+To assess the scoring metric we computed disagreement scores on 241 questions from the Metaculus Fall AIB tournament. We scraped forecasts from 7 top-performing bots (Panshul42, pgodzinai, lightningrod, AltasForecasting, GreeneiBot2, CumulativeBot, and manticAI), computed the disagreement score, and plotted histograms by question type (Figure 2). Note: these questions were not written with the specific purpose of inducing disagreement between AI forecasters.
+  
+
+Figure 2: Disagreement scores on Metaculus Fall AIB tournament by question type.
+The mean disagreement scores +/- one standard deviation were 25.6 +/- 22.0 for binary; 74.5 +/- 31.4 for numerical; and 49.5 +/- 20.7 for multiple choice.
+The binary question that produced the highest disagreement was Will major components of the Affordable Care Act be repealed or curtailed before 2026?. The bot’s predictions are reported in the below table. This question induced a disagreement score of 143.63.
+
+
+	Yes
+	No
+	Panshul42
+	10%
+	90%
+	pgodzinai
+	7%
+	93%
+	lightningrod
+	95%
+	5%
+	AltasForecasting
+	13%
+	87%
+	GreeneiBot2
+	5%
+	95%
+	CumulativeBot
+	9.1%
+	90.9%
+	manticAI
+	6.7%
+	93.3%
+	The multiple choice question that produced the highest disagreement was How many people will be added to the Viasna Belarusian political prisoners tracker in September 2025?. The bot’s predictions are reported in the below table (note: CumulativeBot did not produce a forecast for this question). This question induced a disagreement score of 102.93.
+
+
+	0-12
+	13-24
+	25 or more
+	Panshul42
+	53.5%
+	31.5%
+	15%
+	pgodzinai
+	68%
+	27%
+	5%
+	lightningrod
+	55%
+	35%
+	10%
+	AltasForecasting
+	20.8%
+	22.9%
+	56.3%
+	GreeneiBot2
+	7.7%
+	90.2%
+	2.1%
+	CumulativeBot
+	-
+	-
+	-
+	manticAI
+	58.7%
+	33.0%
+	8.3%
+	The numerical question that produced the highest disagreement was What will be the seasonally adjusted S&P/Case-Shiller US National Home Price Index in the following months? (Jul-25). The bot’s predictions are reported in the below table (NB: the statistics reported in the table don’t communicate differences in the tails of the forecasted distributions which affect the disagreement score). This question induced a disagreement score of 243.78.
+
+
+	median (25th percentile–75th percentile)
+	Panshul42
+	326 (325–326)
+	pgodzinai
+	320 (319–320)
+	lightningrod
+	329 (328–330)
+	AltasForecasting
+	326 (325–326)
+	GreeneiBot2
+	326 (326–327)
+	CumulativeBot
+	326 (325–327)
+	manticAI
+	326 (325–326)
+	
+
+
+
+[a]Is this a fitting way to ask date questions with a "Not by X date" condition? If so, should the end date range match that date? https://competitions.mantic.com/questions/10/when-will-spacex-conduct-an-initial-public-offering-ipo/
+[b]That is the correct format but yes it should have the date range match the end of the tournament. This should be being corrected automatically so I will check what has gone wrong in this case. Thanks for flagging!
+1 total reaction
+Michael Vella reacted with 👍 at 2026-04-21 6:24 PM UTC
+[c]Could there be some guidelines/automated check to turn numeric into discrete if it's a clear count question? Similarly, turning a question into MC such as Fed rates, which likely score better as numerical compared to multiple choice. While bots could/should adapt and eventually place mass appropriately, it's unfortunate that question writers are incentivized (and allowed?) to use numerical questions wherever possible even if not most fitting.
+[d]The system should be making these kinds of conversions already. Were you able to bypass the check?
+[e]I was able to get the Fed example you gave to pass the filters (https://competitions.mantic.com/questions/49/what-will-the-united-states-fed-funds-interest-rate-be-on-august-1-2026/). We're working on a fix. Thanks for flagging.
+[f]No problem. This one is what caught my eye https://competitions.mantic.com/questions/25/how-many-countries-will-who-report-as-having-new-cholera-or-acute-watery-diarrho/
+1 total reaction
+Ben Day reacted with 👍 at 2026-04-21 6:57 PM UTC
