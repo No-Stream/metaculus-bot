@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import logging
 from collections import Counter, defaultdict
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -75,6 +75,12 @@ SCORE_ATOL = 1e-6
 DRIFT_APPEARED = "appeared"
 DRIFT_DISAPPEARED = "disappeared"
 DRIFT_MOVED = "moved"
+
+# One table, so prior_snapshot hoists exactly the fields the drift path later reads flat.
+PLATFORM_DRIFT_ACCESSORS: tuple[tuple[str, Callable[[dict], float | None]], ...] = (
+    ("peer_score", peer_score),
+    ("spot_peer_score", spot_peer_score),
+)
 
 # The cohort constants hold strings ('43746', ...); perf records carry an int question_id.
 KNOWN_BUG_QUESTION_IDS: frozenset[int] = frozenset(int(qid) for qid in KNOWN_BUG_QIDS)
@@ -296,8 +302,8 @@ def prior_snapshot(prior_records: list[dict], prior_label: str) -> tuple[set[Rec
             "log_score": record.get("log_score"),
             "mc_log_score": record.get("mc_log_score"),
             "numeric_log_score": record.get("numeric_log_score"),
-            "peer_score": (record.get("metaculus_scores") or {}).get("peer_score"),
-            "spot_peer_score": (record.get("metaculus_scores") or {}).get("spot_peer_score"),
+            # Hoisted flat here and read flat by the drift path; insertion order is output order.
+            **{field: accessor(record) for field, accessor in PLATFORM_DRIFT_ACCESSORS},
             "our_prob_yes": record.get("our_prob_yes"),
             "config_era": record.get("config_era"),
             "triple_subera_fine": record.get("triple_subera_fine"),
@@ -434,18 +440,22 @@ def load_pull_rescores(path: Path) -> tuple[set[RecordKey], dict[RecordKey, list
     return set(fields_by_key), {key: sorted(set(fields)) for key, fields in fields_by_key.items()}, payload
 
 
-def _drift_against_prior(record: dict, prior: dict) -> tuple[list[dict], list[dict]]:
-    """One re-pulled record's score moves, split into ours (bot-side) and Metaculus's."""
+def _drift_against_prior(record: dict, prior_view: dict) -> tuple[list[dict], list[dict]]:
+    """One re-pulled record's score moves, split into ours (bot-side) and Metaculus's.
+
+    The two sides of each comparison are read DIFFERENTLY on purpose: ``docs/performance_analysis.md``
+    "Why the two sides of a drift comparison are read differently".
+    """
     key = record_key(record)
     bot_drift: list[dict] = []
     for score_field in BOT_DRIFT_FIELDS:
-        old, new = prior.get(score_field), record.get(score_field)
+        old, new = prior_view.get(score_field), record.get(score_field)
         transition = score_transition(old, new)
         if transition is not None:
             bot_drift.append({"key": key, "field": score_field, "transition": transition, "prior": old, "now": new})
     platform_drift: list[dict] = []
-    for score_field, now in (("peer_score", peer_score(record)), ("spot_peer_score", spot_peer_score(record))):
-        old = prior.get(score_field)
+    for score_field, accessor in PLATFORM_DRIFT_ACCESSORS:
+        old, now = prior_view.get(score_field), accessor(record)
         transition = score_transition(old, now)
         if transition is not None:
             platform_drift.append(

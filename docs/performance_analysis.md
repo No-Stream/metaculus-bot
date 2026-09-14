@@ -1557,6 +1557,34 @@ survives to a second pull already carried its score block in the first. The only
 scores in the whole archive are ten `fall-aib-2025` records with no `metaculus_scores` block at
 all, and that slug is reused rather than re-pulled, so they never enter the comparison.
 
+### Why the two sides of a drift comparison are read differently
+
+`_drift_against_prior` reads the prior side as `prior_view.get("peer_score")` and the current side
+as `peer_score(record)`, and that asymmetry is correct rather than a bug to tidy. The two arguments
+are different shapes. `record` is a live perf record, which carries its platform scores only nested
+under `metaculus_scores`; no archived record has ever carried a top-level `peer_score`, in any of
+the 6,353 records across the nine tagged rounds. `prior_view` is not a record at all: it is one
+value of the `prior_snapshot` index, an eight-key flat view that deliberately hoists
+`metaculus_scores.peer_score` and `.spot_peer_score` to top-level keys and keeps no nested block.
+So on the view the flat read is the only one that works and an accessor returns `None`, while on the
+record the reverse holds.
+
+Making both sides symmetric breaks the report in whichever direction you pick. Routing both through
+the accessors reads `None` for every prior value, which under the transition classifier turns every
+single re-pulled record into an `appeared`: 358 spurious entries on the 2026-09-01 to 2026-09-09
+comparison alone, 179 records times two fields, plus the alertable warning, in a round where
+Metaculus re-scored nothing. Routing both through the flat read would break the current side the
+same way. `PLATFORM_DRIFT_ACCESSORS` is the one table both ends use, so `prior_snapshot` hoists
+exactly the fields the drift path later reads flat and the two cannot drift apart; the snapshot goes
+through the accessors rather than indexing `metaculus_scores`, which keeps the spot-peer rule intact.
+`TestPriorViewIsFlatByConstruction` pins the shape of both arguments so a symmetric-looking
+"cleanup" fails a test that says why.
+
+Worth noting what the transition classifier bought here. Under the old both-non-null guard this
+same mistake would have been silent forever, because a `None` prior made the platform branch
+unable to report anything at all. It now announces itself as hundreds of `appeared` entries and a
+warning on the first real round, which is the failure mode a guard should have.
+
 ### The two rescore paths ask different questions, and should not be made to agree
 
 `rescore_diff.diff_platform_rescores` runs on the PULL side and asks whether Metaculus touched
@@ -1573,6 +1601,5 @@ path should be widened to imitate the other. The dataset side must keep reading 
 accessors rather than indexing `metaculus_scores` directly, or the continuous-question halving
 lands twice or not at all. The one thing that must agree is checked: `_log_pull_tag_agreement`
 warns when the local ternary `platform_rescored_pull_tag` distribution departs from the pull's own
-`tag_distribution`. Both sides read the same quantity for the two shared fields, verified against
-the archive: `prior_snapshot` populates its `peer_score` / `spot_peer_score` keys off the prior
-record's `metaculus_scores` block, and no archived record carries a top-level `peer_score` at all.
+`tag_distribution`. Both sides do read the same quantity for the two shared fields, by different
+route on each end, for the reason the previous section gives.

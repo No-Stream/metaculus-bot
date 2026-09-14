@@ -16,17 +16,21 @@ import pytest
 
 from metaculus_bot.performance_analysis import round_dataset, round_outputs
 from metaculus_bot.performance_analysis.eras import B4E9DF0_MERGED_AT, WIDENING_FLIP_MERGED_AT
+from metaculus_bot.performance_analysis.platform_scores import spot_peer_score
 from metaculus_bot.performance_analysis.round_dataset import (
     DRIFT_APPEARED,
     DRIFT_DISAPPEARED,
     DRIFT_MOVED,
+    PLATFORM_DRIFT_ACCESSORS,
     SCORE_ATOL,
     TAG_FIELDS,
     RoundSpec,
+    _drift_against_prior,
     build_round_dataset,
     dedup,
     heal_stored_scores,
     is_scored,
+    prior_snapshot,
     score_transition,
     strip_tags,
 )
@@ -149,6 +153,37 @@ class TestHealStoredScores:
         record["rescored_fields_prior_rounds"] = []
         assert heal_stored_scores([record], "fresh_this-round") == []
         assert record["rescored_fields"] == []
+
+
+class TestPriorViewIsFlatByConstruction:
+    """The asymmetry a symmetric-looking "fix" breaks: 358 spurious `appeared` on one real round."""
+
+    def test_a_real_record_carries_its_platform_scores_only_nested(self) -> None:
+        record = _binary_record(1, 2, WEIGHTED_SLUG, TRIPLE_SUBMITTED)
+        assert record["metaculus_scores"]["spot_peer_score"] == 5.0
+        assert "spot_peer_score" not in record, "no archived record carries a top-level platform score"
+
+    def test_the_prior_view_hoists_them_flat_and_keeps_no_nested_block(self) -> None:
+        _, _, index = prior_snapshot([_binary_record(1, 2, WEIGHTED_SLUG, TRIPLE_SUBMITTED)], "prior-round")
+        view = index[(1, 2)]
+        assert view["peer_score"] == 4.0
+        assert view["spot_peer_score"] == 5.0
+        assert "metaculus_scores" not in view
+
+    def test_the_accessors_read_a_live_record_and_never_the_prior_view(self) -> None:
+        record = _binary_record(1, 2, WEIGHTED_SLUG, TRIPLE_SUBMITTED)
+        _, _, index = prior_snapshot([record], "prior-round")
+        assert spot_peer_score(record) == 5.0
+        assert spot_peer_score(index[(1, 2)]) is None, "the view is flat, so an accessor cannot read it"
+
+    def test_the_view_hoists_exactly_the_fields_the_drift_path_reads(self) -> None:
+        _, _, index = prior_snapshot([_binary_record(1, 2, WEIGHTED_SLUG, TRIPLE_SUBMITTED)], "prior-round")
+        assert {field for field, _ in PLATFORM_DRIFT_ACCESSORS} <= set(index[(1, 2)])
+
+    def test_an_unmoved_platform_score_is_no_drift_through_the_real_read_paths(self) -> None:
+        record = _binary_record(1, 2, WEIGHTED_SLUG, TRIPLE_SUBMITTED)
+        _, _, index = prior_snapshot([_binary_record(1, 2, WEIGHTED_SLUG, TRIPLE_SUBMITTED)], "prior-round")
+        assert _drift_against_prior(record, index[(1, 2)]) == ([], [])
 
 
 class TestScoreTransition:
