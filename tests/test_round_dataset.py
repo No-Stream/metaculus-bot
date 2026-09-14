@@ -17,12 +17,17 @@ import pytest
 from metaculus_bot.performance_analysis import round_dataset, round_outputs
 from metaculus_bot.performance_analysis.eras import B4E9DF0_MERGED_AT, WIDENING_FLIP_MERGED_AT
 from metaculus_bot.performance_analysis.round_dataset import (
+    DRIFT_APPEARED,
+    DRIFT_DISAPPEARED,
+    DRIFT_MOVED,
+    SCORE_ATOL,
     TAG_FIELDS,
     RoundSpec,
     build_round_dataset,
     dedup,
     heal_stored_scores,
     is_scored,
+    score_transition,
     strip_tags,
 )
 from metaculus_bot.performance_analysis.round_outputs import write_round_outputs
@@ -144,6 +149,62 @@ class TestHealStoredScores:
         record["rescored_fields_prior_rounds"] = []
         assert heal_stored_scores([record], "fresh_this-round") == []
         assert record["rescored_fields"] == []
+
+
+class TestScoreTransition:
+    """A one-sided null is a change. Nine archived rounds saw zero of these, and one q44798 move."""
+
+    def test_two_nulls_are_not_a_change(self) -> None:
+        assert score_transition(None, None) is None
+
+    def test_a_score_arriving_where_there_was_none_appeared(self) -> None:
+        assert score_transition(None, -5.4) == DRIFT_APPEARED
+
+    def test_a_score_metaculus_withdrew_disappeared(self) -> None:
+        assert score_transition(5.4, None) == DRIFT_DISAPPEARED
+
+    def test_a_real_move_beyond_tolerance_moved(self) -> None:
+        assert score_transition(5.406978908431959, -5.418975442292634) == DRIFT_MOVED
+
+    def test_serialization_wiggle_inside_the_tolerance_held(self) -> None:
+        assert score_transition(5.0, 5.0 + SCORE_ATOL / 2) is None
+
+    def test_a_zero_score_is_a_value_not_an_absence(self) -> None:
+        assert score_transition(0.0, None) == DRIFT_DISAPPEARED
+        assert score_transition(None, 0.0) == DRIFT_APPEARED
+
+
+class TestPlatformScoreDisappearing:
+    """The gap this closed: a withdrawn score used to leave the drift report reading zero."""
+
+    @pytest.fixture
+    def dataset(self, tmp_path: Path) -> round_dataset.RoundDataset:
+        fresh = _binary_record(101, 201, WEIGHTED_SLUG, TRIPLE_SUBMITTED)
+        fresh["metaculus_scores"] = {"peer_score": 4.0, "coverage": 1.0}
+        prior = [_binary_record(101, 201, WEIGHTED_SLUG, TRIPLE_SUBMITTED)]
+        spec = _write_round(tmp_path, fresh=[fresh], prior=prior, weights={101: 1.0})
+        return build_round_dataset(spec)
+
+    def test_the_withdrawn_field_is_reported_as_drift(self, dataset: round_dataset.RoundDataset) -> None:
+        assert [(e["field"], e["transition"], e["prior"], e["now"]) for e in dataset.platform_score_drift] == [
+            ("spot_peer_score", DRIFT_DISAPPEARED, 5.0, None)
+        ]
+
+    def test_the_record_carries_the_field_in_its_rescore_tag(self, dataset: round_dataset.RoundDataset) -> None:
+        assert dataset.records[0]["platform_rescored_this_round"] == ["spot_peer_score"]
+
+    def test_the_warning_names_the_transition(self, tmp_path: Path, caplog) -> None:
+        fresh = _binary_record(101, 201, WEIGHTED_SLUG, TRIPLE_SUBMITTED)
+        fresh["metaculus_scores"] = {"peer_score": 4.0, "coverage": 1.0}
+        spec = _write_round(
+            tmp_path,
+            fresh=[fresh],
+            prior=[_binary_record(101, 201, WEIGHTED_SLUG, TRIPLE_SUBMITTED)],
+            weights={101: 1.0},
+        )
+        with caplog.at_level(logging.WARNING):
+            build_round_dataset(spec)
+        assert any(DRIFT_DISAPPEARED in record.message for record in caplog.records)
 
 
 class TestBuildRoundDataset:

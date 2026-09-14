@@ -71,6 +71,11 @@ SCORE_FIELDS: tuple[str, ...] = ("brier_score", "log_score", "numeric_log_score"
 BOT_DRIFT_FIELDS: tuple[str, ...] = ("log_score", "mc_log_score", "numeric_log_score")
 SCORE_ATOL = 1e-6
 
+# The three ways a score can differ between rounds; a null on one side is a move, not a non-event.
+DRIFT_APPEARED = "appeared"
+DRIFT_DISAPPEARED = "disappeared"
+DRIFT_MOVED = "moved"
+
 # The cohort constants hold strings ('43746', ...); perf records carry an int question_id.
 KNOWN_BUG_QUESTION_IDS: frozenset[int] = frozenset(int(qid) for qid in KNOWN_BUG_QIDS)
 DEGRADED_FULL_QUESTION_IDS: frozenset[int] = frozenset(int(qid) for qid in DEGRADED_RUN_QIDS)
@@ -323,13 +328,26 @@ def dedup(records: list[dict]) -> list[dict]:
     return list(by_key.values())
 
 
+def score_transition(prior_value: float | None, now: float | None) -> str | None:
+    """Which of the three ways a score pair differs between two reads, or None when it held.
+
+    A score appearing or disappearing is a real change, so it is classified rather than skipped:
+    ``docs/performance_analysis.md`` "The three drift transitions".
+    """
+    if prior_value is None and now is None:
+        return None
+    if prior_value is None:
+        return DRIFT_APPEARED
+    if now is None:
+        return DRIFT_DISAPPEARED
+    return DRIFT_MOVED if abs(float(prior_value) - float(now)) > SCORE_ATOL else None
+
+
 def _score_deltas(before: dict[str, float | None], record: dict) -> dict[str, dict]:
     deltas: dict[str, dict] = {}
     for score_field in SCORE_FIELDS:
         old, new = before[score_field], record.get(score_field)
-        if old is None and new is None:
-            continue
-        if old is None or new is None or abs(float(old) - float(new)) > SCORE_ATOL:
+        if score_transition(old, new) is not None:
             deltas[score_field] = {"before": old, "after": new}
     return deltas
 
@@ -422,14 +440,29 @@ def _drift_against_prior(record: dict, prior: dict) -> tuple[list[dict], list[di
     bot_drift: list[dict] = []
     for score_field in BOT_DRIFT_FIELDS:
         old, new = prior.get(score_field), record.get(score_field)
-        if old is not None and new is not None and abs(float(old) - float(new)) > SCORE_ATOL:
-            bot_drift.append({"key": key, "field": score_field, "prior": old, "now": new})
+        transition = score_transition(old, new)
+        if transition is not None:
+            bot_drift.append({"key": key, "field": score_field, "transition": transition, "prior": old, "now": new})
     platform_drift: list[dict] = []
     for score_field, now in (("peer_score", peer_score(record)), ("spot_peer_score", spot_peer_score(record))):
         old = prior.get(score_field)
-        if old is not None and now is not None and abs(float(old) - now) > SCORE_ATOL:
-            platform_drift.append({"key": key, "field": score_field, "prior": old, "now": now})
+        transition = score_transition(old, now)
+        if transition is not None:
+            platform_drift.append(
+                {"key": key, "field": score_field, "transition": transition, "prior": old, "now": now}
+            )
     return bot_drift, platform_drift
+
+
+def _transition_tally(drift: list[dict]) -> dict[str, int]:
+    """How many of this round's drift entries appeared, disappeared and moved."""
+    counts = Counter(entry["transition"] for entry in drift)
+    return {state: counts[state] for state in (DRIFT_APPEARED, DRIFT_DISAPPEARED, DRIFT_MOVED) if counts[state]}
+
+
+def _log_drift_entries(drift: list[dict]) -> None:
+    for entry in drift:
+        logger.info(f"      {entry['key']} {entry['field']} {entry['transition']}: {entry['prior']} -> {entry['now']}")
 
 
 def tag_platform_rescores(
@@ -459,16 +492,18 @@ def tag_platform_rescores(
         record["platform_rescored_pull_tag"] = (key in pull_keys) if compared else None
 
     _log_pull_tag_agreement(records, spec.weighted_slug, pull_payload)
-    logger.info(f"  bot log-score drift: {len(bot_drift)} field(s) moved")
-    for entry in bot_drift:
-        logger.info(f"      {entry['key']} {entry['field']}: {entry['prior']} -> {entry['now']}")
-    logger.info(f"  metaculus platform-score drift (spot_peer + peer): {len(platform_drift)} field(s) moved")
-    for entry in platform_drift:
-        logger.info(f"      {entry['key']} {entry['field']}: {entry['prior']} -> {entry['now']}")
+    logger.info(f"  bot log-score drift: {len(bot_drift)} field(s) changed {_transition_tally(bot_drift)}")
+    _log_drift_entries(bot_drift)
+    logger.info(
+        f"  metaculus platform-score drift (spot_peer + peer): {len(platform_drift)} field(s) changed "
+        f"{_transition_tally(platform_drift)}"
+    )
+    _log_drift_entries(platform_drift)
     if platform_drift:
         logger.warning(
-            "a platform score moved on a re-pulled record: Metaculus re-scored or re-resolved it, so "
-            "any prior-round table quoting the old value is stale for that question."
+            f"a platform score {'/'.join(sorted({e['transition'] for e in platform_drift}))} on a re-pulled "
+            "record: Metaculus re-scored, re-resolved or un-scored it, so any prior-round table quoting "
+            "the old value is stale for that question."
         )
     cumulative = [record for record in records if record["platform_rescored"]]
     logger.info(

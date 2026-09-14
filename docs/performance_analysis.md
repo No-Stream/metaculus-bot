@@ -1526,3 +1526,53 @@ pull with no overlapping key produce identical tags.
 a round comparison use one threshold. The platform's scores round-trip through JSON exactly and
 our scorer reproduces them to about 1e-14, while the gaps this exists to catch are whole points:
 the known-stale q44798 gaps start at 0.6.
+
+### The three drift transitions
+
+`round_dataset.score_transition` classifies every prior-versus-now score pair the round compares,
+and each entry of `counts_by_era.json`'s `bot_log_score_drift_detail` and `platform_drift_detail`
+carries the answer in its own `transition` field beside the `prior` and `now` values:
+
+| Transition | What it means |
+|---|---|
+| `moved` | Both rounds carried a value and they differ by more than `SCORE_ATOL`. |
+| `disappeared` | The prior round carried a value and this round carries none. |
+| `appeared` | The prior round carried none and this round carries a value. |
+
+The two one-sided cases used to be skipped outright: the guard required both sides non-null, so a
+score Metaculus withdrew read as no drift at all. That made the top-line
+`metaculus_platform_score_drift_fields` report zero and suppressed its warning while the pull-side
+diff, which has always treated a one-sided null as a change, reported the same record as rescored.
+A withdrawn score is the anomalous direction and the one a stale published table most needs to
+hear about, so it is now drift.
+
+The transition is a label on values the entry already carried rather than a separate count block,
+because the measured frequency says no reader will ever have a long list to skim. Over the nine
+archived rounds that carry a tagged file, 587 fresh-pull records matched a prior counterpart and
+produced zero `appeared`, zero `disappeared`, and exactly one `moved`: q44798 on both `peer_score`
+and `spot_peer_score` in the 2026-09-01 round. `appeared` is close to structurally impossible on a
+compared record, because the collector pulls only resolved questions (`resolution_raw` is non-null
+on all 905 records of the 2026-09-09 round) and Metaculus scores at resolution, so a record that
+survives to a second pull already carried its score block in the first. The only null platform
+scores in the whole archive are ten `fall-aib-2025` records with no `metaculus_scores` block at
+all, and that slug is reused rather than re-pulled, so they never enter the comparison.
+
+### The two rescore paths ask different questions, and should not be made to agree
+
+`rescore_diff.diff_platform_rescores` runs on the PULL side and asks whether Metaculus touched
+this question at all. It diffs this pull against the prior round's raw `perf_<slug>.json`, over
+`resolution_raw`, `resolution_parsed` and every key of `metaculus_scores` on either side.
+
+`round_dataset._drift_against_prior` runs on the DATASET side and asks whether the numbers a round
+actually ranks and publishes on moved. It reads `peer_score` and `spot_peer_score` through
+`platform_scores.py`'s accessors, against the prior round's `perf_all_tagged.json`, which is the
+dataset every downstream lane read and therefore the baseline a stale table came from.
+
+Different baselines and different breadth, so the counts are not expected to match, and neither
+path should be widened to imitate the other. The dataset side must keep reading through the
+accessors rather than indexing `metaculus_scores` directly, or the continuous-question halving
+lands twice or not at all. The one thing that must agree is checked: `_log_pull_tag_agreement`
+warns when the local ternary `platform_rescored_pull_tag` distribution departs from the pull's own
+`tag_distribution`. Both sides read the same quantity for the two shared fields, verified against
+the archive: `prior_snapshot` populates its `peer_score` / `spot_peer_score` keys off the prior
+record's `metaculus_scores` block, and no archived record carries a top-level `peer_score` at all.
