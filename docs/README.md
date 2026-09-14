@@ -17,6 +17,9 @@ need; the repo-root pointers at the bottom cover quick-start and design history.
 | [roster_history.md](roster_history.md) | The ensemble roster's design rule (latest per vendor, resolved only from a live model-list read), the dated history of every roster change and the merge that made it live, the support-model roles, and the two subsystems that are wired but dormant in prod. |
 | [performance_analysis.md](performance_analysis.md) | Residual-analysis conventions and receipts: era bucketing with the merge-to-main rule, the exclusion cohorts, the research archive's three record classes, the PIT and spot-peer conventions, `spot_peer_delta`, the starved outer tail, per-model recovery, and the clip-threshold sweep. |
 | [operations.md](operations.md) | Running the bot: environment setup with `uv`, the shared vs. personal API keys, Google AI Studio billing, the production workflows and their env flags, credit telemetry, backtesting, and the cost gate (any live or paid run needs operator approval). |
+| [constants.md](constants.md) | One entry per value in `constants.py`, in file order: the measurement, incident or decision behind it. The code keeps one line of why and a pointer here. |
+| [telemetry_markers.md](telemetry_markers.md) | The run-log marker registry: every `MarkerSpec` with its fields and receipts, how the harvester matches them, the qid_kind convention, and the HTML-comment markers. |
+| [supply_probe.md](supply_probe.md) | The question-supply probe: why it exists, what each report block means, the Mantic mode and its public-snapshot caveat, and the API facts it is built around. |
 
 ## Repo-root references
 
