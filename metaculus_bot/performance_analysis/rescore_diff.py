@@ -1,47 +1,23 @@
 """Detecting an IN-PLACE re-resolution or re-score between two performance pulls.
 
-Metaculus can change a question's resolution after the fact without moving any timestamp
-we store. On 2026-08-31 it resolved q44798 (post 44645, "Halo: Campaign Evolved
-Metascore") at 80 — the PS5 hero card on Metacritic — and then, some time in the next
-26 hours, edited it to 82, the Xbox card the resolution criteria actually name.
-``resolution_set_time`` still read 2026-08-31T21:38:45Z afterwards, which PRECEDES the
-pull that read 80, so nothing timestamp-shaped could have flagged the edit. The record's
-spot peer went from +5.41 to -5.42 between two consecutive rounds, and every table the
-earlier round had published about that question was silently stale.
+Metaculus can change a question's resolution after the fact without moving any timestamp we
+store, so the only reliable detector is a value-level diff of the pull against its predecessor.
+:func:`diff_platform_rescores` does that, tagging each re-pulled record in place: the RESOLUTION
+(``resolution_raw`` and its parsed form) plus every ``metaculus_scores`` key on either side.
 
-So the only reliable detector is a value-level diff of the pull against its predecessor.
-:func:`diff_platform_rescores` does that, tagging each re-pulled record in place. It
-compares two things:
+The tag is deliberately THREE-state, because "compared and nothing moved" and "never compared"
+are different facts and the second is what a run with no ``--prior`` produces:
 
-* the RESOLUTION itself (``resolution_raw`` and its parsed form), and
-* every field of ``metaculus_scores`` — the union of the keys on both sides, so a field
-  Metaculus adds later is diffed without an edit here.
-
-The tag is deliberately a THREE-state answer, because "we compared and nothing moved" and
-"we never compared" are different facts and the second is what a run with no ``--prior``
-produces:
-
-* ``platform_rescored is None`` — no prior record existed for this (question, post), so
-  nothing was compared. Also the state of every record when no prior dataset is supplied
-  at all.
+* ``platform_rescored is None`` — no prior record existed for this (question, post).
 * ``platform_rescored is False`` — compared against a prior record, nothing moved.
 * ``platform_rescored is True`` — compared, and at least one field moved.
-  ``platform_rescored_fields`` names which, ``prior_resolution`` carries the prior
-  ``resolution_raw`` (equal to the current one on a score-only re-score, so a reader can
-  tell the two cases apart), and ``prior_metaculus_scores`` carries the prior score block
-  so a downstream table can show both numbers without re-reading the old file.
+  ``platform_rescored_fields`` names which, and ``prior_resolution`` /
+  ``prior_metaculus_scores`` carry the prior values so a table can show both.
 
-Naming note: the field is ``platform_rescored_fields`` rather than the ``rescored_fields``
-the prototype used, because ``scratch/residual_2026-09-01/bucket_by_era.py`` already
-spends ``rescored_fields`` on something else entirely — the BOT-side score fields
-``collector.rescore_records`` healed from stored inputs. One name for "our scorer changed
-its mind" and "Metaculus changed the resolution" would make the round's own JSON
-unreadable.
-
-Bot-side score fields (``log_score``, ``numeric_log_score``, ``mc_log_score``,
-``brier_score``) are NOT compared here. They are pure functions of inputs the record
-carries, so a change in one means our scorer changed, not the platform — that is
-``rescore_records``'s job, and mixing the two would attribute our own fix to Metaculus.
+Bot-side score fields are NOT compared here; they are ``collector.rescore_records``'s job and
+land in ``round_dataset``'s separately-named ``rescored_fields``. The q44798 incident behind this
+module, the naming split, and the reason each prior snapshot is attached only to a moved record:
+``docs/performance_analysis.md`` "Bot-side healing versus platform re-resolution".
 """
 
 from __future__ import annotations
@@ -52,18 +28,12 @@ from dataclasses import dataclass
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-# Resolution fields compared verbatim. ``resolution_raw`` is the string Metaculus reported
-# ("82", "yes", "above_upper_bound"); ``resolution_parsed`` is our coercion of it, carried
-# too so a parse change shows up as its own field rather than hiding behind an equal raw.
+# Both, so a parse change shows as its own field rather than hiding behind an equal raw string.
 RESOLUTION_FIELDS: tuple[str, ...] = ("resolution_raw", "resolution_parsed")
 
 PLATFORM_SCORE_BLOCK = "metaculus_scores"
 
-# Recomputation/serialization wiggle versus a genuinely different value. The platform's own
-# scores round-trip through JSON exactly and our scorer reproduces them to ~1e-14, while the
-# real gaps this exists to catch are whole points (the known-stale q44798 gaps start at 0.6).
-# ``collector.rescore_records`` imports this rather than keeping its own copy, so the
-# "changed" threshold is the same number on both sides of a round comparison.
+# Serialization wiggle versus a real move; collector.rescore_records imports it (see docs).
 RESCORE_ATOL: float = 1e-6
 
 
@@ -188,8 +158,7 @@ def diff_platform_rescores(prior_records: Sequence[dict], new_records: Sequence[
     if duplicates:
         logger.warning(
             f"PLATFORM_RESCORED: prior dataset holds {len(duplicates)} duplicated "
-            f"(question_id, post_id) key(s), last wins; first five: {duplicates[:5]} "
-            "(all of them are on the returned RescoreDiff.duplicate_prior_keys)"
+            f"(question_id, post_id) key(s), last wins: {duplicates}"
         )
 
     compared = 0
@@ -236,9 +205,7 @@ def _apply_tag(record: dict, *, prior: dict | None, changes: Sequence[FieldChang
         return
     record["platform_rescored"] = bool(changes)
     record["platform_rescored_fields"] = [change.field for change in changes]
-    # Only carried on a record that actually moved: on an unchanged record the current
-    # values ARE the prior ones, and copying them onto every record would double the size
-    # of a dataset to say nothing.
+    # Moved records only: on an unchanged one the current values ARE the prior ones (see docs).
     record["prior_resolution"] = prior.get("resolution_raw") if changes else None
     record["prior_metaculus_scores"] = prior.get(PLATFORM_SCORE_BLOCK) if changes else None
 
@@ -252,9 +219,7 @@ def _tag_field_values(record: dict, name: str) -> tuple[object, object]:
         return prior_scores.get(key), new_scores.get(key)
     if name == "resolution_raw":
         return record.get("prior_resolution"), record.get("resolution_raw")
-    # resolution_parsed: the tag stores only the raw prior value, so the old parse is not
-    # recoverable from the record. Reported as None rather than guessed — resolution_raw
-    # moves with it in every real case, and that row carries the values.
+    # resolution_parsed: the old parse is not recoverable from the tag, so it is not guessed.
     return None, record.get(name)
 
 
@@ -280,8 +245,7 @@ def render_rescore_summary(records: Sequence[dict]) -> list[str]:
         f"{len(rescored)} re-scored or re-resolved."
     ]
     if compared == 0:
-        # Cause-agnostic: a dataset that never went through the diff and a prior pull with no
-        # overlapping key produce the identical tags, so the text claims neither.
+        # Cause-agnostic: an undiffed dataset and a non-overlapping prior tag identically.
         lines.append(
             "  Nothing was compared: no record carries a prior-pull match, so this says nothing "
             "about whether prior-round tables are current."

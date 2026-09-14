@@ -1,4 +1,4 @@
-.PHONY: install lock test test_verbose all lint lint_imports deps format typecheck typecheck_ty cov audit run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research sync_telemetry sync_raw_research sync_all resync_from_store backfill_research download_research download_run_logs download_raw_research backfill_comments score_ghosts close_margin_watch supply_probe supply_probe_mantic cost_report dispatch_watch cronjob_dispatch_setup backtest_with_cache run_mantic run_mantic_one strip_bench probe_resolver replay_ladder
+.PHONY: install lock test test_verbose all lint lint_imports deps format typecheck typecheck_ty cov audit run benchmark precommit precommit_all precommit_install analyze_correlations analyze_correlations_latest backtest_smoke_test backtest_small backtest_medium backtest_large ablation_qa_research ablation_smoke ablation_small ablation_medium ablation_score test_e2e test_live test_fast check_credits sync_research sync_telemetry sync_raw_research sync_all resync_from_store backfill_research download_research download_run_logs download_raw_research backfill_comments score_ghosts close_margin_watch supply_probe supply_probe_mantic probe_slugs verify_pull cost_report dispatch_watch cronjob_dispatch_setup backtest_with_cache run_mantic run_mantic_one strip_bench probe_resolver replay_ladder artifacts_link artifacts_check artifacts_migrate
 
 # Stream logs live from recipes; avoid per-target buffering
 MAKEFLAGS += --output-sync=none
@@ -327,6 +327,24 @@ supply_probe:
 supply_probe_mantic:
 	uv run python scripts/supply_probe.py --platform mantic $(ARGS)
 
+# Which season slugs exist, which the repo's constants point at, and which are stale: one project
+# GET per candidate (the configured slugs plus the generated season-successor spellings). Read-only
+# + free (Metaculus project metadata only; no LLM, no research, no publish). The project object is
+# the authoritative existence check because the tournaments LIST omits an `unlisted` project, which
+# is what a new season is before its first question. Post counts are supply_probe's job.
+# ARGS="--seasons-ahead 2", ARGS="--slugs <a> <b>" for extras, ARGS="--output <path>".
+probe_slugs:
+	uv run python scripts/probe_slugs.py $(ARGS)
+
+# Coverage audit of a completed residual-round pull, FULLY OFFLINE (no network at all): which
+# resolved posts produced no record and why, resolved group members with no record, the diff versus
+# the prior round, whether every overlapping platform score reproduces, and whether the pull still
+# parses per-model forecasts out of the bot's comments. Recordless posts a prior round already
+# classified are derived from that round's own checkpoint, so nothing is hardcoded per round.
+# Needs ARGS="--records <path>"; add --prior-records for checks 3-5 and --output for the new cohort.
+verify_pull:
+	uv run python scripts/verify_pull.py $(ARGS)
+
 # Cost per question off the telemetry archive (read-only + free; run sync_telemetry first): per
 # run (questions, charged $, $/question), per role ($/question, prompt and output tokens per
 # question, prompt-cache share, largest single prompt) and the week-over-week median $/question.
@@ -417,8 +435,25 @@ check_credits:
 # PAID, PERSONAL KEY ONLY (ask-first gate, see AGENTS.md): the paired section-strip bench forecasts
 # every resolved gap-fill pair four ways (full bundle, minus v1, minus v2, minus both) with one cheap
 # model on OPENROUTER_API_KEY and scores the arms against the resolutions. Nothing publishes and no
-# research runs; the estimate at the default 3 replicates is about $1.25. A bare `make strip_bench`
-# prints the plan and refuses; ARGS="--dry-run" is the free view; ARGS="--i-accept-spend" runs it
-# under --max-spend-usd (default 10); ARGS="--rescore <run dir>" rebuilds results offline.
+# research runs; the estimate at the default 3 replicates is about $1.25. Every mode except
+# --rescore needs --pairs and --perf-json, which name the round directory being benched (they used
+# to default to a fixed round and silently went stale). So the plan-and-refuse call is
+# ARGS="--pairs <pairs.jsonl> --perf-json <perf_all_tagged.json>", the same plus ARGS="--dry-run"
+# is the free view, plus ARGS="--i-accept-spend" runs it under --max-spend-usd (default 10), and
+# ARGS="--rescore <run dir>" rebuilds results offline from a finished run.
 strip_bench:
 	uv run python -m scripts.probes.section_strip_bench $(ARGS)
+
+# Symlink the gitignored artifact trees (backtests/, scratch/, benchmarks/, research_outputs/,
+# run_logs/) to the private sibling repo that carries them between machines. Free, offline, and
+# no LLM or research call. `artifacts_check` reports without changing anything; `artifacts_migrate`
+# is the one-time move on the machine that currently holds the data. See scripts/artifacts_link.sh
+# for why the artifacts live in a separate PRIVATE repo and why they are stored raw.
+artifacts_link:
+	@scripts/artifacts_link.sh
+
+artifacts_check:
+	@scripts/artifacts_link.sh --check
+
+artifacts_migrate:
+	@scripts/artifacts_link.sh --migrate

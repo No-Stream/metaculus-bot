@@ -11,8 +11,11 @@ Fully offline: the comparison tests are pure dict-to-dict, and the CLI class at 
 patches both dataset loads, so nothing here touches the API or the disk.
 """
 
+import json
 import logging
 from unittest.mock import patch
+
+import pytest
 
 from metaculus_bot.performance_analysis import cli as perf_cli
 from metaculus_bot.performance_analysis.rescore_diff import (
@@ -269,7 +272,7 @@ class TestPerformanceCliPriorWiring:
     """
 
     def test_the_cached_prior_path_diffs_and_prints_the_move(self, capsys):
-        # load_dataset is called for --prior first, then for --cached (cli.main's order).
+        """The two loads are ordered --prior then --cached, which is ``cli.main``'s own order."""
         prior = [_record()]
         new = [_record(resolution_raw="82", resolution_parsed=82.0, spot_peer=-5.4190)]
 
@@ -292,3 +295,54 @@ class TestPerformanceCliPriorWiring:
             perf_cli.main(["--cached", "new.json"])
 
         assert "Platform re-resolution diff" not in capsys.readouterr().out
+
+
+class TestPerformanceCliOutput:
+    """``--output`` has to save on the CACHED path too, and must never default to a real file.
+
+    ``save_dataset`` used to sit inside the live-pull branch, so ``--cached X --prior Y
+    --output Z`` ran the diff, tagged the records in memory and wrote nothing: the flag was
+    accepted and discarded, and the tagged dataset died with the process. Nine residual rounds
+    carried a ``diff_prior.py`` whose only job was to call the diff and save the result.
+
+    The other half of the fix is that ``--output`` no longer defaults to
+    ``scratch/performance_data.json``. Saving on the cached path under a default output would
+    have made a read-only report clobber an unrelated pull, and a fresh clone has no
+    ``scratch/`` at all.
+    """
+
+    def _write(self, path, records: list[dict]) -> str:
+        path.write_text(json.dumps(records), encoding="utf-8")
+        return str(path)
+
+    def test_the_cached_path_saves_the_tagged_records_to_output(self, tmp_path, capsys):
+        prior_path = self._write(tmp_path / "old.json", [_record()])
+        cached_path = self._write(tmp_path / "new.json", [_record(resolution_raw="82", resolution_parsed=82.0)])
+        out_path = tmp_path / "tagged.json"
+
+        with patch.object(perf_cli, "generate_report", return_value=""):
+            perf_cli.main(["--cached", cached_path, "--prior", prior_path, "--output", str(out_path)])
+
+        saved = json.loads(out_path.read_text(encoding="utf-8"))
+        assert [record["platform_rescored"] for record in saved] == [True]
+        assert saved[0]["platform_rescored_fields"] == ["resolution_raw", "resolution_parsed"]
+
+    def test_the_cached_path_without_output_writes_nothing(self, tmp_path, capsys):
+        cached_path = self._write(tmp_path / "new.json", [_record()])
+
+        with patch.object(perf_cli, "generate_report", return_value=""):
+            perf_cli.main(["--cached", cached_path])
+
+        assert list(tmp_path.iterdir()) == [tmp_path / "new.json"]
+
+    def test_a_live_pull_without_output_is_refused_before_any_network_call(self):
+        with (
+            patch.object(perf_cli, "verify_metaculus_api_identity") as preflight,
+            patch.object(perf_cli, "build_performance_dataset") as pull,
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            perf_cli.main(["--tournament", "fall-aib-2026"])
+
+        assert exit_info.value.code == 2
+        preflight.assert_not_called()
+        pull.assert_not_called()

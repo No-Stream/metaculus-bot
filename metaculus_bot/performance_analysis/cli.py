@@ -3,6 +3,9 @@
 Usage:
     python -m metaculus_bot.performance_analysis [--tournament SLUG] [--output PATH] [--cached PATH]
                                                  [--prior PATH]
+
+``--output`` saves on both paths and has no default: docs/performance_analysis.md
+"The round pull, and why ``--prior`` is mandatory".
 """
 
 import argparse
@@ -16,14 +19,20 @@ from metaculus_bot.performance_analysis.rescore_diff import diff_platform_rescor
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-DEFAULT_OUTPUT_PATH = "scratch/performance_data.json"
 DEFAULT_TOURNAMENT = "spring-aib-2026"
 
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Metaculus bot performance analysis")
     parser.add_argument("--tournament", default=DEFAULT_TOURNAMENT, help="Tournament slug (default: %(default)s)")
-    parser.add_argument("--output", default=DEFAULT_OUTPUT_PATH, help="Output JSON path (default: %(default)s)")
+    parser.add_argument(
+        "--output",
+        default=None,
+        help=(
+            "Where to save the dataset. Saves on both the live-pull and the --cached path, and is "
+            "REQUIRED for a live pull. Omit it on --cached for a read-only report."
+        ),
+    )
     parser.add_argument("--cached", default=None, help="Load from cached JSON instead of fetching from API")
     parser.add_argument(
         "--prior",
@@ -35,6 +44,8 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
     args = parser.parse_args(argv)
+    if args.cached is None and args.output is None:
+        parser.error("--output is required for a live pull, which would otherwise discard everything it fetched")
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s", stream=sys.stderr)
 
@@ -43,17 +54,16 @@ def main(argv: list[str] | None = None) -> None:
     if args.cached:
         logger.info(f"Loading cached dataset from {args.cached}")
         data = load_dataset(args.cached)
-        # The cached path skips build_performance_dataset entirely, so the diff runs here.
-        # Diffing a cached pull against an older one is a legitimate offline check — it is
-        # how a re-resolution gets caught after the fact, without a second API pull.
+        # Catches a re-resolution after the fact, with no second API pull.
         if prior is not None:
             diff_platform_rescores(prior, data)
     else:
-        # The live pull sends METACULUS_TOKEN to the API; confirm the host is
-        # the real Metaculus first (DNS-parking incident — see
-        # metaculus_bot/api_preflight.py). Skipped for --cached (disk read).
+        # The live pull sends METACULUS_TOKEN, so confirm the host first (see api_preflight.py).
         verify_metaculus_api_identity()
         data = build_performance_dataset(tournament=args.tournament, prior_records=prior)
+
+    # Both paths save: the cached path tags records in place and used to drop them on exit.
+    if args.output:
         save_dataset(data, args.output)
 
     if prior is not None:

@@ -4,36 +4,11 @@ The pass this belongs to, and how to read its output, is documented on the CLI m
 ``performance_analysis.clip_threshold``; this module holds the numbers behind it. Rendering
 lives in ``clip_threshold_report`` so the dependency runs one way: CLI -> report -> here.
 
-Three rules are load-bearing throughout and are stated once here rather than at every use.
-
-**Tightening is exact; loosening is censored.** A candidate bound at least as tight as the
-one in force is fully determined by the published value, whether or not that value was
-itself clamped, so ``clip_delta`` intersects the candidate with the in-force clamp before
-computing anything. A candidate LOOSER than the in-force clamp cannot be priced on a record
-that sits at that bound: the clamp erased the raw member value. Those records are counted
-(``censored_n``) and bounded, never estimated.
-
-**Censoring happens at the MEMBER, not the published value.** The pipeline clamps each
-member and THEN aggregates, so a clamped member can sit in a median position while the
-published median is above the floor (an even roster averages the two middle members:
-members ``0.02 / 0.03`` publish ``0.025``). ``censored_n`` keys on the published value and
-is the narrow count; ``member_censored_n`` keys on a clamped member in a median position
-(any position under a mean aggregator) and is the count that actually bounds what a looser
-clip could have moved. A member above the floor in a non-median position cannot move the
-median however low its raw value was, which is why the member rule is exact rather than
-"any member at the floor".
-
-**Both types live in one vector shape.** ``ClipRecord.published`` is the outcome-space
-probability vector, ``(p_no, p_yes)`` for binary and the option vector for MC, which is what
-lets the counterfactual, the replay and the censoring rules stay single-branch. The clamp
-semantics still differ (binary clamps ``p_yes`` and takes the complement; MC clamps every
-option and renormalises), and ``apply_bounds`` is the one place that branches on it.
-
-One disclosure rides beside those rules. An MC floor ``c`` cannot be DELIVERED on a ballot
-with more than ``1 / c`` options (eleven options each at least 0.10 already exceed 1), and
-the live clamp then returns its sub-floor fallback; such records are priced like any other
-but counted in ``infeasible_n`` so a cell labelled "floor 0.10" says on how many ballots that
-floor was not the floor actually applied.
+Three rules run throughout: both question types share one outcome-space vector shape,
+tightening is exact while loosening is censored and bounded, and censoring keys on a clamped
+MEMBER rather than on the published value. Those rules, the infeasible-floor disclosure behind
+``infeasible_n``, the clamp-history append discipline and the receipt behind every tolerance
+below: docs/performance_analysis.md "The sweep model" and "Sweep constants and tolerances".
 """
 
 from __future__ import annotations
@@ -52,7 +27,7 @@ from metaculus_bot.bootstrap import bootstrap_means
 from metaculus_bot.constants import BINARY_PROB_MAX, BINARY_PROB_MIN, MC_PROB_MAX, MC_PROB_MIN
 from metaculus_bot.mc_processing import FLOOR_FEASIBILITY_ATOL, clamp_and_renormalize_probs
 from metaculus_bot.numeric.utils import aggregate_binary_mean
-from metaculus_bot.performance_analysis.analysis import FT_0292_MERGED_AT, WIDENING_FLIP_MERGED_AT
+from metaculus_bot.performance_analysis.eras import FT_0292_MERGED_AT, WIDENING_FLIP_MERGED_AT
 from metaculus_bot.performance_analysis.parsing import _parse_probability
 from metaculus_bot.performance_analysis.platform_scores import spot_peer_score
 from metaculus_bot.performance_analysis.stacker_detection import base_or_per_model_forecasts, detect_stacker_fired
@@ -71,48 +46,32 @@ SIDES: tuple[ClipSide, ...] = ("floor_only", "ceiling_only", "symmetric")
 Aggregator = Literal["median", "mean", "unknown"]
 CONFIRMED_STACKER = "confirmed_stacker"
 
-# Candidate floors (ceiling 1 - c). Module constants so a round can widen them without
-# touching logic; every c must satisfy 0 < c < 0.5 for the clamp to be a clamp.
 BINARY_FLOOR_GRID: tuple[float, ...] = (0.005, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05, 0.075, 0.10)
 MC_FLOOR_GRID: tuple[float, ...] = (0.005, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05, 0.075, 0.10)
 GRID_BY_TYPE: dict[str, tuple[float, ...]] = {BINARY: BINARY_FLOOR_GRID, MULTIPLE_CHOICE: MC_FLOOR_GRID}
 # At c >= 0.5 the bounds invert (lo > hi) and apply_bounds collapses every publish to 1 - c.
 assert all(0.0 < c < 0.5 for grid in GRID_BY_TYPE.values() for c in grid), "a candidate floor must satisfy 0 < c < 0.5"
 
-# ft 0.2.92's PredictedOptionList validator clamps every option into [0.01, 0.99] on
-# construction, so an MC floor below MC_PROB_MIN is not shippable today whatever this sweep
-# says about it. Those rows are reported and labelled rather than dropped.
+# ft 0.2.92's option validator clamps into [0.01, 0.99], so a floor below MC_PROB_MIN is unshippable today.
 MC_UNSHIPPABLE_NOTE = "not shippable under ft 0.2.92"
 
 BOOTSTRAP_B: int = 4000
 BOOTSTRAP_SEED: int = 20260902
 BOOTSTRAP_CL: float = 0.95
-# A record sits AT its in-force bound within this tolerance. Binary publishes are a median
-# rounded to 3 dp, so a clamped one hits the floor exactly; MC options pass through a
-# renormalisation that leaves 0.0101 / 0.011 where 0.01 was clamped, which is why the MC
-# tolerance is coarse enough to catch that drift and nothing wider.
+# MC renormalisation leaves 0.0101 where 0.01 was clamped; a clamped binary publish hits the floor exactly.
 BINARY_CENSOR_ATOL: float = 1e-9
 MC_CENSOR_ATOL: float = 0.0015
 
-# A record counts as MOVED when its spot-peer delta clears this. MC vectors are
-# renormalised, so an unaffected MC record's delta is float noise (~1e-14 points) rather
-# than a hard zero; binary deltas are exactly 0 when nothing moves.
+# An unaffected MC record's delta is renormalisation noise (~1e-14), not the hard zero binary gives.
 DELTA_ATOL: float = 1e-9
 
-# The published-vector counterfactual and the per-model replay disagree when the resolving
-# mass differs by more than this — half a point of probability, the resolution at which a
-# disagreement could plausibly have changed a published forecast. The same tolerance decides
-# whether a replayed aggregate REPRODUCES the published vector (aggregator detection).
+# Half a point of probability: the resolution at which a replay disagreement could have changed a publish.
 REPLAY_DISAGREE_ATOL: float = 0.005
 
-# Two candidates tie for the argmax within this many spot-peer points. Ties are the norm,
-# not an edge case: every candidate at or below a window's in-force floor scores exactly 0
-# when no publish in that window was clamped, so the winner is usually a plateau.
+# Ties are the norm: every candidate at or below a window's in-force floor scores exactly 0.
 ARGMAX_TIE_ATOL: float = DELTA_ATOL
 
-# The clamp in force, oldest regime first: (start_or_None, lo, hi), every row a LITERAL so a
-# constant change cannot retroactively reprice the records published under the retired clamp
-# (the asserts below force the APPEND). Binary [0.01, 0.99] predates the earliest archived record.
+# Every row a LITERAL so a constant change cannot retroactively reprice the retired clamp's records.
 _CLAMP_HISTORY: dict[str, tuple[tuple[datetime | None, float, float], ...]] = {
     BINARY: ((None, 0.01, 0.99), (WIDENING_FLIP_MERGED_AT, 0.02, 0.98)),
     MULTIPLE_CHOICE: ((None, 0.005, 0.995), (FT_0292_MERGED_AT, 0.01, 0.99)),
@@ -126,9 +85,7 @@ assert _CLAMP_HISTORY[MULTIPLE_CHOICE][-1][1:] == (MC_PROB_MIN, MC_PROB_MAX), (
     "and clip_threshold_windows._CLAMP_REGIME_START instead of editing the last row"
 )
 
-# Extreme-bin edges: (label, lower, upper, p_midpoint). Low bins are (lower, upper], high
-# bins [lower, upper). The implied rate of the COUNTED event is the midpoint for a low bin
-# and its complement for a high one, because a high bin counts NO resolutions.
+# (label, lower, upper, p_midpoint); a high bin's implied rate is the complement, since it counts NO resolutions.
 LOW_PRICE_BINS: tuple[tuple[str, float, float, float], ...] = (
     ("<= 0.01", -1.0, 0.01, 0.005),
     ("(0.01, 0.02]", 0.01, 0.02, 0.015),
@@ -799,10 +756,7 @@ def sweep_row(
     abs_deltas = [abs(d) for d in deltas]
     total_abs = sum(abs_deltas)
     ci_lo, ci_hi = bootstrap_mean_ci(deltas)
-    # Only a row that MOVED something has a driver. An MC row where the candidate is looser
-    # than the clamp in force still carries ~1e-13 of renormalisation noise, and a share
-    # computed over that noise reads as a real concentration (0.07) and names a question the
-    # candidate never touched, on a row whose own n_affected is 0.
+    # A looser MC candidate leaves ~1e-13 of renormalisation noise, whose top1_share reads as a real 0.07.
     moved = total_abs > DELTA_ATOL
     driver = max(zip(records, clips, strict=True), key=lambda pair: abs(pair[1].delta))[0] if moved else None
     return SweepRow(

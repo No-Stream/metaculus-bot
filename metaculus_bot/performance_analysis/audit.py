@@ -33,9 +33,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from metaculus_bot.numeric.config import PCHIP_CDF_POINTS, grid_step_constraints
-from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf
-from metaculus_bot.performance_analysis.collector import load_dataset, resolve_numeric_record_to_score_inputs
+from metaculus_bot.performance_analysis.collector import load_dataset
+from metaculus_bot.performance_analysis.member_replay import (
+    MemberScoringInputs,
+    member_cdf,
+    member_scoring_inputs,
+    score_member_cdf,
+)
 from metaculus_bot.performance_analysis.parsing import (
     MIN_SCOREABLE_ANCHORS,
     _parse_probability,
@@ -57,7 +61,7 @@ from metaculus_bot.performance_analysis.ranking_cohort import (
     log_ranking_cohort,
     per_model_ranking_cohort,
 )
-from metaculus_bot.performance_analysis.scoring import brier_score, numeric_log_score
+from metaculus_bot.performance_analysis.scoring import brier_score
 
 logger = logging.getLogger(__name__)
 
@@ -347,59 +351,10 @@ def _rank_binary(record: dict) -> list[dict]:
     return ranked
 
 
-def _record_cdf_size(record: dict) -> int:
-    """The question's own CDF grid size: ``inbound_outcome_count + 1``, else the
-    published CDF's length, else the standard 201. Discrete questions run coarser
-    grids, and a per-member CDF rebuilt on the 201 default is scored against a
-    1/200 baseline instead of the question's own (up to 85 log pts on an 11-point
-    grid, always inflating good coarse-grid scores)."""
-    inbound = (record.get("scaling") or {}).get("inbound_outcome_count")
-    if inbound:
-        return int(inbound) + 1
-    published = record.get("our_forecast_values") or []
-    return len(published) if len(published) >= 3 else PCHIP_CDF_POINTS
-
-
-@dataclass(frozen=True, slots=True)
-class _NumericScoringInputs:
-    """Everything a member curve needs to be rebuilt and log-scored on one record."""
-
-    resolution: float
-    lower_bound: float
-    upper_bound: float
-    zero_point: float | None
-    open_lower: bool
-    open_upper: bool
-    cdf_size: int
-    min_step: float
-    max_step: float
-
-
-def _numeric_scoring_inputs(record: dict) -> _NumericScoringInputs | None:
-    """Bundle the record's bounds, grid size and per-bin step constraints, or None."""
-    score_inputs = resolve_numeric_record_to_score_inputs(record)
-    if score_inputs is None:
-        return None
-    res_float, lower_bound, upper_bound, zero_point = score_inputs
-    cdf_size = _record_cdf_size(record)
-    min_step, max_step = grid_step_constraints(cdf_size)
-    return _NumericScoringInputs(
-        resolution=res_float,
-        lower_bound=lower_bound,
-        upper_bound=upper_bound,
-        zero_point=zero_point,
-        open_lower=bool(record.get("open_lower_bound", False)),
-        open_upper=bool(record.get("open_upper_bound", False)),
-        cdf_size=cdf_size,
-        min_step=min_step,
-        max_step=max_step,
-    )
-
-
 def _score_member_curve(
     model: str,
     percentile_pairs: list,
-    inputs: _NumericScoringInputs,
+    inputs: MemberScoringInputs,
     *,
     post_id: object,
 ) -> dict | None:
@@ -415,31 +370,13 @@ def _score_member_curve(
             f"{conflicts} label(s) declared twice with different values; the last value is scored"
         )
     try:
-        cdf, _ = generate_pchip_cdf(
-            percentile_dict,
-            open_upper_bound=inputs.open_upper,
-            open_lower_bound=inputs.open_lower,
-            upper_bound=inputs.upper_bound,
-            lower_bound=inputs.lower_bound,
-            zero_point=inputs.zero_point,
-            min_step=inputs.min_step,
-            max_step=inputs.max_step,
-            num_points=inputs.cdf_size,
-        )
+        cdf = member_cdf(percentile_pairs, inputs)
     except (ValueError, RuntimeError) as exc:
         logger.warning(f"Per-model PCHIP failure post={post_id} model={model}: {exc}")
         return None
 
     try:
-        score = numeric_log_score(
-            cdf,
-            inputs.resolution,
-            inputs.lower_bound,
-            inputs.upper_bound,
-            open_lower_bound=inputs.open_lower,
-            open_upper_bound=inputs.open_upper,
-            zero_point=inputs.zero_point,
-        )
+        score = score_member_cdf(cdf, inputs)
     except (ValueError, ZeroDivisionError) as exc:
         logger.warning(f"Per-model scoring failure post={post_id} model={model}: {exc}")
         return None
@@ -454,7 +391,7 @@ def _score_member_curve(
 
 
 def _rank_numeric(record: dict) -> list[dict]:
-    inputs = _numeric_scoring_inputs(record)
+    inputs = member_scoring_inputs(record)
     if inputs is None:
         return []
 

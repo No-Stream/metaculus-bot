@@ -17,13 +17,12 @@ from typing import Any, ClassVar, cast
 
 import pytest
 
-from metaculus_bot.numeric.config import PCHIP_CDF_POINTS, grid_step_constraints
+from metaculus_bot.numeric.config import grid_step_constraints
 from metaculus_bot.numeric.pchip_cdf import generate_pchip_cdf
-from metaculus_bot.performance_analysis import audit
+from metaculus_bot.performance_analysis import audit, member_replay
 from metaculus_bot.performance_analysis.audit import (
     EXTERNAL_COMMENTS_DIRNAME,
     _format_our_prediction,
-    _record_cdf_size,
     emit_combined_report,
     emit_external_comment_stub,
     emit_miss_markdown,
@@ -389,13 +388,6 @@ class TestRankNumericOwnGrid:
         # and on a good concentrated forecast, inflated — score.
         assert abs(by_model["model-a"] - grid_201) > 1.0
         assert grid_201 > own_grid
-
-    def test_record_cdf_size_derivation(self):
-        assert _record_cdf_size({"scaling": {"inbound_outcome_count": 41}}) == 42
-        assert _record_cdf_size({"scaling": {}, "our_forecast_values": [0.0] * 11}) == 11
-        assert _record_cdf_size({"scaling": {}}) == PCHIP_CDF_POINTS
-        # A published list too short to be a CDF is not a grid size either.
-        assert _record_cdf_size({"scaling": {}, "our_forecast_values": [0.0, 1.0]}) == PCHIP_CDF_POINTS
 
 
 class TestFormatOurPredictionMultipleChoice:
@@ -1223,28 +1215,27 @@ class TestRankNumericPerModel:
         assert "P90" in raw
 
     def test_numeric_skips_model_when_scoring_raises(self, monkeypatch):
-        # numeric_log_score may raise ValueError or ZeroDivisionError on
-        # degenerate CDFs that PCHIP nonetheless accepts. The skip path at
-        # audit.py's `except (ValueError, ZeroDivisionError)` block must drop
-        # the offending model and continue ranking the others.
+        """A member whose CDF scores degenerately is dropped, and the rest still rank.
+
+        Patched on ``member_replay``, where the scoring call now lives.
+        """
         per_model = {
             "good": [(10, 45.0), (50, 50.0), (90, 55.0)],
             "bad_score": [(10, 40.0), (50, 50.0), (90, 60.0)],
         }
         rec = _numeric_record(1, resolution=50.0, per_model_percentiles=per_model)
 
-        original = audit.numeric_log_score
+        original = member_replay.numeric_log_score
         call_state = {"call_idx": 0}
 
         def flaky_score(*args, **kwargs):
-            # Iteration order over `per_model` is insertion-order in CPython 3.7+,
-            # so "good" is scored first (call 0), "bad_score" second (call 1).
+            # per_model iterates in insertion order, so "bad_score" is the second call.
             call_state["call_idx"] += 1
             if call_state["call_idx"] == 2:
                 raise ValueError("degenerate CDF")
             return original(*args, **kwargs)
 
-        monkeypatch.setattr(audit, "numeric_log_score", flaky_score)
+        monkeypatch.setattr(member_replay, "numeric_log_score", flaky_score)
         ranked = audit.rank_our_models_by_accuracy(rec)
         models_ranked = [r["model"] for r in ranked]
         assert models_ranked == ["good"]

@@ -436,17 +436,17 @@ def summarize_slug_supply(
     )
 
 
-def _get_json(params: dict[str, str | int], token: str | None, *, url: str = POSTS_URL) -> dict:
+def get_json(params: dict[str, str | int], token: str | None, *, url: str = POSTS_URL) -> dict:
     """GET a posts endpoint with a bounded, 429-aware retry.
 
-    ``url`` defaults to the Metaculus posts LIST; the forfeit sweep passes a post's detail URL and
-    the Mantic mode its own list URL through the same retry, since the endpoints share the rate
-    limiter that motivated it. A None ``token`` sends no ``Authorization`` header (public Mantic read).
+    ``url`` defaults to the Metaculus posts LIST; the forfeit sweep passes a post's detail URL, the
+    Mantic mode its own list URL and ``scripts/probe_slugs.py`` a project URL through the same retry,
+    since every one of those endpoints shares the rate limiter that motivated it. A None ``token``
+    sends no ``Authorization`` header (public Mantic read). Public because the slug probe reuses it.
 
-    Local rather than reusing ``performance_analysis.collector``'s helper: that one is
-    scoped to the scoring pull (three retries, and a ``RuntimeError`` when they run out),
-    while this probe pages several slugs in one pass and soft-fails per slug — so an
-    exhausted retry has to arrive as a ``requests`` exception for the per-slug handler.
+    Local rather than reusing ``performance_analysis.collector``'s helper, which is scoped to the
+    scoring pull (three retries, then a ``RuntimeError``): every caller here soft-fails per slug, so
+    an exhausted retry has to arrive as a ``requests`` exception.
 
     The exhausted 429 breaks out and raises the descriptive error below. It used to fall
     through to ``raise_for_status`` on the last attempt, which made that raise unreachable
@@ -489,7 +489,7 @@ def fetch_posts_by_status(
                 "offset": page * PAGE_SIZE,
                 **platform.list_params,
             }
-            data = _get_json(params, token, url=platform.posts_url)
+            data = get_json(params, token, url=platform.posts_url)
             results = data.get("results") or []
             posts.extend(results)
             if len(results) < PAGE_SIZE:
@@ -549,7 +549,7 @@ def resolve_bot_forecasts(posts_by_status: dict[str, list[dict]], token: str | N
     for index, (post_id, status) in enumerate(needed.items()):
         logger.debug(f"{label}: detail GET post {post_id} ({status}), {index + 1}/{total}")
         try:
-            fetched[post_id] = _get_json({}, token, url=f"{POSTS_URL}{post_id}/")
+            fetched[post_id] = get_json({}, token, url=f"{POSTS_URL}{post_id}/")
         except requests.RequestException as exc:
             logger.warning(f"{label}: post {post_id} ({status}) detail fetch failed ({exc}); state stays unknown")
         done = index + 1

@@ -1,56 +1,17 @@
 """Era-bucketed numeric-width / calibration monitor (READ-ONLY, free).
 
-Tracks how wide the bot's published numeric distributions are, and how well
-that width is calibrated, split by config era. Era boundaries are
-**merge-to-main timestamps**, not authoring dates — see the constants below.
-The bot has historically oscillated between too-wide and too-narrow numeric
-forecasts:
+Tracks how wide the bot's published numeric distributions are, and how well that width is
+calibrated, split by config era. Per era it reports, on the bot's PUBLISHED 201-point CDF:
+central-80% and central-50% coverage with Beta-Binomial / Jeffreys-prior 95% CIs, tail
+coverage (cov@10 / cov@50 / cov@90), PIT std, mean PIT, median relative band width, and
+``band_miss`` split into its low and high tails. PIT is F_bot(resolution) on the canonical
+Metaculus value grid (``build_cdf_value_grid``); ``compute_pit_reading`` holds the two
+out-of-range conventions.
 
-  * Until 2026-05-18 the pipeline INTENTIONALLY widened tails (``k_tail=1.25``
-    in the tail-widening pass).
-  * On 2026-05-18 widening was turned off (``k_tail=1.0``, identity) after a
-    calibration study showed the widened tails were too fat.
-  * On 2026-07-21 the july15 bundle landed, whose width-relevant piece is the
-    Time-Series-Anchor prompt clause. It pushes "sharpen, don't widen"
-    (published low-tail coverage was ~0.03 vs a 0.10 target — badly too wide),
-    so the forward risk flips toward over-sharpening. This monitor is the
-    loop-closer for that transition. The same merge dropped the forecaster
-    roster from six models to the latest-per-vendor triple and lowered
-    ``MIN_FORECASTERS_TO_PUBLISH``, so a width shift across this boundary
-    cannot be attributed to the anchor alone. The bucket stays empty until a
-    post-bundle numeric question resolves and is pulled.
-
-Per era it reports, on the bot's PUBLISHED 201-point CDF:
-
-  * central-80% coverage  = fraction of PIT in [0.10, 0.90]  (calibrated 0.80)
-  * central-50% coverage  = fraction of PIT in [0.25, 0.75]  (calibrated 0.50)
-    both with Beta-Binomial / Jeffreys-prior 95% CIs.
-  * cov@10 = P(PIT <= 0.10)  (calibrated 0.10; low-tail coverage)
-  * cov@50 = P(PIT <= 0.50)  (calibrated 0.50; directional bias / below-median)
-  * cov@90 = P(PIT <= 0.90)  (calibrated 0.90; high-tail coverage)
-  * PIT std (calibrated Uniform(0,1) std = 1/sqrt(12) ~= 0.289; smaller => PIT
-    piled in the center => distributions too WIDE; larger => piled at the
-    extremes => too NARROW).
-  * median relative band width = median over questions of (P90 - P10) / |P50|,
-    read off the published CDF. This is the RAW sharpness metric and does not
-    depend on resolutions — it answers "how wide are we, in absolute terms",
-    complementing the coverage metrics which answer "is that width calibrated".
-  * band_miss, split into its low and high tails. ``band_miss`` is the
-    out-of-band rate (P(PIT < 0.10) + P(PIT > 0.90), i.e. 1 - raw cov80); the
-    split is what separates a band that is too TIGHT (both tails high) from one
-    that is the right width but MIS-CENTERED (one tail carries the misses).
-    ``cov80`` alone cannot express that distinction, and the two call for
-    opposite corrections.
-
-PIT is F_bot(resolution) evaluated on the canonical Metaculus value grid
-(``build_cdf_value_grid``). Two out-of-range cases, and they differ by what the
-platform told us (see ``compute_pit_reading``): a STRING marker
-(``below_lower_bound`` / ``above_upper_bound``) gives no value, so the reading is
-the INTERVAL our own tail mass pins F to and every coverage column counts it on
-band INTERSECTION while PIT std / mean PIT exclude it; a NUMERIC resolution
-beyond the grid keeps a point PIT, scored off the members' declared-percentile
-curves rather than the grid clamp. Method mirrors
-``scratch/calibration_audit_2026-07-16/mc_numeric_calibration.py``.
+Every column's definition and calibrated target, which direction "off" points, the width
+history the eras bucket on, the underpowered floor and the clustered CI are in
+``docs/performance_analysis.md`` "Reading the width monitor's era table". Era boundaries
+are **merge-to-main timestamps**, not authoring dates.
 
 Alongside the era table this CLI prints a per-QUESTION section, the starved-outer-tail
 scan, which lives in ``outer_tail.py``: that failure is a cliff at a fixed location
@@ -71,8 +32,6 @@ import numpy as np
 
 from metaculus_bot.api_preflight import verify_metaculus_api_identity
 from metaculus_bot.performance_analysis.analysis import (
-    B4E9DF0_MERGED_AT,
-    WIDENING_FLIP_MERGED_AT,
     PitReading,
     jeffreys_ci,
     out_of_range_pit_reading,
@@ -86,6 +45,7 @@ from metaculus_bot.performance_analysis.cohorts import (
     parse_exclude_qids,
 )
 from metaculus_bot.performance_analysis.collector import build_performance_dataset, load_dataset
+from metaculus_bot.performance_analysis.eras import B4E9DF0_MERGED_AT, WIDENING_FLIP_MERGED_AT
 from metaculus_bot.performance_analysis.markdown import markdown_table
 from metaculus_bot.performance_analysis.outer_tail import render_starved_outer_tails, scan_outer_tails
 from metaculus_bot.performance_analysis.scaling import NUMERIC_TYPES, cdf_and_grid
@@ -93,20 +53,10 @@ from metaculus_bot.time_utils import parse_iso_utc
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-# Calibrated reference values, surfaced in the legend so a reader knows which
-# direction "off" points.
+# Surfaced in the legend so a reader knows which direction "off" points.
 UNIFORM_PIT_STD: float = 1.0 / np.sqrt(12.0)  # ~0.2887
 
-# Below this many PITs, a row's point metrics (cov@10/50/90, PIT std, mean PIT,
-# band_miss) are not estimates: their resolution is 1/n, coarser than the finest
-# calibrated target they are compared against (cov@10 = 0.10), so the value can
-# only land on a grid whose spacing exceeds the quantity being measured. At n=1
-# pit_std is exactly 0.0, which reads as "maximally too wide" while carrying no
-# information. Those cells render ``n/a`` in the markdown; the JSON keeps the raw
-# values alongside an ``underpowered`` flag, since a script can decide for itself
-# but a reader cannot un-see a number. cov80/cov50 are exempt — they carry CIs
-# that widen honestly at small n, which is exactly the disclosure the point
-# metrics lack.
+# Why this floor: docs/performance_analysis.md "Reading the width monitor's era table"
 MIN_N_FOR_POINT_METRICS: int = 10
 
 
@@ -124,21 +74,8 @@ class Era:
         return (self.start is None or dt >= self.start) and (self.end is None or dt < self.end)
 
 
-# Config-flip boundaries that plausibly shift the numeric width distribution.
-# These are the ONLY width-relevant flips (per CLAUDE.md era-bucketing guidance:
-# bucket by pipeline-behavior changes, not every git hash).
-#
-# Each value is the committer timestamp of the MERGE COMMIT that carried the
-# change onto `main`, never the authoring date of the commit on its branch:
-# prod runs from `main`, so a change is live only from the moment it lands
-# there. A branch can sit for days, and keying on the authoring date files every
-# run in that gap under the wrong config. Re-derive with
-# `TZ=UTC git log -1 --date=iso-local --format='%h %cd' <merge-sha>`.
-# 0e85e1b: k_tail 1.25 -> 1.0 — aliased for the same reason TS_ANCHOR_ENABLE below is, so
-# this boundary and the clip sweep's binary clamp regime can never disagree.
+# Aliases of eras.py's merge timestamps: docs/performance_analysis.md "Reading the width monitor's era table"
 WIDENING_FLIP = WIDENING_FLIP_MERGED_AT
-# b4e9df0 (july15 bundle) — aliased so this boundary and the max-step clamp screen's
-# era gate can never disagree; the timestamp's single home is analysis.py.
 TS_ANCHOR_ENABLE = B4E9DF0_MERGED_AT
 
 
@@ -324,22 +261,12 @@ class EraWidthMetrics:
 def _n_effective_clusters(post_ids: list[object]) -> int:
     """Count distinct question families for the CI's effective sample size.
 
-    Records sharing a ``post_id`` are one correlated family: the collector expands
-    a ``group_of_questions`` post into one record per sub-question, and those share
-    a series, a window and a resolution source. A record with no ``post_id``
-    (``None``) is treated as its own family — assigned a unique sentinel by
-    position so it is never merged with another None-post record — since we can't
-    prove it shares a family with anything else.
-
-    **The correction is currently inert, and the table says so per row.** Measured
-    2026-08-25 across all archived pulls (residual_2026-06-15 through
-    residual_2026-08-24, plus coherence_2026-07-15): every post carried exactly one
-    resolved record, so ``n_eff == n`` everywhere and the clustered CI equals the
-    naive one. The mechanism is kept because a group post resolving into the
-    tournament is a matter of question supply, not of code — but nothing may claim
-    the CIs have been widened unless ``EraWidthMetrics.ci_clustered`` says they
-    were. (An earlier version of this comment asserted "~62% of records share a
-    post"; no archived dataset supports that figure.)
+    Records sharing a ``post_id`` are one correlated family; a record with no ``post_id``
+    is its own family, assigned a unique sentinel by position so it is never merged with
+    another such record. The correction is currently inert on every archived pull, which
+    the table states per row via ``EraWidthMetrics.ci_clustered``. The measurement behind
+    that, and the retracted claim it replaced, are in ``docs/performance_analysis.md``
+    "Reading the width monitor's era table".
     """
     clusters: set[object] = set()
     for i, pid in enumerate(post_ids):
@@ -416,33 +343,17 @@ def compute_era_metrics(label: str, records: list[dict], n_excluded: int = 0) ->
 
     readings = samples.readings
     n = len(readings)
-    # Point statistics run on the point readings only: a set-valued (out-of-range)
-    # reading has no value to average, and imputing its midpoint would manufacture one.
+    # A set-valued reading has no value to average, and imputing its midpoint would manufacture one.
     points = np.asarray(pit_point_values(readings), dtype=float)
     cov80_k = pit_band_count(readings, 0.10, 0.90)
     cov50_k = pit_band_count(readings, 0.25, 0.75)
 
-    # Coverage CIs are computed at n_eff (distinct post_ids) rather than the raw
-    # question count, so that a post carrying several correlated sub-questions
-    # cannot narrow the CI as if they were independent. Cluster on post_id only —
-    # the one grouping key already on every record; a record missing a post_id
-    # counts as its own cluster (via a unique sentinel) so it is never merged with
-    # another. The point estimate is unchanged (cov_k / n); only the CI width
-    # reflects n_eff, via jeffreys_ci(round(cov_k * n_eff / n), n_eff). On every
-    # archived pull n_eff == n, so this is a no-op there — see
-    # ``_n_effective_clusters`` and the per-row ``ci_clustered`` marker.
+    # Why the CIs run at n_eff: docs/performance_analysis.md "Reading the width monitor's era table"
     n_eff = _n_effective_clusters(samples.pit_post_ids)
     cov80 = jeffreys_ci(round(cov80_k * n_eff / n), n_eff)
     cov50 = jeffreys_ci(round(cov50_k * n_eff / n), n_eff)
 
-    # Out-of-band rate, split by tail. band_miss == 1 - raw cov80, so it adds no
-    # information on its own; the low/high split is the point — it distinguishes
-    # a band that is too tight (both tails elevated) from one of roughly the
-    # right width that is mis-centered (misses piled in one tail), which cov80
-    # cannot, and which call for opposite corrections.
-    # A set-valued reading misses a tail only when the WHOLE interval lies outside it,
-    # which keeps the band_miss == 1 - cov80 identity exact (an interval that fails to
-    # intersect [0.10, 0.90] lies entirely on one side of it).
+    # Why the lo/hi split: docs/performance_analysis.md "Reading the width monitor's era table"
     band_lo = _fraction(readings, lambda reading: reading.entirely_below(0.10))
     band_hi = _fraction(readings, lambda reading: reading.entirely_above(0.90))
 
@@ -498,8 +409,7 @@ def compute_all_eras(
         if r.get("type") not in NUMERIC_TYPES:
             continue
         label = assign_era(r, eras)
-        # The collector writes question_id straight from the API (an int), so
-        # coerce rather than compare an int against a string set and no-op.
+        # question_id arrives from the API as an int, so coerce before comparing against the string set.
         if str(r.get("question_id")) in excluded:
             excluded_counts[label] += 1
             n_excluded_total += 1
@@ -627,8 +537,13 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Era-bucketed numeric width / calibration monitor (read-only)")
     parser.add_argument(
         "--cached",
-        default="scratch/coherence_2026-07-15/perf_all_tagged.json",
-        help="Path to a cached performance dataset JSON (list of records). Default: %(default)s",
+        default=None,
+        help=(
+            "Path to a cached performance dataset JSON (list of records), normally the current "
+            "round's perf_all_tagged.json. Required unless --tournament is given: a default "
+            "naming one round keeps resolving after that round is superseded, so the monitor "
+            "would silently read a stale dataset."
+        ),
     )
     parser.add_argument(
         "--tournament",
@@ -666,8 +581,10 @@ def main(argv: list[str] | None = None) -> None:
         # Confirm the host is the real Metaculus before the token-sending pull.
         verify_metaculus_api_identity()
         data = build_performance_dataset(tournament=args.tournament)
-    else:
+    elif args.cached is not None:
         data = load_dataset(args.cached)
+    else:
+        parser.error("pass --cached <dataset> or --tournament <slug>: there is no dataset to read otherwise")
 
     metrics = compute_all_eras(data, exclude_qids=exclude_qids)
     if exclude_qids:
@@ -677,10 +594,7 @@ def main(argv: list[str] | None = None) -> None:
             f"--exclude-qids: {len(exclude_qids)} requested id(s), {matched} matched a "
             "numeric/discrete record in this pull"
         )
-        # A cohort is defined by an incident, not by what resolved into a pull, so an
-        # absent cohort id is normal and gets no alarm. The id-space trap — question and
-        # post ids share one integer namespace — is only worth a WARN on ids the operator
-        # typed explicitly.
+        # A cohort id absent from a pull is normal, so only explicitly typed ids earn the id-space WARN.
         explicit_ids = {
             token.strip()
             for token in args.exclude_qids.split(",")
@@ -695,13 +609,10 @@ def main(argv: list[str] | None = None) -> None:
                 "this pull — question and post ids share one integer space; translate through "
                 "performance_analysis.id_mapping"
             )
-    # The rendered markdown IS this CLI's product and belongs on stdout; logging above
-    # is deliberately pinned to stderr so the report can be piped on its own.
+    # The report is this CLI's product, so it goes to stdout while logging above stays on stderr.
     print(render_markdown(metrics))  # noqa: T201
 
-    # The starved-outer-tail scan reads the same records and the same exclusions. It is a
-    # per-QUESTION report rather than a per-era one, so it renders as its own section instead
-    # of a column, and it is printed unconditionally — a monitor nobody has to ask for.
+    # A per-QUESTION report, so it renders as its own section rather than a column, and is unconditional.
     scan = scan_outer_tails(data, exclude_qids=exclude_qids)
     print()  # noqa: T201
     print(render_starved_outer_tails(scan))  # noqa: T201

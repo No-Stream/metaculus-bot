@@ -15,8 +15,7 @@ Given (1) + (2), shipping a fixed-coefficient calibration risks introducing
 ensemble-drift bias that exceeds the modest expected benefit. Identity is
 the considered choice. The infrastructure (math, fit CLI, integration hook)
 remains so the analysis can be re-run cheaply when more data accumulates or
-the ensemble stabilizes — see ``scratch_docs_and_planning/FUTURE.md`` for
-the runbook.
+the ensemble stabilizes — see ``FUTURE.md`` for the runbook.
 
 The deviation caps in ``metaculus_bot.constants`` are also dormant until
 non-identity params are checked in here — they apply on top of any
@@ -33,7 +32,5 @@ from metaculus_bot.calibration.platt import PlattParams
 # Final binary aggregation Platt fit. Identity by deliberate choice.
 BINARY_PLATT_PARAMS: PlattParams = PlattParams.identity()
 
-# Final MC aggregation Platt fit. Identity by deliberate choice. The MC fit
-# is a SEPARATE 2-parameter fit (article fits binary and MC independently
-# because the underlying calibration patterns differ).
+# Fit SEPARATELY from the binary one, never reused across the two: their calibration shapes differ.
 MC_PLATT_PARAMS: PlattParams = PlattParams.identity()

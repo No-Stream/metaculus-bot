@@ -5,9 +5,9 @@ make a number trustworthy, and the receipts behind each one. It covers the round
 and the `--prior` rescoring diff, what the archives hold and which of their fields are
 historically unreadable, era bucketing and the merge-to-main dating rule, the standing
 exclusion cohorts, the scoring conventions (spot peer, and `spot_peer_delta` for
-counterfactuals), the clip-threshold sweep, per-model forecast recovery, the PIT
-convention for out-of-range resolutions, starved outer tails, and question-supply /
-forfeit accounting.
+counterfactuals), the clip-threshold sweep, per-model forecast recovery, how to read the
+width monitor's era table, the PIT convention for out-of-range resolutions, starved outer
+tails, and question-supply / forfeit accounting.
 
 Two sibling documents own the other halves, and this doc cross-links rather than
 restates them. `docs/operations.md` § "Performance analysis and the width monitor" is
@@ -39,6 +39,25 @@ list endpoint under `with_cp=true` so each page already carries the token's own
 275109, auth via `METACULUS_TOKEN`), makes no LLM or research calls and publishes
 nothing, so it is **not subject to the repo's cost gate** (unlike `make backtest_*` and
 live runs).
+
+**`--output` is required for a live pull and saves on the `--cached` path too.** It has no
+default: it used to be `scratch/performance_data.json`, which is gitignored and absent in a
+fresh clone, and once the cached path started saving, a default would have made a read-only
+report clobber an unrelated pull. Omitting `--output` under `--cached` is the read-only report.
+Passing it under `--cached --prior` is how the rescore tags reach disk; `save_dataset` used to
+sit inside the live-pull branch, so that combination tagged records in memory and wrote
+nothing, and nine rounds carried a `diff_prior.py` to work around it.
+
+**One page's network blip no longer abandons the sweep.** `_api_get` retries HTTP 429 and the
+transient network failures (`requests.exceptions.Timeout`, which covers read and connect
+timeouts, and `ConnectionError`) out of ONE shared budget of `MAX_RETRIES` attempts, with
+`RETRY_BACKOFF_SECS * attempt` between them. Sharing the budget is what keeps the change safe
+in a path whose overrun costs forecasts: the worst case per page is unchanged from the 429-only
+retry it replaced, `MAX_RETRIES` reads at `REQUEST_TIMEOUT_SECS` plus the backoffs, 105 s at
+the values in `collector.py`. Nothing else is caught, so a genuine failure still crashes with
+its own traceback rather than arriving as a slow success, and an exhausted 429 raises an error
+naming the rate limit instead of reporting the whole rate-limited run as one unlucky request.
+A sustained outage still fails the pull; re-running it is free.
 
 **Pass `--prior <previous round's dataset>` on every round pull.** Metaculus
 re-resolves questions IN PLACE without moving any timestamp we store. It edited q44798
@@ -246,6 +265,35 @@ The companion `gfv2_confidence` grades a False `gfv2_present` the way
 | `ambiguous_trimmed_no_payload` | a trimmed comment record; the section may have been trimmed away |
 | `absent_no_payload` | an untrimmed record from a writer that cannot carry the payload |
 
+Four more rules the tagger in `performance_analysis/research_tags.py` runs on, none of
+them obvious from the code:
+
+- **Header greps are depth-agnostic** (`^#{1,4}`). An artifact record heads its sections
+  at `## `, while a comment-backfill record re-heads everything one level deeper, so an
+  exact-depth grep would read every backfilled record as untreated.
+- **The section flag is the treatment marker, and `gfv2_loop_ran` is deliberately a
+  different fact.** The v2 driver banks a transcript on the record even when it soft-fails
+  and contributes no section to the bundle, so payload presence overstates treatment.
+- **`anchor_confidence` grades a False anchor read** against the trim-immune
+  `## Provider Diagnostics` block: `header` when the header itself was found,
+  `diag_ok_header_missing` when the provider ran and produced a section the text no longer
+  carries (trimming ate it, so treatment is genuinely unclear), `diag_confirms_absent`
+  when the diagnostics line says `empty` / `errored` / `skipped` / `timeout`, and
+  `ambiguous_trimmed_no_diag` on a trimmed record with no diagnostics line at all, since
+  trimming keeps the header and the tail and can eat a leading section.
+- **A question with no archive record gets None on every tag, never False.** Absence of
+  evidence is not an untreated record.
+
+The payload-era boundary that decides carryability is `B4E9DF0_MERGED_AT`
+(2026-07-21T17:07:37Z), aliased in `research_tags.py` as `_GFV2_PAYLOAD_ERA_START`: schema
+v2 landed 2026-06-28 in `1655c43`, three weeks before the `gap_fill_v2` write reached
+`main`, so a schema-v2 artifact from that window is a can't-carry record too rather than a
+confident False. A present payload proves a run whatever the writer class; only an ABSENT
+one depends on carryability, and a null payload counts as absent, because a
+key-present-but-empty read as a run is the collapse the original `bool()` made. A
+`log_backfill` record never tags at all: it is post-id-keyed and identified only by
+`page_url`, so on an id collision the URL check cannot rule out a foreign question.
+
 Separately, `metadata.nr_forecasters` (the Metaculus CROWD size) reads **0 in all 2196
 records pulled before 2026-08-25**, because the collector read it off the question
 dict, where it does not exist; it lives on the POST. Nothing rewrites the archive, so
@@ -332,11 +380,66 @@ no width or score shift across it can be attributed to any one of them. Treating
 dates as separable slices a period of constant prod config and reads noise as a config
 effect. When a doc gives an authoring date, say so, and put the landing date next to it.
 
-The boundary constants live in `performance_analysis/analysis.py`:
-`WIDENING_FLIP_MERGED_AT` (`0e85e1b`, 2026-05-18T17:21:19Z), `FT_0292_MERGED_AT`
-(`325b1b0`, 2026-07-24T19:16:26Z) and `B4E9DF0_MERGED_AT` (2026-07-21T17:07:37Z). See
-"Vocabulary that collides" at the end for the width monitor's aliases of the same
-instants.
+### One home: `performance_analysis/eras.py`
+
+Every boundary instant and every per-record era tag lives in `performance_analysis/eras.py`,
+and nothing else in the tree declares one. Import from there rather than retyping an
+instant: the era map had been retyped by hand into each round's own copy for five rounds,
+and one of those copies carried an authoring date for four months without a single test
+noticing. Where a module wants its own name for a boundary it aliases the object, as
+`width_monitor.py` does with `WIDENING_FLIP` and `TS_ANCHOR_ENABLE` and `research_tags.py`
+does with `_GFV2_PAYLOAD_ERA_START`. See "Vocabulary that collides" at the end for those
+aliases.
+
+| Constant | Merge | Committer instant (UTC) | What landed |
+|---|---|---|---|
+| `WIDENING_FLIP_MERGED_AT` | `0e85e1b` | 2026-05-18T17:21:19Z | numeric `k_tail` 1.25 to 1.0, `SPAN_FLOOR_GAMMA` 1.0 to 0.0, binary clamp 0.01/0.99 to 0.02/0.98 |
+| `B4E9DF0_MERGED_AT` | `b4e9df0` (PR #55) | 2026-07-21T17:07:37Z | the july15 bundle: 3-member roster, gap-fill v2, TS anchor, `MIN_FORECASTERS_TO_PUBLISH` 3 to 1 |
+| `FT_0292_MERGED_AT` | `325b1b0` (PR #57) | 2026-07-24T19:16:26Z | forecasting-tools 0.2.92, MC option clamp 0.005/0.995 to 0.01/0.99 |
+| `JULY25_MERGED_AT` | `73e4782` (PR #58) | 2026-07-26T04:38:40Z | the zero-output retry carve-out |
+| `DRY_KEY_FIX_MERGED_AT` | `c3c91cb` (PR #59) | 2026-07-28T03:07:53Z | a drained donated key falls back to the personal key |
+| `RANKED_MARKET_MERGED_AT` | `bfd5df2` (PR #61) | 2026-08-06T01:28:49Z | ranked prediction-market retrieval |
+| `TIME_BUDGET_MERGED_AT` | `951f8e4` (PR #64) | 2026-08-26T17:23:30Z | the close-derived time budget |
+| `LINTERS_MERGED_AT` | `eded193` (PR #65) | 2026-08-28T03:54:03Z | the lint campaign, which is provenance only and opens no sub-era |
+| `FALL_CONFIG_MERGED_AT` | `8d5a082` (PR #66) | 2026-09-05T01:59:24Z | the next-season bundle: prompt de-bloat, the shared fetch ladder |
+| `IMPERSONATE_RUNG_MERGED_AT` | `a9cbe03` (PR #67) | 2026-09-05T15:31:40Z | the TLS-impersonation fetch rung |
+| `FALL_TARGET_MERGED_AT` | `660fd35` (PR #68) | 2026-09-07T05:52:20Z | the fall tournament target |
+
+`GRID_SCALED_MAX_STEP_MERGED_AT` is an alias of `B4E9DF0_MERGED_AT`, because `9f1175c`
+(grid-scaled max-step for discrete CDF resampling) rode that same merge.
+
+**The widening flip is the worked example of the rule.** `b8d730f` authored it on
+2026-05-12 and is not on `main`'s first-parent history at all: it reached `main` only inside
+`0e85e1b`, six days later. Every round's era map until 2026-09-12 carried
+`datetime(2026, 5, 12)`, the authoring date truncated to midnight. Nothing published moved,
+because zero resolved records fall in the six-day window, which is exactly why it survived:
+the defect was latent, and a backfill recovering May 12-18 records would have activated it.
+
+**The tags.** Five pure functions in the same module read `bot_comment_created_at` (the
+submission time, because a question was forecast under whichever config was live when the
+bot published its comment) and return the fields a round's tagging pass writes:
+
+| Field | Function | Values | Read by |
+|---|---|---|---|
+| `config_era` | `era_of` | `pre_flip`, `post_flip`, `triple_era`, `no_ts` | `era_gap` (its default `ERA_FIELD`), the clip sweep's era windows |
+| `triple_subera` | `triple_subera_of` | `triple_pre_market`, `triple_ranked_market`, `triple_time_budget`, `triple_fall_config` | the coarse pooling, where every fall merge is one bucket |
+| `triple_subera_fine` | `triple_subera_fine_of` | `pre_ft_unfreeze`, `ft_0292`, `july25`, `post_dry_key_fix`, `ranked_markets`, `time_budget`, `fall_config` | `era_gap --era-field triple_subera_fine`, which is how the fall read selects its arms |
+| `ft_unfreeze_side` | `ft_unfreeze_side_of` | `pre_ft_0292`, `ft_0292` | the MC-clamp cuts |
+| `post_linters_merge` | `post_linters_merge_of` | `True` / `False` | provenance only |
+
+Every sub-era function returns `None` outside the triple era. These strings are a data
+contract: a renamed value breaks a standing instrument silently, so add a value rather than
+re-spelling one. A new sub-era is one appended row in `FINE_SUBERA_TABLE` (and a coarse row
+only if it deserves its own pooled bucket), which is why the three September merges share
+`triple_fall_config`: they landed inside three days, and separable rows would slice a period
+of near-constant config.
+
+`tests/test_performance_analysis_eras.py` pins each instant against `git log -1 --format=%cI`
+on its merge sha and asserts that sha is on `main`'s first-parent history, so an assertion
+cannot pass by feeding a constant back to itself. It also walks the package and fails on any
+module that redeclares an instant rather than aliasing the object; that scan found a twelfth
+copy the day it was written. Those assertions need the git objects, so CI's test job checks
+out with `fetch-depth: 0` and the tests skip themselves on a shallow clone.
 
 ## The known-pipeline-bug cohort
 
@@ -587,6 +690,70 @@ Run before the first `fall_config` question resolves (on 2026-09-09 six were for
 closed) it exits with `era arm 'fall_config' has no scoreable records; nothing to compare yet` plus
 the field's value counts, and prints no report.
 
+## Building a round's cluster structure
+
+**The clustering rule is code; which questions share a driver is curated data.** Entry point
+`metaculus_bot/performance_analysis/cluster_structure.py`, read-only and offline, writing the file
+the section above consumes:
+
+```bash
+uv run python -m metaculus_bot.performance_analysis.cluster_structure \
+    --dataset <round>/dim_category_slim.json --output-json <round>/cluster_structure.json \
+    [--tables metaculus_bot/performance_analysis/cluster_tables.json]
+```
+
+Several questions in any wave are one real-world event or one dated statistical release seen from
+different angles, so a record count overstates the evidence: on the 2026-09-09 round the wave's
+largest August miss and its largest win were both readings of one cyclosporiasis outbreak. Each
+question id gets exactly one cluster, at one of three strengths. **`strong`** means one driver
+mechanically resolves every member (one Florida primary, one Employment Situation release, one
+Metaculus Cup leaderboard), so the cluster collapses to one observation. **`weak`** means a shared
+regime, so residuals correlate but the draws are separate, and it collapses only as a sensitivity;
+report the strong-only effective n as primary and the strong-and-weak number as the conservative
+bound. **`single`** means no sibling in the cohort, and every unclustered record becomes its own
+`single_<qid>` cluster so nothing is silently unlabelled. The same resolution-set DATE, the same
+CATEGORY and the same question TEMPLATE are none of them cluster bases: Metaculus writes
+resolutions in calendar batches on unrelated quantities, which the emitted
+`resolution_set_date_histogram` shows so nobody has to take it on faith, and the template families
+(one question shape resolved off one kind of instrument) are reported for method correlation and
+never collapsed.
+
+**The curated tables are a tracked asset, `cluster_tables.json` beside the module.** They hold
+which questions cluster, at what strength, with the basis text for each, plus the clusters retired
+for id continuity, the template families, the links considered and rejected, the forecast-but-
+unresolved questions that join on resolution, and the round's own caveats. That is a human's
+per-round judgement rather than a rule, it grows every round, and it is edited in the JSON, never
+promoted into Python. **Every id in it is a QUESTION id.** Post and question ids share one integer
+namespace and the 2026-09-09 tables prove the collision is live: they carry question ids 44873 and
+44874, which are also minibench POST ids, so a table matched against post ids admits unrelated
+questions (`cohorts.py` carries the same warning for the exclusion cohorts). The asset needs its
+own negation in `.gitignore`, because the blanket `*.json` ignore matches at any depth;
+`tests/test_performance_analysis_cluster_structure.py` asserts `git ls-files` really carries it, so
+the "exists locally, absent on a fresh clone" trap cannot come back.
+
+**Three guards fail shut rather than mislabelling a round.** A cluster naming a question outside
+the measured cohort raises: out-of-cohort siblings belong in the basis prose, named and not
+counted, because a cluster that quietly reaches outside the cohort would collapse draws the round
+never measured. A question claimed by two clusters raises. A retired cluster that still owns an
+assigned member raises, which is how a cluster retired too early is caught; a retired id whose
+members live on under new ids is the SPLIT case and is fine, as when `aug2026_asset_prices` became
+the strong `brent_spot_aug2026` plus `aug2026_retail_fuel` plus `aug2026_rates_and_risk`.
+
+**Cluster ids are assigned over the union cohort, but collapse is computed inside whichever slice
+is being measured**, so a cluster straddling two eras collapses less inside a single-era arm. The
+seven reported slices are the wave new since the prior round (all of it, and its post-flip and
+triple-era halves), the whole triple era, and that era `clean` (degraded-run and known-bug records
+dropped), `strict` (partial-degraded dropped too) and strict-and-new-only. Each slice name carries
+its own record count, so `triple_strict_63` reads itself. The degraded and bug records are cluster
+members and are dropped by the slice, so the strict effective n already reflects them.
+
+**The rule reproduces the round it was extracted from.** Run over
+`scratch/residual_2026-09-09/dim_category_slim.json` with the tracked tables it rebuilds that
+round's `cluster_structure.json` field for field, all fourteen top-level keys including
+`qid_to_cluster`, the per-cluster member blocks, `effective_n` and the prose, differing only in the
+`source` path. `era_gap --clusters` on the rebuilt file prints a byte-identical report, watch row
+included (+5.56 [-5.56, +16.41]).
+
 ## The clip-threshold sweep
 
 **The clip floors are priced by a standing sweep, and a looser clip is censored, never
@@ -625,7 +792,7 @@ counted and bounded, never estimated:
 **The in-force clamp is looked up per record** from `bot_comment_created_at` against
 `WIDENING_FLIP_MERGED_AT` (binary, `0e85e1b`, 2026-05-18T17:21:19Z) and
 `FT_0292_MERGED_AT` (MC, `325b1b0`, 2026-07-24T19:16:26Z), both merge-to-main committer
-dates, living beside `B4E9DF0_MERGED_AT` in `analysis.py`, and `width_monitor.WIDENING_FLIP`
+dates, living beside `B4E9DF0_MERGED_AT` in `eras.py`, and `width_monitor.WIDENING_FLIP`
 aliases the first.
 
 **Each window carries an insurance view**: the break-even clipped-side rate, a Jeffreys
@@ -655,6 +822,91 @@ row that moves no record renders `identity` rather than a CI.
 - The only pro-tightening row in either cohort is the single-survivor degraded publish
   q44874, whose shape the thin publish floor prices at **+51.08 over the 4 genuine k=1
   publishes with zero cost to the other three**.
+
+### The sweep model
+
+`clip_threshold_sweep.py` holds the model and the math; rendering lives in
+`clip_threshold_report`, so the dependency runs one way, CLI to report to sweep. Four facts
+about its representation carry the rest of the module.
+
+**Both question types live in one vector shape.** `ClipRecord.published` is the outcome-space
+probability vector, `(p_no, p_yes)` for binary and the option vector for MC, which is what lets
+the counterfactual, the replay and the censoring rules stay single-branch. The clamp semantics
+still differ: binary clamps `p_yes` and takes the complement, MC clamps every option and
+renormalises, and `apply_bounds` is the one place that branches on it. For the same reason
+`clampable_indices` is `p_yes` alone on binary. `p_no` is its complement, so a floor on `p_yes`
+is the same constraint as a ceiling on `p_no`, and counting both would report a publish sitting
+at the ceiling as floor-censored.
+
+**Tightening intersects with the clamp in force before it computes anything.** A candidate at
+least as tight as the one that was live is fully determined by the published value, whether or
+not that value was itself clamped, so `clip_delta` takes that intersection rather than pricing
+the candidate on its own.
+
+**The member censoring rule reads median POSITIONS, and that is what makes it exact.** A member
+above the floor in a non-median position cannot move the median however low its raw value was,
+which is why `member_censored` checks the positions the median actually reads rather than
+counting any member at the floor. Under a mean aggregator every member moves the publish, so
+every position counts. For MC the rule runs per option, against the members in THAT option's
+median slot; it deliberately does not count a member floored on option j while sitting in
+option k's median slot with a non-floored value. Renormalisation does couple the two, but the
+round's refutation pass rejected "any member component at the floor" as overstating the bound,
+and the coupled move is bounded by the floored mass a looser clip releases anyway.
+
+**A floor can be infeasible on a ballot.** An MC floor `c` cannot be DELIVERED where a ballot
+has more than `1 / c` options (eleven options each at least 0.10 already exceed 1), and the live
+clamp then returns its sub-floor fallback. Such records are priced like any other but counted in
+`infeasible_n`, so a cell labelled "floor 0.10" says on how many ballots that floor was not the
+floor actually applied. `floor_infeasible` mirrors the degenerate test in
+`clamp_and_renormalize_probs`; binary has one free value and is always feasible.
+
+### Sweep constants and tolerances
+
+These live in `clip_threshold_sweep.py` rather than in `constants.py` because they are analysis
+parameters and nothing in the live pipeline reads them.
+
+- **`BINARY_FLOOR_GRID` / `MC_FLOOR_GRID`** hold the candidate FLOORS, each implying the ceiling
+  `1 - c`, and are module constants so that a round can widen the grid without touching logic.
+  Every candidate must satisfy `0 < c < 0.5` for the clamp to be a clamp, which a module-level assert enforces: at `c >= 0.5` the bounds invert (`lo > hi`) and
+  `apply_bounds` collapses every publish to `1 - c`.
+- **`MC_UNSHIPPABLE_NOTE`.** forecasting-tools 0.2.92's `PredictedOptionList` validator clamps
+  every option into [0.01, 0.99] on construction, so an MC floor below `MC_PROB_MIN` is not
+  shippable today whatever this sweep says about it. Those rows are labelled (the `shippable`
+  field) and reported rather than dropped.
+- **`BINARY_CENSOR_ATOL` = 1e-9, `MC_CENSOR_ATOL` = 0.0015.** A record sits AT its in-force
+  bound within this tolerance. Binary publishes are a median rounded to 3 dp, so a clamped one
+  hits the floor exactly; MC options pass through a renormalisation that leaves 0.0101 or 0.011
+  where 0.01 was clamped, and the MC tolerance is coarse enough to catch that drift and nothing
+  wider.
+- **`DELTA_ATOL` = 1e-9.** A record counts as MOVED when its spot-peer delta clears this. Binary
+  deltas are exactly 0 when nothing moves, but MC vectors are renormalised, so an unaffected MC
+  record's delta is float noise of order 1e-14 points. The same threshold guards the row's
+  driver: `sweep_row` names a `top1_question_id` only on a row that moved something, because an
+  MC row whose candidate is looser than the in-force clamp still carries about 1e-13 of
+  renormalisation noise, and a share computed over that noise reads as a real concentration
+  (0.07) and names a question the candidate never touched, on a row whose own `n_affected` is 0.
+- **`REPLAY_DISAGREE_ATOL` = 0.005.** The published-vector counterfactual and the per-model
+  replay count as disagreeing when the resolving mass differs by more than half a point of
+  probability, the resolution at which a disagreement could plausibly have changed a published
+  forecast. The same tolerance decides whether a replayed aggregate REPRODUCES the published
+  vector, which is how `detect_aggregator` tells median from mean.
+- **`ARGMAX_TIE_ATOL`**, equal to `DELTA_ATOL`, is how close two candidates must be in spot-peer
+  points to tie for the argmax. Ties are the norm rather than an edge case: every candidate at
+  or below a window's in-force floor scores exactly 0 when no publish in that window was
+  clamped, so the winner is usually a plateau. That is why `argmax_rows` returns the whole tied
+  set and `argmax_row` takes its smallest `c`, the least interventionist winner.
+- **`_CLAMP_HISTORY`** holds the clamp in force, oldest regime first, as `(start_or_None, lo,
+  hi)` rows. Every row is a LITERAL so that moving `BINARY_PROB_MIN` or `MC_PROB_MIN` cannot
+  retroactively reprice the records published under the retired clamp; the two asserts beside it
+  fail loudly and force an APPEND of a new regime rather than an edit to the last row. Binary
+  [0.01, 0.99] predates the earliest archived record, which is why its first row has no start.
+  An undatable record (`moment=None`) gets the WIDEST historical clamp, because a censoring
+  claim needs to know which floor was live and the assumption that claims the least is the
+  loosest one.
+- **`LOW_PRICE_BINS` / `HIGH_PRICE_BINS`** are extreme-bin edges, `(label, lower, upper,
+  p_midpoint)`. Low bins are half-open as `(lower, upper]` and high bins as `[lower, upper)`.
+  The implied rate of the COUNTED event is the midpoint for a low bin and its complement for a
+  high one, because a high bin counts NO resolutions.
 
 ## Receipts behind the survivor-conditional markers
 
@@ -853,6 +1105,24 @@ when a pull introduces a genuinely new shape. The derivation only admits a recor
 miniature parses IDENTICALLY to its full-size source, and the shape-coverage test fails
 loudly if the set ever narrows.
 
+The redaction keeps only what the parsers key on. The comments are real published
+Metaculus text, so everything carrying no parser signal is elided: research prose,
+per-model rationale prose, third-party news headlines, and the question title. What
+survives is the structural skeleton, meaning section headers, `*Forecaster N*` bullets,
+`Model:` lines, percentile, probability and multiple-choice option value lines, and fenced
+JSON blocks verbatim. `parse_per_model_reasoning_text` is public but deliberately outside
+the faithfulness filter, because the redaction exists to elide rationale prose, which is
+exactly what that parser returns, so it necessarily diverges on every record. Its key set
+still survives the shrink; only the bodies go.
+
+`scripts/derive_mini_comment_fixture.py --emit-expectations` re-renders the test suite's
+`_EXPECTED_PARSES_BY_POST` table from the checked-in fixture, so it needs no local pull.
+The values come from running the real parsers over the fixture, which makes the table a
+characterization of current behaviour rather than an independent specification. That is
+the point, since hand-transcribing a dozen nested dicts is how a typo becomes an
+"expected" value, and it is also the risk: regenerating after a parser change will happily
+bless the change. Read the emitted diff and confirm each moved value is intended.
+
 ## An out-of-range resolution gives a SET-valued PIT reading, not a forced 1.0 / 0.0
 
 Metaculus reports a resolution past the displayed range as the bare string
@@ -885,6 +1155,136 @@ Two API notes for any round script:
 - `EraWidthMetrics.pit_std` / `mean_pit` are `float | None` behind a
   `point_metrics_underpowered` gate and render as `n/a`, so JSON consumers must expect
   nulls.
+
+## Reading the width monitor's era table
+
+`width_monitor.py` reports how wide the bot's published numeric distributions are and
+whether that width is calibrated, split by config era, every column read off the published
+201-point CDF. It exists because the bot has oscillated between too wide and too narrow
+across the two width-relevant merges:
+
+- until **2026-05-18** the pipeline intentionally widened tails (`k_tail=1.25` in the
+  tail-widening pass);
+- on **2026-05-18** widening was turned off (`k_tail=1.0`, identity) after a calibration
+  study found the widened tails too fat;
+- on **2026-07-21** the july15 bundle landed, whose width-relevant piece is the
+  time-series-anchor prompt clause. It pushes "sharpen, don't widen", because published
+  low-tail coverage was about 0.03 against a 0.10 target, badly too wide, so the forward
+  risk flips toward over-sharpening and this monitor is what closes the loop on that
+  transition. The same merge dropped the forecaster roster from six models to the
+  latest-per-vendor triple and lowered `MIN_FORECASTERS_TO_PUBLISH`, so a width shift
+  across that boundary cannot be attributed to the anchor alone.
+
+Nothing finer earns a bucket, per the era-bucketing rule above: a pipeline-behaviour change
+starts an era, a git hash does not. Both boundaries are aliased in `width_monitor.py` from
+the `*_MERGED_AT` constants in `eras.py`, as `WIDENING_FLIP` and `TS_ANCHOR_ENABLE`, so
+that this table and the clip sweep's binary-clamp regime can never disagree. The dating
+rule and the command that re-derives a boundary are in "Era boundaries are merge-to-main
+timestamps, never authoring dates" above; the two spellings are in "Vocabulary that
+collides" below.
+
+### What each column means
+
+- **central-80% coverage** (`cov80`) is the fraction of PIT in [0.10, 0.90], calibrated at
+  0.80, and **central-50% coverage** (`cov50`) the fraction in [0.25, 0.75], calibrated at
+  0.50. Both carry Beta-Binomial / Jeffreys-prior 95% CIs.
+- **cov@10 / cov@50 / cov@90** are P(PIT <= 0.10), P(PIT <= 0.50) and P(PIT <= 0.90),
+  calibrated at 0.10, 0.50 and 0.90. The outer two read low- and high-tail coverage; the
+  middle one reads directional bias, how often the resolution landed below our median.
+- **PIT std** is calibrated against the Uniform(0,1) standard deviation, 1/sqrt(12) or
+  about 0.289. Smaller means the PITs are piled in the center, so the distributions are too
+  WIDE; larger means piled at the extremes, so they are too NARROW.
+- **median relative band width** is the median over questions of (P90 - P10) / |P50| read
+  off the published CDF. It is the raw sharpness metric and depends on no resolution, so it
+  answers "how wide are we in absolute terms" while the coverage columns answer "is that
+  width calibrated".
+- **band_miss** is the out-of-band rate, P(PIT < 0.10) + P(PIT > 0.90), which is exactly
+  1 - raw cov80 and so carries nothing on its own. The lo/hi split is the point: it
+  separates a band that is too TIGHT, both tails elevated, from one of roughly the right
+  width that is MIS-CENTERED, with the misses piled in one tail. `cov80` cannot express
+  that distinction, and the two call for opposite corrections. A set-valued reading misses
+  a tail only when the WHOLE interval lies outside it, which keeps the identity
+  band_miss == 1 - cov80 exact, since an interval that fails to intersect [0.10, 0.90] lies
+  entirely on one side of it.
+
+PIT itself is F_bot(resolution) on the canonical Metaculus value grid
+(`build_cdf_value_grid`), and the two out-of-range cases differ by what the platform told
+us. A string marker (`below_lower_bound` / `above_upper_bound`) gives no value, so the
+reading is the interval our own published tail mass pins F to, and every coverage column
+counts it on band intersection while PIT std and mean PIT exclude it. A numeric resolution
+beyond the grid keeps a point PIT, scored off the members' declared-percentile curves
+rather than the grid clamp. Both conventions are in "An out-of-range resolution gives a
+SET-valued PIT reading, not a forced 1.0 / 0.0" above. The method mirrors
+`scratch/calibration_audit_2026-07-16/mc_numeric_calibration.py`.
+
+### Rows below ten PIT readings render their point metrics as `n/a`
+
+`MIN_N_FOR_POINT_METRICS` is 10. Below that many readings a row's point metrics (cov@10,
+cov@50, cov@90, PIT std, mean PIT and band_miss) are not estimates: their resolution is
+1/n, coarser than the finest calibrated target they are compared against, cov@10 at 0.10,
+so the value can only land on a grid whose spacing exceeds the quantity being measured. At
+n=1 PIT std is exactly 0.0, which reads as "maximally too wide" while carrying no
+information. Those cells render `n/a` in the markdown; the JSON keeps the raw values
+alongside an `underpowered` flag, since a script can decide for itself but a reader cannot
+un-see a number. `cov80` and `cov50` are exempt, because their CIs widen honestly at small
+n, which is exactly the disclosure the point metrics lack. `pit_std` and `mean_pit` run on
+the point-only denominator, so a row can clear the floor on readings and still fall under
+it on point values; `point_metrics_underpowered` is that second gate.
+
+### The clustered CI is real machinery and currently inert
+
+The `cov80` and `cov50` CIs are computed at `n_eff`, the count of distinct `post_id`
+values, rather than at the raw question count, so that a post carrying several correlated
+sub-questions cannot narrow the CI as though they were independent: the collector expands a
+`group_of_questions` post into one record per sub-question, and those share a series, a
+window and a resolution source. Clustering is on `post_id` alone, the one grouping key
+already on every record, and a record with no `post_id` counts as its own family through a
+unique positional sentinel, so it is never merged with another such record. The point
+estimate is untouched, still cov_k / n; only the CI width reflects `n_eff`, via
+`jeffreys_ci(round(cov_k * n_eff / n), n_eff)`.
+
+**The correction is inert on every dataset measured so far, and the table says so per
+row.** Measured 2026-08-25 across all archived pulls (residual_2026-06-15 through
+residual_2026-08-24, plus coherence_2026-07-15): every post carried exactly one resolved
+record, so `n_eff == n` everywhere and the rendered CI is the naive one. The mechanism
+stays because a group post resolving into the tournament is a matter of question supply
+rather than of code, but nothing may claim the CIs were widened unless
+`EraWidthMetrics.ci_clustered` says they were, which is what the `n_eff` cell's
+`(widened)` / `(=n)` marker reports. An earlier version of this reasoning asserted that
+about 62% of records share a post; no archived dataset supports that figure.
+
+### What `max_step_clamp_screen` looks for, and why its cap is era-dependent
+
+The screen answers one question: did a per-bin max-step cap, rather than the forecasters,
+decide the published mass at the truth? On a coarse discrete grid the pre-`9f1175c` flat 0.2
+cap can hold the realized bin far below what every member asked for. q43913 published 0.200
+where the members' own curves wanted 0.575 to 0.823, worth spot peer −41.20 and
+coverage-scaled peer −38.67. That is a pipeline defect posing as a forecast error, and it
+manufactures apparent dissent: each member keeps its concentrated mass while the published
+curve does not.
+
+The cap is looked up per record against the submit timestamp: the flat 0.2 before
+`GRID_SCALED_MAX_STEP_MERGED_AT`, the record's own `grid_step_constraints(len(cdf))` maximum
+after it. Without that gate every post-fix coarse-grid discrete that legitimately holds a
+0.2 bin false-positives. A missing or unparseable timestamp reads as pre-fix, since every
+undated record in the archive predates the fix.
+
+A record is *suspected* only when all three hold: the realized bin is cap-bound (within
+`_CLAMP_CAP_ATOL` of the era-correct cap, or at least `_CLAMP_CAP_NEAR_FRAC` of it, because
+the min-step, ramp and discrete-snap machinery shaves a saturated bin about 1% under the
+cap), at least two attributed member curves exist, and the LEAST concentrated member wants
+at least `member_margin` more mass on that bin. "Every member" is the point: a clamp
+overrides the whole ensemble, unlike a median. A cap-bound bin is not automatically our
+defect, because the cap is the platform's own per-bin rule (`0.2 * 200 / N`); pre-`d4ee57f`
+records additionally carry the slack-proportional smear, while post-`d4ee57f` the excess is
+packed into adjacent bins.
+
+`stacking_effectiveness` in the same module is a COUNTERFACTUAL cohort cut, not a record of
+what the pipeline did. It buckets binary questions by whether their measured spread would
+have tripped the production stacking trigger (strictly greater than the threshold, matching
+production) and reports mean Brier per bucket. Stored data cannot say whether a given
+prediction was actually stacked, so the cut shows how the trigger metric correlates with
+outcome difficulty and nothing more.
 
 ## A starved outer tail is a different defect from the max-step smear, and it is systematic
 
@@ -976,7 +1376,7 @@ Keeping them straight is the same discipline the era rule asks for.
 
 **Era-boundary constants have two vocabularies for one instant.** The width monitor
 names its boundaries `WIDENING_FLIP` and `TS_ANCHOR_ENABLE`; both are aliases defined in
-`width_monitor.py` of `analysis.py`'s `WIDENING_FLIP_MERGED_AT` and
+`width_monitor.py` of `eras.py`'s `WIDENING_FLIP_MERGED_AT` and
 `B4E9DF0_MERGED_AT`. So the width monitor's `TS_ANCHOR_ENABLE` and the clip sweep's
 `B4E9DF0_MERGED_AT` are the same 2026-07-21T17:07:37Z instant under two names. Prefer
 the `*_MERGED_AT` names in new code, and never introduce a third spelling.
@@ -999,3 +1399,207 @@ date; its tell was that the record's own comment named the retired `grok-4.5` /
 `gpt-5.5` / `opus-4.6` roster, dropped by the same merge that landed the anchor. That is
 fixed. The row is absent *today* because empty eras are omitted and no post-july15
 numeric has resolved. Neither statement is stale; read them in that order.
+
+## The round dataset builder
+
+Every round produces one `perf_all_tagged.json`, the dataset every downstream lane reads. The
+rules for building it are the same round to round and live in two tracked modules:
+`performance_analysis/round_dataset.py` (load, dedup, heal, tag, cohort) and
+`performance_analysis/round_outputs.py` (the four output files and the console report).
+Everything that names one particular round lives in a `RoundSpec` the round's own script
+constructs, so a new round is a spec and two calls rather than another copy of the script. The
+script had been copy-pasted forward ten times before this extraction, once per round, and each
+copy diverged; one of them carried a wrong era boundary for four months.
+
+### The round script
+
+```python
+SPEC = RoundSpec(
+    round_dir=THIS_DIR,
+    label="2026-09-16",
+    prior_dir=THIS_DIR.parent / "residual_2026-09-09",
+    prior_label="2026-09-09",
+    telemetry_dir=REPO / "backtests" / "telemetry_archive",
+    weighted_slug="summer-futureeval-2026",
+    required_slugs=("summer-futureeval-2026",),
+    optional_slugs=("metaculus-cup-fall-2026", "minibench"),
+    reused_slugs=("spring-aib-2026", "fall-aib-2025", "summer-futureeval-2026"),
+)
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+write_round_outputs(build_round_dataset(SPEC))
+```
+
+Filenames inside the round directory are conventional, so the spec names slugs rather than
+paths: `perf_<slug>.json` for each pulled tournament, `question_weights.json` for the
+leaderboard weights, `platform_rescored.json` for the pull's own re-resolution diff, and the
+four outputs. A required slug whose file is missing logs a WARNING and contributes nothing; an
+optional slug whose file is missing is silent, which is how a probed-but-empty successor
+tournament is meant to behave. `label` and `prior_label` are the provenance strings a record
+carries (`fresh_2026-09-16`, `reused_2026-09-09_tagged`), so they are the round's own name and
+not a path.
+
+### What the spine does, in order
+
+1. Loads the prior round's tagged file once, and reads three things off it: the baselines this
+   round does not re-pull, the cross-round rescore provenance, and the "was this already here,
+   was it already scored" snapshot behind `is_new_since_prior` and `newly_scored`.
+2. Loads each fresh pull, strips every tag field it owns off a reused record, and dedups on
+   `(question_id, post_id)` preferring the fresh record. A reused record of the weighted slug
+   that survives dedup means the fresh pull lost a question, and that is logged as a warning.
+3. Carries `rescored_fields` and `platform_rescored` forward BY KEY rather than on the reused
+   record itself. A fresh record wins dedup over its reused twin, so a carry on the record would
+   be thrown away and "Metaculus re-resolved this once" would become indistinguishable from
+   "never rescored".
+4. Heals the stored scores through `collector.rescore_records` and records the per-field deltas.
+   A fresh record changing here is a red flag, because the pull was scored by the current
+   collector; a reused record changing is the expected healing of a stale stored value.
+5. Stamps the era tags from `eras.py` and the leaderboard `question_weight`, which is set only on
+   the weighted slug's records and is `None` everywhere else.
+6. Pins the degraded cohort by joining the telemetry archive's `forecaster_drops` markers to that
+   run's per-question markers, then unions the result with `cohorts.py`'s canonical set, so a gap
+   in the archive cannot silently un-tag a known-degraded question.
+7. Flags novelty and the exclusion cohorts, then tags Metaculus-side score movement and
+   cross-checks the local ternary against the pull-side diff's distribution.
+
+### Two invariants
+
+**Field insertion order is part of the output.** `perf_all_tagged.json` is compared byte for byte
+between rounds, and Python preserves dict insertion order into JSON, so the tagging steps assign
+in a fixed order: provenance, then carried provenance, then healing, then era tags and weight,
+then novelty and cohorts, then the platform-rescore fields. Reordering the steps rewrites the
+file without changing a single value.
+
+**The tag vocabulary is a contract.** `era_gap.py` selects its arms with
+`--era-field triple_subera_fine`, and `clip_threshold.py` slices on the `pre_flip` / `post_flip`
+vocabulary. A renamed tag value breaks a standing instrument silently, which is why the tag
+functions live in `eras.py` and are imported rather than rewritten.
+
+### The reproduction receipt
+
+The spine was extracted from `scratch/residual_2026-09-09/bucket_by_era.py`, the tenth copy.
+Running the tracked code over that round's own inputs reproduces `perf_all_tagged.json` (905
+records, 88 MB), `new_since_prior.json` (78 records) and `degraded_cohort.json` byte for byte,
+and reproduces every block of `counts_by_era.json` except two. `generated` is a wall-clock stamp.
+`boundaries_utc.flip` now reads the corrected merge instant 2026-05-18T17:21:19Z instead of the
+2026-05-12 authoring date every scratch copy carried; no record was submitted inside that
+six-day window, so no record's era, tag or score moves with it.
+
+### Bot-side healing versus platform re-resolution: four field families, two owners
+
+A round carries two independent "this number changed" stories and they must never share a name.
+
+`rescored_fields` (with `rescored_fields_this_round` and `rescored_fields_prior_rounds`) is OURS:
+the bot-side score fields `collector.rescore_records` recomputed from the record's own stored
+inputs. Those scores are pure functions of inputs the record already carries, so a change means
+our scorer changed, not the platform.
+
+`platform_rescored` (with `platform_rescored_this_round`, `platform_rescored_prior_rounds` and
+`platform_rescored_pull_tag`) is METACULUS's, detected by `rescore_diff.diff_platform_rescores`.
+It exists because Metaculus can change a resolution after the fact without moving any timestamp
+we store. On 2026-08-31 it resolved q44798 (post 44645, "Halo: Campaign Evolved Metascore") at
+80, the PS5 hero card on Metacritic, and then within 26 hours edited it to 82, the Xbox card the
+resolution criteria actually name. `resolution_set_time` still read 2026-08-31T21:38:45Z
+afterwards, which PRECEDES the pull that read 80, so nothing timestamp-shaped could have flagged
+the edit. That record's spot peer went from +5.41 to -5.42 between two consecutive rounds, and
+every table the earlier round published about it was silently stale. The only reliable detector
+is a value-level diff of the pull against its predecessor: `resolution_raw` and
+`resolution_parsed` verbatim, plus every key of `metaculus_scores` on either side, so a field
+Metaculus adds later is diffed with no edit to the code.
+
+`rescore_diff`'s own tag is deliberately three-state, because "compared, nothing moved" and
+"never compared" are different facts and the second is what a run with no `--prior` produces.
+`None` means no prior record existed for that `(question_id, post_id)`, `False` means compared
+and unchanged, `True` means at least one field moved. On a `True` record only,
+`platform_rescored_fields` names the fields, `prior_resolution` carries the prior
+`resolution_raw` (equal to the current one on a score-only re-score, which is how a reader tells
+the two cases apart) and `prior_metaculus_scores` carries the prior score block. Those two prior
+snapshots are attached to moved records only: on an unchanged record the current values ARE the
+prior ones, and copying them everywhere would double the dataset's size to say nothing. The old
+`resolution_parsed` value is not recoverable from the tag, so `render_rescore_summary` reports it
+as `None` rather than guessing; `resolution_raw` moves with it in every real case and that row
+carries the values. A summary over records where nothing was compared says exactly that and
+claims nothing about staleness, because a dataset that never went through the diff and a prior
+pull with no overlapping key produce identical tags.
+
+`RESCORE_ATOL` is 1e-6, shared by `rescore_diff` and `collector.rescore_records` so both sides of
+a round comparison use one threshold. The platform's scores round-trip through JSON exactly and
+our scorer reproduces them to about 1e-14, while the gaps this exists to catch are whole points:
+the known-stale q44798 gaps start at 0.6.
+
+### The three drift transitions
+
+`round_dataset.score_transition` classifies every prior-versus-now score pair the round compares,
+and each entry of `counts_by_era.json`'s `bot_log_score_drift_detail` and `platform_drift_detail`
+carries the answer in its own `transition` field beside the `prior` and `now` values:
+
+| Transition | What it means |
+|---|---|
+| `moved` | Both rounds carried a value and they differ by more than `SCORE_ATOL`. |
+| `disappeared` | The prior round carried a value and this round carries none. |
+| `appeared` | The prior round carried none and this round carries a value. |
+
+The two one-sided cases used to be skipped outright: the guard required both sides non-null, so a
+score Metaculus withdrew read as no drift at all. That made the top-line
+`metaculus_platform_score_drift_fields` report zero and suppressed its warning while the pull-side
+diff, which has always treated a one-sided null as a change, reported the same record as rescored.
+A withdrawn score is the anomalous direction and the one a stale published table most needs to
+hear about, so it is now drift.
+
+The transition is a label on values the entry already carried rather than a separate count block,
+because the measured frequency says no reader will ever have a long list to skim. Over the nine
+archived rounds that carry a tagged file, 587 fresh-pull records matched a prior counterpart and
+produced zero `appeared`, zero `disappeared`, and exactly one `moved`: q44798 on both `peer_score`
+and `spot_peer_score` in the 2026-09-01 round. `appeared` is close to structurally impossible on a
+compared record, because the collector pulls only resolved questions (`resolution_raw` is non-null
+on all 905 records of the 2026-09-09 round) and Metaculus scores at resolution, so a record that
+survives to a second pull already carried its score block in the first. The only null platform
+scores in the whole archive are ten `fall-aib-2025` records with no `metaculus_scores` block at
+all, and that slug is reused rather than re-pulled, so they never enter the comparison.
+
+### Why the two sides of a drift comparison are read differently
+
+`_drift_against_prior` reads the prior side as `prior_view.get("peer_score")` and the current side
+as `peer_score(record)`, and that asymmetry is correct rather than a bug to tidy. The two arguments
+are different shapes. `record` is a live perf record, which carries its platform scores only nested
+under `metaculus_scores`; no archived record has ever carried a top-level `peer_score`, in any of
+the 6,353 records across the nine tagged rounds. `prior_view` is not a record at all: it is one
+value of the `prior_snapshot` index, an eight-key flat view that deliberately hoists
+`metaculus_scores.peer_score` and `.spot_peer_score` to top-level keys and keeps no nested block.
+So on the view the flat read is the only one that works and an accessor returns `None`, while on the
+record the reverse holds.
+
+Making both sides symmetric breaks the report in whichever direction you pick. Routing both through
+the accessors reads `None` for every prior value, which under the transition classifier turns every
+single re-pulled record into an `appeared`: 358 spurious entries on the 2026-09-01 to 2026-09-09
+comparison alone, 179 records times two fields, plus the alertable warning, in a round where
+Metaculus re-scored nothing. Routing both through the flat read would break the current side the
+same way. `PLATFORM_DRIFT_ACCESSORS` is the one table both ends use, so `prior_snapshot` hoists
+exactly the fields the drift path later reads flat and the two cannot drift apart; the snapshot goes
+through the accessors rather than indexing `metaculus_scores`, which keeps the spot-peer rule intact.
+`TestPriorViewIsFlatByConstruction` pins the shape of both arguments so a symmetric-looking
+"cleanup" fails a test that says why.
+
+Worth noting what the transition classifier bought here. Under the old both-non-null guard this
+same mistake would have been silent forever, because a `None` prior made the platform branch
+unable to report anything at all. It now announces itself as hundreds of `appeared` entries and a
+warning on the first real round, which is the failure mode a guard should have.
+
+### The two rescore paths ask different questions, and should not be made to agree
+
+`rescore_diff.diff_platform_rescores` runs on the PULL side and asks whether Metaculus touched
+this question at all. It diffs this pull against the prior round's raw `perf_<slug>.json`, over
+`resolution_raw`, `resolution_parsed` and every key of `metaculus_scores` on either side.
+
+`round_dataset._drift_against_prior` runs on the DATASET side and asks whether the numbers a round
+actually ranks and publishes on moved. It reads `peer_score` and `spot_peer_score` through
+`platform_scores.py`'s accessors, against the prior round's `perf_all_tagged.json`, which is the
+dataset every downstream lane read and therefore the baseline a stale table came from.
+
+Different baselines and different breadth, so the counts are not expected to match, and neither
+path should be widened to imitate the other. The dataset side must keep reading through the
+accessors rather than indexing `metaculus_scores` directly, or the continuous-question halving
+lands twice or not at all. The one thing that must agree is checked: `_log_pull_tag_agreement`
+warns when the local ternary `platform_rescored_pull_tag` distribution departs from the pull's own
+`tag_distribution`. Both sides do read the same quantity for the two shared fields, by different
+route on each end, for the reason the previous section gives.

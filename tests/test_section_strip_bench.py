@@ -721,6 +721,32 @@ class TestSpendGates:
         with pytest.raises(SystemExit):
             cli.parse_args([*argv, *_dataset_args(dataset)])
 
+    @pytest.mark.parametrize(
+        ("argv", "missing"),
+        [
+            (["--dry-run"], "--pairs and --perf-json"),
+            (["--dry-run", "--pairs", "p.jsonl"], "--perf-json"),
+            (["--dry-run", "--perf-json", "perf.json"], "--pairs"),
+        ],
+        ids=["neither", "no-perf-json", "no-pairs"],
+    )
+    def test_the_round_dataset_has_to_be_passed(self, argv: list[str], missing: str, capsys) -> None:
+        """``--pairs`` and ``--perf-json`` used to default into ``scratch/cost_pass_2026-09-09/``
+        and ``scratch/residual_2026-09-09/``. Those directories are gitignored, so a fresh clone
+        got a confusing missing-file error, and on the operator's machine they keep resolving
+        after the round is superseded, which benches a stale pairing under a current-looking run."""
+        with pytest.raises(SystemExit) as exit_info:
+            cli.parse_args(argv)
+
+        assert exit_info.value.code == 2
+        assert missing in capsys.readouterr().err
+
+    def test_rescore_needs_no_round_dataset(self, tmp_path: Path) -> None:
+        """``--rescore`` rebuilds results from a finished run dir and reads neither file."""
+        args = cli.parse_args(["--rescore", str(tmp_path)])
+
+        assert (args.rescore, args.pairs, args.perf_json) == (tmp_path, None, None)
+
 
 class TestPersonalKeyOnly:
     def test_the_donated_key_is_unreachable_on_the_paid_path(self, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,50 +1,26 @@
 """Derive the checked-in miniature comment fixture from a local performance pull.
 
-Why this exists
----------------
-``tests/test_performance_analysis_parsing.py::TestRealDataRegression`` guards
-per-model attribution recovery — the mechanism the whole residual/calibration
-workflow depends on. It used to read only ``scratch/performance_data.json``,
-which is gitignored, untracked, and rewritten by every ``spring-aib-2026`` pull.
-So the class never ran in CI and its local results were not reproducible
-run-to-run.
+Distills a big local pull into ``tests/data/performance_comments_mini.jsonl``: one
+record per distinct published-comment SHAPE, small enough to check in, deterministic,
+and safe to publish. A record is admitted only when every parser in ``parser_outputs``
+returns IDENTICAL output on the shrunken comment and on the original, enforced as a hard
+filter, because a miniature that parsed differently from its source would leave the test
+suite guarding a fiction.
 
-This script distills that big local pull into
-``tests/data/performance_comments_mini.jsonl``: one record per distinct comment
-SHAPE, small enough to check in, deterministic, and safe to publish. The test
-class reads the miniature as its CI floor and additionally sweeps the big local
-file when present.
+Usage::
 
-Faithfulness invariant
-----------------------
-A record is only included when every parser in ``parser_outputs`` returns
-IDENTICAL output on the shrunken comment and on the original. A miniature that
-parses differently from its source would make the test guard a fiction, so the
-check is a hard filter rather than a warning.
-
-``parse_per_model_reasoning_text`` is public but deliberately OUT of scope: the
-redaction below exists to elide rationale prose, which is exactly what that
-parser returns, so it necessarily diverges on every record. Its key set is
-preserved; only the bodies shrink.
-
-Redaction
----------
-Comments are real published Metaculus text. Everything that carries no parser
-signal is elided: research prose, per-model rationale prose, third-party news
-headlines, and the question title. What survives is the structural skeleton the
-parsers key on — section headers, ``*Forecaster N*`` bullets, ``Model:`` lines,
-percentile/probability/option value lines, and fenced JSON blocks.
-
-Usage
------
     uv run python scripts/derive_mini_comment_fixture.py
     uv run python scripts/derive_mini_comment_fixture.py --emit-expectations
 
-Re-run the first form after a fixture pull introduces a genuinely new comment
-shape (the shape guard in the test suite fails loudly when the miniature stops
-covering one). The second form re-renders the test's exact per-record
-expectation table from the CHECKED-IN fixture, so it needs no local pull; see
-``render_expectations`` for what it emits and why the diff deserves a read.
+The first form re-derives the fixture; re-run it when a pull introduces a genuinely new
+comment shape, which the shape guard in the test suite fails loudly about. The second form
+re-renders the test suite's per-record expectation table from the CHECKED-IN fixture, so it
+needs no local pull.
+
+Why the script exists, what the redaction elides and what it preserves, why
+``parse_per_model_reasoning_text`` is deliberately out of scope, and why an
+``--emit-expectations`` diff deserves a read: ``docs/performance_analysis.md``, section
+"The attribution parsers are guarded on two cohorts, and only one runs in CI".
 """
 
 import argparse
@@ -72,10 +48,8 @@ REPO_ROOT: Path = Path(__file__).resolve().parent.parent
 SOURCE_PATH: Path = REPO_ROOT / "scratch" / "performance_data.json"
 OUTPUT_PATH: Path = REPO_ROOT / "tests" / "data" / "performance_comments_mini.jsonl"
 
-# The test module that consumes ``--emit-expectations`` output, and the name it
-# binds the table to. Passed to the formatter as the stdin filename so the
-# emitted block is wrapped exactly as it will be once pasted in.
-TEST_MODULE_PATH: Path = REPO_ROOT / "tests" / "test_performance_analysis_parsing.py"
+# Given to the formatter as the stdin filename so the emitted table wraps exactly as it will once pasted in there.
+EXPECTATIONS_TEST_MODULE_PATH: Path = REPO_ROOT / "tests" / "test_performance_analysis_parsing.py"
 EXPECTATIONS_VARIABLE: str = "_EXPECTED_PARSES_BY_POST"
 
 TRIM_NOTICE: str = "[... trimmed for length]"
@@ -89,15 +63,11 @@ _FORECAST_SECTION_RE: re.Pattern[str] = re.compile(r"^=+\s*\nFORECAST SECTION:",
 _R1_BLOCK_SPLIT_RE: re.Pattern[str] = re.compile(r"(?m)^(?=##\s+R\d+:\s+Forecaster\s+\d+\s+Reasoning)")
 _TITLE_RE: re.Pattern[str] = re.compile(r"(?m)^\*Question\*:.*$")
 
-# Lines carrying a forecast value the parsers extract: percentile lines, binary
-# probability lines, and multiple-choice option lines.
-_VALUE_LINE_RE: re.Pattern[str] = re.compile(
+_FORECAST_VALUE_LINE_RE: re.Pattern[str] = re.compile(
     r"(?mi)\A\s*(?:Percentile\s+[\d.]+\s*:|(?:final\s+)?probability\s*:|-\s+.+:\s*[\d.]+\s*%)"
 )
 
-# Structural lines in the comment HEAD (everything above the rationales). Bold
-# prose (``**Some news headline**``) is deliberately excluded — it is
-# third-party text, not structure.
+# Bold lines (``**Some news headline**``) are excluded on purpose: third-party prose, not structure.
 _STRUCTURAL_HEAD_RE: re.Pattern[str] = re.compile(
     r"\A(?:#{1,3} \S|\*Forecaster\s+\d+|-\s+.+:\s*[\d.]+\s*%|\*Question\*|\*Final Prediction\*)"
 )
@@ -136,7 +106,7 @@ def _shrink_rationale_block(block: str) -> str:
     (a trailing ``Probability:`` often sits under the closing prose).
     """
     lines = block.split("\n")
-    keep: set[int] = {index for index, line in enumerate(lines) if _VALUE_LINE_RE.match(line)}
+    keep: set[int] = {index for index, line in enumerate(lines) if _FORECAST_VALUE_LINE_RE.match(line)}
     keep.update(range(min(2, len(lines))))  # header + Model: line
     keep.update(index for index, line in enumerate(lines) if line.startswith("## "))
     keep.update(range(max(0, len(lines) - 2), len(lines)))
@@ -161,9 +131,7 @@ def _shrink_head(head: str, *, comment: str) -> str:
             shrunk += TRIM_NOTICE + "\n"
         return shrunk
 
-    # No ``### Research Summary`` marker: this record exercises the
-    # boundary-fallback path in ``_summary_section_for_bullets``, so the ABSENCE
-    # of the marker is itself the property under test and must survive.
+    # The marker's ABSENCE is itself under test (``_summary_section_for_bullets`` fallback), so it must survive.
     lines = head.split("\n")
     keep = {index for index, line in enumerate(lines) if _STRUCTURAL_HEAD_RE.match(line)}
     shrunk = _elide_gaps(lines, keep, RESEARCH_STUB) + "\n"
@@ -257,21 +225,16 @@ def build_fixture(records: list[dict]) -> list[dict]:
 def render_expectations(fixture: list[dict]) -> str:
     """Render the test suite's exact per-record expectation table as Python source.
 
-    The values come from running the REAL parsers over ``fixture``, so this is a
-    CHARACTERIZATION of current behavior, not an independent specification. That
-    is the point (hand-transcribing twelve nested dicts is how typos become
-    "expected" values) and also the risk: regenerating after a parser change will
-    happily bless the change. A diff in the emitted table is a signal to READ the
-    diff and confirm each moved value is intended, never to rubber-stamp.
+    A CHARACTERIZATION of current parser behavior rather than an independent
+    specification, so regenerating after a parser change will happily bless the change;
+    read the emitted diff instead of rubber-stamping it. Detail:
+    ``docs/performance_analysis.md``.
     """
     table = {entry["post_id"]: parser_outputs(entry["comment_text"]) for entry in fixture}
     source = f"{EXPECTATIONS_VARIABLE} = {table!r}\n"
-    # Formatted by the repo's own formatter so the emitted block can be pasted in
-    # without a follow-up `make format` reflowing it into a different diff.
-    # S603: fixed argv, no shell. The executable is this interpreter (``sys.executable``)
-    # and the only interpolation is the module-level ``TEST_MODULE_PATH`` constant.
+    # Run through ruff format so the pasted block needs no reflow; S603 argv is fixed, shell-free, all constants.
     formatted = subprocess.run(  # noqa: S603
-        [sys.executable, "-m", "ruff", "format", "--stdin-filename", str(TEST_MODULE_PATH), "-"],
+        [sys.executable, "-m", "ruff", "format", "--stdin-filename", str(EXPECTATIONS_TEST_MODULE_PATH), "-"],
         input=source,
         capture_output=True,
         text=True,
@@ -311,8 +274,9 @@ def main() -> None:
 
     if not args.source.exists():
         raise SystemExit(
-            f"source pull not found at {args.source}; run the performance-analysis collector first "
-            "(see AGENTS.md 'Residual / performance analysis')"
+            f"source pull not found at {args.source} (gitignored, so a fresh clone has none). Either pass "
+            "--source <an existing pull>, or make one with 'uv run python -m metaculus_bot.performance_analysis "
+            f"--tournament <slug> --output {args.source}'."
         )
 
     with args.source.open() as handle:

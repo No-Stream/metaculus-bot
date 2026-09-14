@@ -2369,6 +2369,50 @@ artifacts expire at 90 days, which makes anything a partial pull skipped
 permanently unrecoverable. The twice-weekly launchd job in
 `scripts/research_sync/` is wired to `sync_all` for the same reason.
 
+### Auditing a round pull, and probing the season slugs
+
+Two free CLIs sit either side of a residual-round pull. Both were per-round scratch
+scripts pasted forward for months before promotion, so their history lives in
+`scratch/residual_*/`.
+
+```bash
+make probe_slugs                                     # before the pull: is the season config current?
+make verify_pull ARGS="--records scratch/residual_<date>/perf_<slug>.json \
+  --prior-records scratch/residual_<prior>/perf_<slug>.json"
+```
+
+`scripts/probe_slugs.py` reads one project object per candidate slug,
+`/api/projects/tournaments/<slug>/`, and reports whether it exists, its visibility,
+question count and forecasting end date. Candidates are the slugs the repo's own
+constants point at (`supply_probe_platforms.DEFAULT_SLUGS`) plus the season-successor
+spellings for this season and the next, generated from a template list rather than
+hand-maintained, so the tracked file needs no per-round edit. The project object rather
+than the tournaments LIST because the list omits anything whose `visibility` is
+`unlisted`, which is precisely the state a new season sits in before its first question.
+It flags two things: a configured slug that is absent or past its forecasting window,
+where every scheduled run finds no question and forfeits the season silently, and a live
+season under a spelling the constants do not name. Post and question counts stay
+`make supply_probe`'s job; this probe pages nothing.
+
+`scripts/verify_pull.py` is fully offline. It reads the pull's checkpoint (the raw post
+payloads it fetched, written beside the records file, so one `--records` path locates
+both) and runs five checks: which resolved posts produced no record and why, which
+resolved members of a covered group post produced none, the diff against the prior round
+(`--output` writes that cohort as JSON), whether every platform score on an overlapping
+record reproduces exactly, and whether the pull still parses per-model forecasts and
+comment text out of the bot's comments. Check 4 is the one with a receipt: Metaculus
+re-resolves in place without moving any timestamp, so a moved score means a table in the
+prior round's write-up went stale silently.
+
+A recordless post classifies as already-known when the PRIOR pull fetched it and emitted
+no record for it, which is derived from that round's own checkpoint rather than listed.
+That is deliberate: these are POST ids and a round-relative expected state, not an
+incident-defined scoring cohort, so they do not belong in
+`performance_analysis/cohorts.py` (question ids, one per incident). A recordless post the
+prior pull never fetched reads INVESTIGATE until a human classifies it and the next round
+inherits the verdict for free, which is how post 44950 surfaced on 2026-09-09 after
+entering the resolved list mid-season.
+
 ### The persisted artifact store, and re-parsing for free
 
 `sync_all` downloads each artifact into `backtests/gha_artifact_store/<artifact-name>/`

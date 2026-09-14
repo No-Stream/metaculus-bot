@@ -9,15 +9,13 @@ each of these tables answers a different question:
   actually happened, beside how often its OWN prices said they would. This is the direct
   evidence; every sweep number is a re-expression of it.
 * :func:`insurance_row`: what a floor is FOR. A floor is insurance against the sub-``c`` band
-  being under-priced, so the row carries the break-even hit rate the floor needs, the
-  Jeffreys interval on the observed rate, the properness cost a calibrated forecaster pays
-  for the clip regardless, and the ceiling the insurance could ever have paid.
+  being under-priced, so the row carries the break-even hit rate it needs, the Jeffreys interval
+  on the observed rate, the properness cost of the clip, and the ceiling the insurance could pay.
 * :func:`nesting_rows`: which questions the nested windows are re-counting, so seven agreeing
   rows are not mistaken for seven replications.
-* :func:`oos_row`: whether a floor fitted on the PAST carries into a later window. A clip
-  level is a fitted calibration layer, and AGENTS.md's era-bucketing rule is that one ships
-  only after an out-of-sample era test. A fit that moves nothing is flagged: its carry is
-  vacuous, not a pass.
+* :func:`oos_row`: whether a floor fitted on the PAST carries into a later window. A clip level
+  is a fitted calibration layer, which AGENTS.md's era rule ships only after an out-of-sample era
+  test. A fit that moves nothing is flagged: its carry is vacuous, not a pass.
 * :func:`replay_cohort` / :func:`cross_check_row`: the honesty check on the sweep's shortcut of
   clamping the PUBLISHED median instead of replaying members through the clamp, with the
   aggregator each record was actually published under. The per-window facts (how many
@@ -43,7 +41,7 @@ from metaculus_bot.constants import (
     THIN_PUBLISH_BINARY_CEIL,
     THIN_PUBLISH_BINARY_FLOOR,
 )
-from metaculus_bot.performance_analysis.analysis import B4E9DF0_MERGED_AT, jeffreys_ci
+from metaculus_bot.performance_analysis.analysis import jeffreys_ci
 from metaculus_bot.performance_analysis.clip_threshold_selection import (
     OOB_BOOTSTRAP_B,
     OobArgmax,
@@ -82,18 +80,17 @@ from metaculus_bot.performance_analysis.clip_threshold_windows import (
     build_windows,
     nested_windows,
 )
+from metaculus_bot.performance_analysis.eras import B4E9DF0_MERGED_AT
 from metaculus_bot.post_processing import apply_thin_publish_floor
 from metaculus_bot.scoring_common import spot_peer_delta
 from metaculus_bot.spread_metrics import binary_prob_range_spread
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-# Below this many records a complement cannot fit a clip level; the OOS row prints n/a
-# rather than a number, mirroring width_monitor's MIN_N_FOR_POINT_METRICS convention.
+# Below this many records the OOS row prints n/a, mirroring width_monitor's MIN_N_FOR_POINT_METRICS.
 MIN_OOS_COMPLEMENT_N: int = 30
 
-# The label on the one MEASURED floor comparison: the floor now in force priced on the
-# records published before it went live, which is the current-regime window's complement.
+# The one MEASURED floor comparison: the live floor priced on the current-regime window's complement.
 WINDOW_OLDER_REGIME = f"before_{WINDOW_CURRENT_CLAMP}"
 
 

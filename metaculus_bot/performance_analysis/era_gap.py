@@ -27,6 +27,7 @@ from itertools import pairwise
 
 import numpy as np
 
+from metaculus_bot.performance_analysis.cluster_structure import ClusterStrength
 from metaculus_bot.performance_analysis.cohorts import EXCLUSION_COHORTS
 from metaculus_bot.performance_analysis.collector import load_dataset
 from metaculus_bot.performance_analysis.markdown import markdown_table
@@ -52,8 +53,6 @@ SECONDS_PER_DAY = 86_400.0
 WATCH_LABEL = "type-adjusted, horizon-matched"
 
 RESOLUTION_DAY_CONVENTION = "one UTC day of actual_resolve_time per cluster"
-# The round convention: only a strong cluster (one shared resolution driver) collapses to one draw.
-COLLAPSED_STRENGTH = "strong"
 
 
 class Verdict(StrEnum):
@@ -122,7 +121,7 @@ class ClusterMap:
     def from_cluster_structure(cls, structure: dict, *, source: str) -> ClusterMap:
         strength = {cid: cluster.get("strength") for cid, cluster in structure["clusters"].items()}
         strong = {
-            qid: cid for qid, cid in structure["qid_to_cluster"].items() if strength.get(cid) == COLLAPSED_STRENGTH
+            qid: cid for qid, cid in structure["qid_to_cluster"].items() if strength.get(cid) == ClusterStrength.STRONG
         }
         return cls(strong=strong, source=source)
 

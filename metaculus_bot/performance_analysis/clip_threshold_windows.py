@@ -15,12 +15,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from metaculus_bot.performance_analysis.analysis import (
+from metaculus_bot.performance_analysis.clip_threshold_sweep import BINARY, MULTIPLE_CHOICE, ClipRecord
+from metaculus_bot.performance_analysis.eras import (
     B4E9DF0_MERGED_AT,
     FT_0292_MERGED_AT,
     WIDENING_FLIP_MERGED_AT,
 )
-from metaculus_bot.performance_analysis.clip_threshold_sweep import BINARY, MULTIPLE_CHOICE, ClipRecord
 
 LOOKBACK_DAYS: int = 90
 
@@ -34,15 +34,13 @@ ERA_WINDOW_PREFIX = "era_"
 WINDOW_ERA_PRE_FLIP = f"{ERA_WINDOW_PREFIX}pre_flip"
 WINDOW_ERA_POST_FLIP = f"{ERA_WINDOW_PREFIX}post_flip"
 
-# Suffix sizes per type. MC carries a last_50 because its whole archive is under 100
-# records, so last_100 and above are the full set and must say so (``Window.oversize``).
+# MC carries a last_50 because its whole archive is under 100 records, so last_100 is oversize.
 LAST_N_BY_TYPE: dict[str, tuple[int, ...]] = {
     BINARY: (300, 200, 100),
     MULTIPLE_CHOICE: (300, 200, 100, 50),
 }
 
-# The start of the clamp regime now in force, per type; the sweep's ``_CLAMP_HISTORY`` asserts
-# its newest row against the live constants, so a constant change has to land in both places.
+# The clamp regime now in force, per type; the sweep's ``_CLAMP_HISTORY`` pins its newest row too.
 _CLAMP_REGIME_START: dict[str, datetime] = {
     BINARY: WIDENING_FLIP_MERGED_AT,
     MULTIPLE_CHOICE: FT_0292_MERGED_AT,
