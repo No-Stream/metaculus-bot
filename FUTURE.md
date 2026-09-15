@@ -105,7 +105,14 @@ overcorrect, and its "exclude finance" advice is inverted on current data). Park
 evidence: the spread-triggered second forecast round (LOW since 2026-08-25 because stacking is prod-disabled, NOT
 because the gate is dead, since it fires on 15 of 30 triple questions), always-on crux extraction, the TS-anchor chart
 image A/B, claude-fable-5 for the Anthropic slots (pulled 2026-07-20 for `content=None` refusals, a reliability rather
-than a quality problem), a trimmed mean, and per-type weighting by historical performance.
+than a quality problem), and per-type weighting by historical performance. Trimmed mean (RUN 2026-09-15 on the five-
+and six-member eras, n=233 numeric-family: +1.6 [+0.1, +3.3] log/question pooled, all of it pre-flip, post-flip −0.01;
+degenerate at three members, so a null for the live roster). Pointwise mean at k≥5 is the one revivable item: the
+2026-09-15 replay at n=262 found +2.0 [−0.0, +4.3] pre-flip (six members, half the sum in two questions), −0.15
+post-flip and −0.43 on the triple, so revisit only if the roster grows back to five or more. The same run replicated
+the quantile-averaging loss at −7.4 [−13.4, −2.4], a tail effect, and attributed the median's edge over its average
+member to location consensus (+6.3 [+4.7, +7.9]) with the width effect a null (−0.5 [−2.3, +1.4]); the vendor-diversity
+delta at k=3 is a null on every type. Receipts: `scratch/aggregation_bench_2026-09-15/` in the artifacts repo.
 
 **Research architecture.** End-to-end per-forecaster agentic research: NO (2026-07-16, re-confirmed 2026-07-19: BTF-2's
 most accurate forecast was a strong prompt on good SHARED research, already this architecture, so the lever is
